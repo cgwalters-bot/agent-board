@@ -337,6 +337,86 @@ pub(super) fn replay() -> Replay {
 const MERGED_RUN: u64 = 39718949900;
 
 #[test]
+fn runner_profile_plan_keeps_in_flight_item_identity() {
+    for runner in ["hosted", "devspace-rhel10-64"] {
+        let mut replay = without_epics(replay());
+        for comment in comments_468(&mut replay) {
+            if let Some(body) = comment["body"].as_str() {
+                comment["body"] = body.replace("\"hosted\"", &format!("\"{runner}\"")).into();
+            }
+        }
+        in_flight(
+            &mut replay,
+            vec![json!({"id": 7,
+            "display_title": "implement cgwalters-forge/tracker#468 (claude)",
+            "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/7"})],
+        );
+        let report = preview(&config(json!({})), &replay);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("tracker#468: a run is in flight")),
+            "{runner}: {:?}",
+            report.lines
+        );
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|line| line.starts_with("start ") && line.contains("tracker#468"))
+        );
+    }
+}
+
+#[test]
+fn runner_profile_plan_is_scheduled_once_without_resolving_it() {
+    for runner in ["hosted", "devspace-rhel10-64"] {
+        let mut forge = Forge::new(None, false);
+        replan_468(&mut forge.replay, "\"hosted\"", &format!("\"{runner}\""));
+        comments_468(&mut forge.replay)
+            .retain(|comment| !text(comment, "/body").contains(plan::DISPATCH_MARKER));
+        for nodes in forge.replay.requests.iter_mut().filter_map(|entry| {
+            entry["answer"]
+                .pointer_mut("/data/repository/pullRequests/nodes")
+                .and_then(Value::as_array_mut)
+        }) {
+            nodes.retain(|node| node["number"] != 889);
+        }
+        text_468(&mut forge.replay, "Work.");
+        let config = config(json!({}));
+        let first = apply(&forge, &config);
+        assert_eq!(first.failures, 0, "{:?}", first.lines);
+        {
+            let requests = forge.writes.borrow();
+            let requests: Vec<_> = requests
+                .iter()
+                .filter(|(method, url, body)| {
+                    method == "POST"
+                        && url.ends_with("/dispatches")
+                        && body["inputs"]["item"] == "468"
+                })
+                .collect();
+            assert_eq!(requests.len(), 1, "{runner}: {:?}", first.lines);
+            assert_eq!(
+                requests[0].2["inputs"].get("runner"),
+                (runner != "hosted").then_some(&json!(runner))
+            );
+        }
+        let second = apply(&forge, &config);
+        assert_eq!(second.failures, 0, "{:?}", second.lines);
+        assert_eq!(
+            forge
+                .dispatches()
+                .iter()
+                .filter(|item| *item == "cgwalters-forge/tracker#468")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn active_work_suppresses_replans_and_research_triage() {
     for (kind, author, state, changed, expected) in [
         (
@@ -9209,6 +9289,69 @@ fn text_468(replay: &mut Replay, body: &str) {
 }
 
 #[test]
+fn recorded_runner_profiles_do_not_enter_automatic_recovery() {
+    for kind in ["implement", "triage", "research"] {
+        for http_refusal in [false, true] {
+            for reruns in [false, true] {
+                let config = config(json!({
+                    "reruns": reruns,
+                    "replanAfterDays": 1,
+                    "triageFollowUpDays": 1,
+                    "skipActiveWork": kind == "research",
+                }));
+                assert!(config.starts.is_none());
+                let mut forge = Forge::new(None, false);
+                only(&mut forge.replay, &["cgwalters-forge/tracker#468"]);
+                replan_468(&mut forge.replay, "\"hosted\"", "\"devspace-rhel10-64\"");
+                replan_468(
+                    &mut forge.replay,
+                    r#""kind":"implement","#,
+                    &format!(r#""kind":"{kind}","#),
+                );
+                failed(
+                    &mut forge.replay,
+                    vec![json!({
+                        "id": 39718949900_u64,
+                        "display_title": format!("{kind} cgwalters-forge/tracker#468 (claude)"),
+                        "conclusion": "failure", "run_attempt": 1,
+                    })],
+                );
+                if http_refusal {
+                    let record = comments_468(&mut forge.replay)
+                        .iter_mut()
+                        .find(|c| text(c, "/url").ends_with("#issuecomment-6332216967"))
+                        .unwrap();
+                    record["body"] = format!(
+                        "<!-- {}: 6332112108@2026-10-22T03:40:56Z -->\nThe plan was not dispatched, or not knowingly (HTTP 422: runner profile is disabled). It is not tried again; edit or replace the plan to dispatch it.",
+                        plan::DISPATCH_MARKER
+                    ).into();
+                }
+                text_468(&mut forge.replay, "Work.");
+                if kind == "research" {
+                    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 468, "cursor": null});
+                    forge.replay.requests.push(json!({"request": graphql_key(active::LINKS, &variables),
+                        "answer": {"data": {"repository": {"issue": {
+                            "lastEditedAt": "2026-10-23T15:00:00Z", "updatedAt": "2026-10-23T15:00:00Z",
+                            "timelineItems": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+                        }}}}}));
+                    forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/tracker/actions/runs/{MERGED_RUN}")},
+                        "answer": {"status": 200, "headers": {}, "body": {
+                            "status": "completed", "conclusion": "failure", "updated_at": "2026-10-23T14:00:00Z"}}}));
+                }
+                for _ in 0..2 {
+                    let report = apply(&forge, &config);
+                    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+                    assert!(report.lines.iter().any(|l| l.starts_with(
+                        "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z's runner profile devspace-rhel10-64 dispatch is recorded; automatic recovery is disabled"
+                    )), "{kind}, HTTP refusal={http_refusal}, reruns={reruns}: {:#?}", report.lines);
+                }
+                assert!(forge.writes.borrow().is_empty(), "{:#?}", forge.writes);
+            }
+        }
+    }
+}
+
+#[test]
 fn apply_reruns_a_failed_run_once() {
     // tracker#468's implement plan was dispatched as run 39718949900.
     let url = "https://github.com/cgwalters-forge/tracker/actions/runs/39718949900";
@@ -9278,6 +9421,7 @@ fn apply_reruns_a_failed_run_once() {
         )
     };
     let stacked: Edit = |r| replan_468(r, r#""item":468,"#, r#""item":468,"stacks_on":467,"#);
+    let profile: Edit = |r| replan_468(r, "\"hosted\"", "\"devspace-rhel10-64\"");
     // #468's plan names tracker#17, a pull request, whose issue read fails
     // as GitHub's does, `answer` its error; only a NOT_FOUND asks what it is.
     fn target_17(r: &mut Replay, error: &str) {
@@ -9360,6 +9504,22 @@ fn apply_reruns_a_failed_run_once() {
             vec![run(2)],
             none,
             &again,
+            0,
+        ),
+        (
+            "an accepted dispatch whose caller refuses a profile is terminal",
+            json!({"reruns": true}),
+            vec![run(1)],
+            profile,
+            "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z's runner profile devspace-rhel10-64 dispatch is recorded; automatic recovery is disabled",
+            0,
+        ),
+        (
+            "a profile refusal before agent startup is not an infrastructure retry",
+            json!({"reruns": true, "starts": {}}),
+            vec![run(1)],
+            profile,
+            "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z's runner profile devspace-rhel10-64 dispatch is recorded; automatic recovery is disabled",
             0,
         ),
         (
@@ -9447,6 +9607,9 @@ fn apply_reruns_a_failed_run_once() {
     for (name, settings, runs, edit, expected, reruns) in cases {
         let config = config(settings);
         let mut forge = Forge::new(None, false);
+        if config.starts.is_some() {
+            newest_runs(&mut forge.replay, vec![], vec![]);
+        }
         failed(&mut forge.replay, runs);
         edit(&mut forge.replay);
         text_468(&mut forge.replay, "Work.");

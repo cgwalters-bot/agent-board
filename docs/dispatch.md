@@ -170,8 +170,14 @@ with a `ref` and these string inputs, which the caller workflow must accept:
 | `effort` | Optional: exactly `heavy`; omitted for the existing default. Carried unchanged even when routing supplies a default pool |
 | `base` | Only for a [stacked](job-plans.md#stacking) plan: the branch to start from |
 
-A plan's `runner` is checked (only `hosted` is accepted) but not sent: the
-caller workflow has one runner. Batched plans add their briefs to `task`.
+A plan's `runner` accepts `hosted` or a caller-owned profile name matching
+`[a-z0-9][a-z0-9_-]{0,31}`. Hosted/absent sends no input, preserving the
+existing request; a non-hosted name is forwarded only as `runner`, never
+resolved here. Non-hosted refusals are terminal, including HTTP 422; no retry
+as hosted is made. Caller workflow failures remain recorded runs, not reasons
+to redispatch. The reviewed tracker resolver is not yet available (tracker#1489);
+live profile support is [gated](job-plans.md#runner-profiles-caller-integration-gated).
+Batched plans add their briefs to `task`.
 
 ### Heavy model caller contract
 

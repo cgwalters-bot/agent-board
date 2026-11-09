@@ -36,20 +36,51 @@ start of a line, holding one JSON object:
 | `repo` | yes | Target repository, `OWNER/NAME`; the caller's bounds must allow it |
 | `item` | yes | Positive issue number in `repo`; for `fix`, the pull request whose branch it rewrites |
 | `kind` | yes | `implement`, `triage`, `research`, `fix` or `session`: the profile the run gets; the pass starts `fix` only with [`fixPlans`](pass.md#scheduling) and `session` only with [`sessionPlans`](sessions.md), and then only the operator's own session plan |
-| `runner` | yes | `hosted`, the only runner the caller has |
+| `runner` | yes | `hosted` (the default planners emit), or a caller-owned profile name: `[a-z0-9][a-z0-9_-]{0,31}`, like `pool`'s syntax and length |
 | `pool` | no | Inference pool named in the caller's `pools.json`: lowercase letters, digits, `-` and `_`, starting with a letter or digit, at most 32 bytes (`gpt5`, `claude-opus`), and not a `tier-` name; absent leaves it to the caller's variables |
 | `effort` | no | Only `"heavy"`: request the selected pool's optional heavy model; omit for the existing default model. Null, empty, `"default"` and other values are refused |
 | `brief` | yes | The task, at most 16,000 characters; the run gets it after the kind's profile |
 | `stacks_on` | no | Another issue number in `repo` whose pull request this implement run builds on ([stacking](#stacking)) |
 
-Every field but `schema` and `runner` maps onto one input of the caller's dispatch workflow
+Every field but `schema` maps onto one input of the caller's dispatch workflow
 ([dispatch](dispatch.md#the-request); `brief` is `task`; `stacks_on` becomes
 `base`, a branch dispatch finds).
 Anything else, including `null` for a field, is refused: the caller has no inputs
 for the base branch, budget or allowed outputs yet, so a plan must not appear to
-set them. A `devspace` runner is refused for the same reason; the caller has no
-devspace runner for upstream forks yet. Each is added to the schema when the
-caller can carry it. One plan per comment; a comment with two is refused.
+set them. One plan per comment; a comment with two is refused.
+
+### Runner profiles (caller integration gated)
+
+The threat is a plan redirecting execution to credential-bearing runner labels
+or an attacker's workflow. Board carries only a bounded profile name, never
+external repository, workflow, ref, configuration path or resource selectors.
+The caller alone resolves profiles, credentials, deployment and admission from
+its trusted configuration. A profile grants no target authority.
+
+Manual and scheduled GitHub dispatch forward a non-hosted name as `runner`.
+`hosted` sends no new input, preserving existing callers and dedupe. Planners
+must keep emitting `hosted`; existing child plans are unchanged. Namespace
+routing and native Forgejo currently refuse non-hosted profiles.
+
+The [tracker resolver contract](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md#runner-profiles)
+requires unknown and disabled names to fail, with no fallback to hosted. A
+non-hosted HTTP refusal is terminal, including 422: board does not retry it
+without run details or replace the runner. A successfully started caller run
+may itself refuse the profile; its failed run remains the recorded result,
+not a new hosted dispatch. Until a reviewed caller refusal signal exists, the
+pass conservatively holds every recorded non-hosted dispatch for a person,
+including records without a run URL. This is independent of automatic reruns
+or early-start recovery settings and blocks automatic replanning and follow-up
+triage, even for successful runs: edit or replace the plan after checking the
+caller's result. Research plans with a non-hosted runner also cannot turn into
+automatic hosted triage. Records still identify the plan by comment and edit
+time, and in-flight holds remain per item, independent of runner selection.
+
+At implementation, tracker#1489 is open and tracker `dispatch.yml` has no runner
+input or reviewed resolver. Tests exercise name transport and refusal with
+mocks, not an invented resolver wire protocol. Live support remains gated on
+that reviewed caller change and runtime integration. No profile is enabled by
+this change; do not submit a non-hosted plan to the current caller.
 
 ### Model effort (caller deployment required)
 

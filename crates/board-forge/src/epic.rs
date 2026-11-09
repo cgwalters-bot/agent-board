@@ -1787,7 +1787,7 @@ mod tests {
         let mut with_repo = create();
         with_repo["plan"]["repo"] = json!("cgwalters-forge/tracker");
         let mut bad_job = create();
-        bad_job["plan"]["runner"] = json!("devspace");
+        bad_job["plan"]["runner"] = json!("../devspace");
         let mut session_job = create();
         session_job["plan"]["kind"] = json!("session");
         let mut epic_label = create();
@@ -2152,7 +2152,7 @@ mod tests {
             (vec![json!({"issue": EPIC})], "no type"),
             // A job plan names its own issue, and is checked as any is.
             (vec![with_repo], "names repo, which is the new issue's"),
-            (vec![bad_job], "plan runner \"devspace\" is not available"),
+            (vec![bad_job], "plan runner must be hosted"),
             (
                 vec![session_job],
                 "kind \"session\" is not a sub-issue's; a session plan is written by hand",

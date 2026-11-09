@@ -5933,7 +5933,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             if let Some(held) = hold(&facts, busy, &writers) {
                 return Ok(Step::Hold(held));
             }
-            if plan::newest_plan(&comments, &writers).is_ok_and(|(p, _)| p.kind == "research") {
+            if plan::newest_plan(&comments, &writers)
+                .is_ok_and(|(p, _)| p.kind == "research" && p.runner == "hosted")
+            {
                 return self.triage((&facts, &comments), AGAIN, (snapshot, target, slots));
             }
         }
@@ -5978,6 +5980,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             match batch::held(&self.client, &comments, &writers, &id, issue)?.first() {
                 None => (plan, id, None, None, operators),
                 Some((_, record)) => {
+                    // A record may be an HTTP refusal with no run URL, or a
+                    // caller run that refused a profile after accepting it.
+                    // The failed-run cache is optional and cannot distinguish
+                    // those from successful profile runs. Until the caller has
+                    // a reviewed refusal signal, no recorded profile plan may
+                    // enter automatic recovery, including hosted replanning.
+                    if plan.runner != "hosted" {
+                        let why = format!(
+                            "plan {id}'s runner profile {} dispatch is recorded; automatic recovery is disabled; edit or replace the plan after checking the caller's result",
+                            plan.runner
+                        );
+                        return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+                    }
                     // The run this plan's record names, where it failed: re-run
                     // once its plan's item passes a start's checks below, with
                     // `reruns`, or with `starts` where it failed before its

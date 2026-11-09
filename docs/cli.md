@@ -511,7 +511,7 @@ agent-board dispatch [OPTIONS] --caller <OWNER/REPO> --workflow <FILE> --operato
 
 Arguments:
 
-- `<ISSUE>`: Issue whose newest accepted plan comment to dispatch: URL, OWNER/REPO#N, or N with --repo
+- `<ISSUE>`: Issue whose newest accepted plan comment to dispatch: URL, OWNER/REPO#N, or N with --repo. A runner profile name is forwarded unchanged; only the caller resolves it. Hosted keeps the existing default request
 
 Options:
 
