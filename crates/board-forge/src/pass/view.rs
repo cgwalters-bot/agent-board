@@ -64,7 +64,17 @@ impl Run {
         })
     }
 
-    fn json(&self) -> Value {
+    /// Its item's `OWNER/REPO#N` in lower case, as holds are matched.
+    pub(super) fn key(&self) -> String {
+        self.item.to_ascii_lowercase()
+    }
+
+    /// Where it runs and its id there, which name it.
+    pub(super) fn id(&self) -> (&str, u64) {
+        (&self.repository, self.id)
+    }
+
+    pub(super) fn json(&self) -> Value {
         let mut out = json!({"item": self.item, "kind": self.kind, "pool": self.pool,
             "run": {"repository": self.repository, "id": self.id}});
         if let Some(at) = &self.started_at {

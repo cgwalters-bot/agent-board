@@ -231,7 +231,7 @@ fn is_ticked(body: &str, checkbox: &str) -> bool {
 /// comments. It errs towards dropping lines: an HTML block of a kind that
 /// runs to a blank line is dropped even where CommonMark would read the
 /// line as a paragraph's.
-fn rendered_lines(body: &str) -> Vec<&str> {
+pub(crate) fn rendered_lines(body: &str) -> Vec<&str> {
     // CommonMark's HTML blocks that run to their end marker, not a blank line.
     const ENDS: &[(&str, &str)] = &[
         ("<!--", "-->"),

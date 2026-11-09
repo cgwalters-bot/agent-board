@@ -929,6 +929,10 @@ pub struct HoldsAt {
     /// Off unless set: private UTC-day activity and yesterday's list-price cost.
     #[serde(default)]
     pub today: bool,
+    /// Off unless set: adds the open P0 epics' progress, runs and blockers
+    /// ([`focus::SCHEMA`]) to the snapshot; needs `epics` and a GitHub board.
+    #[serde(default, rename = "epicFocus")]
+    pub epic_focus: bool,
 }
 
 /// The issue whose body is the operator's direction: in a private
@@ -1332,6 +1336,14 @@ impl Config {
                 ensure!(holds.needs_you, "holds proposals needs holds needsYou");
                 proposals.check(self)?;
             }
+            if holds.epic_focus {
+                // It summarizes stage 3's listing and stage 4's board.
+                ensure!(self.epics.is_some(), "holds epicFocus needs epics");
+                ensure!(
+                    self.github_board().is_some(),
+                    "holds epicFocus supports only a GitHub board"
+                );
+            }
         }
         if let Some(decisions) = &self.decisions {
             ensure!(
@@ -1534,6 +1546,11 @@ impl Config {
     /// `authored`'s.
     fn follows(&self) -> bool {
         !self.follow.is_empty() || self.midstream.is_some() || self.authored.is_some()
+    }
+
+    /// Whether the hold snapshot has the epic focus (`holds.epicFocus`).
+    fn epic_focus(&self) -> bool {
+        self.holds.as_ref().is_some_and(|h| h.epic_focus)
     }
 
     /// Whether `repository` is in `midstream`'s organization, so may be one.
@@ -2107,6 +2124,10 @@ pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> 
     under_way(facts, busy, people)
 }
 
+/// What a `pr-open` hold's reason says around its pull request's
+/// `OWNER/REPO#N`, which the epic focus reads back ([`focus`]).
+const PR_OPEN: [&str; 2] = ["pull request ", " is open"];
+
 /// The part of [`hold`] that says work on an open issue is under way, or may
 /// be: a trusted open pull request, pull requests left unread, or a run in
 /// flight. An issue labelled [`OPERATOR_APPROVAL_LABEL`] waits on the
@@ -2129,7 +2150,8 @@ fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) ->
             let why = format!("{prefix}{repo}#{number}{suffix}");
             return Some(Hold::new(HoldKind::PrOpen, why).operator(true));
         }
-        let why = format!("pull request {repo}#{number} is open");
+        let [before, after] = PR_OPEN;
+        let why = format!("{before}{repo}#{number}{after}");
         return Some(Hold::new(HoldKind::PrOpen, why));
     }
     if !facts.pulls_complete {
@@ -3121,6 +3143,8 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         blocking: RefCell::default(),
         blocked: BTreeSet::new(),
         flights: RefCell::default(),
+        focus_read: None,
+        quiet: None,
     };
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
@@ -3571,6 +3595,11 @@ struct Scheduler<'a, C> {
     /// The agent runs in flight the last listing found ([`Self::listed`]),
     /// for the pass view; `None` where none was listed.
     flights: RefCell<Option<Vec<view::Run>>>,
+    /// Stage 3's P0 epics for the epic focus, once it listed them.
+    focus_read: Option<focus::Read>,
+    /// The open board issues stage 4 read with nothing under way, for the
+    /// epic focus ([`focus::quiet`]); `None` before it read the board.
+    quiet: Option<BTreeSet<String>>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -4833,6 +4862,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // The sweep issue's one run is the sweep's to start.
         if let Some(Some(found)) = &self.swept {
             control.push(key(&found.issue));
+        }
+        if config.epic_focus() {
+            self.quiet = Some(focus::quiet(board.items.values(), &people));
         }
         let mut ranked = Vec::new();
         let mut deferred = 0;
@@ -7531,6 +7563,7 @@ pub mod authored;
 mod blockers;
 mod cost;
 pub(crate) mod epics;
+mod focus;
 pub mod holds;
 
 pub mod decision;

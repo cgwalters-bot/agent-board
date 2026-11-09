@@ -1,0 +1,65 @@
+{
+  "schema": "agent-board/epic-focus/v1",
+  "observed_at": "2026-11-08T12:00:00Z",
+  "priority": "P0",
+  "complete": false,
+  "sources": {"epics": "partial", "runs": "complete", "board": "complete"},
+  "unread_epics": 1,
+  "omitted": 0,
+  "epics": [
+    {
+      "item": "o/t#1",
+      "url": "https://github.com/o/t/issues/1",
+      "title": "Issue 1",
+      "goal": "Ship the thing to users.",
+      "changed_at": "2026-11-08T10:30:00Z",
+      "progress": {"done": 2, "total": 10},
+      "operator_blocked": 1,
+      "blocker": null,
+      "runs": [
+        {"item": "o/t#3", "kind": "implement", "pool": "claude", "run": {"repository": "o/runner", "id": 41}, "started_at": "2026-11-08T11:00:00Z"}
+      ],
+      "runs_omitted": 0,
+      "children": [
+        {"item": "o/t#2", "url": "https://github.com/o/t/issues/2", "title": "Issue 2", "source": "both", "state": "open",
+          "blocker": {"type": "operator", "kind": "needs-human", "reason": "Ship it?", "since": "2026-11-07T00:00:00Z", "pull": null}},
+        {"item": "o/t#3", "url": "https://github.com/o/t/issues/3", "title": "Issue 3", "source": "sub-issue", "state": "open",
+          "blocker": null},
+        {"item": "o/t#5", "url": "https://github.com/o/t/issues/5", "title": "Issue 5", "source": "sub-issue", "state": "open",
+          "blocker": {"type": "ci", "kind": "pr-open", "reason": "pull request o/w#50 is open", "since": "2026-11-07T00:00:00Z", "pull": "o/w#50"}},
+        {"item": "o/t#6", "url": "https://github.com/o/t/issues/6", "title": "Issue 6", "source": "sub-issue", "state": "open",
+          "blocker": {"type": "review", "kind": "pr-open", "reason": "pull request o/w#60 is open", "since": "2026-11-07T00:00:00Z", "pull": "o/w#60"}},
+        {"item": "o/t#7", "url": "https://github.com/o/t/issues/7", "title": "Issue 7", "source": "sub-issue", "state": "open",
+          "blocker": {"type": "hold", "kind": "blocked", "reason": "board Status is Blocked", "since": "2026-11-07T00:00:00Z", "pull": null}},
+        {"item": "o/t#8", "url": "https://github.com/o/t/issues/8", "title": "Issue 8", "source": "sub-issue", "state": "open",
+          "blocker": {"type": "not-started", "kind": null, "reason": null, "since": null, "pull": null}},
+        {"item": "o/t#9", "url": "https://github.com/o/t/issues/9", "title": "Issue 9", "source": "sub-issue", "state": "open",
+          "blocker": {"type": "unknown", "kind": null, "reason": null, "since": null, "pull": null}},
+        {"item": "o/t#10", "url": "https://github.com/o/t/issues/10", "title": "Write docs", "source": "task", "state": "open",
+          "blocker": {"type": "unknown", "kind": null, "reason": null, "since": null, "pull": null}},
+        {"item": "o/t#4", "url": "https://github.com/o/t/issues/4", "title": "Issue 4", "source": "both", "state": "done",
+          "blocker": null},
+        {"item": null, "url": null, "title": "Plain task", "source": "task", "state": "done",
+          "blocker": null}
+      ],
+      "omitted": 0
+    },
+    {
+      "item": "o/t#20",
+      "url": "https://github.com/o/t/issues/20",
+      "title": "Issue 20",
+      "goal": "Shared work.",
+      "changed_at": "2026-11-08T10:05:00Z",
+      "progress": {"done": 0, "total": 1},
+      "operator_blocked": 0,
+      "blocker": null,
+      "runs": [],
+      "runs_omitted": 0,
+      "children": [
+        {"item": "o/t#8", "url": "https://github.com/o/t/issues/8", "title": "Issue 8", "source": "sub-issue", "state": "open",
+          "blocker": {"type": "not-started", "kind": null, "reason": null, "since": null, "pull": null}}
+      ],
+      "omitted": 0
+    }
+  ]
+}
