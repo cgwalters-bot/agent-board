@@ -84,6 +84,138 @@ work. Caller configuration and deployment prompts stay outside this public API.
 Phase 3's credential decision remains unresolved. Bot comments describing the
 proposal do not resolve it or constitute operator approval.
 
+### Phase-3 proposal boundary (specification only)
+
+The concrete threats are a modified or old preview authorizing a start, merge or
+label change, and two controllers writing when a service outage starts the fallback.
+The following is an **offline contract**, not a supported input to `pass --apply`,
+an executor implementation or a deployment decision. Nothing enables it by default
+or by configuration today. The executable reference model is test-only in
+`crates/board-core/tests/executor_contract.rs`; its shared wire fixture is
+[`executor-proposal.json`](../fixtures/executor-proposal.json). It tests admission
+and recovery rules, not live forge atomicity or the existing pass's policy engine.
+
+#### Proposal v1
+
+`agent-board/executor-proposal/v1` is separate from `agent-board/decision/v1`:
+display snapshots and candidates are never executable authority. Its initial typed
+intent vocabulary is deliberately incomplete: start an accepted issue plan by
+comment ID/revision, merge a PR at an exact head, or derive one status label while
+preserving unrelated labels. No API method, URL, workflow, credential, prompt or
+arbitrary request body can be supplied. A future implementation must lower through
+the existing pass/dispatch/poll/status paths, not add a second policy engine.
+
+All fields are required; unknown fields, duplicate fields, unsupported schemas or
+intent kinds and null facts are rejected. Bounds are 64 KiB before parsing, 1–20
+intents, and a validity interval of at most 300 seconds. The executor may impose
+smaller bounds; these do not increase existing `--max-writes`, `--max-dispatch`,
+request/time limits, WIP or pool caps. Attempted claims, receipts and ambiguous POSTs
+still consume the existing caps/reserves. A proposal is not a reservation.
+
+The fixture uses integer UTC Unix seconds for `observed_at`, `created_at` and
+`expires_at`; require `observed_at <= created_at <= now < expires_at` and
+`expires_at - observed_at <= 300`. Cache reads cannot advance observation time.
+`config_digest` binds the complete reviewed caller configuration, including scope,
+policy, referenced pools/bounds files and pinned lowering revision, not merely a
+path or mutable branch. `producer_revision` is the exact reviewed 40-hex commit.
+Each action carries an evidence fingerprint (SHA-256 of the relevant complete
+observations); absent/partial facts cannot be encoded as a successful observation.
+
+Plan identity is lowercase SHA-256 of compact serde JSON serialization of the
+typed proposal in declared field order (arrays retain order; no maps, whitespace
+or optional fields). The schema version fixes this encoding. It is external to
+the payload: the caller pins the identity of the immutable bytes it selected,
+and the executor recomputes it. A replacement is a new plan, never an edit under
+the old identity. **A digest is integrity, not authentication.** Neither a
+self-declared digest nor an authenticated producer authorizes effects. The caller
+selects the proposal through a trusted channel, loads its own reviewed config and
+revision, and checks all three bindings; proposal text cannot select those values.
+The fixture tests a trusted baseline identity, not a producer-supplied checksum.
+
+Immediately before *each* effect, with the writer gate held, reread complete forge
+facts and run the existing decision/admission code. Starts recheck accepted plan
+author/editor/revision, Issue identity, scope, dependencies, open PRs/runs, leases,
+WIP, usage/budget and pool room. Merges recheck exact head, author, draft/base,
+operator approval where required, authenticated review, required checks and queue
+policy. Labels rederive Status from current issue/PR/run facts and reread current
+labels; never replace unrelated labels from a stale snapshot. A changed head,
+source revision, relevant evidence or intended operation requires a new preview;
+incomplete/denied facts hold. Passing schema/digest checks alone never reaches a
+write. The test model compares against injected freshly rederived actions; it does
+not pretend to implement these forge reads. External forge changes still have
+their existing read/write race; use exact-head conditional merge and available
+conditional writes, and never claim a cross-API transaction.
+
+#### One writer, claims and outage recovery
+
+Use **one caller-owned serialized writer gate**, not a service lock plus a separate
+fallback lock. For an Actions executor this means the same caller repository,
+workflow-level concurrency group, `cancel-in-progress: false`, and all mutation
+steps inside that job's lifetime. Both proposal execution and standalone full-pass
+fallback must enter it. Preview producers stay outside and cannot mint write
+tokens. The gate's owner run ID is the fencing epoch recorded with every claim;
+an old owner cannot resume under a new epoch. Gate ownership must be verified
+before credentials are issued and before each mutation. A timestamp lease alone
+does not fence GitHub writes: GitHub does not enforce an epoch on arbitrary POSTs.
+
+Do not steal a gate on timeout or mere absence of a heartbeat. Before handoff,
+the old writer must terminate, credentials must no longer be usable and in-flight
+requests must be drained/reconciled. Cancellation or an unknown writer outcome
+requires recovery/explicit intervention, not automatic timeout takeover. This is
+a requirement on the later caller implementation, **not a guarantee provided by
+Actions concurrency alone**. If direct service writes are selected, they too must
+enter this same gate with a bounded writer lifetime; otherwise an independently
+verified forge-enforced fencing primitive is a prerequisite, not a second lock.
+
+Inside the gate, reuse existing forge-authored claims and receipts. The semantic
+effect key is SHA-256 of the typed intent, excluding proposal identity, clocks and
+observation fingerprint. Thus a fresh preview of the same accepted plan revision
+or PR head cannot bypass a claim. Claims bind key, immutable plan ID, owner epoch,
+target/source revision and status. Only verified bot recorder/editor identities in
+the configured forge scope count; copied markers and local cache entries do not.
+Read claims before action; write pending before submission; then bind the returned
+run/merge/label result in a confirmed receipt. Confirmed start/merge keys are
+terminal no-ops. Labels are repeatable reconciliation: an old confirmation is
+not proof that the desired label is still present. A **new** proposal (or a new
+standalone pass invocation identified by its gate run) may rederive and apply that
+status again after an intervening transition. Keep completed `(plan ID, effect
+key)` receipts so replaying an already consumed proposal cannot reapply a label,
+even after later transitions. A pending semantic key still holds every caller
+until reconciled, regardless of plan ID or expiry. These records live on the forge,
+not in service state; do not replace receipt history with just the latest status.
+
+On a lost response or a successful effect whose receipt failed, inspect existing
+forge runs and their dispatch correlation, exact-head merge/queue state, or current
+derived labels under the existing recovery protocol. Record confirmation only
+with matching evidence. Proven refusal/no submission can release a claim within
+the existing retry policy; elapsed time or an absent search hit is not proof.
+Ambiguous results remain pending for reconciliation, never blindly resubmitted.
+Receipt recovery may continue after plan expiry, but cannot authorize a new effect
+from an expired plan. Claims are not garbage-collected just because a plan expired.
+The serialized gate is essential: comment creation itself is not compare-and-swap.
+
+If the preview service is down, fallback acquires that same gate and runs the
+existing full `pass --apply` from trusted config, fresh forge reads and durable
+claims/receipts. It does not fetch a service plan, consult service memory, reset
+receipts, or wait for the service to acknowledge ownership. It can skip an
+ambiguous item and safely handle other work within caps. Restart and cache loss
+reconstruct ownership/effect history from Actions and the forge; they never erase
+pending claims. An unavailable forge/gate fails closed; independence from the
+preview service does not mean independence from forge authority.
+
+#### Still required before activation
+
+cgwalters must explicitly choose either a read-only service with a short-lived
+Actions writer, or direct service writes with per-action Octo STS credentials.
+Neither posture is selected here. A later implement plan must wire the producer
+in `cgwalters-forge/review` and the executor **and full-pass fallback** in
+`cgwalters-forge/tracker`'s `.github/workflows/poll.yml`, pin reviewed code/config,
+prove the shared gate and credential-drain behavior, and integrate actual rechecks,
+caps and durable recovery. Any STS trust/permission changes require that decision
+and their own review. No caller option/key is introduced by this specification;
+there is nothing to turn on in `.github/pass.json`. Deployments, workflow cutover,
+live writes and retirement of fallback remain out of scope.
+
 ## Writes
 
 `agent-board pass --apply` makes its own writes directly; agentic-job's

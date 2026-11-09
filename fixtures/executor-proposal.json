@@ -1,0 +1,35 @@
+{
+  "schema": "agent-board/executor-proposal/v1",
+  "config_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "producer_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "observed_at": 1794222000,
+  "created_at": 1794222010,
+  "expires_at": 1794222300,
+  "actions": [
+    {
+      "intent": {
+        "kind": "start",
+        "item": {"host": "github.com", "repository": "example/work", "number": 1},
+        "plan_comment": 17,
+        "plan_revision": "2026-11-09T11:00:00Z"
+      },
+      "evidence_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "intent": {
+        "kind": "merge",
+        "pull": {"host": "github.com", "repository": "example/work", "number": 2},
+        "head": "dddddddddddddddddddddddddddddddddddddddd"
+      },
+      "evidence_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    {
+      "intent": {
+        "kind": "status_label",
+        "item": {"host": "github.com", "repository": "example/work", "number": 1},
+        "status": "in_progress"
+      },
+      "evidence_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ]
+}
