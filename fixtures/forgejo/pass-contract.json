@@ -188,6 +188,7 @@
     "epics.inWorkRepositories": {"verdict": "native", "forgejo": "the same epic rule in each work repository"},
     "epics.focus": {"verdict": "refused", "reason": "the Forgejo stages do not read it yet, and an ignored focus would spend as if it were unset"},
     "epics.maxAppliesPerPass": {"verdict": "same"},
+    "epics.heldPlanHours": {"verdict": "refused", "reason": "planning an epic when every candidate is held is only built for GitHub"},
     "epics.close": {"verdict": "native", "forgejo": "PATCH state closed with a comment; no close reason"},
     "wip": {"verdict": "native", "forgejo": "complete caller run listings"},
     "triage": {"verdict": "native", "forgejo": "triage plans dispatched as below"},

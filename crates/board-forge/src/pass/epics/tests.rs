@@ -2352,21 +2352,7 @@ fn idle_pass_plans_a_waiting_epic_early() {
     };
     // tracker#596 held by a person, so that stage 3 plans nothing.
     let quiet = |r: &mut Replay| label_596(r, &["needs-human"]);
-    // tracker#890's last plan had nothing to do, so it waits out the backoff.
-    let empty = |r: &mut Replay| {
-        let comments = r#""after":null,"name":"tracker","number":890,"#;
-        let nodes = &mut crate::pass::tests::answer(r, comments)["data"]["repository"]["issue"]["comments"]
-            ["nodes"];
-        let nodes = nodes.as_array_mut().unwrap();
-        let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": PLAN_890,
-            "outcome": "applied", "actions": []});
-        let mut node = nodes.last().unwrap().clone();
-        node["url"] =
-            "https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-7000000098".into();
-        node["author"] = json!({"login": "cgwalters-bot"});
-        node["body"] = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER).into();
-        nodes.push(node);
-    };
+    let empty = empty_890;
     type Case = (
         &'static str,
         Box<dyn Fn(&mut Replay, &mut Value)>,
@@ -2614,15 +2600,7 @@ fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
         } else if name == "design hold" {
             label(&mut replay, 890, &["needs-design"]);
         } else if name == "empty plan" {
-            let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": PLAN_890,
-                "outcome": "applied", "actions": []});
-            let mut node = comments(&mut replay, COMMENTS_890).last().unwrap().clone();
-            node["url"] =
-                "https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-7000000098"
-                    .into();
-            node["author"] = json!({"login": "cgwalters-bot"});
-            node["body"] = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER).into();
-            comments(&mut replay, COMMENTS_890).push(node);
+            empty_890(&mut replay);
         }
         let mut settings = config(
             json!({"idleReplan": enabled, "triage": name == "busy", "planPools": ["claude"]}),
@@ -2991,6 +2969,181 @@ fn idle_replan_applies_two_bounded_starts() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// tracker#890's last plan had nothing to do, so it waits out the backoff
+/// and is not planned early.
+fn empty_890(replay: &mut Replay) {
+    let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": PLAN_890,
+        "outcome": "applied", "actions": []});
+    let mut node = comments(replay, COMMENTS_890).last().unwrap().clone();
+    node["url"] =
+        "https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-7000000098".into();
+    node["author"] = json!({"login": "cgwalters-bot"});
+    node["body"] = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER).into();
+    comments(replay, COMMENTS_890).push(node);
+}
+
+/// tracker#890's sub-issues as its apply's fingerprint recorded them, so
+/// that nothing changed since and it is not planned again.
+fn unchanged_890(replay: &mut Replay) {
+    let mut pairs: Vec<(String, String)> = (subs_mut(replay, 890)["nodes"].as_array())
+        .unwrap()
+        .iter()
+        .map(|n| {
+            let repository = text(n, "/repository/nameWithOwner");
+            let issue = format!("{repository}#{}", n["number"]).to_ascii_lowercase();
+            (issue, text(n, "/state").to_owned())
+        })
+        .collect();
+    pairs.sort_unstable();
+    let marker = "<!-- agent-board-epic-fingerprint: ";
+    let receipt = (comments(replay, COMMENTS_890).iter_mut())
+        .find(|c| text(c, "/body").starts_with(marker))
+        .unwrap();
+    let body = text(receipt, "/body");
+    let (_, rest) = body.split_once(" -->").unwrap();
+    receipt["body"] = format!("{marker}{} -->{rest}", json!(pairs)).into();
+}
+
+/// With `epics.heldPlanHours`, a pass whose stage 4 held every candidate,
+/// with a planning pool under pace, plans one live epic stage 3 left
+/// unplanned, unchanged or in its backoff, once its last planning request
+/// is that old (agent-board#803). Never with a candidate unread or
+/// started, a person's hold, or no pool under pace.
+#[test]
+fn held_plan_hours_plans_an_epic_when_every_candidate_is_held() {
+    const START: &str =
+        "start planning cgwalters-forge/tracker#890 pool=claude: its last planning request was at ";
+    const WHY: &str =
+        "; every candidate is held, with claude under pace and 6 slot(s) free and nothing started";
+    assert_eq!(config(json!({})).epics.unwrap().held_plan_hours, 0);
+    let epics =
+        |hours: u64| json!({"repository": "cgwalters-forge/tracker", "heldPlanHours": hours});
+    let parsed = Config::parse(&json!({"epics": epics(169)}).to_string());
+    assert!(parsed.is_err());
+    assert!(forgejo::check_options(&json!({"epics": epics(1)})).is_err());
+    type Edit = fn(&mut Replay, &mut Value);
+    let backoff: Edit = |r, _| empty_890(r);
+    let unchanged: Edit = |r, _| unchanged_890(r);
+    let cases: [(&str, u64, Edit, bool); 10] = [
+        ("off", 0, backoff, false),
+        ("backoff", 1, backoff, true),
+        ("unchanged", 1, unchanged, true),
+        (
+            "only pools under pace are drawn",
+            1,
+            |r, c| {
+                unchanged_890(r);
+                // openai open but past its pace, and first: never drawn.
+                let mut snapshot = usage(r);
+                let mut openai = snapshot["pools"]["claude"].clone();
+                openai["used_percent"] = 99.into();
+                snapshot["pools"]["openai"] = openai;
+                set_usage(r, &snapshot);
+                c["planPools"] = json!(["openai", "claude"]);
+            },
+            true,
+        ),
+        ("cooldown", 168, unchanged, false),
+        (
+            "unread",
+            1,
+            |r, _| {
+                unchanged_890(r);
+                crate::pass::tests::unread(r);
+            },
+            false,
+        ),
+        (
+            "stage 4 starts",
+            1,
+            |r, c| {
+                unchanged_890(r);
+                c["triage"] = true.into();
+            },
+            false,
+        ),
+        (
+            "needs-design",
+            1,
+            |r, _| {
+                unchanged_890(r);
+                label(r, 890, &["needs-design"]);
+            },
+            false,
+        ),
+        (
+            "past pace",
+            1,
+            |r, _| {
+                unchanged_890(r);
+                let mut snapshot = usage(r);
+                snapshot["pools"]["claude"]["used_percent"] = 99.into();
+                set_usage(r, &snapshot);
+            },
+            false,
+        ),
+        (
+            "held pool",
+            1,
+            |r, _| {
+                unchanged_890(r);
+                let mut snapshot = usage(r);
+                snapshot["pools"]["claude"]["hold"] = true.into();
+                set_usage(r, &snapshot);
+            },
+            false,
+        ),
+    ];
+    for (name, hours, edit, planned) in cases {
+        let mut replay = replay();
+        unfinished(&mut replay);
+        label_596(&mut replay, &["needs-human"]);
+        crate::pass::tests::only(&mut replay, &["cgwalters-forge/tracker#446"]);
+        let mut settings = json!({"triage": false, "planPools": ["claude"], "epics": epics(hours)});
+        edit(&mut replay, &mut settings);
+        let report = preview(&config(settings), &replay);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let starts: Vec<_> = (report.lines.iter())
+            .filter(|l| l.starts_with("start planning"))
+            .collect();
+        assert_eq!(
+            starts.len(),
+            usize::from(planned),
+            "{name}: {:#?}",
+            report.lines
+        );
+        let line = (report.lines.iter()).any(|l| {
+            l == "pools: claude under pace with every candidate held; planning cgwalters-forge/tracker#890 (one epic a pass)"
+        });
+        assert_eq!(line, planned, "{name}: {:#?}", report.lines);
+        if planned {
+            assert!(starts[0].starts_with(START), "{name}: {}", starts[0]);
+            assert!(starts[0].ends_with(WHY), "{name}: {}", starts[0]);
+            // Its backoff's hold is taken back.
+            let held = (report.holds.iter())
+                .any(|e| matches!(&e.scope, Scope::Epic(i) if i.number == 890));
+            assert!(!held, "{name}: {:#?}", report.holds);
+        }
+        if name == "unchanged" || name == "cooldown" {
+            let idle = format!(
+                "epic cgwalters-forge/tracker#890: plan {PLAN_890} applied; nothing changed since"
+            );
+            assert!(
+                (report.lines.iter()).any(|l| l.starts_with(&idle)),
+                "{name}: {:#?}",
+                report.lines
+            );
+        }
+        if name == "backoff" || name == "off" {
+            let wait = (report.holds.iter()).any(|e| {
+                matches!(&e.scope, Scope::Epic(i) if i.number == 890)
+                    && e.hold.kind == HoldKind::TriageCooldown
+            });
+            assert_eq!(wait, !planned, "{name}: {:#?}", report.holds);
         }
     }
 }

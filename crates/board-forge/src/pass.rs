@@ -805,6 +805,12 @@ pub struct Epics {
     /// `--max-writes` and `--max-status-changes` still bound what they write.
     #[serde(default = "max_applies_per_pass")]
     pub max_applies_per_pass: usize,
+    /// Off unless set (0): where stage 4 held every candidate and a
+    /// planning pool is under pace, one live epic a pass that stage 3 left
+    /// unplanned is planned anyway, once this many hours have passed since
+    /// its last planning request ([`Scheduler::replan_idle`], agent-board#803).
+    #[serde(default)]
+    pub held_plan_hours: u64,
 }
 
 fn max_applies_per_pass() -> usize {
@@ -813,6 +819,9 @@ fn max_applies_per_pass() -> usize {
 
 /// The most `epics.maxAppliesPerPass` may be.
 const MAX_APPLIES_LIMIT: usize = 10;
+
+/// The most `epics.heldPlanHours` may be: a week.
+const HELD_PLAN_HOURS_LIMIT: u64 = 168;
 
 /// [`overlap::Waiver`]'s settings: set, a documentation-only overlap does
 /// not hold an issue in the board's first Priority option, and a draft
@@ -1162,6 +1171,10 @@ impl Config {
             ensure!(
                 (1..=MAX_APPLIES_LIMIT).contains(&epics.max_applies_per_pass),
                 "epics maxAppliesPerPass is not from 1 to {MAX_APPLIES_LIMIT}"
+            );
+            ensure!(
+                epics.held_plan_hours <= HELD_PLAN_HOURS_LIMIT,
+                "epics heldPlanHours is not from 0 to {HELD_PLAN_HOURS_LIMIT}"
             );
             if let Some(focus) = &epics.focus {
                 let at = crate::epic::IssueRef::parse(focus)
@@ -3119,6 +3132,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         other: None,
         epic_starts: Vec::new(),
         waited: Vec::new(),
+        held_epic: None,
         focus: epics::Focus::default(),
         considered: false,
         probes: BTreeMap::new(),
@@ -3516,6 +3530,9 @@ struct Scheduler<'a, C> {
     epic_starts: Vec<ItemRef>,
     /// The epics stage 4 may plan early where it would be idle.
     waited: Vec<epics::Waited>,
+    /// With `epics.heldPlanHours`, the epic stage 4 may plan where it held
+    /// every candidate.
+    held_epic: Option<epics::Waited>,
     /// Stage 4's account of `epics.focus`.
     focus: epics::Focus,
     /// Whether stage 4 has considered a candidate, after which a budget

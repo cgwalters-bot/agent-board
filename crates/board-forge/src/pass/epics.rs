@@ -990,6 +990,9 @@ pub(super) struct Turn {
     starts: usize,
     /// Only the bounded, opt-in idle path may plan more than one epic.
     idle: bool,
+    /// Planning draws only among the pools under pace
+    /// ([`Scheduler::under_pace`]), as `epics.heldPlanHours` requires.
+    paced: bool,
 }
 
 /// Stage 3's board, the runs in flight, if they were read, and its target.
@@ -1027,6 +1030,10 @@ pub(super) struct Waited {
     later: Option<Later>,
     turn: Turn,
     changed: bool,
+    /// Kept by `epics.heldPlanHours` ([`Scheduler::keep_held`]): planned only
+    /// where stage 4 held every candidate, and its hold, if any, found by
+    /// its scope rather than `at`.
+    held: bool,
 }
 
 /// An idle pass must not turn spare quota into unbounded planning overhead.
@@ -1075,6 +1082,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Err(error) if error.is::<ShareSpent>() => {
                 self.holds_whole = false;
                 self.waited.clear();
+                self.held_epic = None;
                 self.line(format!(
                     "budget: epics stopped at its share; the live epics wait for the next pass: {error:#}"
                 ));
@@ -1082,15 +1090,72 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Err(error) => {
                 self.holds_whole = false;
                 self.waited.clear();
+                self.held_epic = None;
                 self.report.failures += 1;
                 self.line(format!("epics error: {error:#}"));
             }
         }
         let starts = turn.starts;
-        for waited in &mut self.waited {
+        for waited in self.waited.iter_mut().chain(&mut self.held_epic) {
             waited.turn = turn;
         }
         starts
+    }
+
+    /// The `planPools` pools with room left at their pace ([`room`]), in
+    /// their order.
+    fn under_pace(&self, snapshot: Option<&Value>) -> Vec<String> {
+        let pools = &self.config.pools.0;
+        (self.config.plan_pools.iter())
+            .filter(|name| {
+                (pools.iter()).any(|(n, settings)| {
+                    n == *name && room(snapshot, n, settings, self.now).is_ok_and(|r| r > 0.0)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// With `epics.heldPlanHours`, keeps the first, so highest-Priority,
+    /// live epic stage 3 leaves unplanned with no run in flight for it, for
+    /// stage 4 to plan where it holds every candidate: once its last
+    /// planning request is that many hours old, so that each epic is asked
+    /// at most once in that time however long the board stays held.
+    fn keep_held(
+        &mut self,
+        facts: &EpicFacts,
+        comments: &[Comment],
+        busy: Option<&String>,
+        reuse: Option<&Comment>,
+    ) {
+        let hours = (self.config.epics.as_ref()).map_or(0, |e| e.held_plan_hours);
+        if hours == 0 || self.held_epic.is_some() || busy.is_some() {
+            return;
+        }
+        let writers = self.writers();
+        let request = newest_request(comments, &writers).map(|c| c.changed);
+        let plan = plan::newest_fenced(comments, &writers, EPIC_PLAN_FENCE).ok();
+        let Some(last) = request.max(plan.map(|c| c.changed)) else {
+            return;
+        };
+        let hours = i64::try_from(hours).unwrap_or(i64::MAX);
+        if self.now - last < time::Duration::hours(hours) {
+            return;
+        }
+        self.held_epic = Some(Waited {
+            at: 0,
+            facts: facts.clone(),
+            why: format!(
+                "its last planning request was at {}, {hours} hour(s) or more ago",
+                stamp(last)
+            ),
+            intro: Intro::First,
+            reuse: reuse.cloned(),
+            later: None,
+            turn: Turn::default(),
+            changed: false,
+            held: true,
+        });
     }
 
     /// Plans [`Waited`]'s epic now, where stage 4 would leave `free` slots
@@ -1100,7 +1165,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// runs it started; `holds`, where stage 4's holds start, moves down
     /// when its hold is taken back and a fresh hold replaces it.
     pub(super) fn replan_idle(&mut self, free: usize, holds: &mut usize) -> usize {
-        let waiting = std::mem::take(&mut self.waited);
+        let mut waiting = std::mem::take(&mut self.waited);
+        waiting.extend(self.held_epic.take());
         let mut started = 0;
         let mut removed = 0;
         for mut waited in waiting {
@@ -1155,28 +1221,59 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if !bonus && (started > 0 || waited.turn.planned || !self.epic_starts.is_empty()) {
             return 0;
         }
-        let scope = Scope::Epic(waited.facts.issue.clone());
-        if !(self.report.holds.get(waited.at)).is_some_and(|e| e.scope == scope)
-            || waited.at >= *holds
-        {
+        // Every candidate held: stage 4 read and judged them all, and none
+        // could start. Slots free beside an unread or failed candidate are
+        // not proof that nothing is ready.
+        let all_held = self.holds_whole
+            && self.deferred_epics.is_empty()
+            && self.report.failures == 0
+            && self.unconsidered == 0
+            && self.unread == 0;
+        let under = self.under_pace(snapshot.as_ref()).join(", ");
+        if waited.held && (under.is_empty() || !all_held) {
             return 0;
         }
-        let wait = self.report.holds.remove(waited.at);
-        *holds -= 1;
+        let scope = Scope::Epic(waited.facts.issue.clone());
+        let at = if waited.held {
+            // An unchanged epic has no hold; one in its backoff has one.
+            self.report.holds[..*holds]
+                .iter()
+                .position(|e| e.scope == scope)
+        } else if (self.report.holds.get(waited.at)).is_some_and(|e| e.scope == scope)
+            && waited.at < *holds
+        {
+            Some(waited.at)
+        } else {
+            return 0;
+        };
+        let wait = at.map(|at| (at, self.report.holds.remove(at)));
+        *holds -= usize::from(wait.is_some());
         let (recorded, planned) = (self.report.holds.len(), self.epic_starts.len());
         let not_started = self.not_started;
-        let why = format!(
-            "{}, with {free} slot(s) free and nothing started",
-            waited.why
-        );
+        let why = match waited.held {
+            true => format!(
+                "{}; every candidate is held, with {under} under pace and {free} slot(s) free and nothing started",
+                waited.why
+            ),
+            false => format!(
+                "{}, with {free} slot(s) free and nothing started",
+                waited.why
+            ),
+        };
         let ask = (why.as_str(), waited.intro.clone(), waited.reuse.as_ref());
         let before = waited.turn.starts;
         let turn = &mut waited.turn;
         turn.idle = bonus;
+        turn.paced = waited.held;
         turn.starts += started;
         if bonus {
             self.line(format!(
                 "pools: {pool} under pace near reset; bounded idle replan ({IDLE_REPLAN_LIMIT} per pass)"
+            ));
+        } else if waited.held {
+            self.line(format!(
+                "pools: {under} under pace with every candidate held; planning {} (one epic a pass)",
+                waited.facts.issue.display()
             ));
         }
         self.plan_now(
@@ -1195,8 +1292,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .iter()
             .any(|e| e.scope == scope);
         if self.epic_starts.len() == planned && !held {
-            self.report.holds.insert(waited.at, wait);
-            *holds += 1;
+            if let Some((at, wait)) = wait {
+                self.report.holds.insert(at, wait);
+                *holds += 1;
+            }
             self.not_started = not_started;
             return 0;
         }
@@ -1383,7 +1482,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             self.epic(facts, project.as_ref(), slots.as_ref(), &target, turn);
         }
-        for waited in &mut self.waited {
+        for waited in self.waited.iter_mut().chain(&mut self.held_epic) {
             waited.later = Some((project.clone(), slots.clone(), target.clone()));
         }
         Ok(())
@@ -1691,7 +1790,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             next
         };
         match next {
-            Next::Idle(why) | Next::Said(why) => self.line(format!("epic {name}: {why}")),
+            Next::Idle(why) => {
+                self.line(format!("epic {name}: {why}"));
+                self.keep_held(facts, &comments, busy, reuse);
+            }
+            Next::Said(why) => self.line(format!("epic {name}: {why}")),
             Next::Hold(hold) => self.epic_held(facts, hold),
             Next::Wait { why, hold, early } => {
                 let at = self.report.holds.len();
@@ -1715,7 +1818,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         later: None,
                         turn: Turn::default(),
                         changed: true,
+                        held: false,
                     });
+                }
+                // Its last plan had nothing to do: stage 4 may still plan
+                // it where it holds every candidate.
+                if !early {
+                    self.keep_held(facts, &comments, busy, reuse);
                 }
             }
             Next::Apply {
@@ -2420,6 +2529,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     later: None,
                     turn: Turn::default(),
                     changed: false,
+                    held: false,
                 });
             }
             return;
@@ -2464,12 +2574,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return;
         }
         let snapshot = self.snapshot();
-        let pool = match choose(
-            snapshot.as_ref(),
-            &config.pools,
-            &config.plan_pools,
-            self.now,
-        ) {
+        let names = match turn.paced {
+            true => self.under_pace(snapshot.as_ref()),
+            false => config.plan_pools.clone(),
+        };
+        let pool = match choose(snapshot.as_ref(), &config.pools, &names, self.now) {
             Ok(pool) => pool,
             Err(no) => {
                 let then = format!("no pool for planning: {no}");
