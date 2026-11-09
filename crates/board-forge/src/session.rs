@@ -861,7 +861,7 @@ mod tests {
             ("a stacked plan", vec![planned("stacks_on", json!(829))], "names stacks_on"),
             ("a fix plan", vec![planned("kind", json!("fix"))], "kind \"fix\" is not one of implement, triage, research"),
             ("a session plan", vec![planned("kind", json!(SESSION_KIND))], "a session may not start another"),
-            ("a devspace plan", vec![planned("runner", json!("devspace"))], "only hosted"),
+            ("a runner selector", vec![planned("runner", json!("../devspace"))], "plan runner must be hosted"),
             ("a plan with a budget", vec![planned("budget", json!(5))], "unknown plan field \"budget\""),
             ("a domain that is not configured", vec![edited(ask.clone(), "domain", json!("upstream"))], "domain \"upstream\" is not one of the configured ask domains (credentials, budget)"),
             ("a question of two lines", vec![edited(ask.clone(), "question", json!("Which pool?\nAnd when?"))], "question must be one line"),

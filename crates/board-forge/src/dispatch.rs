@@ -25,7 +25,7 @@ pub struct Start<'a> {
     pub pool: Option<&'a str>,
     /// Optional model variant, resolved by the caller after pool inheritance.
     pub effort: Option<crate::plan::Effort>,
-    /// Not sent: the caller workflow has one runner and no such input.
+    /// Caller-owned profile name. Hosted/absent leaves the existing input out.
     pub runner: Option<&'a str>,
     /// A stacked plan's base branch; only then is a `base` input sent.
     pub base: Option<&'a str>,
@@ -143,6 +143,10 @@ impl Routing {
         ensure!(
             start.base.is_none(),
             "route does not support stacked plans/base input"
+        );
+        ensure!(
+            start.runner.is_none_or(|runner| runner == "hosted"),
+            "namespace routing does not support runner profiles"
         );
         ensure!(
             start.pool.is_none_or(
@@ -340,6 +344,9 @@ impl GitHub<'_> {
         if let Some(effort) = start.effort {
             body["inputs"]["effort"] = effort.as_str().into();
         }
+        if let Some(runner) = start.runner.filter(|runner| *runner != "hosted") {
+            body["inputs"]["runner"] = runner.into();
+        }
         if let Some(base) = start.base {
             body["inputs"]["base"] = base.into();
         }
@@ -347,6 +354,12 @@ impl GitHub<'_> {
     }
 
     pub fn routed_body(&self, start: &Start, route: Option<&Routing>) -> Result<Value> {
+        // Threat: task data must not become runner labels, paths or workflow
+        // selectors. Carry one bounded name; only the caller resolves it.
+        ensure!(
+            start.runner.is_none_or(crate::plan::valid_pool),
+            "runner must be hosted or a profile name matching [a-z0-9][a-z0-9_-]{{0,31}}"
+        );
         let mut body = self.body(start);
         if let Some(route) = route {
             ensure!(route.select(start)?, "target does not match route");
@@ -413,6 +426,7 @@ impl GitHub<'_> {
                 };
             }
             if status == 422
+                && start.runner.is_none_or(|runner| runner == "hosted")
                 && body
                     .as_object_mut()
                     .and_then(|b| b.remove("return_run_details"))

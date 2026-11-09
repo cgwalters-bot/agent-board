@@ -49,9 +49,6 @@ const ERROR_LIMIT: usize = 200;
 pub const PLAN_KINDS: &[&str] = &["implement", "triage", "research", "fix", SESSION_KIND];
 /// The kind of a per-repository session run ([`crate::session`]).
 pub const SESSION_KIND: &str = "session";
-/// Runners the caller can provide. dispatch.yml has no devspace runner yet;
-/// a plan asking for one is refused here rather than run on a hosted one.
-pub const PLAN_RUNNERS: &[&str] = &["hosted"];
 /// Characters of a brief. GitHub caps a dispatch's inputs at 65,535
 /// characters together, and the profile is put in front of the brief.
 pub const PLAN_BRIEF_LIMIT: usize = 16_000;
@@ -72,7 +69,7 @@ const FIELDS: &[&str] = &[
 ];
 
 /// A plan's pool: lowercase letters, digits, `-` and `_`, led by a letter or digit.
-fn valid_pool(pool: &str) -> bool {
+pub(crate) fn valid_pool(pool: &str) -> bool {
     let name = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
     pool.len() <= POOL_LIMIT
         && pool.bytes().next().is_some_and(name)
@@ -172,9 +169,8 @@ impl JobPlan {
         );
         let runner = text("runner")?;
         ensure!(
-            PLAN_RUNNERS.contains(&runner),
-            "plan runner {runner:?} is not available: the dispatch caller has only {}",
-            PLAN_RUNNERS.join(", ")
+            valid_pool(runner),
+            "plan runner must be hosted or a profile name matching [a-z0-9][a-z0-9_-]{{0,31}}"
         );
         let pool = match object.get("pool") {
             None => "",
@@ -1447,7 +1443,7 @@ mod tests {
             ("item", json!(1.5), "positive issue number"),
             ("kind", json!("review"), "is not one of"),
             ("kind", json!("Implement"), "is not one of"),
-            ("runner", json!("devspace"), "only hosted"),
+            ("runner", json!("../devspace"), "plan runner must be hosted"),
             (
                 "runner",
                 json!({"devspace": {"cores": 8}}),
@@ -1525,6 +1521,54 @@ mod tests {
     }
 
     #[test]
+    fn runner_names_are_bounded_names_not_selectors() {
+        for runner in [
+            "hosted",
+            "devspace-rhel10-64",
+            "a_b-2",
+            "0",
+            &"a".repeat(32),
+        ] {
+            let mut value = plan();
+            value["runner"] = json!(runner);
+            let parsed = JobPlan::from_comment(&body(&value)).unwrap().unwrap();
+            assert_eq!(parsed.runner, runner);
+            let request = parsed.dispatch_request(&target(), None).unwrap();
+            let sent = request["body"]["inputs"].get("runner");
+            assert_eq!(sent, (runner != "hosted").then_some(&json!(runner)));
+        }
+        for runner in [
+            "",
+            "Hosted",
+            "_vm",
+            "-vm",
+            "a/b",
+            "a.b",
+            "a@main",
+            "a b",
+            "a\n",
+            "é",
+            &"a".repeat(33),
+        ] {
+            let mut value = plan();
+            value["runner"] = json!(runner);
+            assert!(JobPlan::from_comment(&body(&value)).is_err(), "{runner:?}");
+        }
+        for key in [
+            "repository",
+            "workflow",
+            "ref",
+            "config",
+            "cores",
+            "runner-labels",
+        ] {
+            let mut value = plan();
+            value[key] = json!("external-selector");
+            assert!(JobPlan::from_json(&value).is_err(), "{key}");
+        }
+    }
+
+    #[test]
     fn plan_fence_table() {
         let open = format!("```{PLAN_FENCE}");
         let plan_text = format!("{:#}", plan());
@@ -1588,7 +1632,7 @@ mod tests {
         let mut replaced = plan();
         replaced["kind"] = json!("research");
         let mut invalid = plan();
-        invalid["runner"] = json!("devspace");
+        invalid["runner"] = json!("../devspace");
         let planned = || comment(1, PLANNER, None, "2026-10-13T10:00:00Z", body(&plan()));
         // Comments in issue order, then the comment number and kind expected, or an error.
         for (comments, expected) in [
@@ -1660,7 +1704,7 @@ mod tests {
                     planned(),
                     comment(2, OPERATOR, None, "2026-10-13T11:00:00Z", body(&invalid)),
                 ],
-                Err("issuecomment-2: plan runner \"devspace\" is not available"),
+                Err("issuecomment-2: plan runner must be hosted"),
             ),
             (
                 vec![
@@ -2542,6 +2586,97 @@ mod tests {
                     let error = format!("{error:#}");
                     assert!(error.contains("not dispatched: --collaborators-only: cgwalters-forge/tracker#540: the conversation is not locked"), "{error}");
                     assert_eq!(forge.bodies().len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn runner_profiles_survive_manual_scheduled_dispatch_and_terminal_refusal() {
+        // Contract fixtures, not a tracker resolver implementation: tracker#1489
+        // has not supplied a reviewed API. Only the runner input is assumed.
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        let writers = [OPERATOR, PLANNER];
+        for runner in ["hosted", "devspace-rhel10-64"] {
+            for scheduled in [false, true] {
+                for refusal in [
+                    None,
+                    Some("unknown runner profile"),
+                    Some("runner profile is disabled"),
+                ] {
+                    let mut value = plan();
+                    value["runner"] = json!(runner);
+                    value.as_object_mut().unwrap().remove("pool");
+                    let forge = Forge::new(
+                        vec![node(7, PLANNER, "2026-10-13T10:00:00Z", &body(&value))],
+                        vec![],
+                    );
+                    // Hosted retains its existing run-details compatibility retry.
+                    let answer = match refusal {
+                        Some(message) => (422, json!({"message": message})),
+                        None => (200, json!({"workflow_run_id": 99})),
+                    };
+                    let dispatcher = Forge::new(vec![], vec![answer.clone(), answer]);
+                    let run = || {
+                        if scheduled {
+                            dispatch_with(
+                                &forge,
+                                &dispatcher,
+                                &issue,
+                                &writers,
+                                &target(),
+                                (
+                                    0,
+                                    None,
+                                    None,
+                                    Scheduled {
+                                        plan: Some("7@2026-10-13T10:00:00Z"),
+                                        ..Default::default()
+                                    },
+                                ),
+                            )
+                        } else {
+                            dispatch(
+                                &forge,
+                                &dispatcher,
+                                &issue,
+                                &writers,
+                                &target(),
+                                0,
+                                None,
+                                None,
+                            )
+                        }
+                    };
+                    match (run(), refusal) {
+                        (Ok(done), None) => assert_eq!(
+                            done.run.as_deref(),
+                            Some("https://github.com/cgwalters-forge/tracker/actions/runs/99")
+                        ),
+                        (Err(error), Some(message)) => {
+                            assert!(format!("{error:#}").contains(message));
+                            assert!(forge.bodies().last().unwrap().contains(message));
+                        }
+                        (result, _) => panic!("{runner} scheduled={scheduled}: {result:?}"),
+                    }
+                    let sent = if runner == "hosted" && refusal.is_some() {
+                        2
+                    } else {
+                        1
+                    };
+                    assert_eq!(dispatcher.dispatches.borrow().len(), sent);
+                    for request in dispatcher.dispatches.borrow().iter() {
+                        assert_eq!(
+                            request["inputs"].get("runner"),
+                            (runner != "hosted").then_some(&json!(runner))
+                        );
+                    }
+                    assert!(format!("{:#}", run().unwrap_err()).contains("record already"));
+                    assert_eq!(dispatcher.dispatches.borrow().len(), sent);
+                    let comments = issue_comments(&forge, &issue).unwrap();
+                    let (parsed, from) = newest_plan(&comments, &writers).unwrap();
+                    assert_eq!(parsed.runner, runner);
+                    assert_eq!(plan_id(from).unwrap(), "7@2026-10-13T10:00:00Z");
                 }
             }
         }
