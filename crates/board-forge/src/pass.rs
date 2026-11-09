@@ -569,6 +569,10 @@ pub struct Config {
     /// Off unless set: caller-owned policy for asks on harness work. Without
     /// it, repository ownership alone never releases an operator wait.
     pub operator_ask: Option<OperatorAsk>,
+    /// Off unless set: by repository, the guidance file a triage brief for
+    /// its issues points the run at ([`guidance`]).
+    #[serde(default)]
+    pub guidance: guidance::Guidance,
     /// Avoid duplicate planning while a PR or research answer owns the work.
     #[serde(default)]
     pub skip_active_work: bool,
@@ -1317,6 +1321,13 @@ impl Config {
                         .context("operatorAsk.harness.repositories")?;
                 }
             }
+        }
+        if !self.guidance.is_empty() {
+            ensure!(
+                self.forgejo_board().is_none(),
+                "guidance supports only GitHub"
+            );
+            guidance::check(&self.guidance)?;
         }
         ensure!(
             !self.triage_close || self.triage_follow_up_days > 0,
@@ -7300,7 +7311,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             "kind": "triage",
             "runner": TRIAGE_RUNNER,
             "pool": pool,
-            "brief": self.directed(brief),
+            "brief": self.directed(self.guided(issue, brief)),
         });
         let config = self.config;
         let tracked = config.triage_follow_up_days > 0 || config.revisit.is_some();
@@ -7406,6 +7417,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Some((text, _)) => {
                 format!("{DIRECTION_HEADING}\n\n{text}\n\n{TASK_HEADING}\n\n{brief}")
             }
+            None => brief,
+        }
+    }
+
+    /// `brief` for a run on `issue`, ending with where its repository's
+    /// guidance is, where `guidance` names it.
+    fn guided(&self, issue: &ItemRef, brief: String) -> String {
+        match guidance::paragraph(&self.config.guidance, &issue.repository) {
+            Some(paragraph) => format!("{brief}\n\n{paragraph}"),
             None => brief,
         }
     }
@@ -7879,6 +7899,7 @@ mod blockers;
 mod cost;
 pub(crate) mod epics;
 mod focus;
+pub mod guidance;
 pub mod holds;
 
 pub mod decision;
