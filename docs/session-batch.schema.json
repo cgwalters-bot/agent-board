@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Session batch v1",
+  "description": "What one per-repository session run proposes; a proposal checked against the caller's bounds, not authority to act.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "repo", "actions"],
+  "properties": {
+    "schema": {"const": "agent-board/session-batch/v1"},
+    "repo": {"$ref": "#/$defs/repo"},
+    "actions": {
+      "type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/action"},
+      "allOf": [
+        {"contains": {"type": "object", "required": ["type"], "properties": {"type": {"const": "close_issue"}}}, "minContains": 0, "maxContains": 5},
+        {"contains": {"type": "object", "required": ["type"], "properties": {"type": {"const": "rescope_issue"}}}, "minContains": 0, "maxContains": 5},
+        {"contains": {"type": "object", "required": ["type"], "properties": {"type": {"const": "set_priority"}}}, "minContains": 0, "maxContains": 10},
+        {"contains": {"type": "object", "required": ["type"], "properties": {"type": {"const": "attach_to_epic"}}}, "minContains": 0, "maxContains": 5},
+        {"contains": {"type": "object", "required": ["type"], "properties": {"type": {"const": "post_plan"}}}, "minContains": 0, "maxContains": 5},
+        {"contains": {"type": "object", "required": ["type"], "properties": {"type": {"const": "ask_operator"}}}, "minContains": 0, "maxContains": 3}
+      ]
+    }
+  },
+  "$defs": {
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/(?!\\.{1,2}(?![\\s\\S]))[A-Za-z0-9_.-]{1,100}(?![\\s\\S])"},
+    "issue": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/(?!\\.{1,2}#)[A-Za-z0-9_.-]{1,100}#[1-9][0-9]*(?![\\s\\S])"},
+    "plain": {"type": "string", "not": {"pattern": "```agent-board|<!--"}},
+    "body": {"type": "string", "minLength": 1, "maxLength": 60000, "pattern": "\\S", "$ref": "#/$defs/plain"},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 4000, "pattern": "\\S", "$ref": "#/$defs/plain"},
+    "question": {"type": "string", "minLength": 1, "maxLength": 500, "pattern": "^[^\\r\\n]*\\S[^\\r\\n]*(?![\\s\\S])", "$ref": "#/$defs/plain"},
+    "domain": {"type": "string", "maxLength": 64, "pattern": "^[a-z-]+(?![\\s\\S])"},
+    "job": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "kind", "runner", "brief"],
+      "properties": {
+        "schema": {"const": "agent-board/job-plan/v1"},
+        "kind": {"enum": ["implement", "triage", "research"]}, "runner": {"const": "hosted"},
+        "pool": {"type": "string", "maxLength": 32, "pattern": "^(?!tier-)[a-z0-9][a-z0-9_-]*(?![\\s\\S])"},
+        "effort": {"const": "heavy"},
+        "brief": {"type": "string", "minLength": 1, "maxLength": 16000, "pattern": "\\S"}
+      }
+    },
+    "action": {
+      "type": "object", "required": ["type"], "unevaluatedProperties": false,
+      "oneOf": [
+        {"required": ["issue", "reason"], "properties": {
+          "type": {"const": "close_issue"}, "issue": {"$ref": "#/$defs/issue"}, "reason": {"$ref": "#/$defs/reason"}
+        }},
+        {"required": ["issue", "body", "reason"], "properties": {
+          "type": {"const": "rescope_issue"}, "issue": {"$ref": "#/$defs/issue"},
+          "body": {"$ref": "#/$defs/body"}, "reason": {"$ref": "#/$defs/reason"}
+        }},
+        {"required": ["issue", "value"], "properties": {
+          "type": {"const": "set_priority"}, "issue": {"$ref": "#/$defs/issue"}, "value": {"type": "string"}
+        }},
+        {"required": ["issue", "epic"], "properties": {
+          "type": {"const": "attach_to_epic"}, "issue": {"$ref": "#/$defs/issue"}, "epic": {"$ref": "#/$defs/issue"}
+        }},
+        {"required": ["issue", "plan"], "properties": {
+          "type": {"const": "post_plan"}, "issue": {"$ref": "#/$defs/issue"}, "plan": {"$ref": "#/$defs/job"}
+        }},
+        {"required": ["domain", "question"], "properties": {
+          "type": {"const": "ask_operator"}, "domain": {"$ref": "#/$defs/domain"}, "question": {"$ref": "#/$defs/question"}
+        }}
+      ]
+    }
+  }
+}

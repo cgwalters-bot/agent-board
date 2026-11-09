@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(
             lines,
             [format!(
-                "cost: published {} to cgwalters-forge/tracker@data as commit1 (35 requests)",
+                "cost: published {} to cgwalters-forge/tracker@data as commit1 (37 requests)",
                 days.join(", ")
             )]
         );
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "cost: published cost/2026-10-28.json to cgwalters-forge/tracker@data as commit1 (24 requests)"
+                "cost: published cost/2026-10-28.json to cgwalters-forge/tracker@data as commit1 (26 requests)"
             ]
         );
         let api = "repos/cgwalters-forge/tracker/git";

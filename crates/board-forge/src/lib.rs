@@ -32,6 +32,7 @@ pub mod prune;
 pub mod release_train;
 pub mod review;
 pub mod runs;
+pub mod session;
 pub mod stack;
 pub mod status;
 pub mod supervise;

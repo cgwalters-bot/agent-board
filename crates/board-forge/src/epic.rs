@@ -305,7 +305,7 @@ pub(crate) fn request(value: &Value) -> Result<Option<String>> {
     Ok(Some(value.to_owned()))
 }
 
-fn text<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
+pub(crate) fn text<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
     object
         .get(key)
         .with_context(|| format!("no {key}"))?
@@ -324,16 +324,25 @@ fn bounded<'a>(object: &'a Map<String, Value>, key: &str, limit: usize) -> Resul
     Ok(value)
 }
 
-/// A reason, posted as a comment by the applier, who is a plan writer: a
-/// fence or hidden marker in it would be a job plan, an epic plan or a
-/// dispatch record under that login.
-fn reason(object: &Map<String, Value>) -> Result<String> {
-    let reason = bounded(object, "reason", REASON_LIMIT)?;
+/// A bounded field posted as a comment by the applier, who is a plan
+/// writer: a fence or hidden marker in it would be a job plan, an epic
+/// plan or a dispatch record under that login.
+pub(crate) fn plain<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    limit: usize,
+) -> Result<&'a str> {
+    let value = bounded(object, key, limit)?;
     ensure!(
-        !reason.contains("```agent-board") && !reason.contains("<!--"),
-        "reason holds an agent-board fence or a hidden marker"
+        !value.contains("```agent-board") && !value.contains("<!--"),
+        "{key} holds an agent-board fence or a hidden marker"
     );
-    Ok(reason.into())
+    Ok(value)
+}
+
+/// A reason, posted as a comment by the applier ([`plain`]).
+fn reason(object: &Map<String, Value>) -> Result<String> {
+    plain(object, "reason", REASON_LIMIT).map(str::to_owned)
 }
 
 /// An issue body, written by the applier: a plan block in it would be a job
@@ -1097,6 +1106,14 @@ fn job_plan(value: &Value, repo: &str) -> Result<JobPlan> {
     // A placeholder that passes the number check; reset below.
     object.insert("item".into(), 1.into());
     let mut plan = JobPlan::from_json(&Value::Object(object))?;
+    // A session is a run over a whole repository, which an agent's plan
+    // may not commit the pools to ([`crate::session`]); the operator or
+    // the pass writes session plans.
+    ensure!(
+        plan.kind != crate::plan::SESSION_KIND,
+        "kind {:?} is not a sub-issue's; a session plan is written by hand",
+        plan.kind
+    );
     plan.item = 0;
     Ok(plan)
 }
@@ -1771,6 +1788,8 @@ mod tests {
         with_repo["plan"]["repo"] = json!("cgwalters-forge/tracker");
         let mut bad_job = create();
         bad_job["plan"]["runner"] = json!("devspace");
+        let mut session_job = create();
+        session_job["plan"]["kind"] = json!("session");
         let mut epic_label = create();
         epic_label["labels"] = json!(["coordinator", " Epic "]);
         let mut outside = create();
@@ -2134,6 +2153,10 @@ mod tests {
             // A job plan names its own issue, and is checked as any is.
             (vec![with_repo], "names repo, which is the new issue's"),
             (vec![bad_job], "plan runner \"devspace\" is not available"),
+            (
+                vec![session_job],
+                "kind \"session\" is not a sub-issue's; a session plan is written by hand",
+            ),
             // Repeated or contradictory actions on one issue.
             (
                 vec![

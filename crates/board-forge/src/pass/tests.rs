@@ -12450,13 +12450,16 @@ fn heavy_plan_cannot_bypass_the_weekly_budget() {
     }
 }
 
-/// Accepted triage and opt-in research plans start once with the exact brief
-/// and kind, without overlap reads. Pool holds and caps still apply, and a
-/// plan targeting another issue stays manual.
+/// Accepted triage and opt-in research and session plans start once with the
+/// exact brief and kind, without overlap reads. Pool holds and caps still
+/// apply, a plan targeting another issue stays manual, and a session plan
+/// starts only as the operator's.
 #[test]
 fn accepted_triage_plans_start_once() {
     assert!(!config(json!({})).research_plans);
+    assert!(!config(json!({})).session_plans);
     assert!(forgejo::check_options(&json!({"researchPlans": true})).is_err());
+    assert!(forgejo::check_options(&json!({"sessionPlans": true})).is_err());
     let plan = "plan=9@2026-10-23T00:00:00Z";
     let start = format!("start triage cgwalters-forge/tracker#446 {plan} pool=claude record=");
     let generated = "start triage cgwalters-forge/tracker#446 pool=claude record=";
@@ -12467,6 +12470,12 @@ fn accepted_triage_plans_start_once() {
     let research_held =
         format!("held by --max-dispatch: start research cgwalters-forge/tracker#446 {plan}");
     let other = "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z triages cgwalters-forge/tracker#527, not this issue; it is dispatched by hand";
+    let session = "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z is for session, which is dispatched by hand; the pass starts only implement and triage plans";
+    let session_planner = "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z is a session plan the operator did not write; the pass starts only the operator's own session plans";
+    let session_start =
+        format!("start session cgwalters-forge/tracker#446 {plan} pool=claude record=");
+    let session_held =
+        format!("held by --max-dispatch: start session cgwalters-forge/tracker#446 {plan}");
     let pool = "hold cgwalters-forge/tracker#446: no pool: openai is held";
     let limits = |dispatch, writes| Limits {
         dispatch,
@@ -12495,6 +12504,12 @@ fn accepted_triage_plans_start_once() {
         ("research enabled held pool", Some((("research", 446), "cgwalters", Some("openai"))), None, none, pool),
         ("research enabled held triagePools", Some((("research", 446), "cgwalters", None)), Some("openai"), none, pool),
         ("research enabled another issue", Some((("research", 527), "cgwalters", None)), None, none, "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z researches cgwalters-forge/tracker#527, not this issue; it is dispatched by hand"),
+        ("a session plan", Some((("session", 446), "cgwalters", None)), None, none, session),
+        ("session enabled", Some((("session", 446), "cgwalters", None)), None, none, &session_start),
+        ("session enabled, the planner's", Some((("session", 446), "cgwalters-bot", None)), None, none, session_planner),
+        ("session enabled capped", Some((("session", 446), "cgwalters", None)), None, limits(Some(0), None), &session_held),
+        ("session enabled held pool", Some((("session", 446), "cgwalters", Some("openai"))), None, none, pool),
+        ("session enabled another issue", Some((("session", 527), "cgwalters", None)), None, none, "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z is a session on cgwalters-forge/tracker#527, not this issue; it is dispatched by hand"),
         ("another issue's", Some((("triage", 527), "cgwalters", None)), None, none, other),
         ("no plan", None, None, none, generated),
     ];
@@ -12505,6 +12520,7 @@ fn accepted_triage_plans_start_once() {
                 None => config(json!({"wip": 3})),
             };
             config.research_plans = name.starts_with("research enabled");
+            config.session_plans = name.starts_with("session enabled");
             let mut forge = Forge::new(None, false);
             only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
             if let Some((plan, author, pool)) = planned {
@@ -12525,32 +12541,21 @@ fn accepted_triage_plans_start_once() {
                 assert!(first.effects.starts.is_empty(), "{name}");
                 continue;
             }
+            let kind = match (config.research_plans, config.session_plans) {
+                (true, _) => "research",
+                (_, true) => "session",
+                _ => "triage",
+            };
             assert_eq!(
                 first.effects.starts,
-                BTreeMap::from([(
-                    if config.research_plans {
-                        "research"
-                    } else {
-                        "triage"
-                    }
-                    .into(),
-                    1
-                )]),
+                BTreeMap::from([(kind.into(), 1)]),
                 "{name}"
             );
             let writes = forge.writes.borrow();
             let (_, _, sent) = (writes.iter())
                 .find(|(_, url, _)| url.ends_with("/dispatches"))
                 .unwrap();
-            assert_eq!(
-                sent["inputs"]["kind"],
-                if config.research_plans {
-                    "research"
-                } else {
-                    "triage"
-                },
-                "{name}"
-            );
+            assert_eq!(sent["inputs"]["kind"], kind, "{name}");
             assert_eq!(sent["inputs"]["pool"], "claude", "{name}");
             assert_eq!(
                 sent["inputs"].get("effort").cloned(),
@@ -12588,6 +12593,66 @@ fn accepted_triage_plans_start_once() {
             );
         }
     }
+}
+
+/// With `sessionPlans`, a session plan is started only as the operator's own
+/// word (agent-board#830): the operator's plan that the planner last edited
+/// waits on the operator, and so does the planner's session plan posted
+/// after the operator's was dispatched, as a session run proposing its own
+/// successor would; the dispatched plan is not started again either.
+#[test]
+fn session_plans_start_only_on_the_operators_word() {
+    let waits = "is a session plan the operator did not write; the pass starts only the operator's own session plans";
+    let mut config = config(json!({"wip": 3}));
+    config.session_plans = true;
+    let session = |author: &str| {
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        job_plan(&mut forge.replay, ("session", 446), author, None);
+        forge
+    };
+    let holds = |report: &Report, name: &str| {
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let line = report.lines.iter().find(|l| l.contains(waits));
+        assert!(line.is_some(), "{name}: {:#?}", report.lines);
+        line.unwrap().clone()
+    };
+
+    let mut forge = session("cgwalters");
+    let comments = &mut answer(&mut forge.replay, r#""name":"tracker","number":446"#)["data"]["repository"]
+        ["issue"]["comments"]["nodes"];
+    let plan = comments.as_array_mut().unwrap().last_mut().unwrap();
+    plan["lastEditedAt"] = json!("2026-10-23T01:00:00Z");
+    plan["editor"] = json!({"login": "cgwalters-bot"});
+    let edited = holds(&apply(&forge, &config), "edited by the planner");
+    assert!(
+        edited.starts_with("hold cgwalters-forge/tracker#446: plan 9@2026-10-23T01:00:00Z "),
+        "{edited}"
+    );
+    assert!(forge.dispatches().is_empty());
+
+    let forge = session("cgwalters");
+    let first = apply(&forge, &config);
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    assert_eq!(forge.dispatches(), ["cgwalters-forge/tracker#446"]);
+    let successor = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 446,
+        "kind": "session", "runner": "hosted", "brief": "Run the next session."});
+    let posted = (forge.replay.now + time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    forge.added.borrow_mut().entry(("cgwalters-forge/tracker".into(), 446)).or_default().push(json!({
+        "id": 10, "url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-10",
+        "body": format!("```{PLAN_FENCE}\n{successor}\n```"), "createdAt": posted,
+        "lastEditedAt": null, "author": {"login": "cgwalters-bot"}, "editor": null,
+    }));
+    let next = holds(&apply(&forge, &config), "the planner's successor");
+    assert!(
+        next.starts_with(&format!(
+            "hold cgwalters-forge/tracker#446: plan 10@{posted} "
+        )),
+        "{next}"
+    );
+    assert_eq!(forge.dispatches().len(), 1);
 }
 
 /// With `fixPlans`, an accepted fix plan on tracker#446 for upstream
@@ -13295,10 +13360,17 @@ fn body_plans_start_a_p0_or_p1_issue() {
             "hold cgwalters-forge/tracker#446: plan body is for research, which is dispatched by hand".into()),
         ("a plan outside the work repositories", true, "P0", block.replace("cgwalters-forge/tracker", "o/r"), bot, None,
             "hold cgwalters-forge/tracker#446: its plan's o/r#446 is not in a work repository".into()),
+        // A session plan starts only from the operator's own comment, even
+        // with `sessionPlans`: its copy would be the bot's.
+        ("the operator's session plan", true, "P0", block.replace("implement", "session"), "cgwalters", None,
+            "hold cgwalters-forge/tracker#446: plan body is a session plan in the issue's body; the pass starts a session only from the operator's own plan comment".into()),
+        ("the bot's session plan", true, "P0", block.replace("implement", "session"), bot, None,
+            "hold cgwalters-forge/tracker#446: plan body is a session plan in the issue's body".into()),
     ];
     for (name, on, priority, body, author, editor, expected) in cases {
         let forge = body_plan_forge(priority, &body, author, editor);
-        let config = config(json!({"bodyPlans": on}));
+        let mut config = config(json!({"bodyPlans": on}));
+        config.session_plans = name.contains("session");
         let first = apply(&forge, &config);
         assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
         let line = first.lines.iter().find(|l| l.contains("tracker#446"));

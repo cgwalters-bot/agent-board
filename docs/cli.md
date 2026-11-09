@@ -141,6 +141,7 @@ Commands:
 
 - [`maintain-digest`](#agent-board-check-maintain-digest): Validate a candidate maintain digest offline; no credentials, network or publication
 - [`proposals`](#agent-board-check-proposals): Refuse outputs outside an identity's assignment and field policy
+- [`session-batch`](#agent-board-check-session-batch): Validate a session run's batch comment offline and print its typed actions; no credentials, network or writes
 
 ## agent-board check maintain-digest
 
@@ -166,6 +167,21 @@ Options:
 
 - `--as <IDENTITY>`: Identity from the policy whose bounds the proposals must stay within
 - `--proposals <FILE>`: JSONL proposals file; reads stdin when omitted
+
+## agent-board check session-batch
+
+Validate a session run's batch comment offline and print its typed actions; no credentials, network or writes
+
+```text
+agent-board check session-batch [OPTIONS]
+```
+
+Options:
+
+- `--body <FILE>`: Candidate comment body holding one agent-board-session block; reads stdin when omitted
+- `--allow-repo <OWNER/REPO>`: Repository whose issues a batch may change; repeat for each. From the caller's configuration
+- `--priority-option <OPTION>`: An option of the board's Priority field; repeat for each
+- `--ask-domain <DOMAIN>`: A domain of the caller's operatorAsk a batch may ask about; repeat for each
 
 ## agent-board project
 
@@ -455,7 +471,7 @@ Options:
 - `--result <RESULT>`: Applied pull request or issue comment URL. Omit for admission only
 - `--apply`: Write the validated proposal to the live board with your GH_TOKEN
 - `--caller <CALLER>`: Dispatch caller repository to search when no Run is recorded
-- `--kind <KIND>`: Dispatch kind to match when looking up a run (possible values: `implement`, `triage`, `research`) (default: `implement`)
+- `--kind <KIND>`: Dispatch kind to match when looking up a run (possible values: `implement`, `triage`, `research`, `session`) (default: `implement`)
 - `--yes`: Accept the unique run printed by caller lookup
 
 ## agent-board request
@@ -483,7 +499,7 @@ Options:
 - `--item <ITEM>`: Issue to dispatch: URL, OWNER/REPO#N, or N with --repo
 - `--caller <CALLER>`: Repository containing the reviewed dispatch.yml caller, not the target code
 - `--branch <BRANCH>`: Caller default branch; the caller independently checks this (default: `main`)
-- `--kind <KIND>`: Profile the caller workflow runs with (possible values: `implement`, `triage`, `research`) (default: `implement`)
+- `--kind <KIND>`: Profile the caller workflow runs with (possible values: `implement`, `triage`, `research`, `session`) (default: `implement`)
 
 ## agent-board dispatch
 

@@ -24,7 +24,7 @@ pub struct Dispatch {
     #[arg(long, default_value = "main")]
     branch: String,
     /// Profile the caller workflow runs with.
-    #[arg(long, default_value = "implement", value_parser = ["implement", "triage", "research"])]
+    #[arg(long, default_value = "implement", value_parser = ["implement", "triage", "research", "session"])]
     kind: String,
 }
 
@@ -88,7 +88,7 @@ pub struct Record {
     #[arg(long)]
     caller: Option<String>,
     /// Dispatch kind to match when looking up a run.
-    #[arg(long, default_value = "implement", value_parser = ["implement", "triage", "research"])]
+    #[arg(long, default_value = "implement", value_parser = ["implement", "triage", "research", "session"])]
     kind: String,
     /// Accept the unique run printed by caller lookup.
     #[arg(long)]

@@ -165,7 +165,7 @@ with a `ref` and these string inputs, which the caller workflow must accept:
 | `task` | The brief: a plan's `brief`, or the task agent-board writes for a fix or triage round |
 | `repo` | Target repository, `OWNER/NAME`; the caller's bounds must allow it |
 | `item` | Issue or pull request number in `repo` |
-| `kind` | `implement`, `triage`, `research` or `fix`: the profile the run gets |
+| `kind` | `implement`, `triage`, `research`, `fix` or [`session`](sessions.md): the profile the run gets |
 | `pool` | Inference pool, or empty to leave it to the caller |
 | `effort` | Optional: exactly `heavy`; omitted for the existing default. Carried unchanged even when routing supplies a default pool |
 | `base` | Only for a [stacked](job-plans.md#stacking) plan: the branch to start from |

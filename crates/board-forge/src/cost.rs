@@ -41,7 +41,14 @@ pub const ARTIFACT: &str = "agent-run";
 /// The kinds the shared agentic-job workflow takes (its `kind` input,
 /// cgwalters-forge/actions' `cgwalters-agentic-job.yml`), each run uploading
 /// `dispatch-KIND-agent-run`. A kind not here is not counted.
-pub const DISPATCH_KINDS: &[&str] = &["implement", "triage", "research", "review", "fix"];
+pub const DISPATCH_KINDS: &[&str] = &[
+    "implement",
+    "triage",
+    "research",
+    "review",
+    "fix",
+    crate::plan::SESSION_KIND,
+];
 /// The one file read from it.
 pub const SUMMARY_FILE: &str = "summary.json";
 /// The most of an artifact's zip downloaded.
