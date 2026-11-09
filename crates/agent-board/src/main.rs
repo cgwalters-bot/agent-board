@@ -19,6 +19,7 @@ mod org_status;
 mod overlap;
 mod pass;
 mod poll;
+mod pools;
 mod promote;
 mod prune;
 mod release_train;
@@ -146,6 +147,8 @@ enum Command {
     },
     /// Start the job an issue's newest accepted plan comment proposes, once (--dry-run prints the request).
     Dispatch(dispatch::FromPlan),
+    /// Resolve deployment-owned pool settings (offline; no inference or writes).
+    Pools(pools::Args),
     /// The open pull requests of -R, of any author, and the implement runs in flight that share a path with a change, with their age and last activity and which drafts are stale, as the dispatch overlap check reads them (read-only; docs/job-plans.md#the-overlap-command).
     Overlap(overlap::Overlap),
     /// Check a coordinator's plan for an epic's sub-issues.
@@ -660,6 +663,7 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 &cli.hostname,
             )
         }
+        Command::Pools(args) => pools::run(args, &mut io::stdout().lock()),
         Command::Dispatch(args) => {
             ensure!(
                 cli.json.is_none(),

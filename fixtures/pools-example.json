@@ -1,0 +1,15 @@
+{
+  "standard": {
+    "agent": "opencode",
+    "model": "example/standard",
+    "budget": "500",
+    "tier": 1,
+    "heavy": { "model": "example/heavy" }
+  },
+  "compact": {
+    "agent": "vibe",
+    "model": "example/compact",
+    "budget": "100",
+    "tier": 2
+  }
+}
