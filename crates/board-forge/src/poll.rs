@@ -8418,6 +8418,10 @@ pub fn run_capped<R: Rest, G: Transport>(
     let not_found = |repo: &str| {
         format!("warning: {repo} was not found (404); fix its entry in the configuration")
     };
+    // Within the pass, the stage's share may refuse the reads of the
+    // repositories past it: they wait for the next pass, as the walk's do
+    // below, and are no error (agent-board#823).
+    let mut deferred = Vec::new();
     for repo in &repositories {
         match pass.activity(repo, &mut outcome.lines) {
             Ok(count) => outcome.activity += count,
@@ -8426,8 +8430,12 @@ pub fn run_capped<R: Rest, G: Transport>(
                 missing.insert(repo.to_ascii_lowercase());
             }
             Err(error) => {
-                outcome.errors += 1;
-                outcome.lines.push(format!("{repo} error: {error:#}"));
+                if error.is::<crate::pass::ShareSpent>() {
+                    deferred.push((repo, error));
+                } else {
+                    outcome.errors += 1;
+                    outcome.lines.push(format!("{repo} error: {error:#}"));
+                }
                 // Keep the page this pass could not replace, or the next one
                 // would report all of it again.
                 let url = events_url(repo);
@@ -8436,6 +8444,14 @@ pub fn run_capped<R: Rest, G: Transport>(
                 }
             }
         }
+    }
+    if let Some((first, error)) = deferred.first() {
+        outcome.lines.push(format!(
+            "activity: the stage's request share is spent at {first}; {} repositories' events wait for the next pass: {error:#}",
+            deferred.len()
+        ));
+        // Unread is not unchanged: the next pass comes soon.
+        outcome.activity += 1;
     }
     let follow: BTreeSet<&String> = follow.iter().collect();
     // With `repositoriesPerPass`, the steps of this pass stay inside an

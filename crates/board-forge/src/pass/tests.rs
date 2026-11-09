@@ -5556,6 +5556,36 @@ fn authored_read_at_its_share_is_deferred() {
     assert!(report.state.is_some());
 }
 
+/// Wherever a stage's share refuses a read, the stage defers what it left
+/// rather than failing: across budgets that stop each share-limited stage
+/// at each of its reads, no line reports a share as an error, and stage 2's
+/// read of the followed repositories' events is among those stopped
+/// (agent-board#800, agent-board#823).
+#[test]
+fn no_share_is_an_error() {
+    let forge = authored_forge();
+    let mut activity = false;
+    for (settings, limits) in [
+        (json!({}), 5..40),
+        (
+            json!({"follow": [AUTHORED_REPO], "pr": {"fixPools": ["claude"]},
+                "reserveScheduling": true, "authored": 2}),
+            10..80,
+        ),
+    ] {
+        let config = config(settings.clone());
+        for limit in limits {
+            let report = apply_within(&forge, &config, limit);
+            let failed = (report.lines.iter())
+                .find(|l| l.contains("requests for the stages after it") && l.contains("error"));
+            assert!(failed.is_none(), "{settings} within {limit}: {failed:?}");
+            activity |= (report.lines.iter())
+                .any(|l| l.starts_with("activity: the stage's request share is spent at "));
+        }
+    }
+    assert!(activity, "no budget stopped stage 2 at the events");
+}
+
 /// A pass past its time bound starts nothing more, and sends nothing; a
 /// start under way when it passed may finish, for a while.
 #[test]
