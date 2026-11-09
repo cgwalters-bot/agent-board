@@ -109,8 +109,16 @@ staging test was enabled. Provenance evaluation is implemented; publication,
 first-write revalidation and unchanged-text publication, bounded writes/recovery,
 sign-off semantics/proof, recorded bot-fork staging verification,
 Status/scheduling handoff and tracker deployment remain follow-ups to #308.
-The shared recorder's known not-found limitation remains: live-client 404 errors
-are not saved as replayable responses. These separate public observations and
+The shared recorder keeps the live client's typed not-found error (404 or 410)
+as `{"absent": true}`, and replay returns the same typed error; older fixtures'
+recorded `"status": 404` answers, as in `policy-public-2026-11-04.json`, still
+replay as responses. Other read
+failures are not recorded, so their replay fails on the unrecorded read. The
+recording projection keeps tree `mode` and `truncated` and timeline `event`.
+`promote/tests.rs` checks that record, projection and replay agree, with zero
+writes, on bot-ok, human-text, needs-text, policy-missing and draft-conversion
+scenarios. These run through a synthetic live client over the edited fixtures,
+not a new live recording. These separate public observations and
 edited scenarios do not claim a successful live promote record/replay.
 
 `awaiting-public-2026-11-08.json` projects the public response of the

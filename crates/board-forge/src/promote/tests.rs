@@ -1946,6 +1946,184 @@ fn recorded_scenarios() {
     }
 }
 
+/// A synthetic live client over a scenario, not a recorded observation: a
+/// 404 answer is the live client's typed absence, a read of `refuse` its
+/// authentication failure, and a write is counted and refused.
+struct Live<'a> {
+    replay: &'a Replay,
+    refuse: Option<&'a str>,
+    writes: Cell<usize>,
+}
+
+impl Rest for Live<'_> {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        if self
+            .refuse
+            .is_some_and(|path| url == format!("{API}{path}"))
+        {
+            return Err(anyhow::Error::from(crate::github::AuthenticationRequired)
+                .context(format!("GET {url}: GitHub HTTP status 401")));
+        }
+        let response = self.replay.get(url, validator)?;
+        if response.status == 404 {
+            return Err(anyhow::Error::from(crate::github::NotFound)
+                .context(format!("GET {url}: GitHub HTTP status 404")));
+        }
+        Ok(response)
+    }
+    fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+        self.writes.set(self.writes.get() + 1);
+        anyhow::bail!("mutation attempted")
+    }
+}
+
+impl Transport for Live<'_> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.replay.graphql(query, variables)
+    }
+}
+
+/// Previews `replay` through [`Live`] and the CLI's recording, then replays
+/// that recording at the same clock: both decisions, and the recording.
+fn round_trip(
+    replay: &Replay,
+    config: &Config,
+    refuse: Option<&str>,
+) -> (Result<Vec<String>>, Result<Vec<String>>, Value) {
+    let live = Live {
+        replay,
+        refuse,
+        writes: Cell::new(0),
+    };
+    let recorder = crate::pass::Recorder::new(&live);
+    let recorded = preview(&recorder, config, replay.now);
+    assert_eq!(live.writes.get(), 0);
+    let fixture: Value =
+        serde_json::from_str(&recording(&recorder.fixture(replay.now).unwrap()).unwrap()).unwrap();
+    let (replayed, _) = run(Replay::from_json(&fixture).unwrap(), config);
+    (recorded, replayed, fixture)
+}
+
+/// The policy scan's optional repository, recorded as absent (404).
+const ABSENT_SCAN: &str = "repos/composefs/.github/contents";
+
+fn recorded_answer<'a>(fixture: &'a Value, path: &str) -> Option<&'a Value> {
+    let url = format!("{API}{path}");
+    fixture["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["request"]["get"] == url)
+        .map(|e| &e["answer"])
+}
+
+#[test]
+fn recording_replays_the_live_decision() {
+    type Case = (&'static str, fn() -> Replay, bool, String);
+    let cases: Vec<Case> = vec![
+        ("bot-ok", scenario, false, candidate(false)),
+        ("human-text", human_scenario, false, human_candidate()),
+        (
+            "human-text held",
+            || {
+                let mut replay = human_scenario();
+                text_evidence(&mut replay)["editor"] = json!({"login":"visitor"});
+                replay
+            },
+            false,
+            policy_hold("needs-text: last body editor is not the operator or is missing"),
+        ),
+        (
+            "policy missing",
+            || {
+                let mut replay = scenario();
+                exact(&mut replay, RECORD)["answer"]["status"] = json!(404);
+                replay
+            },
+            false,
+            policy_hold(
+                "policy missing: no record at cgwalters-forge/tracker:upstream-policy/composefs/composefs-rs.md",
+            ),
+        ),
+        (
+            "drafted after approval",
+            || {
+                let mut replay = scenario();
+                *comments(&mut replay) = json!([]);
+                sync_metadata(&mut replay);
+                *reviews(&mut replay) = json!([{"id":5,"user":{"login":"cgwalters"},"state":"APPROVED","submitted_at":COMMAND,"commit_id":HEAD}]);
+                pull(&mut replay)["draft"] = json!(true);
+                timeline(
+                    &mut replay,
+                    json!([{"event":"convert_to_draft","created_at":"2026-10-24T00:00:00Z"}]),
+                );
+                replay
+            },
+            true,
+            hold("no operator command or approval after observed push"),
+        ),
+    ];
+    for (name, scenario, on_approval, expected) in cases {
+        let mut config = Config::parse(CONFIG).unwrap();
+        config.promote.as_mut().unwrap().on_approval = on_approval;
+        let replay = scenario();
+        let (recorded, replayed, fixture) = round_trip(&replay, &config, None);
+        let expected = vec![expected, REMAINING.into()];
+        assert_eq!(recorded.unwrap(), expected, "{name}");
+        assert_eq!(replayed.unwrap(), expected, "{name}");
+        // Typed absence of a missing record, or of an optional scan source
+        // once the record is read; the approval hold comes before both.
+        let absent = if name == "policy missing" {
+            RECORD
+        } else {
+            ABSENT_SCAN
+        };
+        if !on_approval {
+            assert_eq!(
+                recorded_answer(&fixture, absent),
+                Some(&json!({"absent":true})),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// A transport or authentication failure is neither absence nor recorded:
+/// its replay fails on the unrecorded read instead of passing a gate.
+#[test]
+fn recording_keeps_no_failure() {
+    let config = Config::parse(CONFIG).unwrap();
+    // A tree of the record's history, read after the policy scan.
+    let tree = format!("{TRACKER}/git/trees/{}", "2".repeat(40));
+    let (recorded, replayed, fixture) = round_trip(&scenario(), &config, Some(&tree));
+    let recorded = recorded.unwrap();
+    assert!(recorded[0].starts_with("hold promote"), "{recorded:?}");
+    assert!(recorded[0].contains("status 401"), "{recorded:?}");
+    assert_eq!(recorded_answer(&fixture, &tree), None);
+    // Every kept REST answer is a response or typed absence, never a failure.
+    for e in fixture["requests"].as_array().unwrap() {
+        let answer = &e["answer"];
+        assert!(answer.get("error").is_none(), "{e}");
+        if e["request"]["get"].is_string() {
+            assert!(
+                answer["status"].is_u64() || *answer == json!({"absent":true}),
+                "{e}"
+            );
+        }
+    }
+    let replayed = replayed.unwrap();
+    assert!(
+        replayed[0].contains("the replay did not record"),
+        "{replayed:?}"
+    );
+    // Replay itself gives back the live client's type, not a status.
+    let replay = Replay::from_json(&fixture).unwrap();
+    let Err(error) = replay.get(&format!("{API}{ABSENT_SCAN}"), None) else {
+        panic!("recorded absence replayed as a response");
+    };
+    assert!(error.is::<crate::github::NotFound>(), "{error:#}");
+}
+
 #[test]
 fn on_approval_accepts_a_current_head_approval_after_the_push() {
     type Case = (&'static str, fn(&mut Replay), Option<&'static str>);
