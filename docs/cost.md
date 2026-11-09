@@ -11,9 +11,12 @@ artifact, including reviews, which aren't board items: a review's is named
 `agent-run`, a dispatched run's `dispatch-KIND-agent-run`, for each kind
 the shared agentic-job workflow (`cgwalters-agentic-job.yml` in
 cgwalters-forge/actions, which tracker's dispatch and supervisor workflows
-call) takes: `implement`, `triage`, `research`, `review` and `fix`
-(`DISPATCH_KINDS` in `crates/board-forge/src/cost.rs`). A kind that workflow
-gains later is not counted until `DISPATCH_KINDS` names it too.
+call) takes: `implement`, `triage`, `research`, `review`, `fix` and
+`session` (`DISPATCH_KINDS` in `crates/board-forge/src/cost.rs`). A kind that
+workflow gains later is not counted until `DISPATCH_KINDS` names it too. A
+`research` or [`session`](sessions.md) run is counted under the kind its
+workflow or title names, as the report's kinds have no bucket of their own
+for them.
 
 ## What it reads
 

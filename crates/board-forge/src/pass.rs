@@ -584,6 +584,12 @@ pub struct Config {
     /// `--fix-bounds` ([`Scheduler::fix_plan_head`], agent-board#735).
     #[serde(default)]
     pub fix_plans: bool,
+    /// Off unless set: start an accepted `session` plan on its own issue
+    /// ([`crate::session`], agent-board#830). A session is a long run over
+    /// a whole repository, so starting one is the caller's decision, not a
+    /// planner's: without this, every session plan waits on the operator.
+    #[serde(default)]
+    pub session_plans: bool,
     /// Off unless set: a triage verdict of [`CLOSE_VERDICTS`] closes the
     /// issue rather than asking the operator; needs `triageFollowUpDays`.
     #[serde(default)]
@@ -675,6 +681,23 @@ pub struct Config {
     pub fix_bounds: poll::bounds::FixBoundsSet,
 }
 
+/// Ask domains, `what` being how an error names them: distinct lowercase
+/// ASCII names of letters or hyphens, at most [`OPERATOR_DOMAIN_BYTES`]
+/// each, as the verdict and a session batch quote them.
+pub(crate) fn check_domains(domains: &[String], what: &str) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for domain in domains {
+        ensure!(
+            !domain.is_empty()
+                && domain.len() <= OPERATOR_DOMAIN_BYTES
+                && domain.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                && seen.insert(domain),
+            "{what} must be distinct lowercase ASCII names (letters or hyphens), at most {OPERATOR_DOMAIN_BYTES} bytes"
+        );
+    }
+    Ok(())
+}
+
 /// Trusted caller policy, not issue text. Prose and accepted verdict domains
 /// travel together so the scheduler keeps the asks its brief solicits.
 #[derive(Debug, Deserialize)]
@@ -748,16 +771,7 @@ impl OperatorAsk {
             !self.domains.is_empty() && self.domains.len() <= OPERATOR_POLICY_DOMAINS,
             "operatorAsk.domains must have 1 to {OPERATOR_POLICY_DOMAINS} entries"
         );
-        let mut seen = BTreeSet::new();
-        for domain in &self.domains {
-            ensure!(
-                !domain.is_empty()
-                    && domain.len() <= OPERATOR_DOMAIN_BYTES
-                    && domain.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
-                    && seen.insert(domain),
-                "operatorAsk.domains entries must be distinct lowercase ASCII names (letters or hyphens), at most {OPERATOR_DOMAIN_BYTES} bytes"
-            );
-        }
+        check_domains(&self.domains, "operatorAsk.domains entries")?;
         if let Some(harness) = &self.harness {
             harness.check()?;
         }
@@ -5568,8 +5582,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let read = (&facts, comments.as_slice());
         // The body's plan, posted as a comment at its start, which the plan
-        // protocol then dispatches and records as any other.
-        let (plan, id, body, failed) = if plan::no_plan(&comments, &writers) {
+        // protocol then dispatches and records as any other. `operators`
+        // says whether the plan comment is the operator's own word, written
+        // and last edited by them, which a session plan must be; a body's
+        // plan is never one, as its copy would be the planner's.
+        let (plan, id, body, failed, operators) = if plan::no_plan(&comments, &writers) {
             match self.body_plan(&facts, board)? {
                 None => {
                     if let Some(step) =
@@ -5582,7 +5599,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
                 Some(Err(why)) => return Ok(Step::Hold(Hold::new(HoldKind::Other, why))),
                 Some(Ok((plan, block, read))) => {
-                    (plan, "body".to_owned(), Some((block, read)), None)
+                    (plan, "body".to_owned(), Some((block, read)), None, false)
                 }
             }
         } else {
@@ -5600,8 +5617,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             };
             let id = plan::plan_id(from)?;
+            let operators = plan::written_by(from, &config.operator);
             match batch::held(&self.client, &comments, &writers, &id, issue)?.first() {
-                None => (plan, id, None, None),
+                None => (plan, id, None, None, operators),
                 Some((_, record)) => {
                     // The run this plan's record names, where it failed: re-run
                     // once its plan's item passes a start's checks below, with
@@ -5648,20 +5666,41 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     {
                         return self.release(issue, (from, record), run, first);
                     }
-                    (plan, id, None, Some((run, early)))
+                    (plan, id, None, Some((run, early)), operators)
                 }
             }
         };
-        // Research uses the same admission and dispatch path, but only when
-        // the caller explicitly opts into spending on previously manual plans.
+        // Research and sessions use the same admission and dispatch path,
+        // but only when the caller explicitly opts into spending on
+        // previously manual plans.
         if !(PASS_PLAN_KINDS.contains(&plan.kind.as_str())
             || plan.kind == "research" && config.research_plans
-            || plan.kind == "fix" && config.fix_plans)
+            || plan.kind == "fix" && config.fix_plans
+            || plan.kind == plan::SESSION_KIND && config.session_plans)
             && failed.is_none()
         {
             let why = format!(
                 "plan {id} is for {}, which is dispatched by hand; the pass starts only implement and triage plans",
                 plan.kind
+            );
+            return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+        }
+        // A session is a run over a whole repository, so only the operator's
+        // own word starts one: the planner's plan, which any triage or
+        // session run can post (a session's own successor included), waits
+        // on the operator ([`crate::session`]), whoever edited it last. A
+        // body's plan is copied into the planner's comment before its
+        // dispatch, which would then be the newest plan and no longer the
+        // operator's word, so a session plan starts from a comment only.
+        if plan.kind == plan::SESSION_KIND && body.is_some() {
+            let why = format!(
+                "plan {id} is a session plan in the issue's body; the pass starts a session only from the operator's own plan comment"
+            );
+            return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+        }
+        if plan.kind == plan::SESSION_KIND && !operators {
+            let why = format!(
+                "plan {id} is a session plan the operator did not write; the pass starts only the operator's own session plans"
             );
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
@@ -5706,10 +5745,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if !implement && !fix && dest != *issue {
             let why = format!(
                 "plan {id} {} {}, not this issue; it is dispatched by hand",
-                if plan.kind == "research" {
-                    "researches"
-                } else {
-                    "triages"
+                match plan.kind.as_str() {
+                    "research" => "researches",
+                    plan::SESSION_KIND => "is a session on",
+                    _ => "triages",
                 },
                 dest.display()
             );

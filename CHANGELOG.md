@@ -11,6 +11,18 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- A `session` job plan kind, the first slice of triage per repository in
+  one long run instead of many one-comment item triages (agent-board#830,
+  the per-repository maintainer of tracker#1356): a session answers with
+  one `agent-board-session` batch of at most 20 typed actions, each kind
+  capped (5 closes, 5 rescopes, 10 Priorities, 5 epic links, 5 posted
+  plans, 3 one-line questions to the operator) and checked against the
+  caller's repositories, the board's Priority options and the
+  `operatorAsk` domains; `agent-board check session-batch` validates one
+  offline. The pass starts accepted session plans only with `sessionPlans`
+  (off by default), and then only the operator's own, never the planner's;
+  no batch is applied yet (docs/sessions.md).
+
 - Harness work, issues in the work repositories of `dispatchRepo`'s owner
   outside `pr.noMerge` and the midstream forks, no longer waits on the
   operator but for their own decisions (agent-board#778): an asking triage

@@ -42,8 +42,13 @@ const ERROR_LIMIT: usize = 200;
 /// Profiles a plan may ask for. dispatch.yml also has review, which takes a
 /// pull request and belongs to the poll. A fix plan names the pull request
 /// whose branch it rewrites, such as a promoted one's upstream; the pass
-/// starts one only with `fixPlans` (agent-board#735).
-pub const PLAN_KINDS: &[&str] = &["implement", "triage", "research", "fix"];
+/// starts one only with `fixPlans` (agent-board#735). A session plan's run
+/// triages its item's repository as a whole and answers with one bounded
+/// batch ([`crate::session`], agent-board#830); the pass starts one only
+/// with `sessionPlans`.
+pub const PLAN_KINDS: &[&str] = &["implement", "triage", "research", "fix", SESSION_KIND];
+/// The kind of a per-repository session run ([`crate::session`]).
+pub const SESSION_KIND: &str = "session";
 /// Runners the caller can provide. dispatch.yml has no devspace runner yet;
 /// a plan asking for one is refused here rather than run on a hosted one.
 pub const PLAN_RUNNERS: &[&str] = &["hosted"];
@@ -53,7 +58,7 @@ pub const PLAN_BRIEF_LIMIT: usize = 16_000;
 /// Comment pages read for one issue (100 each). An issue with more is refused,
 /// since the newest plan could be in the part not read.
 pub const PLAN_COMMENT_PAGES: usize = 10;
-const POOL_LIMIT: usize = 32;
+pub(crate) const POOL_LIMIT: usize = 32;
 const FIELDS: &[&str] = &[
     "schema",
     "repo",
@@ -427,6 +432,16 @@ fn trusted(writers: &[&str], login: &Option<String>) -> bool {
         .is_some_and(|l| writers.iter().any(|w| w.eq_ignore_ascii_case(l)))
 }
 
+/// Whether `comment` is `login`'s own word: written by that account and,
+/// if edited, last edited by it too. A plan the pass may start only on the
+/// operator's word, such as a session plan, is checked this way after
+/// [`newest_plan`] has weighed every writer's.
+pub(crate) fn written_by(comment: &Comment, login: &str) -> bool {
+    let only = [login];
+    trusted(&only, &comment.author)
+        && (!(comment.edited || comment.editor.is_some()) || trusted(&only, &comment.editor))
+}
+
 /// Whether [`newest_fenced`] weighs a comment: a writer's with a `fence`
 /// block, or one edited by anyone else. An edit counts as a writer's only
 /// when GitHub names a writer as its editor.
@@ -553,11 +568,17 @@ pub(crate) fn code_fence(line: &str) -> Option<(char, usize)> {
 /// The JSON of the one `fence` block in a comment body: `None` without one.
 /// Which blocks count is [`fence_blocks`]'s rule.
 pub(crate) fn fenced_json(body: &str, fence: &str) -> Result<Option<Value>> {
+    fenced_json_as(body, fence, "plan")
+}
+
+/// [`fenced_json`], naming the block `noun` in its errors.
+pub(crate) fn fenced_json_as(body: &str, fence: &str, noun: &str) -> Result<Option<Value>> {
     let mut found = None;
     for block in fence_blocks(body, fence) {
-        ensure!(found.is_none(), "comment holds more than one plan");
-        let json = block.context("plan fence is not closed")?;
-        found = Some(serde_json::from_str(&json).context("plan is not valid JSON")?);
+        ensure!(found.is_none(), "comment holds more than one {noun}");
+        let json = block.with_context(|| format!("{noun} fence is not closed"))?;
+        found =
+            Some(serde_json::from_str(&json).with_context(|| format!("{noun} is not valid JSON"))?);
     }
     Ok(found)
 }
@@ -1463,10 +1484,13 @@ mod tests {
         let mut stacked = plan();
         stacked["stacks_on"] = json!(3664);
         assert_eq!(JobPlan::from_json(&stacked).unwrap().stacks_on, Some(3664));
-        for kind in ["research", "fix"] {
+        for kind in ["research", "fix", SESSION_KIND] {
             stacked["kind"] = json!(kind);
             let message = JobPlan::from_json(&stacked).unwrap_err().to_string();
             assert!(message.contains("needs kind implement"), "{message}");
+            let mut unstacked = plan();
+            unstacked["kind"] = json!(kind);
+            assert_eq!(JobPlan::from_json(&unstacked).unwrap().kind, kind);
         }
         for key in ["schema", "repo", "item", "kind", "runner", "brief"] {
             let mut missing = plan();

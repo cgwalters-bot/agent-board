@@ -456,6 +456,7 @@ fn agent_artifacts_are_listed_by_each_name_dispatch_gives_them() {
             "dispatch-research-agent-run",
             "dispatch-review-agent-run",
             "dispatch-fix-agent-run",
+            "dispatch-session-agent-run",
         ]
     );
 }

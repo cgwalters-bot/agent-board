@@ -35,7 +35,7 @@ start of a line, holding one JSON object:
 | `schema` | yes | `agent-board/job-plan/v1` |
 | `repo` | yes | Target repository, `OWNER/NAME`; the caller's bounds must allow it |
 | `item` | yes | Positive issue number in `repo`; for `fix`, the pull request whose branch it rewrites |
-| `kind` | yes | `implement`, `triage`, `research` or `fix`: the profile the run gets; the pass starts `fix` only with [`fixPlans`](pass.md#scheduling) |
+| `kind` | yes | `implement`, `triage`, `research`, `fix` or `session`: the profile the run gets; the pass starts `fix` only with [`fixPlans`](pass.md#scheduling) and `session` only with [`sessionPlans`](sessions.md), and then only the operator's own session plan |
 | `runner` | yes | `hosted`, the only runner the caller has |
 | `pool` | no | Inference pool named in the caller's `pools.json`: lowercase letters, digits, `-` and `_`, starting with a letter or digit, at most 32 bytes (`gpt5`, `claude-opus`), and not a `tier-` name; absent leaves it to the caller's variables |
 | `effort` | no | Only `"heavy"`: request the selected pool's optional heavy model; omit for the existing default model. Null, empty, `"default"` and other values are refused |
@@ -127,8 +127,11 @@ unrecorded `implement` or `triage` plan by this protocol, once per plan, so a
 run that has ended does not start its plan again. A `triage` plan is not
 checked for [overlap](#overlap), [stacked](#stacking) or
 [batched](#batching), as its run changes no files. A `triage` plan targeting an
-issue other than the one it is on, and a `research` plan, stay manual dispatches:
-the pass would not follow up either run's output.
+issue other than the one it is on, and a `research` or `session` plan, stay manual dispatches
+unless [`researchPlans`](pass.md#one-configuration-file) or
+[`sessionPlans`](sessions.md) is set: the pass would not follow up either run's output.
+Even then a `session` plan starts only as the operator's own, written and last
+edited by them: a run over a whole repository is never an agent's to start.
 
 ## Collaborator input
 

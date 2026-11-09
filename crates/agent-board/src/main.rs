@@ -402,6 +402,21 @@ enum Check {
         #[arg(long, value_name = "FILE")]
         proposals: Option<PathBuf>,
     },
+    /// Validate a session run's batch comment offline and print its typed actions; no credentials, network or writes.
+    SessionBatch {
+        /// Candidate comment body holding one agent-board-session block; reads stdin when omitted.
+        #[arg(long, value_name = "FILE")]
+        body: Option<PathBuf>,
+        /// Repository whose issues a batch may change; repeat for each. From the caller's configuration.
+        #[arg(long = "allow-repo", value_name = "OWNER/REPO")]
+        repositories: Vec<String>,
+        /// An option of the board's Priority field; repeat for each.
+        #[arg(long = "priority-option", value_name = "OPTION")]
+        priorities: Vec<String>,
+        /// A domain of the caller's operatorAsk a batch may ask about; repeat for each.
+        #[arg(long = "ask-domain", value_name = "DOMAIN")]
+        domains: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -612,6 +627,54 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 .context("read candidate Markdown as UTF-8")?;
             validate_digest(&candidate)?;
             eprintln!("Valid maintain digest; nothing was published.");
+            Ok(())
+        }
+        Command::Check {
+            command:
+                Check::SessionBatch {
+                    body,
+                    repositories,
+                    priorities,
+                    domains,
+                },
+        } => {
+            use board_forge::session::{BODY_MAX_BYTES, Bounds, SESSION_FENCE, SessionBatch};
+            use std::io::Read;
+            let bounds = Bounds {
+                repositories: repositories.clone(),
+                priorities: priorities.clone(),
+                domains: domains.clone(),
+            };
+            bounds.validate()?;
+            let reader: Box<dyn Read> = match body {
+                Some(path) => Box::new(
+                    std::fs::File::open(path)
+                        .with_context(|| format!("read candidate {}", path.display()))?,
+                ),
+                None => Box::new(io::stdin()),
+            };
+            let mut candidate = Vec::new();
+            reader
+                .take(BODY_MAX_BYTES as u64 + 1)
+                .read_to_end(&mut candidate)
+                .context("read candidate comment")?;
+            ensure!(
+                candidate.len() <= BODY_MAX_BYTES,
+                "candidate exceeds {BODY_MAX_BYTES} bytes"
+            );
+            let candidate =
+                String::from_utf8(candidate).context("candidate comment is not UTF-8")?;
+            let batch = SessionBatch::from_comment(&candidate, &bounds)?
+                .with_context(|| format!("missing {SESSION_FENCE} fenced block"))?;
+            let mut out = io::stdout().lock();
+            for action in batch.preview() {
+                writeln!(out, "{action}")?;
+            }
+            eprintln!(
+                "Valid session batch for {} with {} actions; nothing was applied.",
+                batch.repo,
+                batch.actions.len()
+            );
             Ok(())
         }
         Command::Check {

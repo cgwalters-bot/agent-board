@@ -2657,6 +2657,14 @@ is respected; without one, `triagePools` (or `planPools`) applies. Research
 changes no files, so overlap/stack/batch checks do not apply. Its dispatch record
 prevents another start; report follow-up and automatic research reruns remain
 manual. `skipActiveWork` retains precedence as described by that setting.
+`sessionPlans: true` (GitHub only, off by default) starts accepted, unrecorded
+[session](sessions.md) plans the same way, but only from a comment the
+operator wrote and last edited: a session is a long run over a whole
+repository, so starting one is the operator's decision, not a planner's,
+and the planner's session plan holds its issue (`hold OWNER/REPO#N: plan ID
+is a session plan the operator did not write; …`), as does one in an issue
+body, whose `bodyPlans` copy would be the planner's. Its batch is a
+proposal the pass does not apply yet.
 Plans for a different issue stay manual (`needs-operator`): a triage plan of another issue than the
 one it is on (`hold OWNER/REPO#N: plan ID triages OWNER/REPO#M, not this
 issue; …`), whose run's verdict or plan would land where this issue's
@@ -4298,6 +4306,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `replanInvalid` | GitHub only: request one replacement of an invalid bot-written job plan or unparseable epic plan before asking the operator; existing holds and start caps remain; `false` |
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
 | `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling). Stage 2 then takes no step outside our own space but the bot's own rounds on a pull request it authored there with no same-head midstream pull request, see [the poll](poll.md); `false` |
+| `sessionPlans` | GitHub only: start the operator's own accepted [session](sessions.md) plans on their own issue under existing pacing and caps, as `researchPlans` starts research plans; the planner's session plans wait on the operator; `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |

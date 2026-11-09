@@ -90,6 +90,102 @@ fn maintain_digest_check_is_offline_for_file_and_stdin() {
         .success();
 }
 
+/// The session batch check reads a comment body offline, prints one typed
+/// action a line and names a refused action; the bounds come from flags.
+#[test]
+fn session_batch_check_is_offline_and_bounded() {
+    let valid = include_str!("../../../fixtures/pass/session-batch.md");
+    let bounds = [
+        "--allow-repo",
+        "cgwalters-forge/agent-board",
+        "--allow-repo",
+        "cgwalters-forge/tracker",
+        "--priority-option",
+        "P1",
+        "--ask-domain",
+        "budget",
+    ];
+    for (name, body, extra, code, diagnostic) in [
+        (
+            "valid",
+            valid.to_owned(),
+            &bounds[..],
+            0,
+            "Valid session batch for cgwalters-forge/agent-board with 6 actions",
+        ),
+        (
+            "a Priority that is no option",
+            valid.replace("\"P1\"", "\"P9\""),
+            &bounds[..],
+            1,
+            "action 3: Priority \"P9\"",
+        ),
+        (
+            "no batch",
+            "not a batch".into(),
+            &bounds[..],
+            1,
+            "missing agent-board-session",
+        ),
+        (
+            "no bounds",
+            valid.to_owned(),
+            &[][..],
+            1,
+            "cgwalters-forge/agent-board is not a configured repository",
+        ),
+        (
+            "a malformed bound",
+            valid.to_owned(),
+            &["--allow-repo", "cgwalters-forge"][..],
+            1,
+            "invalid configured repository",
+        ),
+        (
+            "an oversize body",
+            "x".repeat(1024 * 1024 + 1),
+            &bounds[..],
+            1,
+            "candidate exceeds 1048576 bytes",
+        ),
+    ] {
+        let result = command()
+            .args(["check", "session-batch"])
+            .args(extra)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .write_stdin(body)
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(diagnostic), "{name}: {stderr}");
+        if code == 0 {
+            let types: Vec<String> = stdout
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap()["type"].to_string())
+                .collect();
+            assert_eq!(types.len(), 6, "{name}: {stdout}");
+            assert_eq!(types[0], "\"close_issue\"", "{name}");
+        } else {
+            assert!(stdout.is_empty(), "{name}: {stdout}");
+        }
+    }
+    command()
+        .args(["check", "session-batch", "--body"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/pass/session-batch.md"
+        ))
+        .args(bounds)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success();
+}
+
 #[test]
 fn pass_next_rejects_invalid_train_before_token_lookup() {
     for (extra, diagnostic) in [
