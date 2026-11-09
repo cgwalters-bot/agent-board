@@ -2118,8 +2118,19 @@ after a non-asking verdict (or after the record, with no verdict) triages the is
 Otherwise `done`, `obsolete`, `needs-design` and `needs-operator` label it
 `needs-human`, so it shows as the operator's ask, and post one comment
 whose hidden first line, `<!-- agent-board-hold: verdict COMMENT-ID -->`,
-names the verdict comment it holds, then a sentence saying so: one step of
-two writes under `--max-writes`, neither made in a preview. The label then
+names the verdict comment it holds, then a `**Decision needed:**` line with
+the one decision wanted and its options (agent-board#826), then a sentence
+linking the verdict and saying what releases the hold: one step of
+two writes under `--max-writes`, neither made in a preview. For `done` and
+`obsolete` the decision is whether to close the issue (close it, or comment
+what remains), ending with why the pass did not (`triageClose` off, or the
+check that refused it, below). For `needs-design` and `needs-operator` it is
+the verdict's own `Decision needed:` line, which the brief asks the run to
+put its one decision and options on, one line of at most 500 characters as
+the needs-you list (above) reads a bot summary, with the verdict's
+`Recommendation:` line after it where it has one, else a pointer to the
+verdict. The needs-you list reads the hold comment, the newest summary, as
+the hold's ask and recommendation. The label then
 keeps the issue out of the follow-up. An asking verdict is answered when a
 later comment by the operator or bot, unedited except by those writers,
 is followed by removal of `needs-human`. Run status, hold, dispatch and plan
@@ -2217,8 +2228,19 @@ block, one of the configured domains. A `needs-operator` or
 labels and assigns nothing: the issue is triaged again at once, its plan
 starting with `replanText`, and a verdict on such a
 plan waits as `partly` does, sharing its doubling wait (`…, harness work held
-for no one; triaged again from …`). `done` and `obsolete`, a close for the
-operator to confirm, and a verdict naming its domain, are asked as before.
+for no one; triaged again from …`). Only a verdict naming its domain is asked
+of the operator. `done` and `obsolete` are not a close for them to confirm
+(agent-board#826): as a follow-up, with `triageClose` the issue is closed as
+below. A close a check below refuses is planned again once, with
+`replanText`, so that a fresh verdict with nothing after it may close;
+refused again, or not made without `triageClose`, it waits as `partly` does,
+saying why (`…, harness work held for no one; not closed: why; triaged again
+from …`), and with nothing changing it waits so until someone comments or
+closes it: a hold for no one, published but not in the operator's queue. As
+an earlier verdict, whose run no lock is known to have covered, the issue is
+triaged again with `replanText`, and the pass's own triage then closes it. A
+standing hold on such a verdict is released as any other harness wait
+(below).
 
 For [tracker#1445](https://github.com/cgwalters-forge/tracker/issues/1445), set
 `cgwalters-forge/tracker`'s `.github/pass.json` key `operatorAsk` to the object in
@@ -2312,9 +2334,17 @@ The file is an operator-reviewed JSON array, for example
 `item` accepts issue URLs, `OWNER/REPO#N`, or numbers with `--repo`.
 This is explicit operator acceptance, not an automatic consumer of agent comments:
 the list has no authority on its own. Preview is the default; `--apply` writes
-with the controller's `GH_TOKEN`. It posts the verdict and decision, then removes
+with the controller's `GH_TOKEN`. It posts the verdict and decision, its hidden
+first line `<!-- agent-board-verdict-apply -->`, then removes
 `needs-human` and `needs-operator` if present, and unassigns only the named operator.
-It does not close issues or interpret the verdict as another mutation.
+It does not close issues or interpret the verdict as another mutation. With
+`assignHolds` the pass takes that comment, by a writer and not a run's
+output, followed by its unassignment, as the operator's response to its
+assignment (below), so that the next pass does not hold the issue again for
+the verdict it answered (agent-board#826: 28 of 46 releases were undone so,
+and those released before the marker existed need `triage apply` again); a
+comment without the marker, or the bot's unassignment alone, releases
+nothing.
 To bound an accidentally oversized batch, `--max-writes` defaults to 20 and accepts
 0 through 100. Each comment, label removal and unassignment costs one write;
 the entire list is read and checked against the cap before the first write.
@@ -2340,8 +2370,14 @@ writer only (`hold OWNER/REPO#N: assigned to OPERATOR since T; any response
 of theirs releases it`, kind `needs-human`). Any response releases it: such
 a comment, a close by the operator (a closed issue is no candidate, so a
 close counts once the issue is open again; an issue's author may close and
-reopen it, which does not count), or an unassignment by anyone but the bot,
-which takes triage access.
+reopen it, which does not count), an unassignment by anyone but the bot,
+which takes triage access, or the controller's `triage apply` decision
+comment (above), created after the assignment, with the bot's unassignment
+of the operator since it: a writer's comment whose first line is
+`<!-- agent-board-verdict-apply -->` and that is not a run's output, the one
+bot comment that counts, and only with the unassignment, two signals as the
+label path's answer and removal, since an agent's comment posted as the bot
+can carry the marker but not unassign anyone (agent-board#826).
 The board read then reads each issue's assignees too, and a candidate the
 operator is not assigned to costs no read of its assignment events, which no
 assignment of theirs can stand without (agent-board#789: those reads were a
