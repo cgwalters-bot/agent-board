@@ -21,7 +21,7 @@ use crate::epic::IssueRef;
 use crate::plan::{PLAN_BRIEF_LIMIT, SESSION_KIND};
 use crate::session::{
     ACTION_LIMIT, ASK_LIMIT, ATTACH_LIMIT, Action, Bounds, CLOSE_LIMIT, PLAN_LIMIT, PRIORITY_LIMIT,
-    RESCOPE_LIMIT, SESSION_BATCH_SCHEMA, SESSION_FENCE,
+    RESCOPE_LIMIT, SESSION_BATCH_SCHEMA, SESSION_FENCE, UPDATED_AT,
 };
 use crate::session_apply::{self, Outcome};
 
@@ -131,7 +131,8 @@ pub(super) fn brief(repo: &str, anchor: &str, operator: &str, bounds: &Bounds) -
          Post exactly one comment on {anchor}: a short summary, then one {SESSION_FENCE} fenced JSON block, \
          {{\"schema\": \"{SESSION_BATCH_SCHEMA}\", \"repo\": \"{repo}\", \"actions\": […]}}, at most {ACTION_LIMIT} actions \
          ({CLOSE_LIMIT} close_issue, {RESCOPE_LIMIT} rescope_issue, {PRIORITY_LIMIT} set_priority, {ATTACH_LIMIT} attach_to_epic, {PLAN_LIMIT} post_plan, {ASK_LIMIT} ask_operator), \
-         each issue in {repo}; an empty actions list says the repository needs nothing. \
+         each issue in {repo}, each action on an issue carrying the issue's \"{UPDATED_AT}\" exactly as read (the apply skips the action if the issue changed since); \
+         an empty actions list says the repository needs nothing. \
          Before posting, check the comment with `agent-board check session-batch --body FILE{repo_flags}{priority_flags}{domain_flags}`, which must exit 0. \
          The batch is a proposal: the run applies nothing in it, and a person reads it. \
          Write nothing else to any issue or pull request: no other comment, label, close, Priority or plan. \
@@ -506,8 +507,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     .map(String::as_str)
                     .filter(|l| !l.starts_with("Receipt: "))
                     .collect();
-                // A batch that changed nothing moved no work on.
-                self.progressed += usize::from(!done.is_empty());
+                // A batch that changed nothing, or whose every action was
+                // skipped, moved no work on.
+                self.progressed += usize::from(done.iter().any(|l| !l.starts_with("Skipped ")));
                 let done = match done.is_empty() {
                     true => "no changes".to_owned(),
                     false => done.join("; "),
@@ -578,6 +580,7 @@ mod tests {
             "ask cgwalters only within the domains budget, one line each",
             &format!("one {SESSION_FENCE} fenced JSON block"),
             &format!("at most {ACTION_LIMIT} actions"),
+            "each action on an issue carrying the issue's \"updated_at\" exactly as read (the apply skips the action if the issue changed since)",
             "`agent-board check session-batch --body FILE --allow-repo cgwalters-forge/agent-board --allow-repo cgwalters-forge/tracker --priority-option P0 --priority-option P1 --ask-domain budget`",
         ] {
             assert!(brief.contains(part), "{part}: {brief}");

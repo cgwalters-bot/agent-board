@@ -8,7 +8,10 @@
 //! can replace the day's plan and record on the anchor, not the day. What
 //! it writes is the batch's own typed actions, each a plain forge write
 //! under the batch's caps, on issues resolved as such before any write;
-//! nothing in a batch widens that.
+//! nothing in a batch widens that. An action on an issue that changed
+//! since the session read it (its `updated_at` is not the action's) is
+//! skipped, with the reason on the receipt, rather than written from the
+//! session's stale view (agent-board#849).
 use crate::epic::IssueRef;
 use crate::epic_apply::{link, node_id, set_option};
 use crate::github::{API_ROOT, Transport};
@@ -17,12 +20,12 @@ use crate::plan::{
     issue_comments, newest_fenced, no_fenced, plan_id, send,
 };
 use crate::poll::Rest;
-use crate::session::{Action, Bounds, SESSION_FENCE, SessionBatch};
+use crate::session::{Action, Bounds, SESSION_FENCE, SessionBatch, stamp};
 use anyhow::{Context, Result, ensure};
 use board_core::ItemRef;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// The receipt's fence info string. Exact, so it is not a batch's.
@@ -36,9 +39,10 @@ pub const PLAN_INTRO: &str =
 /// Priority's node id, project add, item lookup and field write.
 pub const ACTION_REQUESTS: usize = 5;
 
-/// An issue's identity, as the apply resolves each target before writing:
-/// `issue` is null for a pull request's number or none.
-pub(crate) const IDENTITY_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { number repository { nameWithOwner } } } }";
+/// An issue's identity and version, as the apply resolves each target
+/// before writing: `issue` is null for a pull request's number or none;
+/// `updatedAt` is compared with the version each action was decided from.
+pub(crate) const IDENTITY_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { number updatedAt repository { nameWithOwner } } } }";
 /// The requests an apply takes besides its actions and its read-back's
 /// pages: the claim, the receipt's update, the board's ids and one to
 /// spare.
@@ -111,7 +115,7 @@ pub fn check(comment: &Comment, anchor: &ItemRef, bounds: &Bounds) -> Result<Ses
             | Action::Rescope { issue, .. }
             | Action::SetPriority { issue, .. }
             | Action::Plan { issue, .. } => own(issue),
-            Action::Attach { issue, epic } => own(issue) || own(epic),
+            Action::Attach { issue, epic, .. } => own(issue) || own(epic),
             Action::Ask { .. } => false,
         };
         ensure!(
@@ -140,7 +144,9 @@ pub enum Outcome {
 
 /// One batch action as far as its writes were confirmed. The writes are
 /// named `comment`, `patch` (a close or a new body), `priority` and
-/// `link`; a question's is `receipt`, the receipt itself.
+/// `link`; a question's is `receipt`, the receipt itself. An action
+/// skipped because its issue changed since the session read it has
+/// `skipped` saying so and no writes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Confirmed {
     /// Its 1-based position in the batch.
@@ -154,6 +160,10 @@ pub struct Confirmed {
     /// posted or the domain it asked in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Why nothing was written: the issue's `updated_at` now and as the
+    /// session read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
     #[serde(default)]
     pub writes: Vec<String>,
 }
@@ -247,12 +257,15 @@ pub fn receipts(comments: &[Comment], claimers: &[&str]) -> (Vec<Receipt>, Vec<S
 }
 
 /// One line per action, saying what it did: `Closed OWNER/REPO#N as not
-/// planned`, or how far it got.
+/// planned`, why it was skipped, or how far it got.
 pub fn readable(detail: &Detail) -> Vec<String> {
     (detail.actions.iter())
         .map(|c| {
             let issue = c.issue.as_deref().unwrap_or("an issue");
             let about = c.detail.as_deref().unwrap_or("?");
+            if let Some(why) = &c.skipped {
+                return format!("Skipped action {} ({}) on {issue}: {why}", c.action, c.kind);
+            }
             match (c.kind.as_str(), c.whole()) {
                 ("close_issue", true) => format!("Closed {issue} as not planned"),
                 ("rescope_issue", true) => format!("Rescoped {issue}"),
@@ -329,9 +342,9 @@ pub fn planned(batch: &SessionBatch) -> (Vec<String>, usize) {
         .map(|action| match action {
             Action::Close { issue, .. } => format!("Close {issue} as not planned"),
             Action::Rescope { issue, .. } => format!("Rescope {issue}"),
-            Action::SetPriority { issue, value } => format!("Set {issue} to {value}"),
-            Action::Attach { issue, epic } => format!("Attach {issue} to {epic}"),
-            Action::Plan { issue, plan } => format!("Post a plan ({}) on {issue}", plan.kind),
+            Action::SetPriority { issue, value, .. } => format!("Set {issue} to {value}"),
+            Action::Attach { issue, epic, .. } => format!("Attach {issue} to {epic}"),
+            Action::Plan { issue, plan, .. } => format!("Post a plan ({}) on {issue}", plan.kind),
             Action::Ask { domain, .. } => format!("Ask the operator ({domain})"),
         })
         .collect();
@@ -346,10 +359,11 @@ pub fn planned(batch: &SessionBatch) -> (Vec<String>, usize) {
 /// claim of the day (any batch's, from `trusted.since` on) or a changed
 /// batch stops it with nothing written, and updated when the apply ends.
 /// Each issue the actions name is resolved as an issue before the first
-/// write. Stops at the first failed request, keeping the claim: a
-/// cut-short apply is a person's to inspect, never replayed. Callers
-/// serialize passes, as GitHub comments are not a lock. Returns the
-/// receipt's lines and a `Receipt:` line.
+/// write, and an action whose issue changed since the session read it is
+/// skipped, said on the receipt. Stops at the first failed request,
+/// keeping the claim: a cut-short apply is a person's to inspect, never
+/// replayed. Callers serialize passes, as GitHub comments are not a lock.
+/// Returns the receipt's lines and a `Receipt:` line.
 pub fn apply<C: Transport + Rest>(
     client: &C,
     anchor: &ItemRef,
@@ -416,8 +430,15 @@ pub fn apply<C: Transport + Rest>(
             !claims.iter().any(|r| r.id < mine),
             "an earlier apply claim won; nothing applied"
         );
-        resolve(client, batch)?;
-        execute(client, batch, trusted, &from.url, &mut detail.actions)
+        let versions = resolve(client, batch)?;
+        execute(
+            client,
+            batch,
+            &versions,
+            trusted,
+            &from.url,
+            &mut detail.actions,
+        )
     })();
     detail.outcome = match &result {
         Ok(()) => Outcome::Applied,
@@ -449,19 +470,19 @@ pub fn apply<C: Transport + Rest>(
 /// request would otherwise close it or replace its description as the
 /// bot. A number that is no issue, or one GitHub resolves to another
 /// issue than named, stops the apply with nothing written. Epics are
-/// resolved as issues by their own node-id read.
-fn resolve<C: Transport>(client: &C, batch: &SessionBatch) -> Result<()> {
-    let mut seen = BTreeSet::new();
+/// resolved as issues by their own node-id read. Returns each issue's
+/// `updatedAt` now, by the batch's spelling of it, read once here and
+/// not again after the apply's own writes to it moved it on.
+fn resolve<C: Transport>(
+    client: &C,
+    batch: &SessionBatch,
+) -> Result<BTreeMap<String, OffsetDateTime>> {
+    let mut versions = BTreeMap::new();
     for action in &batch.actions {
-        let issue = match action {
-            Action::Close { issue, .. }
-            | Action::Rescope { issue, .. }
-            | Action::SetPriority { issue, .. }
-            | Action::Attach { issue, .. }
-            | Action::Plan { issue, .. } => issue,
-            Action::Ask { .. } => continue,
+        let Some((issue, _)) = action.target() else {
+            continue;
         };
-        if !seen.insert(issue.to_string()) {
+        if versions.contains_key(&issue.to_string()) {
             continue;
         }
         let (owner, name) = issue.repo.split_once('/').context("issue repository")?;
@@ -484,41 +505,70 @@ fn resolve<C: Transport>(client: &C, batch: &SessionBatch) -> Result<()> {
             repo.unwrap_or("?"),
             number.map_or("?".to_owned(), |n| n.to_string())
         );
+        let updated = (node["updatedAt"].as_str())
+            .with_context(|| format!("{issue} has no updatedAt; nothing applied"))?;
+        let updated = OffsetDateTime::parse(updated, &Rfc3339)
+            .with_context(|| format!("{issue} has an invalid updatedAt; nothing applied"))?;
+        versions.insert(issue.to_string(), updated);
     }
-    Ok(())
+    Ok(versions)
 }
 
 /// Each action's writes, in the batch's order, recorded as each is
-/// confirmed; the first failed request ends it.
+/// confirmed; the first failed request ends it. An action whose issue's
+/// `updated_at` in `versions` is not the one it was decided from is
+/// skipped and recorded as such: the session's view of that issue is
+/// stale, and the next session reads the new text.
 fn execute<C: Transport + Rest>(
     client: &C,
     batch: &SessionBatch,
+    versions: &BTreeMap<String, OffsetDateTime>,
     trusted: &Trusted,
     batch_url: &str,
     confirmed: &mut Vec<Confirmed>,
 ) -> Result<()> {
     let from = format!("From [this session batch]({batch_url}).");
     for (index, action) in batch.actions.iter().enumerate() {
-        let (issue, about) = match action {
-            Action::Close { issue, .. } | Action::Rescope { issue, .. } => (Some(issue), None),
-            Action::SetPriority { issue, value } => (Some(issue), Some(value.clone())),
-            Action::Attach { issue, epic } => (Some(issue), Some(epic.to_string())),
-            Action::Plan { issue, plan } => (Some(issue), Some(plan.kind.clone())),
-            Action::Ask { domain, .. } => (None, Some(domain.clone())),
+        let about = match action {
+            Action::Close { .. } | Action::Rescope { .. } => None,
+            Action::SetPriority { value, .. } => Some(value.clone()),
+            Action::Attach { epic, .. } => Some(epic.to_string()),
+            Action::Plan { plan, .. } => Some(plan.kind.clone()),
+            Action::Ask { domain, .. } => Some(domain.clone()),
+        };
+        // No version means the issue was never resolved: a guard that
+        // fails open would write from a view nothing checked.
+        let skipped = match action.target() {
+            Some((issue, read)) => {
+                let now = (versions.get(&issue.to_string()))
+                    .with_context(|| format!("{issue} was not resolved before writing"))?;
+                (*now != read).then(|| {
+                    format!(
+                        "updated {}, not {} as the session read it",
+                        stamp(*now),
+                        stamp(read)
+                    )
+                })
+            }
+            None => None,
         };
         confirmed.push(Confirmed {
             action: index + 1,
             kind: action.kind().into(),
-            issue: issue.map(ToString::to_string),
+            issue: action.target().map(|(issue, _)| issue.to_string()),
             detail: about,
+            skipped,
             writes: Vec::new(),
         });
         let at = confirmed.len() - 1;
+        if confirmed[at].skipped.is_some() {
+            continue;
+        }
         let wrote = |confirmed: &mut Vec<Confirmed>, write: &str| {
             confirmed[at].writes.push(write.into());
         };
         match action {
-            Action::Close { issue, reason } => {
+            Action::Close { issue, reason, .. } => {
                 comment(client, issue, &format!("{reason}\n\n{from}"))?;
                 wrote(confirmed, "comment");
                 let body = json!({"state": "closed", "state_reason": "not_planned"});
@@ -529,6 +579,7 @@ fn execute<C: Transport + Rest>(
                 issue,
                 body,
                 reason,
+                ..
             } => {
                 send(
                     client,
@@ -541,7 +592,7 @@ fn execute<C: Transport + Rest>(
                 comment(client, issue, &format!("{reason}\n\n{from}"))?;
                 wrote(confirmed, "comment");
             }
-            Action::SetPriority { issue, value } => {
+            Action::SetPriority { issue, value, .. } => {
                 let priorities = (trusted.priorities).context("no board ids")?;
                 let option = priorities.options.get(value).context("no option id")?;
                 set_option(
@@ -551,12 +602,12 @@ fn execute<C: Transport + Rest>(
                 )?;
                 wrote(confirmed, "priority");
             }
-            Action::Attach { issue, epic } => {
+            Action::Attach { issue, epic, .. } => {
                 let parent = node_id(client, epic)?;
                 link(client, &parent, issue)?;
                 wrote(confirmed, "link");
             }
-            Action::Plan { issue, plan } => {
+            Action::Plan { issue, plan, .. } => {
                 comment(client, issue, &plan_comment(plan, &from))?;
                 wrote(confirmed, "comment");
             }
@@ -650,13 +701,19 @@ mod tests {
         format!("Summary.\n\n```{SESSION_FENCE}\n{batch}\n```\n")
     }
 
+    /// When the session read each issue, which the forge answers as each
+    /// issue's `updatedAt` unless [`Forge::changed`] names it.
+    const READ: &str = "2026-11-09T06:05:00Z";
+    /// The `updatedAt` of an issue that changed since the session read it.
+    const CHANGED: &str = "2026-11-09T06:45:00Z";
+
     fn actions() -> Value {
         json!([
-            {"type": "close_issue", "issue": "example/work#1", "reason": "Done by #2."},
-            {"type": "rescope_issue", "issue": "example/work#3", "body": "Less.", "reason": "Split."},
-            {"type": "set_priority", "issue": "example/work#4", "value": "P1"},
-            {"type": "attach_to_epic", "issue": "example/work#5", "epic": "example/epics#7"},
-            {"type": "post_plan", "issue": "example/work#6", "plan": {
+            {"type": "close_issue", "issue": "example/work#1", "updated_at": READ, "reason": "Done by #2."},
+            {"type": "rescope_issue", "issue": "example/work#3", "updated_at": READ, "body": "Less.", "reason": "Split."},
+            {"type": "set_priority", "issue": "example/work#4", "updated_at": READ, "value": "P1"},
+            {"type": "attach_to_epic", "issue": "example/work#5", "updated_at": READ, "epic": "example/epics#7"},
+            {"type": "post_plan", "issue": "example/work#6", "updated_at": READ, "plan": {
                 "schema": JOB_PLAN_SCHEMA, "kind": "implement", "runner": "hosted", "brief": "Next."}},
             {"type": "ask_operator", "domain": "budget", "question": "More?"}
         ])
@@ -680,6 +737,8 @@ mod tests {
         login: &'static str,
         /// The numbers that are pull requests, which resolve to no issue.
         pulls: Vec<u64>,
+        /// The issues updated at [`CHANGED`], since the session read them.
+        changed: Vec<u64>,
     }
 
     impl Forge {
@@ -695,6 +754,7 @@ mod tests {
                 fail: None,
                 login: BOT,
                 pulls: Vec::new(),
+                changed: Vec::new(),
             }
         }
 
@@ -729,10 +789,16 @@ mod tests {
             }
             if query == IDENTITY_QUERY {
                 let number = variables["number"].as_u64().unwrap();
+                let updated = match self.changed.contains(&number) {
+                    true => CHANGED,
+                    false => READ,
+                };
                 let issue = match self.pulls.contains(&number) {
                     true => Value::Null,
-                    false => json!({"number": number, "repository": {"nameWithOwner":
-                        format!("{}/{}", variables["owner"].as_str().unwrap(), variables["name"].as_str().unwrap())}}),
+                    false => {
+                        json!({"number": number, "updatedAt": updated, "repository": {"nameWithOwner":
+                        format!("{}/{}", variables["owner"].as_str().unwrap(), variables["name"].as_str().unwrap())}})
+                    }
                 };
                 return Ok(json!({"repository": {"issue": issue}}));
             }
@@ -892,10 +958,10 @@ mod tests {
         }
         // No action names the anchor, the session's own issue.
         for action in [
-            json!({"type": "close_issue", "issue": "example/work#40", "reason": "Done."}),
-            json!({"type": "set_priority", "issue": "example/WORK#40", "value": "P0"}),
-            json!({"type": "attach_to_epic", "issue": "example/work#5", "epic": "example/work#40"}),
-            json!({"type": "post_plan", "issue": "example/work#40", "plan": {
+            json!({"type": "close_issue", "issue": "example/work#40", "updated_at": READ, "reason": "Done."}),
+            json!({"type": "set_priority", "issue": "example/WORK#40", "updated_at": READ, "value": "P0"}),
+            json!({"type": "attach_to_epic", "issue": "example/work#5", "updated_at": READ, "epic": "example/work#40"}),
+            json!({"type": "post_plan", "issue": "example/work#40", "updated_at": READ, "plan": {
                 "schema": JOB_PLAN_SCHEMA, "kind": "triage", "runner": "hosted", "brief": "Again."}}),
         ] {
             let body = batch_body(json!([
@@ -1029,12 +1095,12 @@ mod tests {
     #[test]
     fn a_pull_request_target_stops_the_apply_before_any_action_write() {
         for action in [
-            json!({"type": "close_issue", "issue": "example/work#12", "reason": "Done."}),
-            json!({"type": "rescope_issue", "issue": "example/work#12", "body": "Less.", "reason": "Split."}),
-            json!({"type": "post_plan", "issue": "example/work#12", "plan": {
+            json!({"type": "close_issue", "issue": "example/work#12", "updated_at": READ, "reason": "Done."}),
+            json!({"type": "rescope_issue", "issue": "example/work#12", "updated_at": READ, "body": "Less.", "reason": "Split."}),
+            json!({"type": "post_plan", "issue": "example/work#12", "updated_at": READ, "plan": {
                 "schema": JOB_PLAN_SCHEMA, "kind": "implement", "runner": "hosted", "brief": "Next."}}),
-            json!({"type": "set_priority", "issue": "example/work#12", "value": "P1"}),
-            json!({"type": "attach_to_epic", "issue": "example/work#12", "epic": "example/epics#7"}),
+            json!({"type": "set_priority", "issue": "example/work#12", "updated_at": READ, "value": "P1"}),
+            json!({"type": "attach_to_epic", "issue": "example/work#12", "updated_at": READ, "epic": "example/epics#7"}),
         ] {
             let mut actions = actions();
             actions.as_array_mut().unwrap().insert(0, action.clone());
@@ -1057,6 +1123,100 @@ mod tests {
             let (read, _) = receipts(&comments, &[OPERATOR, BOT]);
             assert_eq!(read[0].detail.outcome, Outcome::Stopped, "{action}");
             assert!(read[0].detail.actions.is_empty(), "{action}");
+        }
+    }
+
+    /// An action on an issue that changed since the session read it (its
+    /// `updatedAt` is not the action's `updated_at`) is skipped, with the
+    /// reason on the receipt, and the rest of the batch is applied: the
+    /// session's view of that issue is stale, and the next session reads
+    /// the new text. An unchanged issue is written to as before.
+    #[test]
+    fn an_issue_changed_since_the_session_read_it_is_skipped() {
+        let skipped = |action: usize, kind: &str, issue: u64| {
+            format!(
+                "Skipped action {action} ({kind}) on example/work#{issue}: updated {CHANGED}, not {READ} as the session read it"
+            )
+        };
+        let applied = [
+            "Closed example/work#1 as not planned",
+            "Rescoped example/work#3",
+            "Set example/work#4 to P1",
+            "Attached example/work#5 to example/epics#7",
+            "Posted a plan (implement) on example/work#6",
+            "Asked a question (budget), below",
+        ];
+        let everything = [
+            skipped(1, "close_issue", 1),
+            skipped(2, "rescope_issue", 3),
+            skipped(3, "set_priority", 4),
+            skipped(4, "attach_to_epic", 5),
+            skipped(5, "post_plan", 6),
+            applied[5].to_owned(),
+        ];
+        for (name, changed, lines, writes) in [
+            (
+                "no issue changed",
+                vec![],
+                applied.map(str::to_owned).to_vec(),
+                10,
+            ),
+            (
+                "the rescoped issue changed",
+                vec![3],
+                [
+                    applied[0].to_owned(),
+                    skipped(2, "rescope_issue", 3),
+                    applied[2].to_owned(),
+                    applied[3].to_owned(),
+                    applied[4].to_owned(),
+                    applied[5].to_owned(),
+                ]
+                .to_vec(),
+                8,
+            ),
+            (
+                "every issue changed",
+                vec![1, 3, 4, 5, 6],
+                everything.to_vec(),
+                2,
+            ),
+        ] {
+            let mut forge = Forge::new(vec![node(3, BOT, None, &batch_body(actions()))]);
+            forge.changed = changed.clone();
+            let got = run(&forge).unwrap();
+            assert_eq!(got[..got.len() - 1], lines[..], "{name}");
+            let written = forge.written();
+            assert_eq!(written.len(), writes, "{name}: {written:#?}");
+            for issue in &changed {
+                let path = format!("/issues/{issue}");
+                assert!(
+                    !written
+                        .iter()
+                        .any(|w| w.ends_with(&path) || w.contains(&format!("{path}/"))),
+                    "{name}: {written:#?}"
+                );
+            }
+            let comments = comments(&forge.nodes.borrow());
+            let (read, _) = receipts(&comments, &[OPERATOR, BOT]);
+            assert_eq!(read[0].detail.outcome, Outcome::Applied, "{name}");
+            for confirmed in &read[0].detail.actions {
+                let stale = (confirmed.issue.as_deref())
+                    .and_then(|issue| issue.rsplit('#').next()?.parse::<u64>().ok())
+                    .is_some_and(|n| changed.contains(&n));
+                assert_eq!(confirmed.skipped.is_some(), stale, "{name}: {confirmed:?}");
+                assert_eq!(confirmed.whole(), !stale, "{name}: {confirmed:?}");
+            }
+            if !changed.is_empty() {
+                let receipt = forge.receipt();
+                assert!(
+                    receipt.contains(&format!("- {}\n", skipped(2, "rescope_issue", 3)))
+                        && receipt.contains(&format!(
+                            "\"skipped\": \"updated {CHANGED}, not {READ} as the session read it\""
+                        )),
+                    "{name}: {receipt}"
+                );
+            }
         }
     }
 
