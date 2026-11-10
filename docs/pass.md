@@ -2284,6 +2284,17 @@ brief the run writes there. The key is the repository holding the triaged
 issue. The pass does not read the file; the run does, and the brief records
 which one, with its revision where `ref` pins it.
 
+GitHub epic-planning briefs leave sub-issue sizing, whether to include child
+implement plans, and when to rescope or close children to that guidance.
+The compiled brief specifies the epic-plan output format, Priority ordering,
+allowed repositories and the prohibition on editing the epic's own text,
+labels or Priority; it does not prescribe a repository's decomposition norms.
+For agent-board itself those norms live in `AGENTS.md`, under “Planning work
+in this repository”. Callers that want the former procedure must put it in
+their own guidance file and configure its mapping; without one, the brief
+has only the neutral planning task and protocol. This reuses the existing
+off-by-default mapping and its validation bounds, with no new reads or authority.
+
 ```json
 "guidance": {
   "cgwalters-forge/agent-board": {"path": "AGENTS.md"},
@@ -2323,7 +2334,8 @@ not migrated by this change:
 | Where a run finds repository procedure (no compiled string moved yet) | Optional `guidance` names each repository's file (its own `AGENTS.md`, or an agenthome midstream path pinned by commit); triage briefs end by naming it. |
 | `pass.rs`: `PROMOTED`, `NO_UPSTREAM_COMMENT`, `verdict_ask` | Promoted-work routing and upstream-silence policy remain behind `fixPlans`. Move wording together with the checked fix-plan contract, never remove its bounds as a prose-only migration. |
 | `pass.rs`: `verdict_ask` active-work and follow-up-issue instructions | Routing guidance remains coupled to `skipActiveWork` and the verdict/plan protocol. Separate caller preference from required output shape. |
-| `pass/epics.rs`, `pass/forgejo/epics.rs`: planning tasks | Planning procedure, repository scope, operator-comment precedence and epic-edit restrictions remain duplicated. Repository planning norms should move to repository guidance; authenticated scope stays enforced. |
+| `pass/epics.rs`: GitHub planning task | Removed the compiled “create implement-sized sub-issues, each with an implement job plan” and “rescope or close sub-issues that no longer fit” procedure. Repository norms now belong in the existing `guidance` file; agent-board's are in its `AGENTS.md`. Epic-plan format, Priority ordering, operator-comment precedence, repository scope and epic-edit restrictions remain protocol. |
+| `pass/forgejo/epics.rs`: Forgejo planning task | Planning procedure remains built in; `guidance` is not yet supported on Forgejo. Migration there is deferred rather than silently accepting an unsupported mapping. |
 | `pass/revisit.rs`, `pass/forgejo.rs`, `pass/sweep.rs`: revisit/sweep tasks | Evidence, close/plan/question and epic-attachment guidance remain built in. Feature controls select work, not caller prose. |
 | `pass/maintain.rs`: digest task and `PLAN_PLACEHOLDER` | Digest format, assessment and reply-drafting instructions remain built in; caller config selects the digest, not its editorial policy. |
 | `poll.rs`: continuation, rebase, fix, queue-diagnostic and review tasks | Remaining task procedure should use repository or midstream guidance. Existing poll settings choose routing and bounds, not replacement prompts. |
