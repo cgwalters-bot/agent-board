@@ -2697,17 +2697,35 @@ fn pass_replay_previews_a_daily_session() {
         serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
     config["triagePools"] = serde_json::json!(["claude"]);
     config["sessions"] = serde_json::json!({
-        "hourUtc": 0, "issues": ["cgwalters-forge/agent-board#40"]
+        "hourUtc": 0, "issues": ["cgwalters-forge/agent-board#40"],
+        "compareAfter": "2026-10-22T00:00:00Z"
     });
     let path = std::env::temp_dir().join(format!(
         "agent-board-session-config-{}.json",
         std::process::id()
     ));
     std::fs::write(&path, config.to_string()).unwrap();
+    // Synthetic dispatch history: evidence of the log contract, not live savings.
+    let mut recording: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/board-2026-10-23.json")).unwrap();
+    for (day, kind) in [(21, "triage"), (22, "session")] {
+        let url = format!(
+            "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?event=workflow_dispatch&created=2026-10-{day}T00%3A00%3A00Z..2026-10-{day}T23%3A59%3A59Z&per_page=100&page=1"
+        );
+        recording["requests"].as_array_mut().unwrap().push(serde_json::json!({
+            "request": {"get": url}, "answer": {"status": 200, "link": null,
+                "body": {"total_count": 1, "workflow_runs": [{"id": day,
+                    "created_at": format!("2026-10-{day}T00:00:00Z"),
+                    "display_title": format!("{kind} cgwalters-forge/agent-board#40 (claude)")}]}}
+        }));
+    }
+    let history_path = path.with_extension("replay.json");
+    std::fs::write(&history_path, recording.to_string()).unwrap();
     let output = command()
         .args(["pass", "--config"])
         .arg(&path)
-        .args(["--replay", "fixtures/pass/board-2026-10-23.json"])
+        .arg("--replay")
+        .arg(&history_path)
         .current_dir(root)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
@@ -2716,6 +2734,7 @@ fn pass_replay_previews_a_daily_session() {
         .get_output()
         .clone();
     std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(&history_path).unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
     let starts: Vec<&str> = text.lines().filter(|l| l.starts_with("start ")).collect();
     assert_eq!(
@@ -2724,6 +2743,7 @@ fn pass_replay_previews_a_daily_session() {
         "{text}"
     );
     assert_eq!(starts.len(), 6, "{text}");
+    assert!(text.contains("session comparison cgwalters-forge/agent-board: before=[2026-10-21T00:00:00Z,2026-10-22T00:00:00Z) after=[2026-10-22T00:00:00Z,2026-10-23T00:00:00Z) before: triage=1 session=0; after: triage=0 session=1; listed dispatch creations, not inference savings"), "{text}");
     assert!(
         !text.contains("triage cgwalters-forge/agent-board#40"),
         "{text}"

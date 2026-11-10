@@ -45,12 +45,18 @@ pub struct Sessions {
     /// rewrites nothing.
     #[serde(default)]
     pub apply: bool,
+    /// Trusted rollout time for the optional equal-day dispatch comparison.
+    /// Off unless set; never inferred from an agent's comments or plans.
+    pub compare_after: Option<String>,
 }
 
 impl Sessions {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
         ensure!(self.hour_utc < 24, "sessions hourUtc is not 0 to 23");
         ensure!(!self.issues.is_empty(), "sessions issues names no issue");
+        if let Some(at) = &self.compare_after {
+            comparison::activation(at)?;
+        }
         ensure!(
             !config.triage_pools().is_empty(),
             "sessions need triagePools or planPools"
@@ -538,6 +544,7 @@ mod tests {
             hour_utc,
             issues: vec!["cgwalters-forge/agent-board#830".into()],
             apply: false,
+            compare_after: None,
         }
     }
 
@@ -607,3 +614,5 @@ mod tests {
         )
     }
 }
+
+pub(super) mod comparison;

@@ -216,6 +216,7 @@
     "sessions.hourUtc": {"verdict": "refused", "reason": "daily session starts are only built for GitHub"},
     "sessions.issues": {"verdict": "refused", "reason": "daily session starts are only built for GitHub"},
     "sessions.apply": {"verdict": "refused", "reason": "session batches are applied only on GitHub"},
+    "sessions.compareAfter": {"verdict": "refused", "reason": "session dispatch comparison reads GitHub Actions history only"},
     "maintain.repos.sinceDays": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
     "maintain.repos.min": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
     "maintain.repos.max": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},

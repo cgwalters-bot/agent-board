@@ -19075,6 +19075,70 @@ fn session_settings() -> Value {
 
 const SESSION_START: &str = "start session cgwalters-forge/agent-board#40 pool=claude";
 
+#[test]
+fn session_comparison_is_opt_in_and_never_counts_preview_starts() {
+    let r = replay();
+    let settings = session_settings();
+    let report = preview(&config(settings.clone()), &r);
+    assert!(
+        !report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("session comparison"))
+    );
+    for (at, want) in [
+        (
+            "2026-10-23T00:00:00Z",
+            "unknown: after window has not ended",
+        ),
+        ("2026-10-22T00:00:00Z", "before: unknown"),
+    ] {
+        let mut settings = settings.clone();
+        settings["sessions"]["compareAfter"] = at.into();
+        let report = preview(&config(settings), &r);
+        let line = report
+            .lines
+            .iter()
+            .find(|l| l.starts_with("session comparison"))
+            .unwrap();
+        assert!(line.contains(want), "{line}");
+        assert!(
+            !line.contains("triage=0") && !line.contains("session=1"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn session_comparison_overlapping_pages_are_unknown() {
+    let mut r = replay();
+    let mut settings = session_settings();
+    settings["sessions"]["compareAfter"] = "2026-10-22T00:00:00Z".into();
+    for (day, pages) in [(21, 2), (22, 1)] {
+        for page in 1..=pages {
+            let run = json!({"id": 1, "display_title": "session cgwalters-forge/agent-board#40",
+                "created_at": "2026-10-21T00:00:00Z", "run_attempt": page});
+            let runs = if day == 21 { json!([run]) } else { json!([]) };
+            let url = format!(
+                "{API_ROOT}repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?event=workflow_dispatch&created=2026-10-{day}T00%3A00%3A00Z..2026-10-{day}T23%3A59%3A59Z&per_page=100&page={page}"
+            );
+            r.requests.push(json!({"request": {"get": url}, "answer": {
+                "status": 200, "link": if day == 21 && page == 1 { Some("<https://api.github.com/next>; rel=\"next\"") } else { None },
+                "body": {"total_count": if day == 21 {2} else {0}, "workflow_runs": runs}}}));
+        }
+    }
+    let report = preview(&config(settings), &r);
+    let line = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("session comparison"))
+        .unwrap();
+    assert!(
+        line.contains("before: unknown (dispatch history incomplete); after: triage=0 session=0"),
+        "{line}"
+    );
+}
+
 /// `author`'s `kind` plan on agent-board#40, comment 9 of 2026-10-22, and
 /// the bot's dispatch record of it at `recorded`, if any.
 fn anchor_plan(replay: &mut Replay, kind: &str, author: &str, recorded: Option<&str>) {
@@ -19340,6 +19404,16 @@ fn sessions_config_table() {
     };
     for (pools, section, error) in [
         (json!(["claude"]), sessions(json!({})), None),
+        (
+            json!(["claude"]),
+            sessions(json!({"compareAfter": "2026-11-10T06:00:00Z"})),
+            None,
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"compareAfter": "2026-11-10T06:00:00+01:00"})),
+            Some("sessions compareAfter must be whole-second UTC"),
+        ),
         (
             json!([]),
             sessions(json!({})),

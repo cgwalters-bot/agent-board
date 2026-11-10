@@ -3357,6 +3357,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         let why = "stage 3 or 4 stopped part way, so they would be partial";
         scheduler.line(format!("holds: not published; {why}"));
     }
+    scheduler.session_comparison();
     if !apply {
         scheduler.observe_decision();
     }
