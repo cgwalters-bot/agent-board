@@ -1008,9 +1008,35 @@ approval the review job never gives a draft), and once clean and green it
 waits with `a midstream draft, waiting for promotion`, unlabelled.
 `continuation.pools` (absent by default) names a pool for a `budget`,
 `runtime` or `cap` checkpoint, as pools are how a run gets more budget, time or a higher cap; the `cap` pool
-is used once a pull request. A continuation that completes is marked ready
-by agentic-job, which in v0.5.1 does not rewrite the title or description
-from its commits. With `continuation.retitle: true` (off by default) the poll
+is used once a pull request. A changed continuation accepted as complete is
+marked ready by agentic-job, not by this poll. An unchanged result can be
+genuinely complete without inventing a commit, but accepting it as complete
+requires explicit checked evidence for that PR, head and run. Missing notes,
+green CI, a bot assertion or a `noop` alone are not that evidence. Incomplete
+work or failed/unavailable verification must retain a checkpoint. Head messages
+without one still fall back to the body's checkpoint, even an old one; removing
+that fallback would turn absent notes into false completion.
+
+The deployed tracker `dispatch.yml` calls actions' `cgwalters-agentic-job.yml`,
+whose policy/check/apply pin inspected for this slice is
+[`427ce2295925654be9c35e91ca5cee91bbc2c9ea`](https://github.com/cgwalters-forge/agentic-job/tree/427ce2295925654be9c35e91ca5cee91bbc2c9ea).
+Its `run/handback.rs` reads `outcome.json`'s `checkpoint.complete`, but
+`check/mod.rs` exports a checkpoint only from an accepted PR body or push
+message. `apply/readiness.rs` requires a push, so an unchanged `noop` does not
+authorize readiness. The missing companion contract is a producer disposition
+for explicit unchanged completion, validated by check and carried in its trusted
+artifact to apply, bound through policy to repository/PR, exact head and run
+(including attempt). It must reject missing, malformed, contradictory or stopped/
+failed verification evidence and recheck the open PR/head and holds before any
+readiness change. Raw agent outcomes must not become completion authority here.
+No new format or consumer is introduced; unchanged acceptance remains disabled.
+[tracker#1071](https://github.com/cgwalters-forge/tracker/issues/1071) owns remaining
+live acceptance: a separately authorized continuation must record PR/head/run,
+working fmt/clippy, required checks and a valid changed or explicitly complete
+unchanged result without an incomplete hold. Unit tests do not prove it.
+
+agentic-job does not rewrite the title or description from continuation commits.
+With `continuation.retitle: true` (off by default) the poll
 does: a ready pull request of the bot still titled or described as partial
 work (or with the placeholder title), where the newest round is a
 continuation or fix and the head moved since, is approved and has green checks,
