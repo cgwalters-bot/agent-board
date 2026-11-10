@@ -130,6 +130,14 @@ boards, enable sweeping, or implement deferred mutation paths incidentally. Leav
 homegit and its running controllers untouched; see [design scope](docs/design.md#1-scope-and-durable-model).
 Do not edit workflow/security configuration unless the task explicitly needs it.
 
+## Planning work in this repository
+
+When planning an agent-board epic, create implement-sized sub-issues for the
+remaining work, each with an implement job plan. Rescope or close sub-issues
+that no longer fit. Include this repository's `AGENTS.md` in child job briefs
+so that implementation runs read its build, review and hand-back instructions.
+These are agent-board's planning norms, not defaults for other repositories.
+
 ## Hand-back
 
 A feature that ships off (a new option in `POLL_OPTIONS`, `SUPERVISOR_OPTIONS`
