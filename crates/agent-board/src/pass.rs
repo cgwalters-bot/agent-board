@@ -38,7 +38,7 @@ pub struct Pass {
     /// Preview live, and save every read and its answer to FILE as a replay fixture.
     #[arg(long, value_name = "FILE", conflicts_with = "apply")]
     pub record: Option<PathBuf>,
-    /// Only check --config and --fix-bounds as a pass would, and exit: no token, no read of the forge. For a caller's pull request CI, so a configuration the pass refuses fails review instead of every pass after merge.
+    /// Only check --config and --fix-bounds as a pass would, and exit. Explicit repository lists need no token or forge reads; organization entries need GH_TOKEN to resolve their bounded listing before policy validation. For a caller's pull request CI, so a configuration the pass refuses fails review instead of every pass after merge.
     #[arg(long, conflicts_with_all = ["apply", "replay", "record"])]
     pub check_config: bool,
 }
@@ -250,7 +250,8 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         return next(args, out);
     }
     let path = args.config.as_ref().context("pass needs --config")?;
-    let mut config = Config::parse(&read(path)?).with_context(|| format!("{}", path.display()))?;
+    let mut config =
+        Config::parse_sources(&read(path)?).with_context(|| format!("{}", path.display()))?;
     if let Some(board) = config.forgejo_board() {
         // Stop unsupported operations before opening files or looking up any
         // credentials, including the GitHub apply/record/replay paths below.
@@ -332,6 +333,17 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     }
     config.fix_bounds = FixBoundsSet::read(&args.fix_bounds)?;
     if args.check_config {
+        if config.has_repository_sources() {
+            let client = Client::from_env()?.retry_within(
+                Instant::now()
+                    + Duration::from_secs(board_forge::repository_lists::RESOLUTION_SECONDS),
+            );
+            let mut lines = Vec::new();
+            config.resolve(&client, &mut lines)?;
+            for line in lines {
+                eprintln!("{line}");
+            }
+        }
         writeln!(out, "{CONFIG_OK}")?;
         return Ok(());
     }

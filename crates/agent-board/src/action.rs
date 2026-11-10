@@ -31,6 +31,7 @@ pub fn check<T: Transport>(
     let value =
         serde_json::from_str(&std::fs::read_to_string(&args.config).context("read action config")?)
             .context("decode action config")?;
+    let value = crate::config::expand(value)?;
     let config = Config::from_json(&value)?;
     let comments = board_forge::plan::issue_comments(&transport()?, &issue)?;
     let (proposal, from) = newest_action(&comments, &config)?;

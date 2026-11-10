@@ -43,6 +43,7 @@ pub fn send<T: Transport + Rest>(
     let value =
         serde_json::from_str(&std::fs::read_to_string(&args.config).context("read review config")?)
             .context("decode review config")?;
+    let value = crate::config::expand(value)?;
     let config = Config::from_json(&value)?;
     let approval = match &args.approved_by_edit {
         Some(path) => {

@@ -220,8 +220,8 @@ pub(crate) fn read(path: &Path) -> Result<Value> {
 fn settings(files: &Files) -> Result<Settings> {
     let usage = files.usage_config.as_deref().map(read).transpose()?;
     Settings::from_json(
-        &read(&files.config)?,
-        &read(&files.supervisor_config)?,
+        &crate::config::read(&files.config)?,
+        &crate::config::read(&files.supervisor_config)?,
         usage.as_ref(),
     )
 }

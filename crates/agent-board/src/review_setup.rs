@@ -147,8 +147,9 @@ fn check(
 }
 
 pub fn run(options: &Options) -> Result<()> {
-    let config =
-        Config::parse(&std::fs::read_to_string(&options.config).context("read pass config")?)?;
+    let config = crate::config::pass(
+        &std::fs::read_to_string(&options.config).context("read pass config")?,
+    )?;
     let targets = targets(&config)?;
     let started = Instant::now();
     let client = Client::from_env()?.retry_within(started + DEADLINE);

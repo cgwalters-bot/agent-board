@@ -9,7 +9,6 @@ use board_forge::github::{
     DEFAULT_HOST, FieldWrite, GitHub, Transport, already_member, field_writes,
 };
 use board_forge::items::{self, ITEM_CACHE_SCHEMA, ITEM_REQUEST_LIMIT, Select};
-use board_forge::pass::Config;
 use board_forge::poll::Rest;
 use board_forge::prune::Cache;
 use clap::Args;
@@ -80,7 +79,8 @@ pub fn list_issues<C: Rest + Transport>(
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
     };
     let path = args.config.as_ref().context("this read needs --config")?;
-    let config = Config::parse(&read(path)?).with_context(|| format!("{}", path.display()))?;
+    let config =
+        crate::config::pass(&read(path)?).with_context(|| format!("{}", path.display()))?;
     let cache = match &args.cache {
         Some(path) if path.exists() => {
             let value = serde_json::from_str(&read(path)?)

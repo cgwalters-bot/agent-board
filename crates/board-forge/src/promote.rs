@@ -171,6 +171,7 @@ fn assess(
 const RECORDED_FIELDS: &[&str] = &[
     "full_name",
     "fork",
+    "archived",
     "parent",
     "source",
     "owner",

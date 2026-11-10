@@ -107,6 +107,7 @@ pub fn apply<T: Transport + board_forge::poll::Rest>(
     let value =
         serde_json::from_str(&std::fs::read_to_string(&args.config).context("read epic config")?)
             .context("decode epic config")?;
+    let value = crate::config::expand(value)?;
     let config = board_forge::epic_apply::Config::from_json(&value)?;
     let expected = board_forge::epic_apply::Preconditions {
         request: args.expect_request.clone(),

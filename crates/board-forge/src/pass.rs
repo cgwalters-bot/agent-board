@@ -520,6 +520,10 @@ const PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
+    /// Org sources are kept separate from runtime policy. A pass resolves
+    /// these and validates the concrete policy before taking any stage.
+    #[serde(skip)]
+    repository_sources: Option<String>,
     pub operator: String,
     pub bot: String,
     pub dispatch_repo: String,
@@ -976,6 +980,19 @@ impl<'de> Deserialize<'de> for Pools {
     }
 }
 
+/// JSON value normalization must not reorder pool tie-breaking or hide duplicate
+/// names. Read this ordered map directly from the original source document.
+fn source_pools(text: &str) -> Result<Pools> {
+    #[derive(Deserialize)]
+    struct Ordered {
+        #[serde(default)]
+        pools: Pools,
+    }
+    Ok(serde_json::from_str::<Ordered>(text)
+        .context("pass pools")?
+        .pools)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
@@ -1151,13 +1168,42 @@ fn valid_pool(name: &str) -> bool {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self> {
+        let config = Self::parse_sources(text)?;
+        ensure!(
+            config.repository_sources.is_none(),
+            "organization repository entries need resolution; use the pass source loader"
+        );
+        Ok(config)
+    }
+
+    /// Decode trusted pass sources. Organization-backed policies are checked
+    /// fully only after live expansion; no caller may execute the partial
+    /// concrete lists before [`Self::resolve`].
+    pub fn parse_sources(text: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(text).context("pass config is not JSON")?;
         if value["board"]["forge"] == "forgejo" {
             forgejo::check_options(&value)?;
         }
         no_nulls(&value, "config")?;
-        let config: Self = serde_json::from_str(text).context("pass config")?;
-        config.check()?;
+        let mut concrete = value.clone();
+        let sources = crate::repository_lists::Sources::take(&mut concrete)?;
+        let mut config: Self = if sources.is_empty() {
+            serde_json::from_str(text).context("pass config")?
+        } else {
+            crate::repository_lists::check_source_fields(text)?;
+            let mut config: Self = serde_json::from_value(concrete).context("pass config")?;
+            config.pools = source_pools(text)?;
+            config
+        };
+        if sources.is_empty() {
+            config.check()?;
+        } else {
+            ensure!(
+                config.forgejo_board().is_none(),
+                "organization repository entries require GitHub"
+            );
+            config.repository_sources = Some(text.to_owned());
+        }
         // The grant is already paced; a target or burst set beside it, which
         // has a default, would be read as pacing it does not do.
         if config.grant().is_some() {
@@ -1170,6 +1216,25 @@ impl Config {
             }
         }
         Ok(config)
+    }
+
+    /// Resolve a source configuration afresh. The returned policy is fully
+    /// validated; failures occur before any pass stage can write or dispatch.
+    pub fn resolve(&self, client: &impl Rest, lines: &mut Vec<String>) -> Result<Option<Self>> {
+        let Some(text) = &self.repository_sources else {
+            return Ok(None);
+        };
+        let mut value = serde_json::from_str(text).context("pass config is not JSON")?;
+        let sources = crate::repository_lists::Sources::take(&mut value)?;
+        sources.resolve(&mut value, client, lines)?;
+        let mut config = Self::parse(&value.to_string())?;
+        config.pools = source_pools(text)?;
+        config.fix_bounds = self.fix_bounds.clone();
+        Ok(Some(config))
+    }
+
+    pub fn has_repository_sources(&self) -> bool {
+        self.repository_sources.is_some()
     }
 
     /// The budget, where it is the broker's grant.
@@ -3156,6 +3221,15 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds: &Bounds,
 ) -> Result<Report> {
     let caps = Caps::new(limits);
+    let mut lines = Vec::new();
+    let resolved = config.resolve(
+        &Budget {
+            inner: client,
+            bounds,
+        },
+        &mut lines,
+    )?;
+    let config = resolved.as_ref().unwrap_or(config);
     let mut report = stages(
         client,
         dispatcher,
@@ -3165,6 +3239,8 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         &caps,
     )
     .await;
+    lines.append(&mut report.lines);
+    report.lines = lines;
     bounds.collapse(&mut report);
     report.summary = caps.summary();
     report.spent = bounds.spent();

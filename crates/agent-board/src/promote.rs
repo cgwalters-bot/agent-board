@@ -34,7 +34,7 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
     let read = |path: &PathBuf| {
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
     };
-    let config = Config::parse(&read(&args.config)?)?;
+    let config = Config::parse_sources(&read(&args.config)?)?;
     ensure!(
         config.forgejo_board().is_none(),
         "promote supports GitHub only"
@@ -62,30 +62,48 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
         }
         vec!["promote: off".to_owned()]
     } else if let Some(replay) = &replay {
-        promote::preview(replay, &config, replay.now)?
+        preview(replay, &config, replay.now)?
     } else {
         let now = time::OffsetDateTime::now_utc();
         let client = Client::from_env()?
             .retry_within(Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT));
         if let Some(path) = &args.record {
             let recorder = Recorder::new(&client);
-            let result = promote::preview(&recorder, &config, now);
+            let result = preview(&recorder, &config, now);
             std::fs::write(path, promote::recording(&recorder.fixture(now)?)?)
                 .with_context(|| format!("write {}", path.display()))?;
             result?
         } else if args.apply {
-            promote::apply(
+            let mut lines = Vec::new();
+            let resolved = config.resolve(&client, &mut lines)?;
+            lines.extend(promote::apply(
                 &client,
-                &config,
+                resolved.as_ref().unwrap_or(&config),
                 now,
                 args.max_writes.context("--max-writes required")?,
-            )?
+            )?);
+            lines
         } else {
-            promote::preview(&client, &config, now)?
+            preview(&client, &config, now)?
         }
     };
     for line in lines {
         writeln!(out, "{line}")?;
     }
     Ok(())
+}
+
+fn preview<C: board_forge::poll::Rest + board_forge::github::Transport>(
+    client: &C,
+    config: &Config,
+    now: time::OffsetDateTime,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let resolved = config.resolve(client, &mut lines)?;
+    lines.extend(promote::preview(
+        client,
+        resolved.as_ref().unwrap_or(config),
+        now,
+    )?);
+    Ok(lines)
 }

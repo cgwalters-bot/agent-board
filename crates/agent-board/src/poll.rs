@@ -110,7 +110,11 @@ pub fn run(
     args: &Poll,
     board: impl FnOnce() -> Result<Option<board_core::Snapshot>>,
 ) -> Result<()> {
-    let value = args.config.as_deref().map(read).transpose()?;
+    let value = args
+        .config
+        .as_deref()
+        .map(crate::config::read)
+        .transpose()?;
     let pools = args.pools.as_deref().map(read).transpose()?;
     let now = time::OffsetDateTime::now_utc();
     let (effective, mut policy) = configured(args, value.as_ref(), pools.as_ref(), now)?;

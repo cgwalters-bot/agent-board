@@ -4301,9 +4301,55 @@ not a new field to add to a deployment. It is not the poll/supervisor's
 agent-board.json and does not automatically accept the old caller file.
 The pinned executable/build reference belongs in the workflow, not this file.
 
+### Organization repository entries
+
+Repository lists can mix explicit names with `{"org":"cgwalters-forge","forks":false}`.
+This applies to `follow`, `workRepositories`, `holds.proposals.repositories`,
+`operatorAsk.harness.repositories`, `budget.harnessRepositories`,
+`pr.reviewDispatchRepositories`, `pr.draftReviewRepositories`, `pr.noMerge`,
+`statusReconcile.runRepositories`, `review.targets`, nested `repositories` selectors,
+and `maintain.repos.include`/`exclude`. Pool, label and path lists are not
+repository lists. Explicit names remain additive, even when they name a fork.
+The standalone poll, supervisor, status and trusted-config readers use the same
+expansion. Forgejo does not support organization entries.
+
+This is off unless an organization entry is configured. Each GitHub pass reads
+the organization's repository list afresh, excludes forks and archived
+repositories, and logs both the organization's resolved set and each expanded
+list. Lists containing organizations are sorted and deduplicated without regard
+to case. Repeated organizations share one listing within a configuration read.
+No allowlist is required; adding a qualifying repository to the organization
+adds it to every list that names that organization. This expands those lists'
+existing authority; it does not change fix bounds, merge rules or write caps.
+Source normalization rejects duplicate object fields so an ambiguous scope
+such as two `dispatchRepo` keys cannot silently become the last value.
+
+The concrete failure bounded here is a large or incomplete organization
+inventory consuming the pass or silently narrowing its policy. Resolution
+allows at most ten distinct organizations and ten pages of 100 repositories
+per organization, stopping new reads after 120 seconds (an in-flight read may
+finish later). It uses constructed GitHub API paths, never a response's `Link`
+URL. Missing fork/archive facts, foreign-owner names, denied reads or a listing
+that does not finish within these bounds fail before any pass stage. Existing
+list-size and policy checks apply to the complete expanded result, not a
+truncated subset. Pass discovery also consumes its normal request/time budget.
+Record/replay includes these reads and needs no live token when replaying.
+
+`--check-config` remains offline for explicit lists. With organization entries
+it needs the usual `GH_TOKEN` (or `GITHUB_TOKEN`) with repository-list read
+access, and performs the same bounded resolution and full policy validation,
+without writes or dispatches. Do not give untrusted PR CI a privileged token
+to check a proposed organization policy; check that policy in a trusted context.
+
+Caller activation: in `cgwalters-forge/tracker`, `.github/pass.json`, add
+`{"org":"cgwalters-forge","forks":false}` to `follow`, `workRepositories`,
+`holds.proposals.repositories` and `operatorAsk.harness.repositories`, keeping
+any explicit repositories still needed. No deployed configuration is changed here.
+
 ### v1 parsing and compatibility
 
-`Config::parse` in `crates/board-forge/src/pass.rs` is the entry point: valid JSON,
+`Config::parse` in `crates/board-forge/src/pass.rs` validates the concrete policy
+after any organization sources have been expanded: valid JSON,
 no null anywhere (including inside lists and maps), typed decoding, then semantic
 validation. Unknown keys at the root and in structured sections are errors, even
 in a disabled section. Pool/model names and budget pool mappings are map keys,
