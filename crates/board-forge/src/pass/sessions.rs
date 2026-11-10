@@ -10,14 +10,20 @@
 //! pass's own recorded session plan waits on a person. A due session takes
 //! a slot before stage 4's per-item starts, since it stands in for many of
 //! them, under the same WIP, pacing, budget and `--max-dispatch` as any
-//! start; nothing it proposes is applied by the pass yet.
+//! start. With `sessions.apply`, the batch a session answers with on its
+//! anchor is applied once a day, under the same bounds the brief named,
+//! with a receipt on the anchor ([`crate::session_apply`], agent-board#845);
+//! the day is the configured due time's, which no comment on the anchor
+//! moves. A writer's comment there that anyone else edited holds the
+//! anchor for a person as it holds a plan, until the next day's due time.
 use super::*;
 use crate::epic::IssueRef;
 use crate::plan::{PLAN_BRIEF_LIMIT, SESSION_KIND};
 use crate::session::{
-    ACTION_LIMIT, ASK_LIMIT, ATTACH_LIMIT, Bounds, CLOSE_LIMIT, PLAN_LIMIT, PRIORITY_LIMIT,
+    ACTION_LIMIT, ASK_LIMIT, ATTACH_LIMIT, Action, Bounds, CLOSE_LIMIT, PLAN_LIMIT, PRIORITY_LIMIT,
     RESCOPE_LIMIT, SESSION_BATCH_SCHEMA, SESSION_FENCE,
 };
+use crate::session_apply::{self, Outcome};
 
 /// What a session's plan says first.
 pub(super) const SESSION_INTRO: &str =
@@ -32,6 +38,13 @@ pub struct Sessions {
     /// The issue each repository's session reports on, `OWNER/REPO#N`: one
     /// open issue on the board in each work repository that has sessions.
     pub issues: Vec<String>,
+    /// Apply the batch a session answers with, once, with a receipt on its
+    /// anchor ([`Scheduler::batch`]). Off by default: off, a batch is read
+    /// by a person and changes nothing, so a session that misreads a
+    /// repository, or a run that posts a batch as the bot, closes and
+    /// rewrites nothing.
+    #[serde(default)]
+    pub apply: bool,
 }
 
 impl Sessions {
@@ -230,17 +243,27 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let comments = plan::issue_comments(&self.client, anchor)
             .with_context(|| format!("reading {at}'s comments"))?;
         let writers = self.writers();
+        // A writer's comment that anyone else edited is weighed as a plan
+        // ([`plan::newest_plan`]) and holds the anchor for a person; one
+        // edited before today's due time is an earlier day's (a receipt, a
+        // batch or a plan whose day is past), which today's session
+        // supersedes rather than waits on for good. Records and batches
+        // are read from every comment.
+        let weighed: Vec<plan::Comment> = (comments.iter())
+            .filter(|c| !(plan::foreign_edit(c, &writers) && c.changed < due))
+            .cloned()
+            .collect();
         // A plan on the anchor that is not the pass's own recorded session
         // plan waits on a person: a hold, which the hold snapshot lists, not
         // a line alone, since no later pass can get past it by itself. The
         // bot's own unrecorded plan is not started either, as a run posts as
         // the bot too, and no agent starts a session.
-        if !plan::no_plan(&comments, &writers) {
-            let (plan, from) = match plan::newest_plan(&comments, &writers) {
+        if !plan::no_plan(&weighed, &writers) {
+            let (plan, from) = match plan::newest_plan(&weighed, &writers) {
                 Ok(newest) => newest,
                 Err(error) => {
                     let why = format!(
-                        "its newest plan cannot be used: {error:#}; a person replaces it, and its session waits"
+                        "its newest plan cannot be used: {error:#}; a person replaces it, or the next day's session supersedes it"
                     );
                     self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
                     return Ok(None);
@@ -256,7 +279,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 return Ok(None);
             }
             let held = batch::held(&self.client, &comments, &writers, &id, anchor)?;
-            let Some((_, record)) = held.first() else {
+            let Some(&(record_id, record)) = held.first() else {
                 let why = format!(
                     "its session plan {id} has no dispatch record; a person dispatches it by hand or removes it, and its session waits"
                 );
@@ -270,6 +293,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     record.url,
                     sweep::stamp(due + time::Duration::days(1))
                 ));
+                self.batch(sessions, anchor, facts, &comments, (record_id, due), board)?;
                 return Ok(None);
             }
         }
@@ -294,11 +318,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 return Ok(None);
             }
         };
-        let bounds = Bounds {
-            repositories: config.work_repositories.clone(),
-            priorities: board.options.clone(),
-            domains: (config.operator_ask.as_ref()).map_or_else(Vec::new, |a| a.domains.clone()),
-        };
+        let bounds = self.session_bounds(board);
         let brief = brief(repo, &at, &config.operator, &bounds);
         let length = brief.chars().count();
         ensure!(
@@ -323,6 +343,184 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             step => Some(step),
         })
     }
+
+    /// What a session's batch may touch, from the caller's configuration
+    /// and the board: the brief names these, and the apply checks them.
+    fn session_bounds(&self, board: &BoardRead) -> Bounds {
+        let config = self.config;
+        Bounds {
+            repositories: config.work_repositories.clone(),
+            priorities: board.options.clone(),
+            domains: (config.operator_ask.as_ref()).map_or_else(Vec::new, |a| a.domains.clone()),
+        }
+    }
+
+    /// The batch answering today's session plan, found after its dispatch
+    /// record `record` on the anchor: applied once, with a receipt on the
+    /// anchor, where [`Sessions::apply`] is set and it passes the bounds
+    /// the brief named; said once a pass where it was applied; and held
+    /// for a person where it is refused or its apply was cut short, until
+    /// the next session's plan supersedes it. Without `apply`, a batch is
+    /// a person's to read, said once a pass.
+    fn batch(
+        &mut self,
+        sessions: &Sessions,
+        anchor: &ItemRef,
+        facts: &Facts,
+        comments: &[plan::Comment],
+        (record, due): (u64, OffsetDateTime),
+        board: &BoardRead,
+    ) -> Result<()> {
+        let repo = anchor.repository.as_str();
+        let writers = self.writers();
+        let from = match session_apply::answer(comments, &writers, record) {
+            Ok(None) => return Ok(()),
+            Ok(Some(from)) => from,
+            Err(error) => {
+                let why = format!("{error:#}; a person replaces it, and its batch waits");
+                self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
+                return Ok(());
+            }
+        };
+        let id = plan::plan_id(from)?;
+        // The day's receipts, from its due time: one batch is applied a
+        // day, so the oldest claim there settles it, whichever batch it
+        // names and whichever record it follows, since a run posting as
+        // the bot can replace the day's plan and record but not the day;
+        // an earlier day's are its own.
+        let since: Vec<plan::Comment> = (comments.iter())
+            .filter(|c| c.created >= due)
+            .cloned()
+            .collect();
+        let (receipts, unread) = session_apply::receipts(&since, &writers);
+        if !unread.is_empty() {
+            let why = format!(
+                "{} looks like a batch receipt but cannot be read; a person inspects it, and batch {id} waits",
+                unread.join(", ")
+            );
+            self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
+            return Ok(());
+        }
+        if let Some(receipt) = receipts.first() {
+            if receipt.detail.batch != id {
+                let why = format!(
+                    "batch {id} is not applied: {} claims batch {} for today already; one batch is applied a day, and a person reads the rest",
+                    receipt.url, receipt.detail.batch
+                );
+                self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
+                return Ok(());
+            }
+            match receipt.detail.outcome {
+                Outcome::Applied => self.line(format!(
+                    "session {repo}: batch {id} was applied at {}, {}",
+                    sweep::stamp(receipt.changed),
+                    receipt.url
+                )),
+                outcome => {
+                    let how = match outcome {
+                        Outcome::Stopped => "stopped after a failed request",
+                        _ => "claimed and never finished",
+                    };
+                    let why = format!(
+                        "the apply of batch {id} was {how}; it is never replayed: a person inspects {}",
+                        receipt.url
+                    );
+                    self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
+                }
+            }
+            return Ok(());
+        }
+        if !sessions.apply {
+            self.line(format!(
+                "session {repo}: batch {id} is a person's to read; sessions.apply is off"
+            ));
+            return Ok(());
+        }
+        let bounds = self.session_bounds(board);
+        let batch = match session_apply::check(from, anchor, &bounds) {
+            Ok(batch) => batch,
+            Err(error) => {
+                let why = format!("batch {id} is refused: {error:#}; a person reads it");
+                self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
+                return Ok(());
+            }
+        };
+        let (lines, writes) = session_apply::planned(&batch);
+        let words = match lines.is_empty() {
+            true => "no changes".to_owned(),
+            false => lines.join("; "),
+        };
+        let line = format!("apply session {repo} batch={id}: {words}");
+        if let Some(held) = self.caps.check_many(Kind::Write, writes) {
+            self.line(format!("{held}: {line}"));
+            return Ok(());
+        }
+        if let Some(why) = self.other_holds() {
+            self.line(format!("session {repo}: batch {id} waits; {why}"));
+            return Ok(());
+        }
+        if !self.apply {
+            self.caps.count_many(Kind::Write, writes);
+            self.line(line);
+            return Ok(());
+        }
+        let bounds = self.client.bounds;
+        // The apply reads the comments back once, as many pages as now.
+        let pages = comments.len() / 100 + 1;
+        let needed = session_apply::APPLY_REQUESTS
+            + pages
+            + session_apply::ACTION_REQUESTS * batch.actions.len()
+            + WRITE_RESERVE;
+        if !bounds.fits(needed) {
+            self.line(format!(
+                "session {repo}: batch {id} waits; the pass has {} requests left, fewer than its apply may take ({needed}), or ran out of time",
+                bounds.left.get()
+            ));
+            return Ok(());
+        }
+        // The board's ids, read only where the batch sets a Priority.
+        let sets = (batch.actions.iter()).any(|a| matches!(a, Action::SetPriority { .. }));
+        let priorities = match self.config.github_board().filter(|_| sets) {
+            Some(board) => Some(self.project(board).context("the board's ids")?.priorities()),
+            None => None,
+        };
+        let trusted = session_apply::Trusted {
+            operator: &self.config.operator,
+            claimers: writers,
+            since: due,
+            priorities: priorities.as_ref(),
+        };
+        // Its reads were in time, so its writes may finish past the bound.
+        bounds.finishing.set(true);
+        let result = session_apply::apply(&self.client, anchor, from, &batch, &trusted, self.now);
+        bounds.finishing.set(false);
+        // What it wrote is on its receipt either way; count it all.
+        self.caps.count_many(Kind::Write, writes);
+        match result {
+            Ok(done) => {
+                let receipt = (done.iter())
+                    .find_map(|l| l.strip_prefix("Receipt: "))
+                    .map(|url| format!(" receipt={url}"))
+                    .unwrap_or_default();
+                let done: Vec<&str> = (done.iter())
+                    .map(String::as_str)
+                    .filter(|l| !l.starts_with("Receipt: "))
+                    .collect();
+                // A batch that changed nothing moved no work on.
+                self.progressed += usize::from(!done.is_empty());
+                let done = match done.is_empty() {
+                    true => "no changes".to_owned(),
+                    false => done.join("; "),
+                };
+                self.line(format!("apply session {repo} batch={id}: {done}{receipt}"));
+            }
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!("{line} failed: {error:#}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +535,7 @@ mod tests {
         Sessions {
             hour_utc,
             issues: vec!["cgwalters-forge/agent-board#830".into()],
+            apply: false,
         }
     }
 

@@ -33,6 +33,7 @@ pub mod release_train;
 pub mod review;
 pub mod runs;
 pub mod session;
+pub mod session_apply;
 pub mod stack;
 pub mod status;
 pub mod supervise;

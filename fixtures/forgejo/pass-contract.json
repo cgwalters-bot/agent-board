@@ -215,6 +215,7 @@
     "sweep.repository": {"verdict": "native", "forgejo": "a work repository of this instance; other repositories' issues listed only where public, not internal, with a public owner"},
     "sessions.hourUtc": {"verdict": "refused", "reason": "daily session starts are only built for GitHub"},
     "sessions.issues": {"verdict": "refused", "reason": "daily session starts are only built for GitHub"},
+    "sessions.apply": {"verdict": "refused", "reason": "session batches are applied only on GitHub"},
     "maintain.repos.sinceDays": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
     "maintain.repos.min": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
     "maintain.repos.max": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},

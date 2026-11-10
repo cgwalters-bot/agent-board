@@ -9,7 +9,8 @@
 //! one item at a time. Its batch is a proposal, as an epic plan is: any
 //! run that comments as the planner can write one, so the bounds checked
 //! here, from the caller's configuration, and the cap on each kind of
-//! action are what limit it. Nothing here applies a batch;
+//! action are what limit it. Nothing here applies a batch: the pass does,
+//! once, through [`crate::session_apply`] (agent-board#845), and
 //! `agent-board check session-batch` validates one offline.
 use crate::epic::{BODY_LIMIT, IssueRef, REASON_LIMIT, plain, text};
 use crate::pass::check_domains;
@@ -124,6 +125,20 @@ pub enum Action {
     Plan { issue: IssueRef, plan: JobPlan },
     /// One line for the operator, within a configured domain.
     Ask { domain: String, question: String },
+}
+
+impl Action {
+    /// Its `type` in a batch.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Close { .. } => CLOSE,
+            Self::Rescope { .. } => RESCOPE,
+            Self::SetPriority { .. } => SET_PRIORITY,
+            Self::Attach { .. } => ATTACH,
+            Self::Plan { .. } => POST_PLAN,
+            Self::Ask { .. } => ASK,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
