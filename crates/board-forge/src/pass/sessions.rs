@@ -1,8 +1,8 @@
 //! Daily sessions (agent-board#830, docs/sessions.md#daily-sessions): with
 //! `sessions` set, the pass starts one [`crate::session`] run a day on each
 //! configured repository, from the configured hour, in place of many cold
-//! one-comment item triages. Each repository has one anchor issue, named by
-//! the caller, which the session's plan is posted on and its batch is
+//! one-comment item triages. Each repository has one labelled anchor issue,
+//! found or created by the pass, which the session's plan is posted on and its batch is
 //! answered on; the plan protocol's dispatch record there is the day's
 //! receipt, so a pass every hour starts one session a day, not twenty-four,
 //! and a run still in flight is not doubled. The anchor is the pass's: it
@@ -29,6 +29,97 @@ use crate::session_apply::{self, Outcome};
 pub(super) const SESSION_INTRO: &str =
     "The board pass asks a session run to triage this repository as a whole today.";
 
+/// Reserved for the session ledger, never per-item planning or triage.
+pub(crate) const ANCHOR_LABEL: &str = "agent-board-session";
+
+/// A complete, deliberately tiny listing is enough: two anchors are already
+/// ambiguous. Never create after a failed or truncated read. All calls use the
+/// pass's existing request, time and write budgets; preview never writes.
+fn anchor(client: &impl Rest, repo: &str, apply: bool, caps: &Caps) -> Result<Option<ItemRef>> {
+    let url = format!("{API_ROOT}repos/{repo}");
+    let response = client.get(
+        &format!("{url}/issues?state=open&labels={ANCHOR_LABEL}&per_page=2"),
+        None,
+    )?;
+    ensure!(
+        response.status == 200,
+        "anchor listing HTTP {}",
+        response.status
+    );
+    let issues = response
+        .body
+        .as_array()
+        .context("anchor listing is not an array")?;
+    ensure!(
+        issues.len() < 2
+            && !response
+                .link
+                .as_deref()
+                .is_some_and(|l| l.contains("rel=\"next\"")),
+        "multiple or incomplete session anchors; a person must leave exactly one open labelled issue"
+    );
+    let number = if let Some(issue) = issues.first() {
+        ensure!(
+            issue.get("pull_request").is_none(),
+            "session anchor is a pull request"
+        );
+        ensure!(issue["state"] == "open", "session anchor is not open");
+        issue["number"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .context("anchor has no issue number")?
+    } else {
+        if !apply {
+            return Ok(None);
+        }
+        let label_status = match client.get(&format!("{url}/labels/{ANCHOR_LABEL}"), None) {
+            Ok(label) => label.status,
+            Err(error) if error.is::<crate::github::NotFound>() => 404,
+            Err(error) => return Err(error),
+        };
+        ensure!(
+            matches!(label_status, 200 | 404),
+            "anchor label HTTP {}",
+            label_status
+        );
+        if let Some(held) = caps.check_many(Kind::Write, if label_status == 404 { 2 } else { 1 }) {
+            bail!("{held}");
+        }
+        match label_status {
+            200 => {}
+            404 => {
+                caps.count(Kind::Write);
+                let (status, _) = client.send("POST", &format!("{url}/labels"),
+                    &json!({"name": ANCHOR_LABEL, "color": "ededed", "description": "Daily session anchor; not a work item"}))?;
+                ensure!(status == 201, "create anchor label HTTP {status}");
+            }
+            status => bail!("anchor label HTTP {status}"),
+        }
+        caps.count(Kind::Write);
+        let (status, created) = client.send("POST", &format!("{url}/issues"), &json!({
+            "title": "Daily repository sessions",
+            "body": "This issue is the ledger for agent-board's daily repository sessions: plans, batches, daily claims and receipts stay here. It is not a work item; do not plan or triage it. Keep exactly one open issue with the agent-board-session label.",
+            "labels": [ANCHOR_LABEL]
+        }))?;
+        ensure!(status == 201, "create session anchor HTTP {status}");
+        ensure!(
+            created["labels"]
+                .as_array()
+                .is_some_and(|labels| labels.iter().any(|l| l["name"] == ANCHOR_LABEL)),
+            "created session anchor lacks its label; inspect before retrying"
+        );
+        created["number"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .context("created anchor has no issue number")?
+    };
+    Ok(Some(ItemRef {
+        host: DEFAULT_HOST.into(),
+        repository: repo.into(),
+        number,
+    }))
+}
+
 /// `sessions` in the configuration ([`Config::sessions`]).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -37,7 +128,12 @@ pub struct Sessions {
     pub hour_utc: u8,
     /// The issue each repository's session reports on, `OWNER/REPO#N`: one
     /// open issue on the board in each work repository that has sessions.
+    #[serde(default)]
     pub issues: Vec<String>,
+    /// Work repositories whose labelled anchor the pass manages. Organization
+    /// sources are expanded by the shared repository-list resolver.
+    #[serde(default)]
+    pub repositories: Vec<String>,
     /// Apply the batch a session answers with, once, with a receipt on its
     /// anchor ([`Scheduler::batch`]). Off by default: off, a batch is read
     /// by a person and changes nothing, so a session that misreads a
@@ -53,7 +149,14 @@ pub struct Sessions {
 impl Sessions {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
         ensure!(self.hour_utc < 24, "sessions hourUtc is not 0 to 23");
-        ensure!(!self.issues.is_empty(), "sessions issues names no issue");
+        ensure!(
+            !self.issues.is_empty() || !self.repositories.is_empty(),
+            "sessions issues names no issue; set repositories instead"
+        );
+        ensure!(
+            self.issues.is_empty() || self.repositories.is_empty(),
+            "sessions cannot set both issues and repositories"
+        );
         if let Some(at) = &self.compare_after {
             comparison::activation(at)?;
         }
@@ -66,6 +169,17 @@ impl Sessions {
         let holds = (config.holds.as_ref()).map(|h| ("holds", &h.repository, h.issue));
         let control: Vec<_> = usage.into_iter().chain(holds).collect();
         let mut seen = BTreeSet::new();
+        for repo in &self.repositories {
+            validate_repository(repo).context("sessions repositories")?;
+            ensure!(
+                config.works_in(repo),
+                "sessions repository {repo} is not in a work repository"
+            );
+            ensure!(
+                seen.insert(repo.to_ascii_lowercase()),
+                "sessions repositories name {repo} twice"
+            );
+        }
         for at in &self.issues {
             let issue = IssueRef::parse(at).context("sessions issues")?;
             ensure!(
@@ -96,6 +210,14 @@ impl Sessions {
                 repository: issue.repo,
                 number: issue.number,
             })
+            .collect()
+    }
+
+    pub(super) fn repos(&self) -> Vec<String> {
+        self.repositories
+            .iter()
+            .cloned()
+            .chain(self.anchors().into_iter().map(|a| a.repository))
             .collect()
     }
 
@@ -171,9 +293,24 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let Some(sessions) = self.config.sessions.as_ref() else {
             return (free, 0);
         };
+        if !sessions.issues.is_empty() {
+            self.line(
+                "warning: sessions.issues is deprecated for one release; use sessions.repositories"
+                    .into(),
+            );
+        }
+        let anchors = sessions
+            .anchors()
+            .into_iter()
+            .map(|a| (a.repository.clone(), Some(a)))
+            .chain(
+                sessions
+                    .repositories
+                    .iter()
+                    .map(|repo| (repo.clone(), None)),
+            );
         let mut taken = 0;
-        for anchor in sessions.anchors() {
-            let repo = anchor.repository.clone();
+        for (repo, explicit) in anchors {
             let bounds = self.client.bounds;
             // What is left is a start's: the sessions wait for the next pass.
             if bounds.reserved() {
@@ -181,7 +318,21 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 break;
             }
             let refused = bounds.refused.get();
-            let step = self.session(sessions, &anchor, board, slots, free, context);
+            // Discover and process one repository at a time: listing a large
+            // organization must not spend the reserve before its first start.
+            let step = (|| -> Result<Option<Step>> {
+                let found = match explicit {
+                    Some(found) => Some(found),
+                    None => anchor(&self.client, &repo, self.apply, self.caps)?,
+                };
+                let Some(found) = found else {
+                    self.line(format!(
+                        "session {repo}: would create its {ANCHOR_LABEL} anchor; no session starts"
+                    ));
+                    return Ok(None);
+                };
+                self.session(sessions, &found, board, slots, free, context)
+            })();
             let started = matches!(
                 step,
                 Ok(Some(
@@ -236,7 +387,29 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let config = self.config;
         let repo = anchor.repository.as_str();
         let at = anchor.display();
-        let Some(facts) = board.items.get(&key(anchor)) else {
+        let usage = config
+            .usage
+            .as_ref()
+            .map(|u| ("usage", &u.repository, u.issue));
+        let holds = config
+            .holds
+            .as_ref()
+            .map(|h| ("holds", &h.repository, h.issue));
+        for (role, repository, number) in usage.into_iter().chain(holds) {
+            ensure!(
+                !repository.eq_ignore_ascii_case(repo) || number != anchor.number,
+                "its anchor {at} is the {role} issue"
+            );
+        }
+        let managed;
+        let facts = if sessions.repositories.is_empty() {
+            board.items.get(&key(anchor))
+        } else {
+            managed = self.facts(anchor, board)?;
+            ensure!(managed.open, "its anchor is not open");
+            Some(&managed)
+        };
+        let Some(facts) = facts else {
             self.line(format!(
                 "session {repo}: its issue {at} is not an open issue on the board; no session starts"
             ));
@@ -543,8 +716,142 @@ mod tests {
         Sessions {
             hour_utc,
             issues: vec!["cgwalters-forge/agent-board#830".into()],
+            repositories: vec![],
             apply: false,
             compare_after: None,
+        }
+    }
+
+    #[test]
+    fn anchor_creation_reuse_and_failed_reads() {
+        struct Forge {
+            listing: Value,
+            status: u16,
+            writes: RefCell<Vec<Value>>,
+        }
+        impl Rest for Forge {
+            fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+                Ok(RestResponse {
+                    status: if url.contains("/labels/") {
+                        404
+                    } else {
+                        self.status
+                    },
+                    body: self.listing.clone(),
+                    link: None,
+                    etag: None,
+                    last_modified: None,
+                })
+            }
+            fn send(&self, _: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+                self.writes.borrow_mut().push(body.clone());
+                Ok((
+                    201,
+                    if url.ends_with("/issues") {
+                        json!({"number": 40, "labels": [{"name": ANCHOR_LABEL}]})
+                    } else {
+                        json!({})
+                    },
+                ))
+            }
+        }
+        for (listing, status, apply, writes, ok) in [
+            (json!([]), 200, true, 2, true),
+            (json!([]), 200, false, 0, true),
+            (json!([{"number":40,"state":"open"}]), 200, true, 0, true),
+            (json!([{"number":40},{"number":41}]), 200, true, 0, false),
+            (json!([]), 403, true, 0, false),
+            (json!({}), 200, true, 0, false),
+            (
+                json!([{"number":40,"state":"open","pull_request":{}}]),
+                200,
+                true,
+                0,
+                false,
+            ),
+        ] {
+            let forge = Forge {
+                listing,
+                status,
+                writes: RefCell::default(),
+            };
+            let result = anchor(&forge, "example/work", apply, &Caps::default());
+            assert_eq!(result.is_ok(), ok, "{result:?}");
+            assert_eq!(forge.writes.borrow().len(), writes);
+            if ok && apply {
+                assert_eq!(result.unwrap().unwrap().number, 40);
+            }
+        }
+    }
+
+    #[test]
+    fn anchor_creation_handles_typed_label_errors() {
+        struct Forge {
+            missing: bool,
+            writes: RefCell<Vec<String>>,
+        }
+
+        impl Rest for Forge {
+            fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+                if url.contains("/labels/") {
+                    // GitHub::get returns a contextual typed error, not a 404 response.
+                    return if self.missing {
+                        Err(anyhow::Error::from(crate::github::NotFound)
+                            .context("GET label: GitHub HTTP status 404"))
+                    } else {
+                        Err(anyhow::Error::from(crate::github::AuthenticationRequired)
+                            .context("GET label: GitHub HTTP status 401"))
+                    };
+                }
+                Ok(RestResponse {
+                    status: 200,
+                    body: json!([]),
+                    link: None,
+                    etag: None,
+                    last_modified: None,
+                })
+            }
+
+            fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+                assert_eq!(method, "POST");
+                self.writes.borrow_mut().push(url.to_owned());
+                if url.ends_with("/labels") {
+                    assert_eq!(body["name"], ANCHOR_LABEL);
+                    Ok((201, json!({})))
+                } else {
+                    assert_eq!(body["labels"], json!([ANCHOR_LABEL]));
+                    Ok((
+                        201,
+                        json!({"number": 40, "labels": [{"name": ANCHOR_LABEL}]}),
+                    ))
+                }
+            }
+        }
+
+        for missing in [true, false] {
+            let forge = Forge {
+                missing,
+                writes: RefCell::default(),
+            };
+            let caps = Caps::default();
+            let result = anchor(&forge, "example/work", true, &caps);
+            if missing {
+                assert_eq!(result.unwrap().unwrap().number, 40);
+                assert_eq!(
+                    *forge.writes.borrow(),
+                    [
+                        format!("{API_ROOT}repos/example/work/labels"),
+                        format!("{API_ROOT}repos/example/work/issues"),
+                    ]
+                );
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .is::<crate::github::AuthenticationRequired>()
+                );
+                assert!(forge.writes.borrow().is_empty());
+            }
         }
     }
 

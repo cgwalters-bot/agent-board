@@ -39,8 +39,8 @@ fn window(
         .sessions
         .as_ref()
         .into_iter()
-        .flat_map(Sessions::anchors)
-        .map(|a| (a.repository.to_ascii_lowercase(), Counts::default()))
+        .flat_map(Sessions::repos)
+        .map(|repo| (repo.to_ascii_lowercase(), Counts::default()))
         .collect();
     // GitHub's created range includes both ends, at whole-second precision.
     let range = format!(
@@ -164,8 +164,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let read = |a, b| window(&self.client, self.config, a, b, deadline);
         let before = read(start, at);
         let after = read(at, end);
-        for anchor in sessions.anchors() {
-            let repo = anchor.repository.to_ascii_lowercase();
+        for repo in sessions.repos() {
+            let repo = repo.to_ascii_lowercase();
             let show = |result: &Result<BTreeMap<String, Counts>>| match result {
                 Ok(counts) => counts
                     .get(&repo)

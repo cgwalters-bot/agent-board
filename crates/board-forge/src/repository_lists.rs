@@ -303,6 +303,7 @@ mod tests {
         let mut value = json!({
             "follow": [org, "external/upstream", "CGWALTERS-FORGE/actions"],
             "workRepositories": [org],
+            "sessions": {"repositories": [org]},
             "holds": {"proposals": {"repositories": [org]}},
             "operatorAsk": {"harness": {"repositories": [org]}},
             "budget": {"harnessRepositories": [org]},
@@ -328,6 +329,7 @@ mod tests {
             expected.len() + 1
         );
         for path in [
+            "/sessions/repositories",
             "/holds/proposals/repositories",
             "/operatorAsk/harness/repositories",
             "/budget/harnessRepositories",

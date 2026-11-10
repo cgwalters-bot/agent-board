@@ -2929,8 +2929,11 @@ comment ([Forgejo](forges.md#the-weekly-sweep)):
 With `sessions` set (off unless set), stage 4 starts, before its per-item
 starts, one [session](sessions.md#daily-sessions) run a day on each
 configured repository's anchor issue, from `sessions.hourUtc`
-(agent-board#830). The anchor, `OWNER/REPO#N` in `sessions.issues`, is an
-open issue on the board in a work repository, one per repository; it is
+(agent-board#830). `sessions.repositories` names work repositories (strings
+or organization entries). The pass finds or creates one open issue labelled
+`agent-board-session` in each; duplicate anchors refuse the session and are
+logged. For one release `sessions.issues` still names explicit anchors on
+the board, with a deprecation warning. The anchor is
 left out of the candidates, as the sweep issue is, since its run is the
 session's to start. The day's receipt is the dispatch record on the anchor:
 a session plan recorded at or after the due time means today's started
@@ -2939,7 +2942,7 @@ one recorded before it, or no plan, lets today's start as stage 4 starts a
 triage run, within WIP, `--max-dispatch`, the weekly budget and pacing
 (`start session OWNER/REPO#N pool=P`, its pool drawn from `triagePools`), its
 plan posted as the bot's and recorded by the plan protocol. An anchor off
-the board or with a run in flight starts nothing, in one `session
+the board (legacy `issues` only) or with a run in flight starts nothing, in one `session
 OWNER/REPO: …` line a pass; one whose newest plan is unrecorded, of
 another kind or unusable is held for the operator (`hold OWNER/REPO#N: its
 session plan ID has no dispatch record; …`), which the hold snapshot lists,
@@ -4460,7 +4463,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `forgejoIntake.state` | Forgejo only: opt-in operator issue-comment routing with a separate per-instance cursor file, see [native issue intake](forges.md#native-issue-intake); section absent (off). Caller follow-up: tracker `.github/forgejo-pass.json`, `forgejoIntake: {"state": ".state/forgejo-intake.json"}`, only after #271 prerequisites; not the GitHub pass config |
 | `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs `triage`, either scope; section absent (off) |
 | `sweep.max`, `sweep.repository` | The most issues (1–100) one sweep lists; the work repository its issue is filed in; `40`, `epics.repository` |
-| `sessions.hourUtc`, `sessions.issues` | GitHub only: the hour (0–23 UTC) from which a day's [sessions](sessions.md#daily-sessions) are due, and the anchor issue (`OWNER/REPO#N`, an open issue on the board) of each work repository that gets one session a day, one per repository, see [daily sessions](#daily-sessions); needs `triagePools` or `planPools`; section absent (off) |
+| `sessions.hourUtc`, `sessions.repositories`, `sessions.issues` | GitHub only: the hour (0–23 UTC) from which a day's [sessions](sessions.md#daily-sessions) are due, and work repositories (strings or organization entries); the pass manages each repository's labelled anchor, see [daily sessions](#daily-sessions); needs `triagePools` or `planPools`; section absent (off). Legacy `sessions.issues` remains for one release with a warning; do not combine the keys. |
 | `sessions.apply` | Apply the batch a day's session answers with on its anchor, once, with a receipt there, within the bounds its brief named and `--max-writes`, see [daily sessions](#daily-sessions) and [applying a batch](sessions.md#applying-a-batch); off, a batch is a person's to read; `false` |
 | `sessions.compareAfter` | Optional trusted rollout timestamp, whole-second UTC ending `Z`; log per-repository triage/session dispatch creations in the equal 24-hour windows before and after it, with bounded reads and unknown coverage explicit; see [dispatch comparison](sessions.md#dispatch-comparison); absent (off) |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |

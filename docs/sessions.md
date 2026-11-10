@@ -74,26 +74,41 @@ With `sessions` in the pass's [configuration](pass.md#one-configuration-file)
 names, from `sessions.hourUtc`:
 
 ```json
-"sessions": {"hourUtc": 6, "issues": ["cgwalters-forge/agent-board#830"]}
+"sessions": {"hourUtc": 6, "repositories": [{"org": "cgwalters-forge", "forks": false}]}
 ```
 
-`sessions.issues` names each repository's **anchor issue**, `OWNER/REPO#N`:
-an open issue on the board in a work repository, one per repository, which
-the session's plan is posted on and its batch is answered on. The caller
-names it, not an issue's text, so no filed issue becomes an anchor. The
-section needs `triagePools` or `planPools`, which the session's pool is
-drawn from as a triage run's is.
+`sessions.repositories` names work repositories, as `OWNER/REPO` strings or
+the shared [organization entries](pass.md#one-configuration-file). The pass
+finds each repository's **anchor issue** by the fixed `agent-board-session`
+label among open issues, or creates it with a short explanation on first use.
+It need not already be on the project board. Plans, batches, claims and
+receipts stay there. Labelled anchors are excluded from per-item candidates,
+so they are never planned or triaged as work items.
+
+The concrete risk is choosing between competing ledgers and dispatching twice:
+the listing asks for at most two matches and refuses multiple anchors or an
+incomplete or failed read, logging an error rather than creating or starting.
+Preview reports a missing anchor without creating it. Apply creates its label
+if necessary, then the issue, under the existing pass request/time/write caps.
+Concurrent passes can still create duplicates; the next pass refuses until a
+person leaves exactly one open labelled issue. This adds no independent write
+authority: sessions remain off unless configured and preview remains read-only.
+
+For one release, `sessions.issues` still accepts explicit `OWNER/REPO#N`
+anchors on the board, with a deprecation warning. Do not combine it with
+`repositories`. The section needs `triagePools` or `planPools`, which the
+session's pool is drawn from as a triage run's is.
 
 Each pass, for each anchor in the configured order:
 
-1. An anchor that is not an open issue on the board starts nothing
+1. A legacy explicit anchor that is not an open issue on the board starts nothing
    (`session OWNER/REPO: its issue OWNER/REPO#N is not an open issue on the
    board; no session starts`), as does one with a run in flight (`session
    OWNER/REPO: its run is in flight, URL`).
 2. The anchor's comments are read, up to the plan protocol's page bound
    (ten pages of 100; an anchor gains a plan, a record and a reply a day,
    so after about a year of sessions the read fails, `session OWNER/REPO
-   error: …`, until the caller names a fresh anchor). With a newest plan
+   error: …`, until a person closes it so a fresh anchor can be created). With a newest plan
    there, it must be a `session` plan with a dispatch record. Anything
    else holds the anchor for the operator, a `hold OWNER/REPO#N: …` the
    [hold snapshot](pass.md#what-is-built) lists, since no later pass can
@@ -141,7 +156,7 @@ its run name, `session OWNER/REPO#N (POOL)`.
 
 What this stops: without the section nothing starts; with it, each
 repository costs at most one long run a day, started only on the caller's
-named issue, and only by the pass. A run posts as the bot, so it can
+repository's anchor, and only by the pass. A run posts as the bot, so it can
 forge a plan or a record on the anchor, but only one dated today: that
 suppresses a session, as any plan it leaves there does, and never starts
 one. Nothing the session proposes is applied unless the section also sets
@@ -163,7 +178,7 @@ triages, and hence claiming savings without evidence. `sessions.compareAfter`
 is off unless set. Set it to the actual rollout time from the caller's trusted
 configuration/deployment record, as a whole-second UTC timestamp ending `Z`.
 Never copy a claimed activation date from an issue, plan or session batch.
-It applies to all repositories in `sessions.issues`; use it only for a shared
+It applies to all configured session repositories; use it only for a shared
 rollout boundary. It grants no dispatch or mutation authority and changes no
 triage scheduling, spending caps or credentials.
 
@@ -209,7 +224,7 @@ after today's session started reads the batch answering it and applies it
 once:
 
 ```json
-"sessions": {"hourUtc": 6, "issues": ["cgwalters-forge/agent-board#830"], "apply": true}
+"sessions": {"hourUtc": 6, "repositories": ["cgwalters-forge/agent-board"], "apply": true}
 ```
 
 1. **Which batch.** The newest comment on the anchor holding an
@@ -498,9 +513,9 @@ operator's own words decide, and to post one batch. The pass starts
 accepted session plans only once the caller's pass configuration sets
 `sessionPlans` to `true`, and its own [daily sessions](#daily-sessions)
 only once it has a `sessions` section: in `cgwalters-forge/tracker`'s
-`.github/pass.json`, `"sessions": {"hourUtc": 6, "issues":
-["cgwalters-forge/agent-board#830"]}` gives agent-board one session a day
-from 06:00 UTC, answered on agent-board#830. The pass applies those
+`.github/pass.json`, `"sessions": {"hourUtc": 6, "repositories":
+["cgwalters-forge/agent-board"]}` gives agent-board one session a day
+from 06:00 UTC, answered on its automatically managed anchor. The pass applies those
 batches only once the section also sets `"apply": true`
 ([applying a batch](#applying-a-batch)); until then they are read by a
 person. Once its batches prove themselves, the caller can lower per-item
