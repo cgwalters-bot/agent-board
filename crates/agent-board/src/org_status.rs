@@ -16,11 +16,7 @@ pub struct Status {
 }
 
 pub fn settings(args: &Status, owner: &str) -> Result<Settings> {
-    Settings::from_json(
-        owner,
-        &crate::supervise::read(&args.config)?,
-        args.job_limit,
-    )
+    Settings::from_json(owner, &crate::config::read(&args.config)?, args.job_limit)
 }
 
 /// The report, read with `client`'s token within the pass's bounds;

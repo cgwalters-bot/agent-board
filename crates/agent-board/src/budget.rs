@@ -3,7 +3,6 @@
 use anyhow::{Context, Result, ensure};
 use board_forge::changes::parse_time;
 use board_forge::github::Transport;
-use board_forge::pass::Config;
 use std::{io::Write, path::PathBuf};
 
 #[derive(clap::Args)]
@@ -34,7 +33,8 @@ pub fn run<T: Transport>(
 ) -> Result<()> {
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("read {}", args.config.display()))?;
-    let config = Config::parse(&text).with_context(|| format!("{}", args.config.display()))?;
+    let config =
+        crate::config::pass(&text).with_context(|| format!("{}", args.config.display()))?;
     if args.split || args.four_weeks {
         ensure!(
             config.harness_repositories().is_some(),

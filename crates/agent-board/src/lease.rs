@@ -42,7 +42,7 @@ pub struct Release {
 
 fn config(path: &PathBuf) -> Result<Config> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    Config::parse(&text).with_context(|| format!("{}", path.display()))
+    crate::config::pass(&text).with_context(|| format!("{}", path.display()))
 }
 
 /// Takes a lease with GH_TOKEN, printing what it reaped and `admit POOL/SLOT`;

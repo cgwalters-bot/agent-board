@@ -5,6 +5,7 @@ mod broker;
 mod budget;
 mod ci_health;
 mod cli_docs;
+mod config;
 mod cost;
 mod decisions;
 mod deploy;
@@ -1169,7 +1170,7 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
             };
             let plan = if let Some(path) = config {
-                let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+                let value = crate::config::read(path)?;
                 let settings = board_forge::status::configured(&value)?;
                 if settings.enabled {
                     board_forge::status::plan(

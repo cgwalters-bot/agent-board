@@ -295,7 +295,9 @@ dispatch caller (step 2) and the review caller (step 4); each says so.
    ```
 
    `agent-board pass --config pass.json --check-config` checks the file
-   alone, as a pass would, with no token or forge read; run it in the
+   alone, as a pass would, with no token or forge read for explicit repository
+   lists. Organization entries require bounded live resolution and a read token
+   in a trusted context ([repository sources](pass.md#organization-repository-entries)); run the offline check in the
    caller's pull request CI with the pinned agent-board, so a change the
    pass refuses fails review rather than every pass after merge.
    No `--apply`, no `--record`, no scheduled caller and no dispatch token yet.

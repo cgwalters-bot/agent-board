@@ -1,0 +1,8 @@
+{
+  "operator": "operator",
+  "bot": "bot",
+  "dispatchRepo": "example/dispatch",
+  "dispatchWorkflow": "dispatch.yml",
+  "dispatchRef": "main",
+  "workRepositories": [{"org": "cgwalters-forge", "forks": false}]
+}

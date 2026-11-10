@@ -2930,7 +2930,130 @@ fn pass_replay_previews_without_credentials() {
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
 }
 
-/// `pass --check-config` checks the configuration as a pass would, with no
+#[test]
+fn pass_replay_resolves_organization_sources_without_credentials() {
+    let output = command()
+        .args([
+            "pass",
+            "--config",
+            "fixtures/pass/org-config.json",
+            "--replay",
+            "fixtures/pass/org-repositories.json",
+        ])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("DISPATCH_TOKEN")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("repositories: org cgwalters-forge resolved ["),
+        "{text}"
+    );
+    let resolved = text
+        .lines()
+        .find(|l| l.starts_with("repositories: /workRepositories"))
+        .unwrap();
+    assert!(resolved.contains("cgwalters-forge/agent-board"));
+    assert!(!resolved.contains("cgwalters-forge/bootc"));
+    assert!(text.contains("requests 1"), "{text}");
+    assert!(!text.lines().any(|l| l.starts_with("start ")));
+}
+
+#[test]
+fn organization_sources_preserve_promotion_replay_and_reconcile_config_loading() {
+    let dir = std::env::temp_dir().join(format!("agent-board-org-config-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.json");
+    let replay_path = dir.join("replay.json");
+    let mut config: Value =
+        serde_json::from_str(include_str!("../../../fixtures/promote/config.json")).unwrap();
+    config["budget"] =
+        serde_json::json!({"harnessRepositories":[{"org":"cgwalters-forge","forks":false}]});
+    let mut replay: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/promote/public-2026-11-04.json"
+    ))
+    .unwrap();
+    let org: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/org-repositories.json")).unwrap();
+    replay["requests"]
+        .as_array_mut()
+        .unwrap()
+        .extend(org["requests"].as_array().unwrap().iter().cloned());
+    std::fs::write(&path, config.to_string()).unwrap();
+    std::fs::write(&replay_path, replay.to_string()).unwrap();
+    let output = command()
+        .args(["promote", "--config"])
+        .arg(&path)
+        .arg("--replay")
+        .arg(&replay_path)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("DISPATCH_TOKEN")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("repositories: org cgwalters-forge resolved ["),
+        "{text}"
+    );
+    assert!(
+        text.contains("hold promote cgwalters-forge/composefs-rs#"),
+        "{text}"
+    );
+
+    // A disabled promotion still performs no reads or token lookup.
+    config.as_object_mut().unwrap().remove("promote");
+    std::fs::write(&path, config.to_string()).unwrap();
+    command()
+        .args(["promote", "--config"])
+        .arg(&path)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success()
+        .stdout("promote: off\n");
+
+    // Reconcile must run source validation even with status reconciliation off,
+    // rather than silently accepting an unexpanded organization object.
+    std::fs::write(
+        &path,
+        serde_json::json!({"statusReconcile": {
+            "enabled": false, "runRepositories":[{"org":"team","forks":true}]
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = command()
+        .args([
+            "reconcile",
+            "plan",
+            "--snapshot",
+            "fixtures/board.json",
+            "--config",
+        ])
+        .arg(&path)
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("organization entries require forks: false")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `pass --check-config` checks an explicit configuration as a pass would, with no
 /// token or forge read, and refuses to be mixed with a pass's own options.
 #[test]
 fn pass_check_config_table() {

@@ -31,6 +31,7 @@ pub mod pools;
 pub mod promote;
 pub mod prune;
 pub mod release_train;
+pub mod repository_lists;
 pub mod review;
 pub mod runs;
 pub mod session;

@@ -1,7 +1,6 @@
 //! `agent-board cost` (docs/cost.md): one day's agent spend, read-only.
 use anyhow::{Context, Result, ensure};
 use board_forge::cost::{Reader, parse_date, read_day, report, repositories};
-use board_forge::pass::Config;
 use board_forge::poll::Rest;
 use std::{io::Write, path::PathBuf};
 
@@ -50,7 +49,8 @@ pub fn run<C: Rest>(
 ) -> Result<()> {
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("read {}", args.config.display()))?;
-    let config = Config::parse(&text).with_context(|| format!("{}", args.config.display()))?;
+    let config =
+        crate::config::pass(&text).with_context(|| format!("{}", args.config.display()))?;
     let date = parse_date(&args.date)?;
     ensure!(date <= today, "{} is after today", args.date);
     if let Some(cache) = &args.cache {

@@ -2,7 +2,6 @@
 //! close, read-only.
 use anyhow::{Context, Result};
 use board_forge::github::Transport;
-use board_forge::pass::Config;
 use board_forge::poll::Rest;
 use board_forge::prune::{self, Cache, DEFAULT_STALE_DAYS, PRUNE_REQUEST_LIMIT, STALE_DAYS_LIMIT};
 use std::{io::Write, path::PathBuf};
@@ -34,7 +33,7 @@ pub fn run<C: Rest + Transport>(
     let read = |path: &PathBuf| {
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
     };
-    let config = Config::parse(&read(&args.config)?)
+    let config = crate::config::pass(&read(&args.config)?)
         .with_context(|| format!("{}", args.config.display()))?;
     prune::check(&config, args.stale_days).with_context(|| format!("{}", args.config.display()))?;
     let cache = match &args.cache {
