@@ -66,7 +66,7 @@ pub fn find(transport: &impl Rest, caller: &str, item: &ItemRef, kind: &str) -> 
 /// dispatch.yml names a run `KIND OWNER/REPO#N`, plus ` (POOL)` when a pool is given.
 /// Anything else after the target stays a non-match, so a title cannot claim an item
 /// by merely mentioning it.
-fn title_matches(title: &str, item: &ItemRef, kind: &str) -> bool {
+pub(crate) fn title_matches(title: &str, item: &ItemRef, kind: &str) -> bool {
     let Some((found_kind, repo, number)) = run_title(title) else {
         return false;
     };

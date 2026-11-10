@@ -56,10 +56,13 @@ The first three slices of agent-board#830:
   (agent-board#845).
 - A session's run is counted by [`agent-board cost`](cost.md) under its
   `dispatch-session-agent-run` artifact.
+- The opt-in [dispatch comparison](#dispatch-comparison) logs triage and
+  session counts in equal UTC windows around a trusted rollout timestamp.
 
-Not built yet, in order: a session due early when enough events
-accumulate, rather than daily; and the pass log comparing triage counts
-before and after.
+Not built yet: a session due early when enough events accumulate, rather
+than daily. Live rollout, a first applied batch and an observed before/after
+comparison remain acceptance work in [tracker#1505](https://github.com/cgwalters-forge/tracker/issues/1505)
+and #830; the offline tests are not that evidence.
 Without `sessions.apply`, a session's actions are read by a person. A
 session that also changes files opens a pull request through the ordinary
 `create_pull_request` safe output; the batch carries no file change.
@@ -152,6 +155,52 @@ and `"triagePools": ["claude"]` added to `fixtures/pass/config.json`, plans
 `start session cgwalters-forge/agent-board#40 pool=claude` as its first
 start and no triage of that issue; the CLI test
 `pass_replay_previews_a_daily_session` keeps it so.
+
+## Dispatch comparison
+
+The concrete risk is mistaking planned starts or missing history for fewer
+triages, and hence claiming savings without evidence. `sessions.compareAfter`
+is off unless set. Set it to the actual rollout time from the caller's trusted
+configuration/deployment record, as a whole-second UTC timestamp ending `Z`.
+Never copy a claimed activation date from an issue, plan or session batch.
+It applies to all repositories in `sessions.issues`; use it only for a shared
+rollout boundary. It grants no dispatch or mutation authority and changes no
+triage scheduling, spending caps or credentials.
+
+After both windows have ended, each pass reads the configured dispatch
+workflow's `workflow_dispatch` runs in `[activation - 24h, activation)` and
+`[activation, activation + 24h)`. The pass log names those exact UTC windows
+and counts `triage` and `session` run creations separately for each configured
+repository, case-insensitively. Reruns keep their run ID and original creation
+time and count once; attempts are not new starts. Preview runs may read and
+print this history, but their proposed starts never enter it. These are workflow
+dispatch creations, including failed/cancelled runs, not proof that inference
+started, batches applied, or tokens or dollars were saved. Run titles are
+correlation hints, never authorization.
+
+The two windows share at most six GETs (three pages of 100 each per window)
+and ten seconds, inside the pass's remaining request/time bounds, after holds
+publication. New reads stop at the deadline; an in-flight GET can finish later.
+No unbounded historical scan, artifact download, extra state or write is added.
+A denied, missing, malformed, changing, truncated or over-budget listing is
+`unknown`, independently per window, never zero. An unfinished after window is
+unknown and makes no history reads. An empty **successfully listed** window
+counts zero listed creations only: GitHub may have deleted runs, retention and
+manual renaming cannot be reconstructed, and the pass cannot certify a complete
+historical census. Keep deployment evidence and pass logs for the comparison.
+
+Replay evidence only: `pass_replay_previews_a_daily_session` adds synthetic
+history to the 23 October recording with `compareAfter: "2026-10-22T00:00:00Z"`.
+Its log includes:
+
+```text
+session comparison cgwalters-forge/agent-board: before=[2026-10-21T00:00:00Z,2026-10-22T00:00:00Z) after=[2026-10-22T00:00:00Z,2026-10-23T00:00:00Z) before: triage=1 session=0; after: triage=0 session=1; listed dispatch creations, not inference savings
+```
+
+That is not live rollout or measured savings. Caller: `cgwalters-forge/tracker`,
+`.github/pass.json`, key `sessions.compareAfter`, value the actual rollout's
+UTC timestamp, only once that deployment time is known. Leave it absent until
+then; neither this change nor the replay date enables it in production.
 
 ## Applying a batch
 
