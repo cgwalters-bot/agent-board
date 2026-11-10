@@ -1329,7 +1329,7 @@ fn execute<C: Transport + Rest>(
         } else if let (Action::Attach { issue }, Some("addSubIssue")) =
             (action, mutation["graphql"].as_str())
         {
-            link(client, epic, issue)?;
+            link(client, &epic.id, issue)?;
             record(confirmed, "link", Some(issue.to_string()));
         } else if let (Action::Create { blocked_by, .. }, Some("addBlockedBy")) =
             (action, mutation["graphql"].as_str())
@@ -1348,7 +1348,7 @@ fn execute<C: Transport + Rest>(
             record(confirmed, "blocked_by", None);
         } else if mutation["graphql"] == "addSubIssue" {
             let sub = created.get(&n).context("sub-issue was not created")?;
-            link(client, epic, sub)?;
+            link(client, &epic.id, sub)?;
             record(confirmed, "link", None);
             let value = priorities
                 .get(&(n as usize))
@@ -1377,14 +1377,14 @@ fn execute<C: Transport + Rest>(
     Ok(())
 }
 
-/// Links `sub` to the epic as a sub-issue.
-fn link<T: Transport>(client: &T, epic: &Epic, sub: &IssueRef) -> Result<()> {
-    client.graphql("mutation($issueId: ID!, $subIssueUrl: String!) { addSubIssue(input: {issueId: $issueId, subIssueUrl: $subIssueUrl}) { issue { id } } }", json!({"issueId": epic.id, "subIssueUrl": format!("https://{DEFAULT_HOST}/{}/issues/{}", sub.repo, sub.number)}))?;
+/// Links `sub` to the epic whose node id is `epic` as a sub-issue.
+pub(crate) fn link<T: Transport>(client: &T, epic: &str, sub: &IssueRef) -> Result<()> {
+    client.graphql("mutation($issueId: ID!, $subIssueUrl: String!) { addSubIssue(input: {issueId: $issueId, subIssueUrl: $subIssueUrl}) { issue { id } } }", json!({"issueId": epic, "subIssueUrl": format!("https://{DEFAULT_HOST}/{}/issues/{}", sub.repo, sub.number)}))?;
     Ok(())
 }
 
 /// The node ID of `issue`, which project and dependency mutations take.
-fn node_id<T: Transport>(client: &T, issue: &IssueRef) -> Result<String> {
+pub(crate) fn node_id<T: Transport>(client: &T, issue: &IssueRef) -> Result<String> {
     let (owner, name) = issue.repo.split_once('/').context("issue repository")?;
     let data = client.graphql("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id } } }", json!({"owner": owner, "name": name, "number": issue.number}))?;
     data.pointer("/repository/issue/id")
@@ -1408,27 +1408,43 @@ fn set_priority<T: Transport>(
     value: &str,
     config: &Config,
 ) -> Result<()> {
+    let option = config
+        .priorities
+        .get(value)
+        .context("unconfigured Priority")?;
+    set_option(
+        client,
+        issue,
+        (&config.project, &config.priority_field_id, option),
+    )
+}
+
+/// [`set_priority`] by ids: puts `issue` on the project `project`, where
+/// it may be already, and sets its single-select field `field` to
+/// `option`. Shared with the session batch applier
+/// ([`crate::session_apply`]).
+pub(crate) fn set_option<T: Transport>(
+    client: &T,
+    issue: &IssueRef,
+    (project, field, option): (&str, &str, &str),
+) -> Result<()> {
     let content = node_id(client, issue).context("priority target")?;
-    let added = client.graphql("mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } } }", json!({"project": config.project, "content": content}));
+    let added = client.graphql("mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } } }", json!({"project": project, "content": content}));
     let item = match added {
         Ok(data) => data
             .pointer("/addProjectV2ItemById/item/id")
             .and_then(Value::as_str)
             .map(str::to_owned)
             .context("project membership has no id")?,
-        Err(error) if already_member(&error) => existing_item(client, issue, config)?,
+        Err(error) if already_member(&error) => existing_item(client, issue, project)?,
         Err(error) => return Err(error),
     };
-    let option = config
-        .priorities
-        .get(value)
-        .context("unconfigured Priority")?;
-    client.graphql("mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) { updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $option}}) { projectV2Item { id } } }", json!({"project": config.project, "item": item, "field": config.priority_field_id, "option": option}))?;
+    client.graphql("mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) { updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $option}}) { projectV2Item { id } } }", json!({"project": project, "item": item, "field": field, "option": option}))?;
     Ok(())
 }
 
-/// The item of `issue` on the configured project, which GitHub said holds it.
-fn existing_item<T: Transport>(client: &T, issue: &IssueRef, config: &Config) -> Result<String> {
+/// The item of `issue` on the project `project`, which GitHub said holds it.
+fn existing_item<T: Transport>(client: &T, issue: &IssueRef, project: &str) -> Result<String> {
     let (owner, name) = issue.repo.split_once('/').context("issue repository")?;
     let data = client.graphql("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { projectItems(first: 100) { nodes { id project { id } } pageInfo { hasNextPage } } } } }", json!({"owner": owner, "name": name, "number": issue.number}))?;
     let items = data
@@ -1436,7 +1452,7 @@ fn existing_item<T: Transport>(client: &T, issue: &IssueRef, config: &Config) ->
         .with_context(|| format!("{issue} is not an issue"))?;
     let nodes = items["nodes"].as_array().context("missing project items")?;
     let members: Vec<_> = (nodes.iter())
-        .filter(|node| node["project"]["id"].as_str() == Some(config.project.as_str()))
+        .filter(|node| node["project"]["id"].as_str() == Some(project))
         .collect();
     // An item past the first page would be unknown, as in `GitHub::issue_item`.
     match members[..] {

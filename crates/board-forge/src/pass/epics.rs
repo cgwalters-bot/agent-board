@@ -15,6 +15,7 @@ use crate::epic_apply::{self, Outcome, Preconditions, Receipt};
 use crate::plan::{
     Comment, DISPATCH_MARKER, PLAN_FENCE, fenced_json, has_fence, newest_fenced, no_fenced, plan_id,
 };
+use crate::session_apply;
 
 /// Open epics listed a request. Each brings its labels and board items, so
 /// the page is kept small; its sub-issues are read apart ([`SUBS_PER_PAGE`]).
@@ -186,6 +187,19 @@ pub(super) struct Project {
     field: String,
     /// Option id and name, in board order: the last is the lowest Priority.
     options: Vec<(String, String)>,
+}
+
+impl Project {
+    /// The ids a session batch's `set_priority` writes by.
+    pub(super) fn priorities(&self) -> session_apply::Priorities {
+        session_apply::Priorities {
+            project: self.id.clone(),
+            field: self.field.clone(),
+            options: (self.options.iter())
+                .map(|(id, name)| (name.clone(), id.clone()))
+                .collect(),
+        }
+    }
 }
 
 /// An open epic as this stage reads it.
@@ -1662,7 +1676,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// The board's ids.
-    fn project(&self, board: &Board) -> Result<Project> {
+    pub(super) fn project(&self, board: &Board) -> Result<Project> {
         let data = self.client.graphql(
             PROJECT_QUERY,
             json!({"owner": board.owner, "number": board.project, "field": board.priority_field}),

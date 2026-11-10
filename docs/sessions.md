@@ -24,7 +24,7 @@ newly filed items and operator mentions.
 
 ## What is built
 
-The first two slices of agent-board#830:
+The first three slices of agent-board#830:
 
 - `session` is a [job plan](job-plans.md) kind. A session plan names the
   issue it reports on, an open issue of the repository it triages, such as
@@ -50,14 +50,17 @@ The first two slices of agent-board#830:
 - The batch format below, its [schema](session-batch.schema.json), and
   `agent-board check session-batch`, which validates a candidate comment
   offline against bounds given as flags and prints the typed actions.
+- [Applying a batch](#applying-a-batch): with `sessions.apply`, off by
+  default, the pass applies the batch a daily session answers with, once,
+  with a receipt on the anchor as [epic apply](epic-plans.md) leaves one
+  (agent-board#845).
 - A session's run is counted by [`agent-board cost`](cost.md) under its
   `dispatch-session-agent-run` artifact.
 
-Not built yet, in order: applying an accepted batch once, with a receipt on
-its item as [epic apply](epic-plans.md) leaves one; a session due early
-when enough events accumulate, rather than daily; and the pass log
-comparing triage counts before and after.
-Until a batch is applied, a session's actions are read by a person. A
+Not built yet, in order: a session due early when enough events
+accumulate, rather than daily; and the pass log comparing triage counts
+before and after.
+Without `sessions.apply`, a session's actions are read by a person. A
 session that also changes files opens a pull request through the ordinary
 `create_pull_request` safe output; the batch carries no file change.
 
@@ -138,8 +141,9 @@ repository costs at most one long run a day, started only on the caller's
 named issue, and only by the pass. A run posts as the bot, so it can
 forge a plan or a record on the anchor, but only one dated today: that
 suppresses a session, as any plan it leaves there does, and never starts
-one. Nothing the session proposes is applied by the pass yet; its batch
-is read by a person.
+one. Nothing the session proposes is applied unless the section also sets
+`apply` ([below](#applying-a-batch)); without it, its batch is read by a
+person.
 
 A dry run from the recorded board of 2026-10-23
 ([replay](pass.md#replay-and-release-gate)), with
@@ -148,6 +152,150 @@ and `"triagePools": ["claude"]` added to `fixtures/pass/config.json`, plans
 `start session cgwalters-forge/agent-board#40 pool=claude` as its first
 start and no triage of that issue; the CLI test
 `pass_replay_previews_a_daily_session` keeps it so.
+
+## Applying a batch
+
+With `"apply": true` in the `sessions` section (off unless set), each pass
+after today's session started reads the batch answering it and applies it
+once:
+
+```json
+"sessions": {"hourUtc": 6, "issues": ["cgwalters-forge/agent-board#830"], "apply": true}
+```
+
+1. **Which batch.** The newest comment on the anchor holding an
+   `agent-board-session` block, written by the bot (a session run posts as
+   the bot) or the operator and, if edited, edited by one of them, whose
+   comment id is after the day's dispatch record. Anyone else's comment is
+   no batch, and a writer's comment edited by anyone else holds the anchor
+   for the operator, as such a comment holds a plan. A batch before the
+   record answered an earlier plan and is not applied; so a batch left
+   unapplied when the next day's session starts is a person's to read.
+   One batch is applied a day, the day being the configured `hourUtc`'s:
+   once a receipt posted since the day's due time exists, whichever
+   record it follows, a newer or edited batch (a new id) is held for the
+   operator (`batch ID is not applied: URL claims batch ID2 for today
+   already; …`) rather than spending the caps again. The receipts counted
+   are the day's, not those after the record, because a run posting as
+   the bot can post a new session plan, a record and a batch on the
+   anchor the same day; it cannot move the due time.
+2. **Bounds.** The batch is checked as [`check session-batch`](#check)
+   checks it, against the [bounds](#bounds) the brief named, read from
+   the caller's configuration and the board, never from the batch; its
+   `repo` must be the anchor's repository; and no action may name the
+   anchor itself, the session's own issue, whose close, new body or plan
+   would take it from the pass's sessions. A refused batch holds the
+   anchor (`hold OWNER/REPO#N: batch ID is refused: …; a person reads
+   it`), which the hold snapshot lists, until the next session's record
+   supersedes it: a session cannot stop its repository's sessions for good
+   by posting a malformed batch, and a person sees every refusal.
+3. **Receipt first.** The pass posts the receipt on the anchor as the
+   claim before any write, reads the anchor's comments back, and writes
+   nothing if the batch changed, if an earlier claim of the day exists
+   (two passes racing: the oldest wins), or if the claim did not land as
+   the bot's or the operator's. It then resolves every issue the actions
+   name as a GitHub issue: the REST paths a close, a new body or a
+   comment take address pull requests by the same numbers, so a number
+   that is a pull request's, or no issue, or that GitHub resolves to
+   another issue than named, stops the apply with nothing written. Then
+   it makes each action's writes in the batch's order and updates the
+   receipt with what was confirmed. A batch with a receipt is never
+   applied again: later passes say `session OWNER/REPO: batch ID was
+   applied at T, URL`. Deleting the receipt would allow a replay, as
+   deleting a dispatch record would; that is repository write access.
+4. **Partial failure.** The apply stops at the first failed request and
+   keeps the claim; the receipt says `Stopped applying …` and lists what
+   was confirmed, and the pass line says `apply session … failed: …`.
+   Later passes hold the anchor for the operator (`the apply of batch ID
+   was stopped after a failed request; it is never replayed: a person
+   inspects URL`) rather than replay it; so does a receipt posted since
+   the day's due time by the bot or the operator that cannot be read, or
+   that anyone else edited, since it may claim any batch of the day.
+   Earlier days' receipts are their own sessions', so each hold here lasts
+   until the next session's record; and a writer's comment on the anchor
+   that anyone else edited, which holds the anchor as it holds a plan, is
+   weighed only while its edit is from today's due time on, so that hold
+   too ends when the next day's session starts over it. No rollback is
+   attempted.
+5. **Caps.** The apply is one write step for the receipt and one for
+   each writing action, taken whole or held whole by `--max-writes`
+   (`held by --max-writes: apply session …`); a preview says what it
+   would do under `apply session OWNER/REPO batch=ID: …` and writes
+   nothing, counting the same steps. It waits where another pass is in
+   progress or the pass's requests are nearly spent.
+
+What each action writes, as the bot: `close_issue` comments the reason
+and closes the issue as not planned; `rescope_issue` replaces the body
+and comments the reason; `set_priority` puts the issue on the board,
+where it may be already, and sets its Priority by the board's option id;
+`attach_to_epic` links the issue as a sub-issue of the epic;
+`post_plan` posts the job plan on its issue, which the pass then starts
+as any plan of the bot's; `ask_operator` writes nothing of its own: the
+receipt lists each question for the operator under `Questions for
+@OPERATOR`. A reason or plan comment ends with `From [this session
+batch](URL)`, so each change traces to the batch that asked for it.
+
+The receipt is one comment on the anchor, readable first, then one fenced
+`agent-board-session-apply` block with the machine detail:
+
+````markdown
+Applied [this session batch](https://github.com/OWNER/REPO/issues/40#issuecomment-11) at 2026-10-23T15:03:00Z.
+
+- Closed OWNER/REPO#701 as not planned
+- Set OWNER/REPO#691 to P1
+- Asked a question (budget), below
+
+Questions for @OPERATOR:
+- (budget) May the claude pool's burst rise to 120 while sessions run daily?
+
+```agent-board-session-apply
+{
+  "schema": "agent-board/session-apply/v1",
+  "batch": "11@2026-10-23T06:30:00Z",
+  "outcome": "applied",
+  "actions": [
+    {"action": 1, "type": "close_issue", "issue": "OWNER/REPO#701", "writes": ["comment", "patch"]},
+    {"action": 2, "type": "set_priority", "issue": "OWNER/REPO#691", "detail": "P1", "writes": ["priority"]},
+    {"action": 3, "type": "ask_operator", "detail": "budget", "writes": ["receipt"]}
+  ]
+}
+```
+````
+
+`batch` is the batch comment's id and last change time, as a plan's id;
+`outcome` is `claimed` (under way, or cut short before it could say),
+`applied` or `stopped`; each action's `writes` names the requests
+confirmed (`comment`, `patch`, `priority`, `link`, or `receipt` for a
+question), so a stopped apply shows how far it got. Unknown fields are
+ignored, so a later build's receipts still claim.
+
+What this stops: off, nothing a session writes changes any issue. On, a
+session changes only what its bounded batch names, in the configured
+repositories, within the caps on each kind of action, once a day; a batch
+posted twice is applied once (only the newest after the record counts),
+a day with a receipt applies no second batch however many plans and
+records a run posts as the bot, a refused batch is never applied, only
+issues are written to (each is resolved as one before the first write,
+so a pull request's number closes or rewrites nothing), and a run cannot
+have the pass write where the caller did not allow, since the bounds come
+from the configuration; and the receipt and every comment are written
+under the bot's own login, which the batch's text checks keep from
+carrying a plan, a record or a receipt.
+
+Evidence that an accepted batch applies once: the pass test
+`sessions_apply_an_accepted_batch_once` applies a batch of one action of
+each writing kind on the recorded board, checks the claim is the first
+write and the receipt's update the last, runs two more applying passes
+and a preview over the same forge, and sees the receipt read and no write
+made again; `sessions_apply_one_batch_a_day_whatever_the_record` then
+posts a second session plan, record and batch as the bot the same day
+and sees the new batch held on the day's receipt;
+`sessions_stop_a_batch_naming_a_pull_request_before_any_write` sees a
+batch naming a pull request's number claimed and stopped with no action
+written; `session_apply`'s unit tests cover an earlier claim winning, a
+claim that did not land as a claimer's, a pull request named by each
+kind of action, and an apply stopped by a failed request with its claim
+kept.
 
 ## Format
 
@@ -173,11 +321,12 @@ a line, holding one JSON object:
 ````
 
 `repo` is the repository the session ran on, `OWNER/NAME`, in the
-configured repositories; an applier checks it against the item the batch is
-on. Each action names an issue as `OWNER/REPO#N`, in `repo` itself, so a
-session on one repository cannot triage every configured one; only an
-`epic` may be in another configured repository, as epics live in the
-tracker. Each action is one of:
+configured repositories; the [apply](#applying-a-batch) checks it against
+the anchor the batch is on. Each action names an issue as `OWNER/REPO#N`,
+in `repo` itself, so a session on one repository cannot triage every
+configured one; only an `epic` may be in another configured repository,
+as epics live in the tracker; and the apply refuses an action on the
+anchor itself. Each action is one of:
 
 | `type` | Fields | What an applier would do | Most in one batch |
 |---|---|---|---|
@@ -221,7 +370,7 @@ validator accepts is not yet accepted.
 
 The bounds come from the caller's configuration, never from a batch or a
 dispatcher's inputs; empty bounds allow nothing. The offline check takes
-them as flags; the applier of a later slice is meant to read them from the
+them as flags; the pass's [apply](#applying-a-batch) reads them from the
 sources named here:
 
 | Bound | Meant to come from | Checked |
@@ -268,6 +417,8 @@ accepted session plans only once the caller's pass configuration sets
 only once it has a `sessions` section: in `cgwalters-forge/tracker`'s
 `.github/pass.json`, `"sessions": {"hourUtc": 6, "issues":
 ["cgwalters-forge/agent-board#830"]}` gives agent-board one session a day
-from 06:00 UTC, answered on agent-board#830. Once its batches prove
-themselves, the caller can lower per-item triage there: raise
-`triageFollowUpDays` and leave `idleReplan` off.
+from 06:00 UTC, answered on agent-board#830. The pass applies those
+batches only once the section also sets `"apply": true`
+([applying a batch](#applying-a-batch)); until then they are read by a
+person. Once its batches prove themselves, the caller can lower per-item
+triage there: raise `triageFollowUpDays` and leave `idleReplan` off.

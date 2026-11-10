@@ -406,8 +406,6 @@ pub(crate) fn newest_fenced<'a>(
     for writer in writers {
         ensure!(is_github_login(writer), "invalid login {writer:?}");
     }
-    let foreign_edit =
-        |c: &Comment| (c.edited || c.editor.is_some()) && !trusted(writers, &c.editor);
     let newest = comments
         .iter()
         .filter(|c| weighed(c, writers, fence))
@@ -415,7 +413,7 @@ pub(crate) fn newest_fenced<'a>(
         .max_by_key(|c| c.changed)
         .with_context(|| format!("no plan on this issue from an accepted writer ({fence})"))?;
     ensure!(
-        !foreign_edit(newest),
+        !foreign_edit(newest, writers),
         "newest plan {} was last edited by {}, who may not write plans",
         newest.url,
         newest
@@ -446,8 +444,14 @@ pub(crate) fn written_by(comment: &Comment, login: &str) -> bool {
 /// block, or one edited by anyone else. An edit counts as a writer's only
 /// when GitHub names a writer as its editor.
 fn weighed(c: &Comment, writers: &[&str], fence: &str) -> bool {
-    let foreign_edit = (c.edited || c.editor.is_some()) && !trusted(writers, &c.editor);
-    trusted(writers, &c.author) && (has_fence(&c.body, fence) || foreign_edit)
+    trusted(writers, &c.author) && (has_fence(&c.body, fence) || foreign_edit(c, writers))
+}
+
+/// Whether `c` was edited by anyone but a writer: an edit GitHub names
+/// no writer as the editor of, so a plan or a record it holds is not
+/// its author's word any more.
+pub(crate) fn foreign_edit(c: &Comment, writers: &[&str]) -> bool {
+    (c.edited || c.editor.is_some()) && !trusted(writers, &c.editor)
 }
 
 /// Whether no comment holds a plan for [`newest_plan`] to weigh, as against

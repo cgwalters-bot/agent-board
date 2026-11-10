@@ -11,6 +11,19 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Session batches applied, the third slice of agent-board#830
+  (agent-board#845): with `"apply": true` in the pass configuration's
+  `sessions` section (off by default), each pass after a day's session
+  started applies the batch answering it once a day, within the bounds
+  its brief named and `--max-writes`, posting the receipt on the anchor
+  as the claim before any write, resolving each issue named as an issue
+  (never a pull request) before the first write, and applying no second
+  batch on a day with a receipt; a refused batch, a cut-short apply or an
+  unreadable receipt holds the anchor for the operator until the next
+  session. Closes, rescopes, Priorities, epic links and posted plans are
+  written as the bot; questions are listed on the receipt for the
+  operator (docs/sessions.md#applying-a-batch).
+
 - Daily sessions, the second slice of agent-board#830: with the pass
   configuration's `sessions` section (`hourUtc` and the anchor issue of
   each work repository that gets one, off by default), stage 4 starts one
@@ -19,8 +32,7 @@ Since the workspace started at 0.1.0 it has gained:
   naming the caller's bounds and the offline batch check; the dispatch
   record on the anchor is the day's receipt, the anchor is no candidate
   of its own, and a session run in flight now counts as a dispatch run
-  (docs/sessions.md#daily-sessions). Nothing a session proposes is applied
-  yet.
+  (docs/sessions.md#daily-sessions).
 
 - A `session` job plan kind, the first slice of triage per repository in
   one long run instead of many one-comment item triages (agent-board#830,

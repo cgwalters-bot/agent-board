@@ -2664,6 +2664,9 @@ pub(super) struct Forge {
     /// read-back.
     rival: Option<Value>,
     chain_reads: RefCell<Vec<Vec<String>>>,
+    /// The numbers in any repository that are pull requests, which a
+    /// session batch's apply resolves to no issue ([`session_apply`]).
+    pulls: Vec<u64>,
 }
 
 /// The workflow run an applying pass runs in, a run of workflow 77.
@@ -2707,6 +2710,7 @@ impl Forge {
             refuse: RefCell::new(None),
             rival: None,
             chain_reads: RefCell::new(Vec::new()),
+            pulls: vec![],
         }
     }
 
@@ -3031,6 +3035,42 @@ impl Transport for Forge {
                 data.insert(format!("i{n}"), json!({"issueOrPullRequest": node}));
             }
             return Ok(Value::Object(data));
+        }
+        // The board's ids and the writes a session batch's apply makes by
+        // them ([`session_apply`]), kept as `GRAPHQL` writes.
+        if query.contains("fragment Project on ProjectV2") {
+            return Ok(json!({"repositoryOwner": {"projectV2": {"id": "PVT_board",
+                "field": {"id": "F_priority", "options": [
+                    {"id": "O_p0", "name": "P0"}, {"id": "O_p1", "name": "P1"}, {"id": "O_p2", "name": "P2"}]}}}}));
+        }
+        if query.contains("issue(number: $number) { id } }") {
+            return Ok(
+                json!({"repository": {"issue": {"id": format!("I_{}", variables["number"])}}}),
+            );
+        }
+        if query == crate::session_apply::IDENTITY_QUERY {
+            let number = variables["number"].as_u64().unwrap();
+            let issue = match self.pulls.contains(&number) {
+                true => Value::Null,
+                false => json!({"number": number, "repository": {"nameWithOwner":
+                    format!("{}/{}", text(&variables, "/owner"), text(&variables, "/name"))}}),
+            };
+            return Ok(json!({"repository": {"issue": issue}}));
+        }
+        if let Some(name) = [
+            "addSubIssue",
+            "addProjectV2ItemById",
+            "updateProjectV2ItemFieldValue",
+        ]
+        .into_iter()
+        .find(|m| query.contains(m))
+        {
+            self.writes
+                .borrow_mut()
+                .push(("GRAPHQL".into(), name.into(), variables));
+            return Ok(json!({"addProjectV2ItemById": {"item": {"id": "PVTI_new"}},
+                "updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTI_new"}},
+                "addSubIssue": {"issue": {"id": "I_epic"}}}));
         }
         if query.contains(needs::epics::CHAIN_FIELDS) {
             let mut data = json!({});
@@ -19162,32 +19202,58 @@ fn sessions_wait_on_the_anchors_plan_or_a_person() {
     let recorded_today = "session cgwalters-forge/agent-board: today's started at 2026-10-23T06:00:00Z, https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-10; the next is due from 2026-10-24T00:00:00Z";
     let unrecorded = "hold cgwalters-forge/agent-board#40: its session plan 9@2026-10-22T06:00:00Z has no dispatch record; a person dispatches it by hand or removes it, and its session waits";
     let other_kind = "hold cgwalters-forge/agent-board#40: its newest plan 9@2026-10-22T06:00:00Z is for implement, not a session; a person moves it, and its session waits";
-    for (name, plan, want) in [
+    // A writer's comment anyone else edited holds the anchor as a plan
+    // would, until the next due time: a receipt a visitor edited today
+    // holds today's session; one edited yesterday is yesterday's, and
+    // today's session starts over it rather than waiting for good.
+    let edited_today = "hold cgwalters-forge/agent-board#40: its newest plan cannot be used: newest plan https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-11 was last edited by visitor, who may not write plans; a person replaces it, or the next day's session supersedes it";
+    for (name, plan, receipt, want) in [
         (
             "recorded yesterday",
             Some(("session", "cgwalters-bot", Some("2026-10-22T06:05:00Z"))),
+            None,
             SESSION_START,
         ),
         (
             "recorded today",
             Some(("session", "cgwalters-bot", Some("2026-10-23T06:00:00Z"))),
+            None,
             recorded_today,
         ),
         (
             "the operator's, unrecorded",
             Some(("session", "cgwalters", None)),
+            None,
             unrecorded,
         ),
         (
             "another kind",
             Some(("implement", "cgwalters", None)),
+            None,
             other_kind,
         ),
-        ("no plan", None, SESSION_START),
+        ("no plan", None, None, SESSION_START),
+        (
+            "a receipt a visitor edited yesterday",
+            Some(("session", "cgwalters-bot", Some("2026-10-22T06:05:00Z"))),
+            Some(("2026-10-22T07:00:00Z", "2026-10-22T07:30:00Z")),
+            SESSION_START,
+        ),
+        (
+            "a receipt a visitor edited today",
+            Some(("session", "cgwalters-bot", Some("2026-10-23T06:00:00Z"))),
+            Some(("2026-10-23T06:40:00Z", "2026-10-23T07:00:00Z")),
+            edited_today,
+        ),
     ] {
         let mut forge = Forge::new(None, false);
         if let Some((kind, author, recorded)) = plan {
             anchor_plan(&mut forge.replay, kind, author, recorded);
+        }
+        if let Some(when) = receipt {
+            let body = receipt_body("8@2026-10-22T06:30:00Z");
+            let by = ("cgwalters-bot", Some("visitor"));
+            anchor_comment(&mut forge.replay, 11, by, when, &body);
         }
         let report = preview(&config(session_settings()), &forge.replay);
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
@@ -19334,6 +19400,510 @@ fn sessions_config_table() {
         got.contains("sessions issue cgwalters-forge/agent-board#830 is the usage issue"),
         "{got}"
     );
+}
+
+/// Comment `id` on agent-board#40 by `author`, posted at `created` and,
+/// with an `editor`, last edited by them at `edited`.
+fn anchor_comment(
+    replay: &mut Replay,
+    id: u64,
+    (author, editor): (&str, Option<&str>),
+    (created, edited): (&str, &str),
+    body: &str,
+) {
+    let comments = &mut answer(replay, r#""name":"agent-board","number":40"#)["data"]["repository"]
+        ["issue"]["comments"]["nodes"];
+    comments.as_array_mut().unwrap().push(json!({
+        "url": format!("https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-{id}"),
+        "body": body, "createdAt": created,
+        "lastEditedAt": editor.map(|_| edited),
+        "author": {"login": author}, "editor": editor.map(|login| json!({"login": login})),
+    }));
+}
+
+/// The body of a session batch of `actions` on agent-board.
+fn batch_body(actions: Value) -> String {
+    let batch = json!({"schema": crate::session::SESSION_BATCH_SCHEMA,
+        "repo": "cgwalters-forge/agent-board", "actions": actions});
+    format!(
+        "Session summary.\n\n```{}\n{batch}\n```\n",
+        crate::session::SESSION_FENCE
+    )
+}
+
+/// A session batch comment on agent-board#40, comment 11 of 06:30 today,
+/// after the day's record ([`anchor_plan`] with a record of today).
+fn anchor_batch(replay: &mut Replay, author: &str, editor: Option<&str>, actions: Value) {
+    let body = batch_body(actions);
+    let when = ("2026-10-23T06:30:00Z", "2026-10-23T06:35:00Z");
+    anchor_comment(replay, 11, (author, editor), when, &body);
+}
+
+/// The body of an applied receipt claiming `batch`, with no actions.
+fn receipt_body(batch: &str) -> String {
+    format!(
+        "Applied [this session batch](https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-11) at 2026-10-23T06:40:00Z.\n\n```{}\n{{\"schema\": \"{}\", \"batch\": \"{batch}\", \"outcome\": \"applied\", \"actions\": []}}\n```\n",
+        crate::session_apply::APPLY_FENCE,
+        crate::session_apply::RECEIPT_SCHEMA
+    )
+}
+
+/// One action of each writing kind on agent-board issues, the epic in the
+/// tracker: what the recording's bounds allow.
+fn batch_actions() -> Value {
+    json!([
+        {"type": "close_issue", "issue": "cgwalters-forge/agent-board#701", "reason": "Done by #788."},
+        {"type": "rescope_issue", "issue": "cgwalters-forge/agent-board#683", "body": "One page.", "reason": "Narrowed."},
+        {"type": "set_priority", "issue": "cgwalters-forge/agent-board#691", "value": "P1"},
+        {"type": "attach_to_epic", "issue": "cgwalters-forge/agent-board#703", "epic": "cgwalters-forge/tracker#1356"},
+        {"type": "post_plan", "issue": "cgwalters-forge/agent-board#830", "plan": {
+            "schema": JOB_PLAN_SCHEMA, "kind": "implement", "runner": "hosted", "brief": "Apply the batch."}}
+    ])
+}
+
+const BATCH_ID: &str = "11@2026-10-23T06:30:00Z";
+const APPLIED: &str = "Closed cgwalters-forge/agent-board#701 as not planned; Rescoped cgwalters-forge/agent-board#683; Set cgwalters-forge/agent-board#691 to P1; Attached cgwalters-forge/agent-board#703 to cgwalters-forge/tracker#1356; Posted a plan (implement) on cgwalters-forge/agent-board#830";
+
+/// The write steps a pass's summary counts (`writes N` or `writes N/M`).
+fn planned_writes(report: &Report) -> usize {
+    let (_, after) = report.summary.split_once("writes ").unwrap();
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().unwrap()
+}
+
+/// The writes a pass made to the anchor, the batch's issues or by
+/// GraphQL, as `METHOD path` or `GRAPHQL mutation`; not its item starts.
+fn session_writes(forge: &Forge) -> Vec<String> {
+    let targets = ["40", "701", "683", "691", "703", "830"];
+    let receipt = format!("```{}\n", crate::session_apply::APPLY_FENCE);
+    (forge.writes.borrow().iter())
+        .filter(|(method, url, body)| {
+            let issue = (url.strip_prefix(&format!(
+                "{API_ROOT}repos/cgwalters-forge/agent-board/issues/"
+            )))
+            .and_then(|rest| rest.split('/').next());
+            method == "GRAPHQL"
+                || issue.is_some_and(|n| targets.contains(&n))
+                || (issue == Some("comments")
+                    && body["body"].as_str().is_some_and(|b| b.contains(&receipt)))
+        })
+        .map(|(method, url, _)| format!("{method} {}", url.trim_start_matches(API_ROOT)))
+        .collect()
+}
+
+/// A session's batch (agent-board#845), posted as the bot after today's
+/// record: without `sessions.apply` it is a person's to read; with it, a
+/// preview says what the apply would do and counts its write steps, an
+/// apply claims it with a receipt on the anchor before writing, makes each
+/// action's writes, and the next pass reads the receipt and writes
+/// nothing more, however often it runs.
+#[test]
+fn sessions_apply_an_accepted_batch_once() {
+    let mut forge = Forge::new(None, false);
+    anchor_plan(
+        &mut forge.replay,
+        "session",
+        "cgwalters-bot",
+        Some("2026-10-23T06:00:00Z"),
+    );
+    anchor_batch(&mut forge.replay, "cgwalters-bot", None, batch_actions());
+    let today = "session cgwalters-forge/agent-board: today's started at 2026-10-23T06:00:00Z, https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-10; the next is due from 2026-10-24T00:00:00Z";
+    let report = preview(&config(session_settings()), &forge.replay);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        session_lines(&report),
+        [
+            today,
+            &format!(
+                "session cgwalters-forge/agent-board: batch {BATCH_ID} is a person's to read; sessions.apply is off"
+            )
+        ]
+    );
+    let unapplied = planned_writes(&report);
+
+    let mut settings = session_settings();
+    settings["sessions"]["apply"] = json!(true);
+    let report = preview(&config(settings.clone()), &forge.replay);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let planned = format!(
+        "apply session cgwalters-forge/agent-board batch={BATCH_ID}: Close cgwalters-forge/agent-board#701 as not planned; Rescope cgwalters-forge/agent-board#683; Set cgwalters-forge/agent-board#691 to P1; Attach cgwalters-forge/agent-board#703 to cgwalters-forge/tracker#1356; Post a plan (implement) on cgwalters-forge/agent-board#830"
+    );
+    assert!(report.lines.contains(&planned), "{:#?}", report.lines);
+    // The receipt and five writing actions, taken whole or held whole.
+    assert_eq!(planned_writes(&report), unapplied + 6, "{}", report.summary);
+    let limits = Limits {
+        writes: Some(5),
+        ..Limits::default()
+    };
+    let report = apply_limited(&forge, &config(settings.clone()), limits);
+    assert!(
+        report
+            .lines
+            .contains(&format!("held by --max-writes: {planned}")),
+        "{:#?}",
+        report.lines
+    );
+    assert!(
+        session_writes(&forge).is_empty(),
+        "{:#?}",
+        session_writes(&forge)
+    );
+
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let applied = (report.lines.iter())
+        .find(|l| l.starts_with("apply session cgwalters-forge/agent-board"))
+        .unwrap();
+    let receipt_url = "https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-";
+    let (done, receipt) = applied.rsplit_once(" receipt=").unwrap();
+    assert_eq!(
+        done,
+        format!("apply session cgwalters-forge/agent-board batch={BATCH_ID}: {APPLIED}")
+    );
+    assert!(receipt.starts_with(receipt_url), "{applied}");
+    // The claim first, then each action's writes, then the receipt's update.
+    assert_eq!(
+        session_writes(&forge),
+        [
+            "POST repos/cgwalters-forge/agent-board/issues/40/comments",
+            "POST repos/cgwalters-forge/agent-board/issues/701/comments",
+            "PATCH repos/cgwalters-forge/agent-board/issues/701",
+            "PATCH repos/cgwalters-forge/agent-board/issues/683",
+            "POST repos/cgwalters-forge/agent-board/issues/683/comments",
+            "GRAPHQL addProjectV2ItemById",
+            "GRAPHQL updateProjectV2ItemFieldValue",
+            "GRAPHQL addSubIssue",
+            "POST repos/cgwalters-forge/agent-board/issues/830/comments",
+            &format!(
+                "PATCH repos/cgwalters-forge/agent-board/issues/comments/{}",
+                receipt.rsplit('-').next().unwrap()
+            ),
+        ]
+    );
+    {
+        let writes = forge.writes.borrow();
+        let find = |method: &str, name: &str| {
+            (writes.iter())
+                .find(|(m, u, _)| m == method && u.ends_with(name))
+                .map(|(.., body)| body.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            find("PATCH", "/issues/701"),
+            json!({"state": "closed", "state_reason": "not_planned"})
+        );
+        assert_eq!(find("PATCH", "/issues/683"), json!({"body": "One page."}));
+        // The board's ids, by option name, never a batch's.
+        assert_eq!(
+            find("GRAPHQL", "updateProjectV2ItemFieldValue"),
+            json!({"project": "PVT_board", "item": "PVTI_new", "field": "F_priority", "option": "O_p1"})
+        );
+        assert_eq!(
+            find("GRAPHQL", "addSubIssue"),
+            json!({"issueId": "I_1356", "subIssueUrl": "https://github.com/cgwalters-forge/agent-board/issues/703"})
+        );
+    }
+    let plans = forge.comments_on("cgwalters-forge/agent-board", 830);
+    assert_eq!(plans.len(), 1);
+    assert!(
+        plans[0].starts_with(crate::session_apply::PLAN_INTRO),
+        "{}",
+        plans[0]
+    );
+    let plan = plan::JobPlan::from_comment(&plans[0]).unwrap().unwrap();
+    assert_eq!(
+        (plan.repo.as_str(), plan.item, plan.kind.as_str()),
+        ("cgwalters-forge/agent-board", 830, "implement")
+    );
+    let receipts = forge.comments_on("cgwalters-forge/agent-board", 40);
+    assert_eq!(receipts.len(), 1, "{receipts:#?}");
+    assert!(
+        receipts[0].starts_with("Applied [this session batch](https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-11) at 2026-10-23T15:"),
+        "{}",
+        receipts[0]
+    );
+    assert!(
+        receipts[0].contains(&format!("```{}\n", crate::session_apply::APPLY_FENCE)),
+        "{}",
+        receipts[0]
+    );
+
+    // The next passes today, and a preview: the receipt is read, and
+    // nothing is written again.
+    let written = session_writes(&forge).len();
+    for _ in 0..2 {
+        let report = apply(&forge, &config(settings.clone()));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        let lines = session_lines(&report);
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(
+            lines[1].starts_with(&format!(
+                "session cgwalters-forge/agent-board: batch {BATCH_ID} was applied at 2026-10-23T15:"
+            )) && lines[1].ends_with(&format!(", {receipt}")),
+            "{lines:#?}"
+        );
+        assert_eq!(session_writes(&forge).len(), written);
+    }
+    // A preview reading the receipt plans no apply either.
+    let report = block(run(
+        &forge,
+        &forge,
+        &config(settings),
+        State::default(),
+        (Mode::Preview, Limits::default()),
+        forge.replay.now,
+    ))
+    .unwrap();
+    let lines = session_lines(&report);
+    assert!(
+        lines.len() == 2 && lines[1].contains(" was applied at "),
+        "{lines:#?}"
+    );
+    assert_eq!(session_writes(&forge).len(), written);
+}
+
+/// One batch is applied a day, the day being the configured due time's:
+/// after today's batch was applied, a run posting as the bot replaces
+/// the day's session plan, dispatch record and batch on the anchor, and
+/// the next pass holds the new batch on the day's receipt rather than
+/// spending the caps again, since the receipts counted are the day's,
+/// not those after a record the run could post.
+#[test]
+fn sessions_apply_one_batch_a_day_whatever_the_record() {
+    let mut settings = session_settings();
+    settings["sessions"]["apply"] = json!(true);
+    let mut forge = Forge::new(None, false);
+    anchor_plan(
+        &mut forge.replay,
+        "session",
+        "cgwalters-bot",
+        Some("2026-10-23T06:00:00Z"),
+    );
+    anchor_batch(&mut forge.replay, "cgwalters-bot", None, batch_actions());
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let written = session_writes(&forge);
+    let receipt = (
+        forge.comments_on("cgwalters-forge/agent-board", 40).len(),
+        written.len(),
+    );
+    assert_eq!(receipt, (1, 10), "{written:#?}");
+
+    // The forged day: a new session plan, its record and a batch, all
+    // today and all after the real session's receipt, as a run could post
+    // them; their ids follow the receipt's, as GitHub's would.
+    let plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/agent-board", "item": 40,
+        "kind": "session", "runner": "hosted", "brief": "Again."});
+    let bot = ("cgwalters-bot", None);
+    let at = |t: &'static str| (t, t);
+    anchor_comment(
+        &mut forge.replay,
+        9_100_000_001,
+        bot,
+        at("2026-10-23T07:00:00Z"),
+        &format!("```{PLAN_FENCE}\n{plan}\n```"),
+    );
+    anchor_comment(
+        &mut forge.replay,
+        9_100_000_002,
+        bot,
+        at("2026-10-23T07:05:00Z"),
+        "<!-- agent-board-dispatch: 9100000001@2026-10-23T07:00:00Z -->\nDispatched.",
+    );
+    let again = json!([{"type": "close_issue", "issue": "cgwalters-forge/agent-board#703", "reason": "Done."}]);
+    anchor_comment(
+        &mut forge.replay,
+        9_100_000_003,
+        bot,
+        at("2026-10-23T07:10:00Z"),
+        &batch_body(again),
+    );
+    for _ in 0..2 {
+        let report = apply(&forge, &config(settings.clone()));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        let lines = session_lines(&report);
+        let hold = format!(
+            "hold cgwalters-forge/agent-board#40: batch 9100000003@2026-10-23T07:10:00Z is not applied: https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-9000000001 claims batch {BATCH_ID} for today already; one batch is applied a day, and a person reads the rest"
+        );
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(
+            lines[0].starts_with(
+                "session cgwalters-forge/agent-board: today's started at 2026-10-23T07:05:00Z"
+            ),
+            "{lines:#?}"
+        );
+        assert_eq!(lines[1], hold, "{lines:#?}");
+        assert_eq!(
+            (report.holds.iter()).filter(|h| h.line() == hold).count(),
+            1
+        );
+        assert_eq!(session_writes(&forge), written);
+    }
+}
+
+/// A batch naming a pull request's number (here agent-board#701 is one):
+/// the apply claims the batch, resolves each issue before any action
+/// write, stops with nothing written and keeps the claim, so the next
+/// pass holds the anchor rather than replaying; the same REST paths would
+/// have closed the pull request or replaced its description.
+#[test]
+fn sessions_stop_a_batch_naming_a_pull_request_before_any_write() {
+    let mut settings = session_settings();
+    settings["sessions"]["apply"] = json!(true);
+    let mut forge = Forge::new(None, false);
+    forge.pulls = vec![701];
+    anchor_plan(
+        &mut forge.replay,
+        "session",
+        "cgwalters-bot",
+        Some("2026-10-23T06:00:00Z"),
+    );
+    anchor_batch(&mut forge.replay, "cgwalters-bot", None, batch_actions());
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
+    let failed = (report.lines.iter())
+        .find(|l| l.starts_with("apply session cgwalters-forge/agent-board"))
+        .unwrap();
+    assert!(
+        failed.contains(" failed: ")
+            && failed.contains("cgwalters-forge/agent-board#701 is not an issue; nothing applied"),
+        "{failed}"
+    );
+    let written = session_writes(&forge);
+    assert_eq!(written.len(), 2, "the claim and its update: {written:#?}");
+    assert!(
+        written[0].ends_with("/issues/40/comments") && written[1].contains("/issues/comments/"),
+        "{written:#?}"
+    );
+    let receipts = forge.comments_on("cgwalters-forge/agent-board", 40);
+    assert!(
+        receipts[0].starts_with("Stopped applying [this session batch]"),
+        "{}",
+        receipts[0]
+    );
+    let report = apply(&forge, &config(settings));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let lines = session_lines(&report);
+    assert!(
+        lines.len() == 2
+            && lines[1].starts_with(&format!(
+                "hold cgwalters-forge/agent-board#40: the apply of batch {BATCH_ID} was stopped after a failed request; it is never replayed"
+            )),
+        "{lines:#?}"
+    );
+    assert_eq!(session_writes(&forge).len(), written.len());
+}
+
+/// What stops a batch from being applied: a refused action (here a
+/// question outside the configured domains, as the recording configures
+/// none), a batch edited by anyone but a writer, and a receipt of an apply
+/// cut short hold the anchor for a person until the next session; a
+/// visitor's batch is no batch; and a failed request stops the apply with
+/// its claim kept, so no later pass replays it.
+#[test]
+fn sessions_hold_refused_batches_and_cut_short_applies() {
+    let mut settings = session_settings();
+    settings["sessions"]["apply"] = json!(true);
+    let ask = json!([{"type": "ask_operator", "domain": "budget", "question": "More?"}]);
+    let refused = format!(
+        "hold cgwalters-forge/agent-board#40: batch {BATCH_ID} is refused: action 1: domain \"budget\" is not one of the configured ask domains (); a person reads it"
+    );
+    // A writer's comment edited by anyone else is weighed as a plan first
+    // ([`plan::newest_plan`]), so the anchor's plan check holds it.
+    let edited = "hold cgwalters-forge/agent-board#40: its newest plan cannot be used: newest plan https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-11 was last edited by visitor, who may not write plans; a person replaces it, or the next day's session supersedes it".to_owned();
+    for (name, author, editor, actions, want) in [
+        (
+            "a refused action",
+            "cgwalters-bot",
+            None,
+            ask.clone(),
+            Some(refused),
+        ),
+        (
+            "a foreign edit",
+            "cgwalters-bot",
+            Some("visitor"),
+            batch_actions(),
+            Some(edited),
+        ),
+        ("a visitor's batch", "visitor", None, batch_actions(), None),
+        ("the operator's batch", "cgwalters", None, ask, None),
+    ] {
+        let mut forge = Forge::new(None, false);
+        anchor_plan(
+            &mut forge.replay,
+            "session",
+            "cgwalters-bot",
+            Some("2026-10-23T06:00:00Z"),
+        );
+        anchor_batch(&mut forge.replay, author, editor, actions);
+        let report = apply(&forge, &config(settings.clone()));
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let lines = session_lines(&report);
+        match &want {
+            Some(want) => {
+                assert_eq!(lines.last(), Some(&want.as_str()), "{name}: {lines:#?}");
+                assert_eq!(
+                    (report.holds.iter()).filter(|h| h.line() == *want).count(),
+                    1,
+                    "{name}"
+                );
+            }
+            None if name == "a visitor's batch" => assert_eq!(lines.len(), 1, "{name}: {lines:#?}"),
+            // The operator's own batch is checked as the bot's would be.
+            None => assert!(
+                lines[1].starts_with("hold cgwalters-forge/agent-board#40: batch 11@"),
+                "{name}: {lines:#?}"
+            ),
+        }
+        assert!(
+            session_writes(&forge).is_empty(),
+            "{name}: {:#?}",
+            session_writes(&forge)
+        );
+    }
+
+    // A failed request after the claim: the receipt says what was done,
+    // and the next pass holds the anchor rather than replaying.
+    let mut forge = Forge::new(Some("addSubIssue("), false);
+    anchor_plan(
+        &mut forge.replay,
+        "session",
+        "cgwalters-bot",
+        Some("2026-10-23T06:00:00Z"),
+    );
+    anchor_batch(&mut forge.replay, "cgwalters-bot", None, batch_actions());
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
+    let failed = (report.lines.iter())
+        .find(|l| l.starts_with("apply session cgwalters-forge/agent-board"))
+        .unwrap();
+    assert!(
+        failed.contains(" failed: session apply stopped; confirmed writes:\nClosed cgwalters-forge/agent-board#701 as not planned\nRescoped cgwalters-forge/agent-board#683\nSet cgwalters-forge/agent-board#691 to P1\nAction 4 (attach_to_epic) on cgwalters-forge/agent-board#703: stopped before any write\nClaim retained; do not replay."),
+        "{failed}"
+    );
+    let written = session_writes(&forge);
+    assert!(
+        !written.iter().any(|w| w.ends_with("/issues/830/comments")),
+        "{written:#?}"
+    );
+    let receipts = forge.comments_on("cgwalters-forge/agent-board", 40);
+    assert!(
+        receipts[0].starts_with("Stopped applying [this session batch]"),
+        "{}",
+        receipts[0]
+    );
+    let report = apply(&forge, &config(settings));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let lines = session_lines(&report);
+    assert!(
+        lines.len() == 2
+            && lines[1].starts_with(&format!(
+                "hold cgwalters-forge/agent-board#40: the apply of batch {BATCH_ID} was stopped after a failed request; it is never replayed: a person inspects https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-"
+            )),
+        "{lines:#?}"
+    );
+    assert_eq!(session_writes(&forge).len(), written.len());
 }
 
 /// tracker#889 closes tracker#468, at P0, and agentic-job#9 closes

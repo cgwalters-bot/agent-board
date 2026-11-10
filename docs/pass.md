@@ -2945,8 +2945,26 @@ another kind or unusable is held for the operator (`hold OWNER/REPO#N: its
 session plan ID has no dispatch record; …`), which the hold snapshot lists,
 since no pass gets past it by itself. A session run in flight counts for
 WIP and holds its anchor by its run name as any dispatch run. The brief names the configured bounds
-and the offline check the run must pass before posting its batch, which the
-pass does not apply yet ([sessions](sessions.md#daily-sessions)).
+and the offline check the run must pass before posting its batch.
+
+Once today's session has started, each pass also reads the batch that
+answers it: the newest `agent-board-session` comment on the anchor by the
+bot or the operator after the day's record. Without `sessions.apply` it
+is a person's to read (`session OWNER/REPO: batch ID is a person's to
+read; sessions.apply is off`). With it, the batch is checked against the
+same bounds the brief named and applied once a day (the day being the
+configured `hourUtc`'s, whatever plans and records follow on the anchor),
+each issue it names resolved as an issue before the first write, as one
+write step for its receipt and one for each writing action, taken whole or held whole by
+`--max-writes` (`apply session OWNER/REPO batch=ID: Close …; Set …
+receipt=URL`; a preview says what it would do and writes nothing); its
+receipt on the anchor is the claim, so later passes say `session
+OWNER/REPO: batch ID was applied at T, URL` and write nothing more. A
+batch the bounds refuse, an apply cut short, or a receipt that cannot be
+read holds the anchor for the operator (`hold OWNER/REPO#N: batch ID is
+refused: …; a person reads it`) until the next day's session supersedes
+it, as does a writer's comment on the anchor that anyone else edited
+since the day's due time; see [applying a batch](sessions.md#applying-a-batch).
 
 ## Reruns
 
@@ -4397,6 +4415,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs `triage`, either scope; section absent (off) |
 | `sweep.max`, `sweep.repository` | The most issues (1–100) one sweep lists; the work repository its issue is filed in; `40`, `epics.repository` |
 | `sessions.hourUtc`, `sessions.issues` | GitHub only: the hour (0–23 UTC) from which a day's [sessions](sessions.md#daily-sessions) are due, and the anchor issue (`OWNER/REPO#N`, an open issue on the board) of each work repository that gets one session a day, one per repository, see [daily sessions](#daily-sessions); needs `triagePools` or `planPools`; section absent (off) |
+| `sessions.apply` | Apply the batch a day's session answers with on its anchor, once, with a receipt there, within the bounds its brief named and `--max-writes`, see [daily sessions](#daily-sessions) and [applying a batch](sessions.md#applying-a-batch); off, a batch is a person's to read; `false` |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
 | `maintain.repos.sinceDays`, `maintain.repos.min`, `maintain.repos.max` | The repositories whose incoming pull requests a daily digest assesses: those with at least `min` (≥ 1) of the operator's opened or reviewed pull requests updated in `sinceDays` (1–365) days, the `max` (1–20) most active, derived once a day, see [maintain](#maintain); required |
 | `maintain.repos.include`, `maintain.repos.exclude` | Repositories always kept (at most `max`) and never kept, no duplicates across both; `[]`, `[]` |
