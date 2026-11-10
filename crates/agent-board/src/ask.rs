@@ -22,6 +22,7 @@
 use anyhow::{Context, Result, ensure};
 use board_core::{ItemRef, NEEDS_HUMAN_LABEL, Snapshot};
 use board_forge::github::{GitHub, Transport};
+use board_forge::pass::ASK_HOLD;
 use clap::Args;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -187,8 +188,6 @@ fn create_proposals(
         needs_human("add_labels", blocked),
     ]
 }
-
-const ASK_HOLD: &str = "An operator question is being opened for this item; any earlier triage verdict no longer authorizes closure.";
 
 /// `answer` is `None` for an ask already closed, which is not closed again.
 fn resolve_proposals(ask: &ItemRef, answer: Option<&str>, unblock: Option<&ItemRef>) -> Vec<Value> {

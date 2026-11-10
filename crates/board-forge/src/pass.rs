@@ -252,6 +252,11 @@ const CLOSE_VERDICTS: &[(&str, &str)] = &[("done", "completed"), ("obsolete", "n
 /// What the bot's line for a close on a verdict says first, which
 /// [`Scheduler::close_refused`] reads back so that it closes only once.
 const CLOSED: &str = "The board pass closed this issue as";
+/// Why [`Scheduler::close_refused`] refuses a close for news since the
+/// verdict, which a triage reading it may settle: a refusal for either
+/// waits on the controller, not the operator ([`HoldKind::NeedsClose`]).
+const NEWER_COMMENT: &str = "a comment was posted or edited after this verdict";
+const EDITED_SINCE: &str = "the issue was edited after this verdict";
 /// Why [`TriageScope::Epics`] starts no triage run on an issue outside
 /// every live epic.
 const OUTSIDE_EPICS: &str = "outside every live epic, so not triaged (triage scope epics)";
@@ -291,6 +296,10 @@ const RELEASE_MARKER: &str = "<!-- agent-board-release -->";
 /// would ([`wait::response`]), so that the next pass does not hold the
 /// issue again (agent-board#826). A run's output carrying it is not one.
 pub const VERDICT_APPLY_MARKER: &str = "<!-- agent-board-verdict-apply -->";
+/// The comment `agent-board ask create` posts on the item an operator
+/// question blocks, with [`NEEDS_HUMAN`]: a person's pending question, which
+/// answers no needs-close wait ([`Scheduler::close_wait_answer`]).
+pub const ASK_HOLD: &str = "An operator question is being opened for this item; any earlier triage verdict no longer authorizes closure.";
 /// What a triage brief adds with [`Config::fix_plans`]:
 /// a promoted pull request's midstream one is closed, and only a `fix` run
 /// on the upstream one rewrites its branch in place, where an implement
@@ -7736,6 +7745,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some((answer, kind)) = answer {
             let released = match (kind, self.config.assign_holds) {
                 (HoldKind::NeedsIssue, _) => ", a response to its needs-issue wait",
+                (HoldKind::NeedsClose, _) => ", a response to its needs-close wait",
                 (_, true) => ", the operator's response to its assignment",
                 (_, false) => " and needs-human was removed after it",
             };
@@ -7879,6 +7889,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some((_, c, verdict)) = verdict.as_ref() {
             let on = (*c, comments, Some((from, record)));
             match self.act_on_verdict(&facts.issue, on, verdict, &said, !harness)? {
+                Acted::Step(Step::Hold(held)) if held.kind == HoldKind::NeedsClose => {
+                    let Some(answer) = self.close_wait_answer(c, rest) else {
+                        return Ok(Step::Hold(held));
+                    };
+                    let answer = Some((answer, HoldKind::NeedsClose));
+                    return self.triage_context(read, AGAIN, answer, (snapshot, target, slots));
+                }
                 Acted::Step(step) => return Ok(step),
                 Acted::Refused(why) => said = format!("{said}; not closed: {why}"),
                 Acted::Unclosed => {
@@ -8011,7 +8028,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// does not ask ([`Self::operator_verdict`]): a close it could not make
     /// is [`Acted::Refused`] or [`Acted::Unclosed`], for the caller's wait
     /// (agent-board#826). [`Acted::Nothing`] for any other verdict, which
-    /// had nothing to do.
+    /// had nothing to do. Outside that harness path, an enabled close
+    /// refused for news since the verdict ([`NEWER_COMMENT`],
+    /// [`EDITED_SINCE`]) publishes [`HoldKind::NeedsClose`] for the
+    /// controller, without an operator label or assignment.
     fn act_on_verdict(
         &self,
         issue: &ItemRef,
@@ -8038,6 +8058,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if close.is_some()
             && let Some(why) = self.close_refused(issue, (c, comments), triage)?
         {
+            // News since the verdict is for a triage to read, not a new
+            // operator question: publish the receipt without a label or
+            // assignment. A lock or reopen refusal, which no triage settles,
+            // still asks the operator.
+            if asks && [NEWER_COMMENT, EDITED_SINCE].contains(&why) {
+                return Ok(Acted::Step(Step::Hold(Hold::new(
+                    HoldKind::NeedsClose,
+                    format!("{said}; controller: reconcile close; not closed: {why}"),
+                ))));
+            }
             close = None;
             label = format!("{label}, not closed: {why}");
             refused = Some(why);
@@ -8245,6 +8275,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .collect()
     }
 
+    /// The newest of [`Self::verdict_answers`] to the verdict `c`, among the
+    /// `comments` after it, whose refused close waits on the controller as
+    /// [`HoldKind::NeedsClose`]: as for a needs-issue wait, there is no label
+    /// to remove, so the response itself triages the issue again, though not
+    /// a run's output ([`run_output`]) nor an operator question's hold, which
+    /// waits on its answer.
+    fn close_wait_answer<'c>(
+        &self,
+        c: &plan::Comment,
+        comments: &'c [plan::Comment],
+    ) -> Option<&'c plan::Comment> {
+        (self.verdict_answers(c, comments).into_iter())
+            .filter(|a| !run_output(&a.body) && !a.body.starts_with(ASK_HOLD))
+            .max_by_key(|a| a.changed)
+    }
+
     /// What released the hold of the asking verdict `verdict` among the
     /// `comments` after it: a writer's answer followed by removal of the
     /// label, or with [`Config::assign_holds`] the operator's response to
@@ -8292,7 +8338,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// Why the verdict comment `c` among `comments` may not close `issue`,
-    /// which is then asked of the operator instead. It closes once: the
+    /// which is then asked of the operator instead, or, where the only
+    /// reason is news since the verdict, of a triage. It closes once: the
     /// bot's line for a close on `c` means it was reopened since, or its
     /// close failed, and any reopen since `c` was the operator's call. The
     /// verdict is about the issue as triage read it, so neither its body
@@ -8350,18 +8397,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     }))
                 || (by_bot && bookkeeping && unedited)
         };
-        if (comments.iter()).any(|x| x.url != c.url && x.changed > c.changed && !own(x)) {
-            return Ok(Some("a comment was posted or edited after this verdict"));
-        }
+        let newer = (comments.iter()).any(|x| x.url != c.url && x.changed > c.changed && !own(x));
         let node = self.issue_read(issue, CLOSE_QUERY)?;
         let body = plan::comment(&node)?;
         let events = IssueEvents::read(issue, &node)?;
         // Whoever closed it before, a reopen is the operator's decision.
         if events.reopened > Some(c.changed) {
             return Ok(Some("it was reopened after this verdict"));
-        }
-        if body.changed > c.changed || events.renamed > Some(c.changed) {
-            return Ok(Some("the issue was edited after this verdict"));
         }
         let held = events
             .locked
@@ -8384,6 +8426,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         if !written(&body) || !comments.iter().all(written) {
             return Ok(Some("its body or a comment is not only a writer's"));
+        }
+        // News since the verdict comes last, so that it is the reason only
+        // where every other check passed ([`HoldKind::NeedsClose`]).
+        if newer {
+            return Ok(Some(NEWER_COMMENT));
+        }
+        if body.changed > c.changed || events.renamed > Some(c.changed) {
+            return Ok(Some(EDITED_SINCE));
         }
         Ok(None)
     }

@@ -355,8 +355,9 @@ impl Collector<'_> {
                 let target = hold["url"].as_str().unwrap_or(&url);
                 // Normal scheduling waits are observations, not bugs. Reuse
                 // the pass's explicit alarms rather than inventing timeouts.
-                // A needs-issue wait is the controller's, not the operator's
-                // queue's, so it is raised here for the supervisor.
+                // Needs-issue and needs-close waits are the controller's, not
+                // the operator's queue's, so they are raised here for the
+                // supervisor.
                 let problem = matches!(
                     kind,
                     HoldKind::Stalled
@@ -364,6 +365,7 @@ impl Collector<'_> {
                         | HoldKind::Unreadable
                         | HoldKind::NeedsOperator
                         | HoldKind::NeedsIssue
+                        | HoldKind::NeedsClose
                 ) || (kind == HoldKind::NeedsHuman && pull_urls.contains(target));
                 events.push(json!({"kind": format!("hold/{}", kind.name()), "text": reason, "url": target, "at": snap["at"], "first_at": hold["since"], "problem": problem}));
                 if hold["kind"] == "needs-human" {
@@ -595,7 +597,8 @@ mod tests {
             "holds":[
                 {"kind":"needs-human","reason":"a draft with no checkpoint","since":iso(0),"url":"https://github.com/example/project/issues/3"},
                 {"kind":"needs-human","reason":"a draft with no checkpoint","since":iso(HOUR_MS),"url":"https://github.com/example/project/issues/4"},
-                {"kind":"needs-issue","reason":"triage verdict needs-issue","since":iso(0),"url":"https://github.com/example/project/issues/5"}
+                {"kind":"needs-issue","reason":"triage verdict needs-issue","since":iso(0),"url":"https://github.com/example/project/issues/5"},
+                {"kind":"needs-close","reason":"triage verdict done, receipt; controller: reconcile close; not closed: unlocked","since":iso(0),"url":"https://github.com/example/project/issues/6"}
             ],
             "needs_you":{"complete":false,"omitted":5,"items":[
                 {"key":"one","target":"https://github.com/example/project/issues/3","ask":"labelled needs-human"},
@@ -645,6 +648,12 @@ mod tests {
             "{holds:#?}"
         );
         let quality = c.hold_signatures(true).unwrap();
+        let close = holds
+            .iter()
+            .find(|g| g["kind"] == "hold/needs-close")
+            .unwrap();
+        assert_eq!(close["problem"], true);
+        assert!(close["text"].as_str().unwrap().contains("receipt"));
         assert!(
             quality
                 .iter()
