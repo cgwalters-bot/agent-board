@@ -19,6 +19,7 @@ use crate::poll::validate_repository;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const SESSION_BATCH_SCHEMA: &str = "agent-board/session-batch/v1";
 /// The info string of the fence that holds a session batch.
@@ -49,13 +50,25 @@ pub const BODY_MAX_BYTES: usize = 1024 * 1024;
 /// Action types, the fields each takes besides `type`, and the most of
 /// each in one batch.
 const ACTIONS: &[(&str, &[&str], usize)] = &[
-    (CLOSE, &["issue", "reason"], CLOSE_LIMIT),
-    (RESCOPE, &["issue", "body", "reason"], RESCOPE_LIMIT),
-    (SET_PRIORITY, &["issue", "value"], PRIORITY_LIMIT),
-    (ATTACH, &["issue", "epic"], ATTACH_LIMIT),
-    (POST_PLAN, &["issue", "plan"], PLAN_LIMIT),
+    (CLOSE, &["issue", UPDATED_AT, "reason"], CLOSE_LIMIT),
+    (
+        RESCOPE,
+        &["issue", UPDATED_AT, "body", "reason"],
+        RESCOPE_LIMIT,
+    ),
+    (
+        SET_PRIORITY,
+        &["issue", UPDATED_AT, "value"],
+        PRIORITY_LIMIT,
+    ),
+    (ATTACH, &["issue", UPDATED_AT, "epic"], ATTACH_LIMIT),
+    (POST_PLAN, &["issue", UPDATED_AT, "plan"], PLAN_LIMIT),
     (ASK, &["domain", "question"], ASK_LIMIT),
 ];
+/// The field of every action on an issue holding the issue's `updated_at`
+/// as the session read it: the version the action was decided from, which
+/// the apply compares with the issue's before writing (agent-board#849).
+pub const UPDATED_AT: &str = "updated_at";
 const CLOSE: &str = "close_issue";
 const RESCOPE: &str = "rescope_issue";
 const SET_PRIORITY: &str = "set_priority";
@@ -107,22 +120,43 @@ impl Bounds {
     }
 }
 
+/// Each action on an issue carries `updated_at`, the issue's `updated_at`
+/// as the session read it: the version the action was decided from. An
+/// applier skips the action where the issue's differs when it is about to
+/// write, so a stale view never overwrites an edit made since.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// Comment the reason, close as not planned.
-    Close { issue: IssueRef, reason: String },
+    Close {
+        issue: IssueRef,
+        updated_at: OffsetDateTime,
+        reason: String,
+    },
     /// Replace the body, comment the reason.
     Rescope {
         issue: IssueRef,
+        updated_at: OffsetDateTime,
         body: String,
         reason: String,
     },
     /// Set the board's Priority.
-    SetPriority { issue: IssueRef, value: String },
+    SetPriority {
+        issue: IssueRef,
+        updated_at: OffsetDateTime,
+        value: String,
+    },
     /// Link the issue as a sub-issue of an epic.
-    Attach { issue: IssueRef, epic: IssueRef },
+    Attach {
+        issue: IssueRef,
+        updated_at: OffsetDateTime,
+        epic: IssueRef,
+    },
     /// Post a job plan on the issue; the pass starts it as any plan.
-    Plan { issue: IssueRef, plan: JobPlan },
+    Plan {
+        issue: IssueRef,
+        updated_at: OffsetDateTime,
+        plan: JobPlan,
+    },
     /// One line for the operator, within a configured domain.
     Ask { domain: String, question: String },
 }
@@ -137,6 +171,29 @@ impl Action {
             Self::Attach { .. } => ATTACH,
             Self::Plan { .. } => POST_PLAN,
             Self::Ask { .. } => ASK,
+        }
+    }
+
+    /// The issue it changes and the version it was decided from; none for
+    /// a question.
+    pub fn target(&self) -> Option<(&IssueRef, OffsetDateTime)> {
+        match self {
+            Self::Close {
+                issue, updated_at, ..
+            }
+            | Self::Rescope {
+                issue, updated_at, ..
+            }
+            | Self::SetPriority {
+                issue, updated_at, ..
+            }
+            | Self::Attach {
+                issue, updated_at, ..
+            }
+            | Self::Plan {
+                issue, updated_at, ..
+            } => Some((issue, *updated_at)),
+            Self::Ask { .. } => None,
         }
     }
 }
@@ -215,36 +272,37 @@ impl SessionBatch {
     /// absent pool or effort is left out, as the format leaves it out.
     pub fn preview(&self) -> Vec<Value> {
         (self.actions.iter())
-            .map(|action| match action {
-                Action::Close { issue, reason } => {
-                    json!({"type": CLOSE, "issue": issue.to_string(), "reason": reason})
+            .map(|action| {
+                let mut shown = json!({"type": action.kind()});
+                if let Some((issue, updated_at)) = action.target() {
+                    shown["issue"] = issue.to_string().into();
+                    shown[UPDATED_AT] = stamp(updated_at).into();
                 }
-                Action::Rescope {
-                    issue,
-                    body,
-                    reason,
-                } => json!({
-                    "type": RESCOPE, "issue": issue.to_string(), "body": body, "reason": reason
-                }),
-                Action::SetPriority { issue, value } => {
-                    json!({"type": SET_PRIORITY, "issue": issue.to_string(), "value": value})
-                }
-                Action::Attach { issue, epic } => json!({
-                    "type": ATTACH, "issue": issue.to_string(), "epic": epic.to_string()
-                }),
-                Action::Plan { issue, plan } => {
-                    let mut job = json!({"kind": plan.kind, "brief": plan.brief});
-                    if !plan.pool.is_empty() {
-                        job["pool"] = plan.pool.as_str().into();
+                let rest = match action {
+                    Action::Close { reason, .. } => json!({"reason": reason}),
+                    Action::Rescope { body, reason, .. } => {
+                        json!({"body": body, "reason": reason})
                     }
-                    if let Some(effort) = plan.effort {
-                        job["effort"] = effort.as_str().into();
+                    Action::SetPriority { value, .. } => json!({"value": value}),
+                    Action::Attach { epic, .. } => json!({"epic": epic.to_string()}),
+                    Action::Plan { plan, .. } => {
+                        let mut job = json!({"kind": plan.kind, "brief": plan.brief});
+                        if !plan.pool.is_empty() {
+                            job["pool"] = plan.pool.as_str().into();
+                        }
+                        if let Some(effort) = plan.effort {
+                            job["effort"] = effort.as_str().into();
+                        }
+                        json!({"plan": job})
                     }
-                    json!({"type": POST_PLAN, "issue": issue.to_string(), "plan": job})
+                    Action::Ask { domain, question } => {
+                        json!({"domain": domain, "question": question})
+                    }
+                };
+                if let (Some(shown), Some(rest)) = (shown.as_object_mut(), rest.as_object()) {
+                    shown.extend(rest.clone());
                 }
-                Action::Ask { domain, question } => {
-                    json!({"type": ASK, "domain": domain, "question": question})
-                }
+                shown
             })
             .collect()
     }
@@ -271,6 +329,13 @@ impl Checker<'_> {
             self.repo
         );
         Ok(issue)
+    }
+
+    /// The issue's `updated_at` as the session read it, RFC 3339.
+    fn updated_at(&self, object: &Map<String, Value>) -> Result<OffsetDateTime> {
+        let value = text(object, UPDATED_AT)?;
+        OffsetDateTime::parse(value, &Rfc3339)
+            .with_context(|| format!("{UPDATED_AT} {value:?} is not an RFC 3339 time"))
     }
 
     /// One action of `kind` on `issue`: the same twice would race itself,
@@ -337,23 +402,31 @@ impl Checker<'_> {
         Ok(match kind {
             CLOSE => {
                 let issue = self.issue(object)?;
+                let updated_at = self.updated_at(object)?;
                 let reason = plain(object, "reason", REASON_LIMIT)?.to_owned();
                 self.once(kind, &issue)?;
-                Action::Close { issue, reason }
+                Action::Close {
+                    issue,
+                    updated_at,
+                    reason,
+                }
             }
             RESCOPE => {
                 let issue = self.issue(object)?;
+                let updated_at = self.updated_at(object)?;
                 let body = plain(object, "body", BODY_LIMIT)?.to_owned();
                 let reason = plain(object, "reason", REASON_LIMIT)?.to_owned();
                 self.once(kind, &issue)?;
                 Action::Rescope {
                     issue,
+                    updated_at,
                     body,
                     reason,
                 }
             }
             SET_PRIORITY => {
                 let issue = self.issue(object)?;
+                let updated_at = self.updated_at(object)?;
                 let value = text(object, "value")?;
                 ensure!(
                     self.bounds.priorities.iter().any(|p| p == value),
@@ -363,11 +436,13 @@ impl Checker<'_> {
                 self.once(kind, &issue)?;
                 Action::SetPriority {
                     issue,
+                    updated_at,
                     value: value.into(),
                 }
             }
             ATTACH => {
                 let issue = self.issue(object)?;
+                let updated_at = self.updated_at(object)?;
                 let epic = IssueRef::parse(text(object, "epic")?)?;
                 ensure!(
                     issue.to_string().to_lowercase() != epic.to_string().to_lowercase(),
@@ -375,14 +450,23 @@ impl Checker<'_> {
                 );
                 self.once(kind, &issue)?;
                 let epic = self.epic(object)?;
-                Action::Attach { issue, epic }
+                Action::Attach {
+                    issue,
+                    updated_at,
+                    epic,
+                }
             }
             POST_PLAN => {
                 let issue = self.issue(object)?;
+                let updated_at = self.updated_at(object)?;
                 let plan = object.get("plan").context("no plan")?;
                 let plan = job_plan(plan, &issue).context("plan")?;
                 self.once(kind, &issue)?;
-                Action::Plan { issue, plan }
+                Action::Plan {
+                    issue,
+                    updated_at,
+                    plan,
+                }
             }
             ASK => {
                 let domain = text(object, "domain")?;
@@ -404,6 +488,12 @@ impl Checker<'_> {
             other => bail!("action type {other:?} has no check"),
         })
     }
+}
+
+/// A time as the batch format and the receipts write it, RFC 3339 in UTC.
+pub fn stamp(at: OffsetDateTime) -> String {
+    (at.to_offset(time::UtcOffset::UTC).format(&Rfc3339))
+        .unwrap_or_else(|_| at.unix_timestamp().to_string())
 }
 
 /// A posted plan's object, with the issue it is posted on as its target.
@@ -449,16 +539,19 @@ mod tests {
         }
     }
 
+    /// When the session read each issue, as every action here says.
+    const READ: &str = "2026-11-09T06:05:00Z";
+
     fn close(issue: &str) -> Value {
-        json!({"type": CLOSE, "issue": issue, "reason": "Done by #12."})
+        json!({"type": CLOSE, "issue": issue, "updated_at": READ, "reason": "Done by #12."})
     }
 
     fn attach(issue: &str, epic: &str) -> Value {
-        json!({"type": ATTACH, "issue": issue, "epic": epic})
+        json!({"type": ATTACH, "issue": issue, "updated_at": READ, "epic": epic})
     }
 
     fn plan() -> Value {
-        json!({"type": POST_PLAN, "issue": ISSUE, "plan": {
+        json!({"type": POST_PLAN, "issue": ISSUE, "updated_at": READ, "plan": {
             "schema": "agent-board/job-plan/v1", "kind": "implement", "runner": "hosted",
             "brief": "Implement the next slice."}})
     }
@@ -488,6 +581,18 @@ mod tests {
             json!({"kind": "implement", "brief": "Implement the second slice of agent-board#830: apply an accepted session batch once, with a receipt on its item."})
         );
         assert_eq!(preview[5]["domain"], "budget");
+        // Each action on an issue shows the version it was decided from.
+        for (shown, issue) in preview.iter().zip([701, 683, 691, 703, 830]) {
+            assert_eq!(shown["issue"], format!("{REPO}#{issue}"), "{shown}");
+            assert!(
+                shown[UPDATED_AT].as_str().unwrap().ends_with('Z'),
+                "{shown}"
+            );
+        }
+        assert!(
+            preview[5].get(UPDATED_AT).is_none(),
+            "a question has no issue"
+        );
         assert_eq!(
             SessionBatch::from_comment("No batch here.", &bounds()).unwrap(),
             None
@@ -564,6 +669,17 @@ mod tests {
             .collect();
         assert_eq!(documented, types, "the schema lists every action type");
         for (variant, (_, fields, _)) in variants.iter().zip(ACTIONS) {
+            // Every action on an issue requires the version it was decided from.
+            if fields.contains(&"issue") {
+                assert!(
+                    variant["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(UPDATED_AT)),
+                    "{variant}"
+                );
+                assert_eq!(variant["properties"][UPDATED_AT]["$ref"], "#/$defs/time");
+            }
             let mut keys: Vec<_> = variant["properties"]
                 .as_object()
                 .unwrap()
@@ -637,7 +753,7 @@ mod tests {
         let mut not_a_list = batch(vec![]);
         not_a_list["actions"] = json!({});
         let many: Vec<_> = (1..=ACTION_LIMIT as u64 + 1)
-            .map(|n| json!({"type": SET_PRIORITY, "issue": format!("{REPO}#{n}"), "value": "P1"}))
+            .map(|n| json!({"type": SET_PRIORITY, "issue": format!("{REPO}#{n}"), "updated_at": READ, "value": "P1"}))
             .collect();
         for (name, value, error) in [
             ("a list", json!([batch(vec![])]), "not a JSON object"),
@@ -692,9 +808,12 @@ mod tests {
             action[key] = value;
             action
         };
-        let rescope =
-            json!({"type": RESCOPE, "issue": ISSUE, "body": "New scope.", "reason": "Narrowed."});
-        let priority = json!({"type": SET_PRIORITY, "issue": ISSUE, "value": "P1"});
+        let rescope = json!({"type": RESCOPE, "issue": ISSUE, "updated_at": READ,
+            "body": "New scope.", "reason": "Narrowed."});
+        let priority =
+            json!({"type": SET_PRIORITY, "issue": ISSUE, "updated_at": READ, "value": "P1"});
+        let mut unversioned = close(ISSUE);
+        unversioned.as_object_mut().unwrap().remove(UPDATED_AT);
         let ask = json!({"type": ASK, "domain": "budget", "question": "May the pools grow?"});
         let planned = |key: &str, value: Value| {
             let mut action = plan();
@@ -715,6 +834,11 @@ mod tests {
             ("a null type", vec![json!({"type": null})], "type is not a string"),
             ("an unknown field", vec![edited(close(ISSUE), "labels", json!(["bug"]))], "unknown field \"labels\""),
             ("no issue", vec![json!({"type": CLOSE, "reason": "Done."})], "no issue"),
+            ("no updated_at", vec![unversioned], "no updated_at"),
+            ("a null updated_at", vec![edited(rescope.clone(), UPDATED_AT, Value::Null)], "updated_at is not a string"),
+            ("an updated_at that is no time", vec![edited(priority.clone(), UPDATED_AT, json!("yesterday"))], "updated_at \"yesterday\" is not an RFC 3339 time"),
+            ("a date for updated_at", vec![edited(attach(ISSUE, TRACKER_EPIC), UPDATED_AT, json!("2026-11-09"))], "updated_at \"2026-11-09\" is not an RFC 3339 time"),
+            ("a question with updated_at", vec![edited(ask.clone(), UPDATED_AT, json!(READ))], "unknown field \"updated_at\""),
             ("a null reason", vec![edited(close(ISSUE), "reason", Value::Null)], "reason is not a string"),
             ("an issue in another configured repository", vec![close(TRACKER_EPIC)], "cgwalters-forge/tracker#1356 is not in cgwalters-forge/agent-board, the session's repository"),
             ("an issue outside the bounds", vec![close("someone/else#1")], "someone/else#1 is not in cgwalters-forge/agent-board"),
@@ -776,7 +900,7 @@ mod tests {
             close("cgwalters-forge/agent-board#1"),
             json!({"type": "reopen_issue", "issue": "cgwalters-forge/agent-board#2"}),
             plan(),
-            json!({"type": SET_PRIORITY, "issue": "cgwalters-forge/agent-board#3", "value": "P7"}),
+            json!({"type": SET_PRIORITY, "issue": "cgwalters-forge/agent-board#3", "updated_at": READ, "value": "P7"}),
         ];
         let message = format!(
             "{:#}",
@@ -791,7 +915,8 @@ mod tests {
 
     #[test]
     fn a_priority_a_plan_and_attaches_may_share_targets() {
-        let mut priority = json!({"type": SET_PRIORITY, "issue": ISSUE, "value": "P0"});
+        let mut priority =
+            json!({"type": SET_PRIORITY, "issue": ISSUE, "updated_at": READ, "value": "P0"});
         let mut heavy = plan();
         heavy["plan"]["pool"] = json!("claude");
         heavy["plan"]["effort"] = json!("heavy");
@@ -803,15 +928,26 @@ mod tests {
         ];
         let checked = SessionBatch::validate(&batch(actions), &bounds()).unwrap();
         assert_eq!(checked.actions.len(), 4);
-        let Action::Plan { issue, plan: job } = &checked.actions[1] else {
+        let Action::Plan {
+            issue,
+            updated_at,
+            plan: job,
+        } = &checked.actions[1]
+        else {
             panic!("{:?}", checked.actions[1]);
         };
         assert_eq!((issue.repo.as_str(), issue.number), (REPO, 830));
         assert_eq!((job.repo.as_str(), job.item), (REPO, 830));
+        assert_eq!(stamp(*updated_at), READ);
         assert_eq!(
             checked.preview()[1]["plan"],
             json!({"kind": "implement", "pool": "claude", "effort": "heavy", "brief": "Implement the next slice."})
         );
+        // An offset is read as the instant it names and shown in UTC.
+        let mut offset = plan();
+        offset[UPDATED_AT] = json!("2026-11-09T08:05:00+02:00");
+        let shifted = SessionBatch::validate(&batch(vec![offset]), &bounds()).unwrap();
+        assert_eq!(shifted.preview()[0][UPDATED_AT], READ);
         priority["value"] = json!("P1");
         let message = format!(
             "{:#}",

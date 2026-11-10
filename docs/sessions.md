@@ -197,9 +197,24 @@ once:
    name as a GitHub issue: the REST paths a close, a new body or a
    comment take address pull requests by the same numbers, so a number
    that is a pull request's, or no issue, or that GitHub resolves to
-   another issue than named, stops the apply with nothing written. Then
-   it makes each action's writes in the batch's order and updates the
-   receipt with what was confirmed. A batch with a receipt is never
+   another issue than named, stops the apply with nothing written. The
+   same read gives each issue's `updatedAt` now, which is compared with
+   the `updated_at` each action was decided from: an action whose issue
+   changed since the session read it is **skipped**, with no write, and
+   the receipt says why (`Skipped action 2 (rescope_issue) on
+   OWNER/REPO#683: updated T2, not T1 as the session read it`); the next
+   session reads the new text. Anything that moves an issue's
+   `updatedAt` counts, not only a body edit: a comment, label, assignee,
+   milestone, state or sub-issue change by anyone, the pass's own
+   included, so a batch can be partly skipped on an issue nobody edited,
+   which is the safe side. A board field such as Priority does not move
+   it, so a `set_priority` the operator pre-empted on the board is not
+   skipped by this guard. The issues are read once, before the first
+   write, since the apply's own writes to an issue move its `updatedAt`
+   on; an edit landing in the seconds between that read and the write
+   is not caught, so the guard narrows the race rather than closing it.
+   Then it makes each action's writes in the batch's order and
+   updates the receipt with what was confirmed. A batch with a receipt is never
    applied again: later passes say `session OWNER/REPO: batch ID was
    applied at T, URL`. Deleting the receipt would allow a replay, as
    deleting a dispatch record would; that is repository write access.
@@ -242,6 +257,7 @@ The receipt is one comment on the anchor, readable first, then one fenced
 Applied [this session batch](https://github.com/OWNER/REPO/issues/40#issuecomment-11) at 2026-10-23T15:03:00Z.
 
 - Closed OWNER/REPO#701 as not planned
+- Skipped action 2 (rescope_issue) on OWNER/REPO#683: updated 2026-10-23T14:10:00Z, not 2026-10-23T06:05:00Z as the session read it
 - Set OWNER/REPO#691 to P1
 - Asked a question (budget), below
 
@@ -255,8 +271,9 @@ Questions for @OPERATOR:
   "outcome": "applied",
   "actions": [
     {"action": 1, "type": "close_issue", "issue": "OWNER/REPO#701", "writes": ["comment", "patch"]},
-    {"action": 2, "type": "set_priority", "issue": "OWNER/REPO#691", "detail": "P1", "writes": ["priority"]},
-    {"action": 3, "type": "ask_operator", "detail": "budget", "writes": ["receipt"]}
+    {"action": 2, "type": "rescope_issue", "issue": "OWNER/REPO#683", "skipped": "updated 2026-10-23T14:10:00Z, not 2026-10-23T06:05:00Z as the session read it", "writes": []},
+    {"action": 3, "type": "set_priority", "issue": "OWNER/REPO#691", "detail": "P1", "writes": ["priority"]},
+    {"action": 4, "type": "ask_operator", "detail": "budget", "writes": ["receipt"]}
   ]
 }
 ```
@@ -266,8 +283,9 @@ Questions for @OPERATOR:
 `outcome` is `claimed` (under way, or cut short before it could say),
 `applied` or `stopped`; each action's `writes` names the requests
 confirmed (`comment`, `patch`, `priority`, `link`, or `receipt` for a
-question), so a stopped apply shows how far it got. Unknown fields are
-ignored, so a later build's receipts still claim.
+question), so a stopped apply shows how far it got; a skipped action has
+`skipped` saying why and no writes. Unknown fields are ignored, so a
+later build's receipts still claim.
 
 What this stops: off, nothing a session writes changes any issue. On, a
 session changes only what its bounded batch names, in the configured
@@ -276,11 +294,15 @@ posted twice is applied once (only the newest after the record counts),
 a day with a receipt applies no second batch however many plans and
 records a run posts as the bot, a refused batch is never applied, only
 issues are written to (each is resolved as one before the first write,
-so a pull request's number closes or rewrites nothing), and a run cannot
-have the pass write where the caller did not allow, since the bounds come
-from the configuration; and the receipt and every comment are written
-under the bot's own login, which the batch's text checks keep from
-carrying a plan, a record or a receipt.
+so a pull request's number closes or rewrites nothing), an issue edited
+after the session read it is left as edited (its action is skipped, so
+the session's stale view never replaces an operator's new body or closes
+an issue whose text changed; agent-board#849; a Priority set on the
+board since is not under this guard), and a run cannot have the
+pass write where the caller did not allow, since the bounds come from
+the configuration; and the receipt and every comment are written under
+the bot's own login, which the batch's text checks keep from carrying a
+plan, a record or a receipt.
 
 Evidence that an accepted batch applies once: the pass test
 `sessions_apply_an_accepted_batch_once` applies a batch of one action of
@@ -292,10 +314,15 @@ posts a second session plan, record and batch as the bot the same day
 and sees the new batch held on the day's receipt;
 `sessions_stop_a_batch_naming_a_pull_request_before_any_write` sees a
 batch naming a pull request's number claimed and stopped with no action
-written; `session_apply`'s unit tests cover an earlier claim winning, a
-claim that did not land as a claimer's, a pull request named by each
-kind of action, and an apply stopped by a failed request with its claim
-kept.
+written;
+`sessions_skip_an_action_whose_issue_changed_since_the_session_read_it`
+sees the rescope of an issue edited after the session read it skipped,
+with the reason on the receipt and nothing written to that issue, and
+the rest of the batch applied; `session_apply`'s unit tests cover an
+earlier claim winning, a claim that did not land as a claimer's, a pull
+request named by each kind of action, an apply stopped by a failed
+request with its claim kept, and a batch with no issue changed, one
+changed and every issue changed.
 
 ## Format
 
@@ -308,11 +335,11 @@ a line, holding one JSON object:
   "schema": "agent-board/session-batch/v1",
   "repo": "cgwalters-forge/agent-board",
   "actions": [
-    {"type": "close_issue", "issue": "cgwalters-forge/agent-board#701", "reason": "..."},
-    {"type": "rescope_issue", "issue": "cgwalters-forge/agent-board#683", "body": "...", "reason": "..."},
-    {"type": "set_priority", "issue": "cgwalters-forge/agent-board#691", "value": "P1"},
-    {"type": "attach_to_epic", "issue": "cgwalters-forge/agent-board#703", "epic": "cgwalters-forge/tracker#1356"},
-    {"type": "post_plan", "issue": "cgwalters-forge/agent-board#830",
+    {"type": "close_issue", "issue": "cgwalters-forge/agent-board#701", "updated_at": "2026-10-22T18:40:11Z", "reason": "..."},
+    {"type": "rescope_issue", "issue": "cgwalters-forge/agent-board#683", "updated_at": "2026-10-23T06:05:00Z", "body": "...", "reason": "..."},
+    {"type": "set_priority", "issue": "cgwalters-forge/agent-board#691", "updated_at": "2026-10-21T09:00:00Z", "value": "P1"},
+    {"type": "attach_to_epic", "issue": "cgwalters-forge/agent-board#703", "updated_at": "2026-10-20T15:30:45Z", "epic": "cgwalters-forge/tracker#1356"},
+    {"type": "post_plan", "issue": "cgwalters-forge/agent-board#830", "updated_at": "2026-10-23T05:59:59Z",
      "plan": {"schema": "agent-board/job-plan/v1", "kind": "implement", "runner": "hosted", "brief": "..."}},
     {"type": "ask_operator", "domain": "budget", "question": "..."}
   ]
@@ -326,15 +353,19 @@ the anchor the batch is on. Each action names an issue as `OWNER/REPO#N`,
 in `repo` itself, so a session on one repository cannot triage every
 configured one; only an `epic` may be in another configured repository,
 as epics live in the tracker; and the apply refuses an action on the
-anchor itself. Each action is one of:
+anchor itself. Each action on an issue carries the issue's `updated_at`
+exactly as the session read it (RFC 3339, as the API gives it): the
+version the action was decided from, which the apply compares with the
+issue's before writing and skips the action on a mismatch
+([applying a batch](#applying-a-batch)). Each action is one of:
 
 | `type` | Fields | What an applier would do | Most in one batch |
 |---|---|---|---|
-| `close_issue` | `issue`, `reason` | Comment the reason, close as not planned | 5 |
-| `rescope_issue` | `issue`, `body`, `reason` | Replace the body, comment the reason | 5 |
-| `set_priority` | `issue`, `value` | Set the board's Priority to one of its options | 10 |
-| `attach_to_epic` | `issue`, `epic` | Link the issue as a sub-issue of the epic | 5 |
-| `post_plan` | `issue`, `plan` | Post the job plan on the issue, for the pass to start as any plan | 5 |
+| `close_issue` | `issue`, `updated_at`, `reason` | Comment the reason, close as not planned | 5 |
+| `rescope_issue` | `issue`, `updated_at`, `body`, `reason` | Replace the body, comment the reason | 5 |
+| `set_priority` | `issue`, `updated_at`, `value` | Set the board's Priority to one of its options | 10 |
+| `attach_to_epic` | `issue`, `updated_at`, `epic` | Link the issue as a sub-issue of the epic | 5 |
+| `post_plan` | `issue`, `updated_at`, `plan` | Post the job plan on the issue, for the pass to start as any plan | 5 |
 | `ask_operator` | `domain`, `question` | One line for the operator, in a configured `operatorAsk` domain | 3 |
 
 A batch has at most 20 actions in all, the cap the
@@ -359,9 +390,10 @@ action by position, so a session fixes them all at once. Unknown fields,
 unknown action types and `null` values are refused.
 
 The [schema](session-batch.schema.json) carries every static check above:
-the shapes, lengths and kinds, the cap on each type of action (as
-`maxContains` on `actions`) and the fence and marker refusal, so a schema
-validator refuses what the checker refuses for them. The bounds below and
+the shapes, lengths and kinds, the required `updated_at` and its form,
+the cap on each type of action (as `maxContains` on `actions`) and the
+fence and marker refusal, so a schema validator refuses what the checker
+refuses for them. The bounds below and
 the relations between actions (one action of a type per issue, a closed
 issue untouched otherwise) are the checker's alone; a batch a schema
 validator accepts is not yet accepted.
@@ -385,8 +417,10 @@ its batch; a session cannot commit the pools to more than five runs, nor to
 a session of its own; it cannot touch a repository the caller did not name,
 nor set a Priority the board does not have; it cannot ask the operator
 outside the subjects the caller delegated to them, nor more than three
-questions; and nothing it writes can be read back as a job plan, an epic
-plan or a dispatch record.
+questions; it cannot overwrite what anyone wrote on an issue after it
+read it, since each action carries the version it read and the apply
+skips a changed issue; and nothing it writes can be read back as a job
+plan, an epic plan or a dispatch record.
 
 ## Check
 

@@ -11,6 +11,17 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Session batch writes guarded by the version they were decided from
+  (agent-board#849): every batch action on an issue now carries the
+  issue's `updated_at` as the session read it, which the offline check
+  and the pass require; the apply reads each issue's `updatedAt` before
+  its first write and skips an action whose issue changed since, with
+  the reason on the receipt (`skipped`) and in the pass line, applying
+  the rest. A batch without the field is refused, a batch posted before
+  this change included, which holds its anchor for a person until the
+  next session as any refused batch does. The pass's session brief tells
+  the run to carry it (docs/sessions.md#format).
+
 - Session batches applied, the third slice of agent-board#830
   (agent-board#845): with `"apply": true` in the pass configuration's
   `sessions` section (off by default), each pass after a day's session
