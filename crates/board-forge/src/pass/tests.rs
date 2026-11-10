@@ -433,15 +433,53 @@ pub(super) fn block<T>(pass: impl Future<Output = T>) -> T {
 }
 
 pub(super) fn preview(config: &Config, replay: &Replay) -> Report {
+    let mut replay = Replay {
+        now: replay.now,
+        requests: replay.requests.clone(),
+    };
+    if config.sessions.is_some() {
+        let extras: Vec<_> = replay
+            .requests
+            .iter()
+            .filter(|entry| {
+                entry["request"]["graphql"] == fnv(plan::COMMENTS_QUERY)
+                    && entry["request"]["variables"]["after"].is_null()
+            })
+            .map(|entry| {
+                let mut entry = entry.clone();
+                entry["request"]["graphql"] = fnv(&sessions::activity_query()).into();
+                let variables = entry["request"]["variables"].clone();
+                session_observations(&replay, &variables, &mut entry["answer"]["data"]);
+                entry
+            })
+            .collect();
+        replay.requests.extend(extras);
+    }
     block(run(
-        replay,
-        replay,
+        &replay,
+        &replay,
         config,
         State::default(),
         (Mode::Preview, Limits::default()),
         replay.now,
     ))
     .unwrap()
+}
+
+/// Add bounded synthetic activity to the historical anchor-comment recording.
+fn session_observations(replay: &Replay, variables: &Value, data: &mut Value) {
+    if data["repository"].get("sessionIssues").is_some() {
+        return;
+    }
+    let repo = format!("{}/{}", text(variables, "/owner"), text(variables, "/name"));
+    let issues: Vec<_> = replay.requests.iter().filter_map(|entry|
+        entry["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes").and_then(Value::as_array))
+        .flatten().map(|node| &node["content"])
+        .filter(|node| text(node, "/repository/nameWithOwner") == repo)
+        .take(20).map(|node| json!({"number": node["number"], "updatedAt": node["createdAt"], "comments": {"nodes": []}})).collect();
+    data["repository"]["sessionIssues"] = json!({"nodes": issues});
+    data["repository"]["sessionPulls"] = json!({"nodes": []});
+    data["repository"]["sessionDefault"] = Value::Null;
 }
 
 /// [`preview`] within a budget of `limit` requests.
@@ -3023,6 +3061,11 @@ impl crate::github::GraphQl for Forge {
 
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if query == sessions::activity_query() {
+            let mut data = self.graphql(plan::COMMENTS_QUERY, variables.clone())?;
+            session_observations(&self.replay, &variables, &mut data);
+            return Ok(data);
+        }
         self.failing(&format!("graphql {query}"))?;
         if query.contains(" viewer {") {
             return Ok(json!({"viewer": {"login": self.login}}));
@@ -19082,10 +19125,285 @@ fn sweep_config_table() {
 /// the one triage pool.
 fn session_settings() -> Value {
     json!({"triagePools": ["claude"], "wip": 12,
-        "sessions": {"hourUtc": 0, "issues": ["cgwalters-forge/agent-board#40"]}})
+        "sessions": {"hourUtc": 0, "idleDays": 1, "issues": ["cgwalters-forge/agent-board#40"]}})
 }
 
 const SESSION_START: &str = "start session cgwalters-forge/agent-board#40 pool=claude";
+
+#[test]
+fn sessions_busiest_first_and_bounded_per_pass() {
+    for cap in [None, Some(1), Some(2)] {
+        let forge = Forge::new(None, false);
+        let mut settings = session_settings();
+        settings["sessions"]["issues"] = json!([
+            "cgwalters-forge/agent-board#40",
+            "cgwalters-forge/tracker#446"
+        ]);
+        settings["sessions"]["activity"] = json!({"threshold": 1});
+        if let Some(cap) = cap {
+            settings["sessions"]["maxStarts"] = cap.into();
+        }
+        let report = preview(&config(settings), &forge.replay);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        let starts: Vec<_> = report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("start session "))
+            .collect();
+        assert_eq!(starts.len(), cap.unwrap_or(1), "{:?}", report.lines);
+        // Tracker has more observed issues, though configured second.
+        assert!(
+            starts[0].starts_with("start session cgwalters-forge/tracker#446"),
+            "{:?}",
+            report.lines
+        );
+        assert_eq!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("maxStarts=1 reached")),
+            cap != Some(2)
+        );
+    }
+    let forge = Forge::new(None, false);
+    let settings = config(json!({"triagePools": ["claude"], "wip": 12,
+    "sessions": {"activity": {"threshold": 1}, "issues": [
+        "cgwalters-forge/agent-board#40", "cgwalters-forge/tracker#446"
+    ]}}));
+    for expected in [
+        "cgwalters-forge/tracker#446",
+        "cgwalters-forge/agent-board#40",
+    ] {
+        let report = apply(&forge, &settings);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        let starts: Vec<_> = report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("start session "))
+            .collect();
+        assert_eq!(starts.len(), 1, "{:?}", report.lines);
+        assert!(
+            starts[0].starts_with(&format!("start session {expected} pool=claude")),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn sessions_due_but_over_pace_wait_for_a_later_pass() {
+    let mut forge = Forge::new(None, false);
+    let initial = usage(&mut forge.replay);
+    let mut paced = initial.clone();
+    paced["pools"]["claude"]["used_percent"] = 99.into();
+    paced["pools"]["claude"]["hold"] = true.into();
+    paced["pools"]["claude"]["reason"] = "pace".into();
+    set_usage(&mut forge.replay, &paced);
+    let settings = config(session_settings());
+    let held = preview(&settings, &forge.replay);
+    assert_eq!(held.failures, 0, "{:?}", held.lines);
+    assert!(!held.planned_starts.contains_key("session"));
+    assert!(
+        held.lines
+            .iter()
+            .any(|l| l.starts_with("session cgwalters-forge/agent-board:")
+                && l.contains("claude is held")),
+        "{:?}",
+        held.lines
+    );
+    assert!(forge.writes.borrow().is_empty());
+    set_usage(&mut forge.replay, &initial);
+    let released = preview(&settings, &forge.replay);
+    assert_eq!(released.failures, 0, "{:?}", released.lines);
+    assert_eq!(released.planned_starts.get("session"), Some(&1));
+}
+
+#[test]
+fn sessions_activity_floor_and_weekly_idle_replay() {
+    for (recorded, active, expected, reason) in [
+        ("2026-10-23T06:00:00Z", true, false, "minHours=12 floor"),
+        (
+            "2026-10-22T06:00:00Z",
+            true,
+            true,
+            "activity threshold reached",
+        ),
+        (
+            "2026-10-22T06:00:00Z",
+            false,
+            false,
+            "below activity threshold 5",
+        ),
+        ("2026-10-16T06:00:00Z", false, true, "idleDays=7 elapsed"),
+    ] {
+        let mut forge = Forge::new(None, false);
+        anchor_plan(
+            &mut forge.replay,
+            "session",
+            "cgwalters-bot",
+            Some(recorded),
+        );
+        let repo = &mut answer(&mut forge.replay, r#""name":"agent-board","number":40"#)["data"]["repository"];
+        repo["sessionIssues"] = json!({"nodes": if active {vec![json!({"number": 44,
+            "updatedAt": "2026-10-23T07:00:00Z", "comments": {"nodes": [{
+                "createdAt": "2026-10-23T07:00:00Z", "author": {"login": "cgwalters"}
+            }]}})]} else {vec![]}});
+        repo["sessionPulls"] = json!({"nodes": []});
+        repo["sessionDefault"] = Value::Null;
+        let mut settings = session_settings();
+        settings["sessions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("idleDays");
+        settings["sessions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hourUtc");
+        let report = preview(&config(settings), &forge.replay);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(
+            report.planned_starts.contains_key("session"),
+            expected,
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            report.lines.iter().any(|l| l.contains(reason)),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn sessions_expired_foreign_edits_do_not_erase_the_interval_floor() {
+    for edit_plan in [false, true] {
+        let mut forge = Forge::new(None, false);
+        anchor_plan(
+            &mut forge.replay,
+            "session",
+            "cgwalters-bot",
+            Some("2026-10-23T13:00:00Z"),
+        );
+        let repo = &mut answer(&mut forge.replay, r#""name":"agent-board","number":40"#)["data"]["repository"];
+        let nodes = repo["issue"]["comments"]["nodes"].as_array_mut().unwrap();
+        if !edit_plan {
+            nodes.push(json!({"url": "https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-11",
+                "body": "A later bot comment", "createdAt": "2026-10-23T13:30:00Z",
+                "lastEditedAt": null, "author": {"login": "cgwalters-bot"}, "editor": null}));
+        }
+        let edited = nodes
+            .iter_mut()
+            .find(|c| {
+                c["url"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(if edit_plan { "-9" } else { "-11" })
+            })
+            .unwrap();
+        edited["lastEditedAt"] = "2026-10-23T13:40:00Z".into();
+        edited["editor"] = json!({"login": "visitor"});
+        repo["sessionIssues"] = json!({"nodes": [{"number": 44,
+        "updatedAt": "2026-10-23T14:30:00Z", "comments": {"nodes": [{
+            "createdAt": "2026-10-23T14:30:00Z", "author": {"login": "cgwalters"}
+        }]}}]});
+        repo["sessionPulls"] = json!({"nodes": []});
+        repo["sessionDefault"] = Value::Null;
+        let mut settings = session_settings();
+        // The foreign edit belongs to the prior configured batch day, but
+        // the dispatch is only two hours old, not an absent session.
+        settings["sessions"]["hourUtc"] = 14.into();
+        let report = preview(&config(settings), &forge.replay);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert!(
+            !report.planned_starts.contains_key("session"),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            report.lines.iter().any(|l| l.contains(
+                "activity score=6; last session=2026-10-23T13:00:00Z; minHours=12 floor"
+            )),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn sessions_due_but_start_capped_still_apply_the_existing_batch() {
+    let mut forge = Forge::new(None, false);
+    anchor_plan(
+        &mut forge.replay,
+        "session",
+        "cgwalters-bot",
+        Some("2026-10-23T06:00:00Z"),
+    );
+    anchor_batch(&mut forge.replay, "cgwalters-bot", None, json!([]));
+    let repo =
+        &mut answer(&mut forge.replay, r#""name":"agent-board","number":40"#)["data"]["repository"];
+    repo["sessionIssues"] = json!({"nodes": [{"number": 44, "updatedAt": "2026-10-23T07:00:00Z", "comments": {"nodes": []}}]});
+    repo["sessionPulls"] = json!({"nodes": []});
+    repo["sessionDefault"] = Value::Null;
+    let mut settings = session_settings();
+    settings["sessions"]["issues"] = json!([
+        "cgwalters-forge/agent-board#40",
+        "cgwalters-forge/tracker#446"
+    ]);
+    settings["sessions"]["minHours"] = 1.into();
+    settings["sessions"]["activity"] = json!({"threshold": 1});
+    settings["sessions"]["apply"] = true.into();
+    let report = apply(&forge, &config(settings));
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains("sessions.maxStarts=1 reached")),
+        "{:?}",
+        report.lines
+    );
+    assert!(
+        report.lines.iter().any(|l| l.starts_with(&format!(
+            "apply session cgwalters-forge/agent-board batch={BATCH_ID}: no changes receipt="
+        ))),
+        "{:?}",
+        report.lines
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("start session cgwalters-forge/tracker#446"))
+    );
+    assert!(!report.lines.iter().any(|l| l.starts_with(SESSION_START)));
+}
+
+#[test]
+fn sessions_failed_or_dispatch_capped_attempt_spends_the_pass_cap() {
+    for failed in [false, true] {
+        let forge = Forge::new(failed.then_some("dispatches"), false);
+        let settings = config(json!({"triagePools": ["claude"], "wip": 12,
+        "sessions": {"activity": {"threshold": 1}, "issues": [
+            "cgwalters-forge/agent-board#40", "cgwalters-forge/tracker#446"
+        ]}}));
+        let limits = Limits {
+            dispatch: (!failed).then_some(0),
+            ..Limits::default()
+        };
+        let report = apply_limited(&forge, &settings, limits);
+        assert_eq!(report.failures, usize::from(failed), "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("sessions.maxStarts=1 reached")),
+            "{:?}",
+            report.lines
+        );
+        assert!(!report.lines.iter().any(|l| l.starts_with(SESSION_START)));
+    }
+}
 
 #[test]
 fn sessions_discover_anchors_and_refuse_duplicates() {
@@ -19093,7 +19411,7 @@ fn sessions_discover_anchors_and_refuse_duplicates() {
         let mut r = Forge::new(None, false).replay;
         let mut settings = session_settings();
         settings["sessions"] =
-            json!({"hourUtc": 0, "repositories": ["cgwalters-forge/agent-board"]});
+            json!({"hourUtc": 0, "idleDays": 1, "repositories": ["cgwalters-forge/agent-board"]});
         let issues: Vec<_> = (0..count)
             .map(|n| json!({"number": 40+n, "state": "open"}))
             .collect();
@@ -19332,6 +19650,7 @@ fn anchor_plan(replay: &mut Replay, kind: &str, author: &str, recorded: Option<&
 fn session_lines(report: &Report) -> Vec<&str> {
     (report.lines.iter())
         .map(String::as_str)
+        .filter(|l| !l.contains(": activity score="))
         .filter(|l| {
             l.starts_with("session ")
                 || l.starts_with("start session ")
@@ -19396,10 +19715,9 @@ fn sessions_start_once_a_day_on_the_anchor() {
     let again = session_lines(&report);
     assert!(
         again.len() == 1
-            && again[0].starts_with(
-                "session cgwalters-forge/agent-board: today's started at 2026-10-23T15:"
-            )
-            && again[0].ends_with("; the next is due from 2026-10-24T00:00:00Z"),
+            && again[0]
+                .starts_with("session cgwalters-forge/agent-board: last started at 2026-10-23T15:")
+            && again[0].ends_with("; no new session due"),
         "{again:#?}"
     );
     let sessions = |forge: &Forge| {
@@ -19442,7 +19760,7 @@ fn sessions_start_once_a_day_on_the_anchor() {
 /// the start as any.
 #[test]
 fn sessions_wait_on_the_anchors_plan_or_a_person() {
-    let recorded_today = "session cgwalters-forge/agent-board: today's started at 2026-10-23T06:00:00Z, https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-10; the next is due from 2026-10-24T00:00:00Z";
+    let recorded_today = "session cgwalters-forge/agent-board: last started at 2026-10-23T06:00:00Z, https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-10; no new session due";
     let unrecorded = "hold cgwalters-forge/agent-board#40: its session plan 9@2026-10-22T06:00:00Z has no dispatch record; a person dispatches it by hand or removes it, and its session waits";
     let other_kind = "hold cgwalters-forge/agent-board#40: its newest plan 9@2026-10-22T06:00:00Z is for implement, not a session; a person moves it, and its session waits";
     // A writer's comment anyone else edited holds the anchor as a plan
@@ -19568,6 +19886,36 @@ fn sessions_config_table() {
     };
     for (pools, section, error) in [
         (json!(["claude"]), sessions(json!({})), None),
+        (
+            json!(["claude"]),
+            sessions(json!({"maxStarts": 0})),
+            Some("sessions maxStarts must be positive"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"activity": {"threshold": 0}})),
+            Some("sessions activity.threshold must be positive"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"idleDays": 0})),
+            Some("sessions idleDays must be 1 to 365"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"idleDays": 366})),
+            Some("sessions idleDays must be 1 to 365"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"minHours": 0})),
+            Some("sessions minHours must be 1 to 8760"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"minHours": 8761})),
+            Some("sessions minHours must be 1 to 8760"),
+        ),
         (
             json!(["claude"]),
             sessions(json!({"compareAfter": "2026-11-10T06:00:00Z"})),
@@ -19760,7 +20108,7 @@ fn sessions_apply_an_accepted_batch_once() {
         Some("2026-10-23T06:00:00Z"),
     );
     anchor_batch(&mut forge.replay, "cgwalters-bot", None, batch_actions());
-    let today = "session cgwalters-forge/agent-board: today's started at 2026-10-23T06:00:00Z, https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-10; the next is due from 2026-10-24T00:00:00Z";
+    let today = "session cgwalters-forge/agent-board: last started at 2026-10-23T06:00:00Z, https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-10; no new session due";
     let report = preview(&config(session_settings()), &forge.replay);
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
     assert_eq!(
@@ -19981,7 +20329,7 @@ fn sessions_apply_one_batch_a_day_whatever_the_record() {
         assert_eq!(lines.len(), 2, "{lines:#?}");
         assert!(
             lines[0].starts_with(
-                "session cgwalters-forge/agent-board: today's started at 2026-10-23T07:05:00Z"
+                "session cgwalters-forge/agent-board: last started at 2026-10-23T07:05:00Z"
             ),
             "{lines:#?}"
         );
