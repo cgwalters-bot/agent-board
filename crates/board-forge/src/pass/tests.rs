@@ -15317,6 +15317,199 @@ fn replay_refuses_writes_and_unrecorded_reads() {
     assert_eq!(fnv("a"), "af63dc4c8601ec8c");
 }
 
+/// Synthetic missing-policy scenarios, not new live observations. Run the
+/// normal pass preview through Recorder, including its seeded CLI arrangement.
+#[test]
+fn recording_replays_pass_absence_decisions_and_holds() {
+    for seeded in [false, true] {
+        let (mut promotion, cfg) = crate::promote::tests::awaiting_scenario();
+        let policy = "contents/upstream-policy/composefs/composefs-rs.md";
+        *answer(&mut promotion, policy) = json!({"absent": true});
+        let mut settings = config(json!({"wip": 0, "workRepositories": []}));
+        settings.promote = cfg.promote;
+        let mut forge = Forge::new(None, false);
+        forge.replay.requests.extend(promotion.requests);
+        let now = forge.replay.now;
+        let expected = preview(&settings, &forge.replay);
+        assert_eq!(expected.failures, 0, "{:?}", expected.lines);
+        assert!(
+            expected.lines.iter().any(|l| l
+                .starts_with("promote awaiting cgwalters-forge/composefs-rs#34: policy missing:")),
+            "{:?}",
+            expected.lines
+        );
+
+        let mut seed = replay();
+        seed.requests.clear();
+        if seeded {
+            seed.requests = forge
+                .replay
+                .requests
+                .iter()
+                .filter(|e| e["answer"] == json!({"absent": true}))
+                .cloned()
+                .collect();
+            // No live answer exists for the seeded absences: a fallback would
+            // fail, so equality of the pass's decisions proves seed precedence.
+            forge
+                .replay
+                .requests
+                .retain(|e| e["answer"] != json!({"absent": true}));
+        }
+        let source = Seeded {
+            seed: &seed,
+            live: &forge,
+        };
+        let recorder = Recorder::new(&source);
+        let recorded = block(run(
+            &recorder,
+            &recorder,
+            &settings,
+            State::default(),
+            (Mode::Preview, Limits::default()),
+            now,
+        ))
+        .unwrap();
+        assert!(forge.writes.borrow().is_empty());
+        assert_eq!(recorded.lines, expected.lines);
+        assert_eq!(recorded.holds, expected.holds);
+        assert!(
+            recorder
+                .send("POST", "https://api.github.com/x", &json!({}))
+                .is_err()
+        );
+        assert!(
+            source
+                .send("POST", "https://api.github.com/x", &json!({}))
+                .is_err()
+        );
+        assert!(forge.writes.borrow().is_empty());
+
+        let fixture: Value = serde_json::from_str(&recorder.fixture(now).unwrap()).unwrap();
+        let entry = fixture["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| text(e, "/request/get").contains(policy))
+            .unwrap();
+        assert_eq!(entry["answer"], json!({"absent": true}));
+        let replay = Replay::from_json(&fixture).unwrap();
+        assert_eq!(replay.now, now);
+        let error = replay
+            .get(entry["request"]["get"].as_str().unwrap(), None)
+            .err()
+            .unwrap();
+        assert!(error.is::<crate::github::NotFound>(), "{error:#}");
+        let replayed = preview(&settings, &replay);
+        assert_eq!(replayed.lines, recorded.lines);
+        assert_eq!(replayed.holds, recorded.holds);
+        assert_eq!(replayed.failures, 0);
+        assert!(
+            replay
+                .get("https://api.github.com/unrecorded", None)
+                .is_err()
+        );
+        assert!(
+            replay
+                .send("POST", "https://api.github.com/x", &json!({}))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn seeded_recording_distinguishes_absence_failures_and_legacy_status() {
+    struct Live {
+        reads: Cell<usize>,
+        kind: &'static str,
+    }
+    impl Rest for Live {
+        fn get(&self, _: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+            assert!(validator.is_none());
+            self.reads.set(self.reads.get() + 1);
+            match self.kind {
+                "absent" => Err(crate::github::NotFound.into()),
+                "auth" => Err(crate::github::AuthenticationRequired.into()),
+                // Status-like text must never be interpreted as typed absence.
+                _ => bail!("transport failed: HTTP 404 not found"),
+            }
+        }
+        fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+            panic!("a recording forwarded a write")
+        }
+    }
+    let url = "https://api.github.com/synthetic-missing";
+    for kind in ["absent", "auth", "transport"] {
+        for seeded in [false, true] {
+            let mut seed = replay();
+            seed.requests = if seeded {
+                vec![json!({
+                    "request": {"get": url}, "answer": {"absent": true}
+                })]
+            } else {
+                vec![]
+            };
+            let live = Live {
+                reads: Cell::new(0),
+                kind,
+            };
+            let source = Seeded {
+                seed: &seed,
+                live: &live,
+            };
+            let recorder = Recorder::new(&source);
+            let error = recorder
+                .get(url, Some(("If-None-Match", "synthetic")))
+                .err()
+                .unwrap();
+            let absent = seeded || kind == "absent";
+            assert_eq!(error.is::<crate::github::NotFound>(), absent, "{error:#}");
+            assert_eq!(
+                error.is::<crate::github::AuthenticationRequired>(),
+                !seeded && kind == "auth"
+            );
+            assert_eq!(live.reads.get(), usize::from(!seeded));
+            let fixture: Value =
+                serde_json::from_str(&recorder.fixture(seed.now).unwrap()).unwrap();
+            assert_eq!(
+                fixture["requests"],
+                if absent {
+                    json!([{
+                        "request": {"get": url}, "answer": {"absent": true}
+                    }])
+                } else {
+                    json!([])
+                }
+            );
+            let replay = Replay::from_json(&fixture).unwrap();
+            let error = replay.get(url, None).err().unwrap();
+            assert_eq!(error.is::<crate::github::NotFound>(), absent);
+            if !absent {
+                assert!(error.to_string().contains("the replay did not record"));
+            }
+        }
+    }
+    // Historical status:404 fixtures still return a response, not NotFound.
+    let mut seed = replay();
+    seed.requests = vec![json!({"request": {"get": url},
+        "answer": {"status": 404, "body": {"message": "Not Found"}}})];
+    let live = Live {
+        reads: Cell::new(0),
+        kind: "auth",
+    };
+    let source = Seeded {
+        seed: &seed,
+        live: &live,
+    };
+    let recorder = Recorder::new(&source);
+    assert_eq!(recorder.get(url, None).unwrap().status, 404);
+    assert_eq!(live.reads.get(), 0);
+    let fixture: Value = serde_json::from_str(&recorder.fixture(seed.now).unwrap()).unwrap();
+    let replay = Replay::from_json(&fixture).unwrap();
+    assert_eq!(replay.get(url, None).unwrap().status, 404);
+    assert_eq!(fixture["requests"][0]["answer"]["absent"], Value::Null);
+}
+
 /// Follows `cgwalters-forge/agentic-job`, whose one open pull request, #9,
 /// is the bot's draft that stopped at a checkpoint: stage 2 continues it
 /// where pacing lets it.

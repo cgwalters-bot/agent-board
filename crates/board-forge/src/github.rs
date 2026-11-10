@@ -2317,6 +2317,53 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
+    /// Synthetic HTTP answers exercise the real GET classification without
+    /// opening a socket, looking up credentials, or contacting GitHub.
+    #[test]
+    fn recording_preserves_live_get_absence() {
+        use crate::pass::{Recorder, Replay};
+        use crate::poll::Rest;
+
+        let url = format!("{API_ROOT}repos/example/project/contents/missing");
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        for status in [404, 410, 401] {
+            let mut client = Client::anonymous();
+            client.agent = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .middleware(
+                    move |request: ureq::http::Request<ureq::SendBody<'_>>,
+                          _next: ureq::middleware::MiddlewareNext<'_>| {
+                        assert_eq!(request.method(), "GET");
+                        assert!(request.headers().get("Authorization").is_none());
+                        Ok(ureq::http::Response::builder()
+                            .status(status)
+                            .body(ureq::Body::builder().data("{}"))
+                            .unwrap())
+                    },
+                )
+                .build()
+                .into();
+            let recorder = Recorder::new(&client);
+            let error = recorder.get(&url, None).err().unwrap();
+            assert_eq!(error.is::<NotFound>(), status != 401, "{error:#}");
+            assert_eq!(error.is::<AuthenticationRequired>(), status == 401);
+            let fixture: Value = serde_json::from_str(&recorder.fixture(now).unwrap()).unwrap();
+            if status == 401 {
+                assert_eq!(fixture["requests"], json!([]));
+            } else {
+                assert_eq!(
+                    fixture["requests"],
+                    json!([{
+                        "request": {"get": url}, "answer": {"absent": true}
+                    }])
+                );
+                let replay = Replay::from_json(&fixture).unwrap();
+                let error = replay.get(&url, None).err().unwrap();
+                assert!(error.is::<NotFound>(), "{error:#}");
+            }
+        }
+    }
+
     #[test]
     fn client_uses_platform_trust_with_verification_enabled() {
         let client = Client::with_token("test-key-not-secret".into());
