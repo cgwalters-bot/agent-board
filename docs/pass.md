@@ -624,7 +624,9 @@ children, a reason that counts them and names up to three at the board's
 first two Priority options (P0 and P1), and `operator` true only where there
 is one, so that the review app asks the operator once to label the epic.
 The other kinds are `closed`, `needs-design` (labelled so: a parked design,
-which still blocks dispatch but asks the operator nothing), `needs-issue`
+which still blocks dispatch but asks the operator nothing), `needs-close`
+(an enabled triage close refused for news since its verdict, waiting on the
+controller, not the operator), `needs-issue`
 (a triage verdict waiting on the controller for a follow-up issue, see
 [Scheduling](#scheduling)), `blocked`
 (board Blocked), `waiting-on` (open
@@ -2568,6 +2570,25 @@ unless `triageFollowUpDays` is set. Then the triage brief asks for a
 reads the newest one the bot posted after the dispatch record, unedited but by
 a writer; a visitor's comment is never a verdict. A comment by the operator
 after a non-asking verdict (or after the record, with no verdict) triages the issue again.
+Without `triageClose`, `done` and `obsolete` still ask the operator whether
+to close. With it enabled, a close refused outside delegated harness routing
+only for news since the verdict, a comment posted or edited or the issue
+edited (below), instead publishes `needs-close`, with `operator: false`, the
+verdict's receipt URL and the refusal reason: a triage can read that news,
+the operator need not. Supervisor health raises this as a problem within its
+existing bounded hold collection. It writes no comment, label or assignment,
+including with `assignHolds`, and previews and retries retain the same
+receipt. As with `needs-issue` below, a subsequent writer response, such as
+the controller saying what remains, triages the issue again with that
+response as its context, without a label removal; the brief names it. Run
+bookkeeping and run output do not count (a supervisor note is run output),
+nor does an operator question's hold (`ask create`). Any other refusal, an
+issue not locked throughout its triage, no lock known for an earlier verdict,
+a reopen, a visitor's or the supervisor agent's text, no triage settles, so
+it still asks the operator as below, where `release_listed` can act on it.
+No close check changes, and an old hold, labelled or assigned before, waits
+on its person as before. Existing delegated harness routing is unchanged.
+
 Otherwise `done`, `obsolete`, `needs-design` and `needs-operator` label it
 `needs-human`, so it shows as the operator's ask, and post one comment
 whose hidden first line, `<!-- agent-board-hold: verdict COMMENT-ID -->`,
@@ -2955,9 +2976,10 @@ verdict was about the issue as triage read it. The newest lock, unlock,
 title edit and reopen are each read on their own, so that no number of other
 events hides one. It also closes once:
 reopened after the verdict, whoever closed it, or left open by a failed
-close, which leaves the pass's line for that verdict, the verdict then labels
-it as above, as does one any of these checks refuses, the line and the hold
-comment saying why. Without
+close, which leaves the pass's line for that verdict. A close refused for a
+later comment or edit waits as `needs-close` (above); the verdict labels one
+any other check refuses as above, the line and the hold comment saying why.
+Harness work is planned again instead. Without
 `triageClose` the pass never closes an issue on a verdict; the
 supervisor's `close` may, and takes the label as the pass's hold of a
 `done` verdict only with that comment, and refuses any bot comment after its
@@ -3748,7 +3770,7 @@ operator's, and a `stall …` line in the pass's log:
   since T: REASON`, the reason with its times as `<time>` and cut to 300
   characters. Past ten such alarms, one more entry on the holds issue
   counts and names the rest, which have their lines. Holds that wait by design are exempt: every hold that
-  already waits on the operator, and `needs-human`, `needs-issue`,
+  already waits on the operator, and `needs-human`, `needs-issue`, `needs-close`,
   `needs-design`, `blocked`, `closed`, `waiting-on`, `pr-open`, `in-flight`, `dispatched`,
   `triage-cooldown`, `epic-not-live`, `outside-epics` and
   `overlap-ignored`. So is an `overlap` hold whose every pull request this
@@ -4946,7 +4968,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `triageReplans` | GitHub only: a triage that planned nothing is asked to plan again once its wait passes, changed inputs or not, at most this many times (0–10) in a row, after which an unchanged issue waits on the operator, see [scheduling](#scheduling); needs `triageFollowUpDays`; `0` (off) |
-| `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
+| `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, one refused for news since the verdict waiting as `needs-close`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `replanInvalid` | GitHub only: request one replacement of an invalid bot-written job plan or unparseable epic plan before asking the operator; existing holds and start caps remain; `false` |

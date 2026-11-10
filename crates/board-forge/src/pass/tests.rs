@@ -8502,12 +8502,97 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             LABEL,
         ),
         (
+            "the controller's answer releases a needs-close wait without a label removal",
+            vec![
+                (bot, None, "done", 0),
+                (bot, None, "Checked: part 2 remains.", 1),
+            ],
+            (true, None),
+            "start triage cgwalters-forge/tracker#446 ",
+            true,
+            "",
+        ),
+        (
+            "a supervisor note after the verdict, which no triage settles, asks the operator",
+            vec![(bot, None, "done", 0), (bot, None, "note", 1)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: its body or a comment is the supervisor agent's text",
+            false,
+            LABEL,
+        ),
+        (
+            "so does a visitor's comment after it",
+            vec![
+                (bot, None, "done", 0),
+                ("visitor", None, "Still broken.", 1),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: its body or a comment is not only a writer's",
+            false,
+            LABEL,
+        ),
+        (
+            "and an unlocked issue the operator answered",
+            vec![
+                (bot, None, "done", 0),
+                ("cgwalters", None, "Part 2 remains.", 1),
+                ("", None, "unlocked", 0),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: it was not locked throughout its triage",
+            false,
+            LABEL,
+        ),
+        (
+            "and one reopened since, with the operator's comment",
+            vec![
+                (bot, None, "done", 0),
+                ("cgwalters", None, "Reopening: not done.", 1),
+                ("", None, "reopened", 1),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: it was reopened after this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "the operator's answer on a locked issue releases a needs-close wait",
+            vec![
+                (bot, None, "done", 0),
+                ("cgwalters", None, "Part 2 remains.", 1),
+            ],
+            (true, None),
+            "start triage cgwalters-forge/tracker#446 ",
+            true,
+            "",
+        ),
+        (
+            "an answer does not release the operator still assigned with assignHolds",
+            vec![
+                (bot, None, "done", 0),
+                (bot, None, "hold-marker", 0),
+                (bot, None, "Checked: part 2 remains.", 1),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: assigned to cgwalters since ",
+            false,
+            "",
+        ),
+        (
             "and the operator's edit of the body after the verdict",
             vec![(bot, None, "done", 0), ("", None, "edited", 1)],
             (true, None),
-            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: the issue was edited after this verdict",
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; controller: reconcile close; not closed: the issue was edited after this verdict",
             false,
-            LABEL,
+            "",
+        ),
+        (
+            "obsolete so refused with assignHolds waits for the controller without writes",
+            vec![(bot, None, "obsolete", 0), ("", None, "edited", 1)],
+            (true, Some(0)),
+            "hold cgwalters-forge/tracker#446: triage verdict obsolete, {answer}; controller: reconcile close; not closed: the issue was edited after this verdict",
+            false,
+            "",
         ),
         (
             "reopened after its line, or not closed, it asks the operator",
@@ -8537,9 +8622,9 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             "so does any comment after the verdict, an ask's hold the bot posted too",
             vec![(bot, None, "done", 0), (bot, None, "ask", 0)],
             (true, None),
-            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; controller: reconcile close; not closed: a comment was posted or edited after this verdict",
             false,
-            LABEL,
+            "",
         ),
         (
             "and the operator's edit of an earlier comment after the verdict",
@@ -8549,9 +8634,9 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 ("", None, "edit-first", 1),
             ],
             (true, None),
-            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; controller: reconcile close; not closed: a comment was posted or edited after this verdict",
             false,
-            LABEL,
+            "",
         ),
         (
             "but not the status comment of the triage's own run",
@@ -8577,7 +8662,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             "but a visitor's copy of a status comment keeps it open",
             vec![(bot, None, "done", 0), ("visitor", None, "other-status", 0)],
             (true, None),
-            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: its body or a comment is not only a writer's",
             false,
             LABEL,
         ),
@@ -8588,25 +8673,25 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 (bot, Some("cgwalters"), "other-status", 0),
             ],
             (true, None),
-            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; controller: reconcile close; not closed: a comment was posted or edited after this verdict",
             false,
-            LABEL,
+            "",
         ),
         (
             "or one with its agent's hand-back reason",
             vec![(bot, None, "done", 0), (bot, None, "other-reason", 0)],
             (true, None),
-            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; controller: reconcile close; not closed: a comment was posted or edited after this verdict",
             false,
-            LABEL,
+            "",
         ),
         (
             "or a bot comment quoting a dispatch marker",
             vec![(bot, None, "done", 0), (bot, None, "quoted-dispatch", 0)],
             (true, None),
-            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; controller: reconcile close; not closed: a comment was posted or edited after this verdict",
             false,
-            LABEL,
+            "",
         ),
         (
             "needs-operator still asks the operator",
@@ -8847,7 +8932,10 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         let first = apply(&forge, &config);
         assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
         config.assign_holds = name.contains("with assignHolds");
-        if config.assign_holds {
+        if name.contains("still assigned") {
+            let events = [("AssignedEvent", "cgwalters-bot", -1)];
+            assignments(&mut forge.replay, 446, &events, &["cgwalters"]);
+        } else if config.assign_holds {
             assignments(&mut forge.replay, 446, &[], &[]);
         }
         let comments = forge.comments_on("cgwalters-forge/tracker", 446);
@@ -8939,13 +9027,26 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                     line.as_str().unwrap().to_owned()
                 }
                 "note" => format!("Close it.\n\n{}", crate::input::SUPERVISOR_NOTE),
+                // The pass's hold comment for the newest verdict.
+                "hold-marker" => {
+                    let key = ("cgwalters-forge/tracker".to_owned(), 446);
+                    let added = &forge.added.borrow()[&key];
+                    let fenced = (added.iter().rev())
+                        .find(|c| text(c, "/body").contains(TRIAGE_FENCE))
+                        .unwrap();
+                    let id = plan::comment_id(text(fenced, "/url")).unwrap();
+                    format!("{}\nThe operator was assigned.", hold_marker(id))
+                }
                 // A run's cost line and an agent's safe output.
                 "cost" => format!("Finished.\n\n<!-- {}: 7 -->", crate::budget::RUN_MARKER),
                 "run-output" => {
-                    format!("Created #84.\n\n{}dispatch, id: 7 -->", crate::poll::RUN_MARKER)
+                    format!(
+                        "Created #84.\n\n{}dispatch, id: 7 -->",
+                        crate::poll::RUN_MARKER
+                    )
                 }
                 // `ask create --apply`'s hold, crates/agent-board/src/ask.rs.
-                "ask" => "An operator question is being opened for this item; any earlier triage verdict no longer authorizes closure.".to_owned(),
+                "ask" => ASK_HOLD.to_owned(),
                 // agentic-job's status comment for the run the record names.
                 "status" => {
                     let key = ("cgwalters-forge/tracker".to_owned(), 446);
@@ -9042,6 +9143,36 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         ))
         .unwrap();
         assert_eq!(second.failures, 0, "{name}: {:#?}", second.lines);
+        if expected.contains("controller: reconcile close") {
+            for report in [&preview, &second] {
+                let entry = report
+                    .holds
+                    .iter()
+                    .find(|e| e.hold.kind == HoldKind::NeedsClose)
+                    .unwrap_or_else(|| panic!("{name}: {:#?}", report.lines));
+                assert!(!entry.hold.operator, "{name}: must not ask the operator");
+                assert!(
+                    entry.hold.reason.contains(&answer),
+                    "{name}: missing receipt"
+                );
+            }
+            // With no durable mutation, retrying publishes the same receipt,
+            // not a new assignment, comment or label.
+            let issue = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446");
+            let written = verdict_writes(&forge, &issue);
+            let retry = apply(&forge, &config);
+            assert_eq!(retry.failures, 0, "{name}: {:#?}", retry.lines);
+            assert!(
+                retry.lines.iter().any(|l| l.starts_with(&expected)),
+                "{name}: {:#?}",
+                retry.lines
+            );
+            assert_eq!(
+                verdict_writes(&forge, &issue),
+                written,
+                "{name}: retry wrote"
+            );
+        }
         if name.starts_with("needs-issue") {
             let entry = second
                 .holds
@@ -9066,14 +9197,18 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             .filter(|d| d.ends_with("tracker#446"))
             .count();
         assert_eq!(triaged, 1 + usize::from(again), "{name}");
-        if name.contains("releases an issue-number wait") {
+        let released = [
+            ("releases an issue-number wait", "needs-issue"),
+            ("releases a needs-close wait", "needs-close"),
+        ];
+        if let Some((_, kind)) = released.iter().find(|(n, _)| name.contains(n)) {
             let writes = forge.writes.borrow();
             let (_, _, sent) = (writes.iter().rev())
                 .find(|(_, url, _)| url.ends_with("/dispatches"))
                 .unwrap();
             let task = text(sent, "/inputs/task");
             assert!(
-                task.contains(", a response to its needs-issue wait.")
+                task.contains(&format!(", a response to its {kind} wait."))
                     && !task.contains("needs-human was removed"),
                 "{name}: {task}"
             );
@@ -10751,6 +10886,7 @@ fn verdict_writes(forge: &Forge, issue: &str) -> Vec<(String, Value)> {
         .filter(|(_, url, body)| {
             let said = text(body, "/body");
             let acted = url.ends_with("/labels")
+                || url.ends_with("/assignees")
                 || url == issue
                 || said.starts_with("<!-- agent-board-hold")
                 || said.starts_with("The board pass closed");

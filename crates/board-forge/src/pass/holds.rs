@@ -119,6 +119,11 @@ pub enum HoldKind {
     /// Triage needs a follow-up issue number, not a human decision. Left
     /// visible to the controller without labelling or assigning the source.
     NeedsIssue,
+    /// An enabled triage close was refused for news since its verdict. Left
+    /// visible to the controller with the verdict as its receipt, without
+    /// labelling or assigning the source; a writer's response triages it
+    /// again.
+    NeedsClose,
     /// Labelled `needs-design`.
     NeedsDesign,
     /// Board Status Blocked, set by a person.
@@ -180,6 +185,7 @@ impl HoldKind {
             Self::Closed => "closed",
             Self::NeedsHuman => "needs-human",
             Self::NeedsIssue => "needs-issue",
+            Self::NeedsClose => "needs-close",
             Self::NeedsDesign => "needs-design",
             Self::Blocked => "blocked",
             Self::WaitingOn => "waiting-on",
