@@ -4312,6 +4312,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // A local apply is not serialized; the CLI caps it instead.
         if let Some(other) = self.other_pass()? {
             let why = format!("another pass is in progress, {other}; it takes the free slots");
+            self.sessions_waiting(&why);
             self.pass_held(HoldKind::Wip, why);
             return Ok(());
         }
@@ -4350,6 +4351,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let active = slots.active(&runs);
         self.report.tally.0.in_flight = Some(active);
         if active >= wip {
+            self.sessions_waiting(&format!("{active} of {wip} runs active"));
             self.pass_held(HoldKind::Wip, format!("{active} of {wip} runs active"));
             if config.sweep.is_some() {
                 let snapshot = self.snapshot();
@@ -4364,6 +4366,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Err(why) = choose(snapshot.as_ref(), &config.pools, &all, self.now)
             && slots.probes.is_empty()
         {
+            self.sessions_waiting(&why);
             self.pass_held(HoldKind::Pools, format!("{why}; new runs wait"));
             self.sweep_without_starts(&mut slots, context);
             return Ok(());
@@ -4371,6 +4374,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(why) = self.budget_hold(1.0) {
             // Held like a step past a cap, so the summary does not read idle.
             self.caps.hold();
+            self.sessions_waiting(&why);
             self.pass_held(HoldKind::Budget, format!("{why}; new runs wait"));
             self.sweep_without_starts(&mut slots, context);
             return Ok(());

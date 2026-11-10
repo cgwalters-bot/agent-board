@@ -1,11 +1,10 @@
-//! Daily sessions (agent-board#830, docs/sessions.md#daily-sessions): with
-//! `sessions` set, the pass starts one [`crate::session`] run a day on each
-//! configured repository, from the configured hour, in place of many cold
+//! Repository sessions (agent-board#862, docs/sessions.md#daily-sessions): with
+//! `sessions` set, the pass prioritizes activity since the last session,
+//! with a minimum interval and an idle fallback, in place of many cold
 //! one-comment item triages. Each repository has one labelled anchor issue,
-//! found or created by the pass, which the session's plan is posted on and its batch is
-//! answered on; the plan protocol's dispatch record there is the day's
-//! receipt, so a pass every hour starts one session a day, not twenty-four,
-//! and a run still in flight is not doubled. The anchor is the pass's: it
+//! found or created by the pass, where its plans and batches live. The plan
+//! protocol's dispatch record resets the activity score and interval; a run
+//! still in flight is not doubled. The anchor is the pass's: it
 //! is left out of stage 4's candidates, and a plan on it that is not the
 //! pass's own recorded session plan waits on a person. A due session takes
 //! a slot before stage 4's per-item starts, since it stands in for many of
@@ -13,8 +12,8 @@
 //! start. With `sessions.apply`, the batch a session answers with on its
 //! anchor is applied once a day, under the same bounds the brief named,
 //! with a receipt on the anchor ([`crate::session_apply`], agent-board#845);
-//! the day is the configured due time's, which no comment on the anchor
-//! moves. A writer's comment there that anyone else edited holds the
+//! the batch day is still the legacy configured hour's, independent of the
+//! activity schedule. A writer's comment there that anyone else edited holds the
 //! anchor for a person as it holds a plan, until the next day's due time.
 use super::*;
 use crate::epic::IssueRef;
@@ -24,6 +23,43 @@ use crate::session::{
     RESCOPE_LIMIT, SESSION_BATCH_SCHEMA, SESSION_FENCE, UPDATED_AT,
 };
 use crate::session_apply::{self, Outcome};
+
+mod activity;
+
+#[cfg(test)]
+pub(super) fn activity_query() -> String {
+    activity::query()
+}
+
+struct Prepared {
+    score: u32,
+    last: Option<OffsetDateTime>,
+    anchor: ItemRef,
+    comments: Vec<plan::Comment>,
+}
+
+/// A receipt on this reserved ledger floors subsequent starts even if its
+/// plan was later edited or replaced. Losing plan edit evidence must never
+/// turn a recent dispatch into "never", scoring the repository from epoch.
+fn last_session(comments: &[plan::Comment], writers: &[&str]) -> Option<OffsetDateTime> {
+    let prefix = format!("<!-- {}: ", plan::DISPATCH_MARKER);
+    comments
+        .iter()
+        .filter(|comment| {
+            comment.author.as_deref().is_some_and(|author| {
+                writers
+                    .iter()
+                    .any(|writer| writer.eq_ignore_ascii_case(author))
+            }) && comment.body.lines().next().is_some_and(|line| {
+                line.trim_end()
+                    .strip_prefix(&prefix)
+                    .and_then(|s| s.strip_suffix(" -->"))
+                    .is_some()
+            })
+        })
+        .map(|comment| comment.created)
+        .max()
+}
 
 /// What a session's plan says first.
 pub(super) const SESSION_INTRO: &str =
@@ -124,8 +160,18 @@ fn anchor(client: &impl Rest, repo: &str, apply: bool, caps: &Caps) -> Result<Op
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Sessions {
-    /// The hour, 0 to 23 UTC, from which a day's sessions are due.
+    /// Legacy batch-receipt day boundary; no longer schedules session starts.
+    #[serde(default)]
     pub hour_utc: u8,
+    /// Prevent organization-wide bursts of long runs, including failed attempts.
+    #[serde(default = "default_max_starts")]
+    pub max_starts: usize,
+    #[serde(default)]
+    pub activity: Activity,
+    #[serde(default = "default_idle_days")]
+    pub idle_days: u16,
+    #[serde(default = "default_min_hours")]
+    pub min_hours: u16,
     /// The issue each repository's session reports on, `OWNER/REPO#N`: one
     /// open issue on the board in each work repository that has sessions.
     #[serde(default)]
@@ -146,9 +192,46 @@ pub struct Sessions {
     pub compare_after: Option<String>,
 }
 
+const fn default_max_starts() -> usize {
+    1
+}
+
+const fn default_idle_days() -> u16 {
+    7
+}
+
+const fn default_min_hours() -> u16 {
+    12
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Activity {
+    pub threshold: u32,
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self { threshold: 5 }
+    }
+}
+
 impl Sessions {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
         ensure!(self.hour_utc < 24, "sessions hourUtc is not 0 to 23");
+        ensure!(self.max_starts > 0, "sessions maxStarts must be positive");
+        ensure!(
+            self.activity.threshold > 0,
+            "sessions activity.threshold must be positive"
+        );
+        ensure!(
+            (1..=365).contains(&self.idle_days),
+            "sessions idleDays must be 1 to 365"
+        );
+        ensure!(
+            (1..=8760).contains(&self.min_hours),
+            "sessions minHours must be 1 to 8760"
+        );
         ensure!(
             !self.issues.is_empty() || !self.repositories.is_empty(),
             "sessions issues names no issue; set repositories instead"
@@ -221,6 +304,50 @@ impl Sessions {
             .collect()
     }
 
+    /// Spread first idle starts over an idle interval; later starts retain
+    /// their own clock. Stable FNV-1a, not Rust's version-dependent hasher.
+    fn idle_offset(&self, repo: &str) -> time::Duration {
+        let hash = repo.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x100000001b3)
+        });
+        time::Duration::hours((hash % (u64::from(self.idle_days) * 24)) as i64)
+    }
+
+    fn reason(
+        &self,
+        repo: &str,
+        created: OffsetDateTime,
+        last: Option<OffsetDateTime>,
+        score: u32,
+        now: OffsetDateTime,
+    ) -> (bool, String) {
+        if let Some(last) = last
+            && now < last + time::Duration::hours(i64::from(self.min_hours))
+        {
+            return (
+                false,
+                format!("minHours={} floor; it waits", self.min_hours),
+            );
+        }
+        if score >= self.activity.threshold {
+            return (true, "activity threshold reached".into());
+        }
+        let idle = last.unwrap_or_else(|| created + self.idle_offset(repo))
+            + time::Duration::days(i64::from(self.idle_days));
+        if now >= idle {
+            (true, format!("idleDays={} elapsed", self.idle_days))
+        } else {
+            (
+                false,
+                format!(
+                    "below activity threshold {}; idle due {}; it waits",
+                    self.activity.threshold,
+                    sweep::stamp(idle)
+                ),
+            )
+        }
+    }
+
     /// When the newest day's sessions were due, at or before `now`.
     pub(super) fn due(&self, now: OffsetDateTime) -> Result<OffsetDateTime> {
         let time = time::Time::from_hms(self.hour_utc, 0, 0).context("sessions hourUtc")?;
@@ -274,13 +401,23 @@ pub(super) fn brief(repo: &str, anchor: &str, operator: &str, bounds: &Bounds) -
 }
 
 impl<C: Rest + Transport> Scheduler<'_, C> {
+    pub(super) fn sessions_waiting(&mut self, why: &str) {
+        if let Some(sessions) = &self.config.sessions {
+            for repo in sessions.repos() {
+                self.line(format!(
+                    "session {repo}: activity and last session unread; {why}; it waits"
+                ));
+            }
+        }
+    }
+
     /// The anchor issues of [`Config::sessions`], which stage 4's
     /// candidates leave out: each one's run is its session's to start.
     pub(super) fn session_anchors(&self) -> Vec<ItemRef> {
         (self.config.sessions.as_ref()).map_or_else(Vec::new, Sessions::anchors)
     }
 
-    /// With [`Config::sessions`], the day's due sessions, each on its
+    /// With [`Config::sessions`], activity-ranked due sessions, each on its
     /// anchor, before stage 4's per-item starts; `free` slots are left,
     /// and how many starts it took.
     pub(super) fn sessions(
@@ -309,18 +446,25 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     .iter()
                     .map(|repo| (repo.clone(), None)),
             );
-        let mut taken = 0;
+        // Read anchors before admission so ranking uses activity *since each
+        // repository's last session*, not activity since the previous pass.
+        // These reads share the pass envelope and leave its start reserve.
+        let mut prepared = Vec::new();
         for (repo, explicit) in anchors {
             let bounds = self.client.bounds;
-            // What is left is a start's: the sessions wait for the next pass.
-            if bounds.reserved() {
-                self.line(format!("session {repo}: {}", self.reserved()));
-                break;
+            let reserve = bounds.reserve.get();
+            // Keep one ordinary read for a managed anchor's facts before
+            // start_run opens the existing start reserve. A large anchor
+            // listing must not consume every prepared session's admission.
+            if bounds.left.get() <= WRITE_RESERVE + reserve + 1 {
+                self.line(format!(
+                    "session {repo}: activity and last session unread; {}",
+                    self.reserved()
+                ));
+                continue;
             }
-            let refused = bounds.refused.get();
-            // Discover and process one repository at a time: listing a large
-            // organization must not spend the reserve before its first start.
-            let step = (|| -> Result<Option<Step>> {
+            bounds.reserve.set(reserve + 1);
+            let read = (|| -> Result<_> {
                 let found = match explicit {
                     Some(found) => Some(found),
                     None => anchor(&self.client, &repo, self.apply, self.caps)?,
@@ -331,17 +475,75 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     ));
                     return Ok(None);
                 };
-                self.session(sessions, &found, board, slots, free, context)
+                if sessions.repositories.is_empty() && !board.items.contains_key(&key(&found)) {
+                    self.line(format!("session {repo}: its issue {} is not an open issue on the board; no session starts", found.display()));
+                    return Ok(None);
+                }
+                if let Some(run) = slots.busy.get(&key(&found)) {
+                    self.line(format!("session {repo}: its run is in flight, {run}"));
+                    return Ok(None);
+                }
+                let (comments, observed) = activity::read(&self.client, &found)
+                    .with_context(|| format!("reading {}'s comments", found.display()))?;
+                let last = last_session(&comments, &self.writers());
+                let score = activity::score(
+                    &observed,
+                    found.number,
+                    last.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                    self.now,
+                    &self.config.operator,
+                );
+                Ok(Some(Prepared {
+                    score,
+                    last,
+                    anchor: found,
+                    comments,
+                }))
             })();
+            bounds.reserve.set(reserve);
+            match read {
+                Ok(Some(prepared_session)) => prepared.push(prepared_session),
+                Ok(None) => {}
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("session {repo} error: {error:#}"));
+                }
+            }
+        }
+        prepared.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| key(&a.anchor).cmp(&key(&b.anchor)))
+        });
+        let mut taken = 0;
+        let mut attempts = 0;
+        for prepared in prepared {
+            let repo = &prepared.anchor.repository;
+            let bounds = self.client.bounds;
+            // What is left is a start's: the sessions wait for the next pass.
+            if bounds.reserved() {
+                self.line(format!("session {repo}: {}", self.reserved()));
+                continue;
+            }
+            let refused = bounds.refused.get();
+            let step = self.session(
+                sessions,
+                &prepared,
+                board,
+                slots,
+                (free, sessions.max_starts - attempts),
+                context,
+            );
             let started = matches!(
                 step,
                 Ok(Some(
                     Step::Started(..) | Step::Failed(..) | Step::Capped(..)
                 ))
             );
+            attempts += usize::from(started);
             if !started && (bounds.reserved() || bounds.refused.get() > refused) {
                 self.line(format!("session {repo}: {}", self.reserved()));
-                break;
+                continue;
             }
             match step {
                 Ok(Some(Step::Started(line, holds))) => {
@@ -370,21 +572,25 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         (free, taken)
     }
 
-    /// One repository's session today, on `anchor`: started where the
-    /// anchor is an open issue on the board with no run in flight, and its
-    /// newest plan, if any, is a recorded session plan from before today's
-    /// due time; anything else on the anchor waits on a person, said once a
-    /// pass.
+    /// Admit an eligible session under the same plan, pool and start checks
+    /// as other work. A non-session or unrecorded plan still waits on a person.
     fn session(
         &mut self,
         sessions: &Sessions,
-        anchor: &ItemRef,
+        prepared: &Prepared,
         board: &BoardRead,
         slots: &Slots,
-        free: usize,
+        (free, remaining): (usize, usize),
         (target, snapshot): (&Target, Option<&Value>),
     ) -> Result<Option<Step>> {
         let config = self.config;
+        let Prepared {
+            anchor,
+            comments,
+            last,
+            score,
+        } = prepared;
+        let (last, score) = (*last, *score);
         let repo = anchor.repository.as_str();
         let at = anchor.display();
         let usage = config
@@ -415,13 +621,16 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             ));
             return Ok(None);
         };
+        let (eligible, reason) = sessions.reason(repo, facts.created, last, score, self.now);
+        self.line(format!(
+            "session {repo}: activity score={score}; last session={}; {reason}",
+            last.map(sweep::stamp).unwrap_or_else(|| "never".into())
+        ));
         if let Some(run) = slots.busy.get(&key(anchor)) {
             self.line(format!("session {repo}: its run is in flight, {run}"));
             return Ok(None);
         }
         let due = sessions.due(self.now)?;
-        let comments = plan::issue_comments(&self.client, anchor)
-            .with_context(|| format!("reading {at}'s comments"))?;
         let writers = self.writers();
         // A writer's comment that anyone else edited is weighed as a plan
         // ([`plan::newest_plan`]) and holds the anchor for a person; one
@@ -458,7 +667,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
                 return Ok(None);
             }
-            let held = batch::held(&self.client, &comments, &writers, &id, anchor)?;
+            let held = batch::held(&self.client, comments, &writers, &id, anchor)?;
             let Some(&(record_id, record)) = held.first() else {
                 let why = format!(
                     "its session plan {id} has no dispatch record; a person dispatches it by hand or removes it, and its session waits"
@@ -466,16 +675,42 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
                 return Ok(None);
             };
-            if record.created >= due {
+            if !eligible {
                 self.line(format!(
-                    "session {repo}: today's started at {}, {}; the next is due from {}",
+                    "session {repo}: last started at {}, {}; no new session due",
                     sweep::stamp(record.created),
                     record.url,
-                    sweep::stamp(due + time::Duration::days(1))
                 ));
-                self.batch(sessions, anchor, facts, &comments, (record_id, due), board)?;
+            }
+            // Apply the existing answer independently of replacement admission:
+            // a due session deferred by maxStarts or pace must not lose its batch.
+            // Preserve the existing once-per-day batch mutation boundary,
+            // even when minHours permits multiple session starts in a day.
+            // An expired foreign-edit hold still gives way to a due
+            // replacement, as before; it cannot authorize an old batch.
+            if !eligible || session_apply::answer(comments, &writers, record_id).is_ok() {
+                self.batch(
+                    sessions,
+                    anchor,
+                    facts,
+                    comments,
+                    (record_id, sessions.due(record.created)?),
+                    board,
+                )?;
+            }
+            if !eligible {
                 return Ok(None);
             }
+        }
+        if !eligible {
+            return Ok(None);
+        }
+        if remaining == 0 {
+            self.line(format!(
+                "session {repo}: sessions.maxStarts={} reached; it waits for the next pass",
+                sessions.max_starts
+            ));
+            return Ok(None);
         }
         if free == 0 {
             self.line(format!("session {repo}: no slot free; it waits"));
@@ -708,6 +943,56 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn activity_idle_interval_and_floor() {
+        let sessions = sessions(0);
+        let now = at("2026-11-10T12:00:00Z");
+        let created = at("2026-10-01T00:00:00Z");
+        for (hours, score, due, reason) in [
+            (11, 100, false, "minHours=12"),
+            (12, 5, true, "activity threshold"),
+            (12, 4, false, "below activity threshold"),
+            (167, 0, false, "below activity threshold"),
+            (168, 0, true, "idleDays=7"),
+        ] {
+            let last = now - time::Duration::hours(hours);
+            let (eligible, why) = sessions.reason("owner/repo", created, Some(last), score, now);
+            assert_eq!(eligible, due, "{hours}: {why}");
+            assert!(why.contains(reason), "{why}");
+        }
+        let offsets: BTreeSet<_> = (0..15)
+            .map(|n| sessions.idle_offset(&format!("owner/repo-{n}")))
+            .collect();
+        assert!(offsets.len() > 10);
+        assert!(offsets.iter().any(|d| d.whole_days() > 0));
+        assert!(
+            offsets
+                .iter()
+                .all(|d| *d >= time::Duration::ZERO && *d < time::Duration::days(7))
+        );
+        assert_eq!(
+            sessions.idle_offset("Owner/Repo"),
+            sessions.idle_offset("owner/repo")
+        );
+        let initial_idle = created + sessions.idle_offset("owner/repo") + time::Duration::days(7);
+        assert!(
+            !sessions
+                .reason(
+                    "owner/repo",
+                    created,
+                    None,
+                    0,
+                    initial_idle - time::Duration::seconds(1)
+                )
+                .0
+        );
+        assert!(
+            sessions
+                .reason("owner/repo", created, None, 0, initial_idle)
+                .0
+        );
+    }
+
     fn at(stamp: &str) -> OffsetDateTime {
         OffsetDateTime::parse(stamp, &Rfc3339).unwrap()
     }
@@ -715,6 +1000,10 @@ mod tests {
     fn sessions(hour_utc: u8) -> Sessions {
         Sessions {
             hour_utc,
+            max_starts: default_max_starts(),
+            activity: Activity::default(),
+            idle_days: default_idle_days(),
+            min_hours: default_min_hours(),
             issues: vec!["cgwalters-forge/agent-board#830".into()],
             repositories: vec![],
             apply: false,

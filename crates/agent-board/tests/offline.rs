@@ -2823,7 +2823,7 @@ fn pass_replay_previews_a_daily_session() {
         serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
     config["triagePools"] = serde_json::json!(["claude"]);
     config["sessions"] = serde_json::json!({
-        "hourUtc": 0, "issues": ["cgwalters-forge/agent-board#40"],
+        "hourUtc": 0, "idleDays": 1, "issues": ["cgwalters-forge/agent-board#40"],
         "compareAfter": "2026-10-22T00:00:00Z"
     });
     let path = std::env::temp_dir().join(format!(
@@ -2834,6 +2834,24 @@ fn pass_replay_previews_a_daily_session() {
     // Synthetic dispatch history: evidence of the log contract, not live savings.
     let mut recording: Value =
         serde_json::from_str(include_str!("../../../fixtures/pass/board-2026-10-23.json")).unwrap();
+    // The historical recording predates activity fields on the first anchor
+    // page. Supply an explicit, synthetic quiet repository for this replay.
+    let mut activity = recording["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["request"]["variables"]["name"] == "agent-board"
+                && entry["request"]["variables"]["number"] == 40
+                && entry["answer"]["data"]["repository"]["issue"]["comments"].is_object()
+        })
+        .unwrap()
+        .clone();
+    activity["request"]["graphql"] = "6d40afa20e813ee9".into();
+    activity["answer"]["data"]["repository"]["sessionIssues"] = serde_json::json!({"nodes": []});
+    activity["answer"]["data"]["repository"]["sessionPulls"] = serde_json::json!({"nodes": []});
+    activity["answer"]["data"]["repository"]["sessionDefault"] = Value::Null;
+    recording["requests"].as_array_mut().unwrap().push(activity);
     for (day, kind) in [(21, "triage"), (22, "session")] {
         let url = format!(
             "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?event=workflow_dispatch&created=2026-10-{day}T00%3A00%3A00Z..2026-10-{day}T23%3A59%3A59Z&per_page=100&page=1"

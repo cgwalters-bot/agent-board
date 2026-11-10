@@ -2927,9 +2927,16 @@ comment ([Forgejo](forges.md#the-weekly-sweep)):
 ## Daily sessions
 
 With `sessions` set (off unless set), stage 4 starts, before its per-item
-starts, one [session](sessions.md#daily-sessions) run a day on each
-configured repository's anchor issue, from `sessions.hourUtc`
-(agent-board#830). `sessions.repositories` names work repositories (strings
+starts, [session](sessions.md#daily-sessions) runs by activity since the last
+session, busiest first (agent-board#862). `sessions.activity.threshold` defaults
+to 5, `sessions.minHours` floors starts at 12 hours and `sessions.idleDays`
+retriages idle repositories after 7 days. Initial idle enrollment is name-hashed
+across that interval. `sessions.maxStarts` caps attempts per pass at 1 by default,
+under ordinary pool pacing; deferred sessions remain eligible. The first anchor
+comment page also reads bounded activity fields, without extra requests; see
+[sessions](sessions.md#daily-sessions) for weights and coverage limits. Every
+repository logs its score, last session and start/hold reason, or unread when
+the pass cannot reach it. `sessions.repositories` names work repositories (strings
 or organization entries). The pass finds or creates one open issue labelled
 `agent-board-session` in each; duplicate anchors refuse the session and are
 logged. For one release `sessions.issues` still names explicit anchors on
@@ -4463,7 +4470,8 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `forgejoIntake.state` | Forgejo only: opt-in operator issue-comment routing with a separate per-instance cursor file, see [native issue intake](forges.md#native-issue-intake); section absent (off). Caller follow-up: tracker `.github/forgejo-pass.json`, `forgejoIntake: {"state": ".state/forgejo-intake.json"}`, only after #271 prerequisites; not the GitHub pass config |
 | `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs `triage`, either scope; section absent (off) |
 | `sweep.max`, `sweep.repository` | The most issues (1–100) one sweep lists; the work repository its issue is filed in; `40`, `epics.repository` |
-| `sessions.hourUtc`, `sessions.repositories`, `sessions.issues` | GitHub only: the hour (0–23 UTC) from which a day's [sessions](sessions.md#daily-sessions) are due, and work repositories (strings or organization entries); the pass manages each repository's labelled anchor, see [daily sessions](#daily-sessions); needs `triagePools` or `planPools`; section absent (off). Legacy `sessions.issues` remains for one release with a warning; do not combine the keys. |
+| `sessions.hourUtc`, `sessions.repositories`, `sessions.issues` | GitHub only: legacy batch-receipt UTC day boundary (0–23, default 0), no longer a start schedule; and work repositories (strings or organization entries). The pass manages each repository's labelled anchor, see [sessions](#daily-sessions); needs `triagePools` or `planPools`; section absent (off). Legacy `sessions.issues` remains for one release with a warning; do not combine the keys. |
+| `sessions.activity.threshold`, `sessions.idleDays`, `sessions.minHours`, `sessions.maxStarts` | Activity score needed to become due (positive, default 5), idle fallback interval (1–365 days, default 7), minimum interval between sessions (1–8760 hours, default 12), and positive per-pass attempt cap (default 1); busiest due repository first, ordinary pool pace and caps still apply. |
 | `sessions.apply` | Apply the batch a day's session answers with on its anchor, once, with a receipt there, within the bounds its brief named and `--max-writes`, see [daily sessions](#daily-sessions) and [applying a batch](sessions.md#applying-a-batch); off, a batch is a person's to read; `false` |
 | `sessions.compareAfter` | Optional trusted rollout timestamp, whole-second UTC ending `Z`; log per-repository triage/session dispatch creations in the equal 24-hour windows before and after it, with bounded reads and unknown coverage explicit; see [dispatch comparison](sessions.md#dispatch-comparison); absent (off) |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
