@@ -2935,7 +2935,19 @@ impl Forge {
                 .trim_start_matches("repos/")
                 .trim_end_matches("/issues");
             let html_url = format!("https://github.com/{repo}/issues/{id}");
-            return Ok((201, json!({"number": id, "html_url": html_url})));
+            let number = if body["labels"] == json!([sessions::ANCHOR_LABEL]) {
+                40
+            } else {
+                id
+            };
+            let labels = body["labels"]
+                .as_array()
+                .map(|ls| ls.iter().map(|l| json!({"name": l})).collect::<Vec<_>>())
+                .unwrap_or_default();
+            return Ok((
+                201,
+                json!({"number": number, "html_url": html_url, "labels": labels}),
+            ));
         }
         if method == "POST" && path.ends_with("/sub_issues") {
             return Ok((201, json!({})));
@@ -19074,6 +19086,158 @@ fn session_settings() -> Value {
 }
 
 const SESSION_START: &str = "start session cgwalters-forge/agent-board#40 pool=claude";
+
+#[test]
+fn sessions_discover_anchors_and_refuse_duplicates() {
+    for count in [0, 1, 2] {
+        let mut r = Forge::new(None, false).replay;
+        let mut settings = session_settings();
+        settings["sessions"] =
+            json!({"hourUtc": 0, "repositories": ["cgwalters-forge/agent-board"]});
+        let issues: Vec<_> = (0..count)
+            .map(|n| json!({"number": 40+n, "state": "open"}))
+            .collect();
+        r.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/agent-board/issues?state=open&labels=agent-board-session&per_page=2")}, "answer": {"status": 200, "body": issues}}));
+        let report = preview(&config(settings), &r);
+        let lines = report.lines.join("\n");
+        match count {
+            0 => assert!(
+                lines.contains("would create its agent-board-session anchor"),
+                "{lines}"
+            ),
+            1 => assert!(lines.contains(SESSION_START), "{lines}"),
+            _ => assert!(
+                lines.contains("multiple or incomplete session anchors"),
+                "{lines}"
+            ),
+        }
+        assert_eq!(report.failures, usize::from(count == 2), "{lines}");
+    }
+}
+
+#[test]
+fn sessions_repository_config_and_anchor_screening() {
+    for (repositories, issues, valid) in [
+        (json!(["cgwalters-forge/agent-board"]), json!([]), true),
+        (
+            json!(["cgwalters-forge/agent-board", "CGWALTERS-FORGE/Agent-Board"]),
+            json!([]),
+            false,
+        ),
+        (json!(["elsewhere/work"]), json!([]), false),
+        (json!(["cgwalters-forge/agent-board#40"]), json!([]), false),
+        (
+            json!(["cgwalters-forge/agent-board"]),
+            json!(["cgwalters-forge/agent-board#40"]),
+            false,
+        ),
+    ] {
+        let mut settings = session_settings();
+        settings["sessions"] =
+            json!({"hourUtc": 0, "repositories": repositories, "issues": issues});
+        let mut value: Value =
+            serde_json::from_str(include_str!("../../../../fixtures/pass/config.json")).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(settings.as_object().unwrap().clone());
+        assert_eq!(Config::parse(&value.to_string()).is_ok(), valid, "{value}");
+    }
+    let config = config(session_settings());
+    let mut facts = facts("cgwalters-forge/agent-board", 40, "2026-10-23T00:00:00Z");
+    facts.labels.push(sessions::ANCHOR_LABEL.into());
+    assert!(matches!(
+        screen(&facts, &config, &[], &["cgwalters", "cgwalters-bot"]),
+        Screen::Out
+    ));
+}
+
+#[test]
+fn sessions_anchor_apply_counts_writes_and_preserves_control_roles() {
+    for cap in [0, 1] {
+        let mut forge = Forge::new(None, false);
+        for (url, body) in [
+            (
+                format!(
+                    "{API_ROOT}repos/cgwalters-forge/agent-board/issues?state=open&labels=agent-board-session&per_page=2"
+                ),
+                json!([]),
+            ),
+            (
+                format!("{API_ROOT}repos/cgwalters-forge/agent-board/labels/agent-board-session"),
+                json!({"name": sessions::ANCHOR_LABEL}),
+            ),
+        ] {
+            forge
+                .replay
+                .requests
+                .push(json!({"request": {"get": url}, "answer": {"status": 200, "body": body}}));
+        }
+        let mut settings = session_settings();
+        settings["sessions"] =
+            json!({"hourUtc": 0, "repositories": ["cgwalters-forge/agent-board"]});
+        let report = apply_limited(
+            &forge,
+            &config(settings),
+            Limits {
+                writes: Some(cap),
+                dispatch: Some(0),
+                ..Limits::default()
+            },
+        );
+        let creates = forge
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(method, url, _)| method == "POST" && url.ends_with("/issues"))
+            .count();
+        assert_eq!(creates, cap, "{:?}", report.lines);
+        assert!(
+            report.summary.contains(&format!("writes {cap}/{cap}")),
+            "{:?}",
+            report.lines
+        );
+        if cap == 0 {
+            assert!(forge.writes.borrow().is_empty());
+        }
+    }
+    for role in ["usage", "holds"] {
+        let mut forge = Forge::new(None, false);
+        if role == "usage" {
+            let mut snapshot = forge
+                .replay
+                .requests
+                .iter()
+                .find(|r| {
+                    r["request"]["get"]
+                        == format!(
+                            "{API_ROOT}repos/cgwalters-forge/bot-ops/issues/1/comments?per_page=100"
+                        )
+                })
+                .unwrap()
+                .clone();
+            snapshot["request"]["get"] = format!(
+                "{API_ROOT}repos/cgwalters-forge/agent-board/issues/40/comments?per_page=100"
+            )
+            .into();
+            forge.replay.requests.push(snapshot);
+        }
+        forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/agent-board/issues?state=open&labels=agent-board-session&per_page=2")}, "answer": {"status": 200, "body": [{"number": 40, "state": "open"}]}}));
+        let mut settings = session_settings();
+        settings["sessions"] =
+            json!({"hourUtc": 0, "repositories": ["cgwalters-forge/agent-board"]});
+        settings[role] = json!({"repository": "cgwalters-forge/agent-board", "issue": 40});
+        let report = preview(&config(settings), &forge.replay);
+        assert!(
+            report.lines.iter().any(|l| l.contains(&format!(
+                "its anchor cgwalters-forge/agent-board#40 is the {role} issue"
+            ))),
+            "{:?}",
+            report.lines
+        );
+        assert!(!report.lines.iter().any(|l| l.starts_with(SESSION_START)));
+    }
+}
 
 #[test]
 fn session_comparison_is_opt_in_and_never_counts_preview_starts() {

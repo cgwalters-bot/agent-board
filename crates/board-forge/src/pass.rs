@@ -632,7 +632,7 @@ pub struct Config {
     /// every live epic for one triage run ([`Scheduler::sweep`]).
     pub sweep: Option<sweep::Sweep>,
     /// Off unless set: one session run a day on each configured
-    /// repository's anchor issue ([`Scheduler::sessions`], agent-board#830).
+    /// repository's managed anchor issue ([`Scheduler::sessions`], agent-board#859).
     pub sessions: Option<sessions::Sessions>,
     /// Off unless set: a daily digest of incoming pull requests, planned
     /// before stage 2 within a share of the pools ([`Scheduler::maintain`]).
@@ -2401,6 +2401,7 @@ fn screen<'a>(
 ) -> Screen<'a> {
     if !facts.open
         || !config.works_in(&facts.issue.repository)
+        || facts.labelled(sessions::ANCHOR_LABEL)
         || control.contains(&facts.issue.display().to_ascii_lowercase())
     {
         return Screen::Out;

@@ -1617,6 +1617,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .as_array()
                 .context("epics have no nodes")?
             {
+                if labels(node)?
+                    .0
+                    .iter()
+                    .any(|l| l.eq_ignore_ascii_case(sessions::ANCHOR_LABEL))
+                {
+                    continue;
+                }
                 let issue = issue_ref(node).context("an epic could not be read")?;
                 // Every epic's sub-issues are read, even where GitHub's
                 // summary counts none: a summary that lags would read as
