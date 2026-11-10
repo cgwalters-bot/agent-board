@@ -71,11 +71,30 @@ session that also changes files opens a pull request through the ordinary
 
 With `sessions` in the pass's [configuration](pass.md#one-configuration-file)
 (off unless set), the pass starts one session a day on each repository it
-names, from `sessions.hourUtc`:
+names, spread across the 24-hour window starting at `sessions.hourUtc`:
 
 ```json
-"sessions": {"hourUtc": 6, "repositories": [{"org": "cgwalters-forge", "forks": false}]}
+"sessions": {"hourUtc": 6, "maxStarts": 1, "repositories": [{"org": "cgwalters-forge", "forks": false}]}
 ```
+
+An organization-wide configuration must not launch all its long sessions at
+once. Each repository's case-insensitive `OWNER/REPO` name is hashed with
+stable FNV-1a (64-bit), modulo 24, to choose its hourly offset from `hourUtc`.
+Adding or reordering repositories does not move another repository's slot;
+collisions are allowed. The pass logs each repository's UTC slot and the reason
+it waits. Each anchor uses its latest due slot, including a fresh anchor's
+initial catch-up start; the per-pass cap bounds this initial catch-up. Deferred
+sessions stay due across the window boundary, even before their first dispatch.
+Missed days do not accumulate.
+
+`sessions.maxStarts` bounds the remaining burst when slots collide or starts
+are delayed: a positive integer, default **1**. It counts previews and failed
+start attempts too (a failed request may have dispatched); a start held by
+`--max-dispatch` also consumes an attempt. A due session beyond this cap waits
+for the next pass, as does one held by pool pace, WIP, budget or dispatch caps.
+Sessions use the same pool admission and accounting as other starts, not a
+separate allowance. Already-started sessions' batches can still be processed
+after the session-start cap is reached. The section remains off unless set.
 
 `sessions.repositories` names work repositories, as `OWNER/REPO` strings or
 the shared [organization entries](pass.md#one-configuration-file). The pass
@@ -99,7 +118,8 @@ anchors on the board, with a deprecation warning. Do not combine it with
 `repositories`. The section needs `triagePools` or `planPools`, which the
 session's pool is drawn from as a triage run's is.
 
-Each pass, for each anchor in the configured order:
+Each pass, for each anchor in the configured order (the slot is fixed by its
+name, not this order):
 
 1. A legacy explicit anchor that is not an open issue on the board starts nothing
    (`session OWNER/REPO: its issue OWNER/REPO#N is not an open issue on the

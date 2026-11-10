@@ -1,6 +1,6 @@
 //! Daily sessions (agent-board#830, docs/sessions.md#daily-sessions): with
 //! `sessions` set, the pass starts one [`crate::session`] run a day on each
-//! configured repository, from the configured hour, in place of many cold
+//! configured repository, at a stable slot across the day, in place of many cold
 //! one-comment item triages. Each repository has one labelled anchor issue,
 //! found or created by the pass, which the session's plan is posted on and its batch is
 //! answered on; the plan protocol's dispatch record there is the day's
@@ -124,8 +124,12 @@ fn anchor(client: &impl Rest, repo: &str, apply: bool, caps: &Caps) -> Result<Op
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Sessions {
-    /// The hour, 0 to 23 UTC, from which a day's sessions are due.
+    /// The start, 0 to 23 UTC, of the daily 24-hour scheduling window.
     pub hour_utc: u8,
+    /// Bound the burst of long runs on an organization-wide configuration.
+    /// Starts (including failed attempts and previews) per pass; default one.
+    #[serde(default = "default_max_starts")]
+    pub max_starts: usize,
     /// The issue each repository's session reports on, `OWNER/REPO#N`: one
     /// open issue on the board in each work repository that has sessions.
     #[serde(default)]
@@ -146,9 +150,14 @@ pub struct Sessions {
     pub compare_after: Option<String>,
 }
 
+const fn default_max_starts() -> usize {
+    1
+}
+
 impl Sessions {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
         ensure!(self.hour_utc < 24, "sessions hourUtc is not 0 to 23");
+        ensure!(self.max_starts > 0, "sessions maxStarts must be positive");
         ensure!(
             !self.issues.is_empty() || !self.repositories.is_empty(),
             "sessions issues names no issue; set repositories instead"
@@ -221,13 +230,46 @@ impl Sessions {
             .collect()
     }
 
-    /// When the newest day's sessions were due, at or before `now`.
-    pub(super) fn due(&self, now: OffsetDateTime) -> Result<OffsetDateTime> {
+    /// Stable FNV-1a over the case-insensitive repository identity. Do not use
+    /// DefaultHasher: its algorithm is not stable across Rust releases.
+    fn offset(&self, repo: &str) -> u8 {
+        let hash = repo.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x100000001b3)
+        });
+        (hash % 24) as u8
+    }
+
+    fn slot_line(&self, repo: &str) -> String {
+        format!(
+            "session {repo}: slot {:02}:00 UTC (window starts {:02}:00 UTC)",
+            (self.hour_utc + self.offset(repo)) % 24,
+            self.hour_utc
+        )
+    }
+
+    /// Start of the current daily window, including windows spanning midnight.
+    fn window(&self, now: OffsetDateTime) -> Result<OffsetDateTime> {
         let time = time::Time::from_hms(self.hour_utc, 0, 0).context("sessions hourUtc")?;
         let today = now.to_offset(time::UtcOffset::UTC).replace_time(time);
         Ok(match today > now {
             true => today - time::Duration::days(1),
             false => today,
+        })
+    }
+
+    /// Repository slot in the current window, possibly still in the future.
+    fn slot(&self, repo: &str, now: OffsetDateTime) -> Result<OffsetDateTime> {
+        Ok(self.window(now)? + time::Duration::hours(i64::from(self.offset(repo))))
+    }
+
+    /// Latest due slot, used for dispatch and batch receipts even before the
+    /// current window's slot. Missed days are not accumulated as a backlog.
+    fn due(&self, repo: &str, now: OffsetDateTime) -> Result<OffsetDateTime> {
+        let slot = self.slot(repo, now)?;
+        Ok(if slot > now {
+            slot - time::Duration::days(1)
+        } else {
+            slot
         })
     }
 }
@@ -274,6 +316,16 @@ pub(super) fn brief(repo: &str, anchor: &str, operator: &str, bounds: &Bounds) -
 }
 
 impl<C: Rest + Transport> Scheduler<'_, C> {
+    /// Scheduling can stop before reading the board. Still explain each
+    /// configured session's slot and the shared hold without extra I/O.
+    pub(super) fn sessions_waiting(&mut self, why: &str) {
+        if let Some(sessions) = &self.config.sessions {
+            for repo in sessions.repos() {
+                self.line(format!("{}; {why}; it waits", sessions.slot_line(&repo)));
+            }
+        }
+    }
+
     /// The anchor issues of [`Config::sessions`], which stage 4's
     /// candidates leave out: each one's run is its session's to start.
     pub(super) fn session_anchors(&self) -> Vec<ItemRef> {
@@ -310,12 +362,16 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     .map(|repo| (repo.clone(), None)),
             );
         let mut taken = 0;
+        let mut attempts = 0;
+        let mut stopped = None;
         for (repo, explicit) in anchors {
+            self.line(sessions.slot_line(&repo));
             let bounds = self.client.bounds;
             // What is left is a start's: the sessions wait for the next pass.
-            if bounds.reserved() {
-                self.line(format!("session {repo}: {}", self.reserved()));
-                break;
+            if bounds.reserved() || stopped.is_some() {
+                let why = stopped.get_or_insert_with(|| self.reserved());
+                self.line(format!("session {repo}: {why}"));
+                continue;
             }
             let refused = bounds.refused.get();
             // Discover and process one repository at a time: listing a large
@@ -331,7 +387,14 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     ));
                     return Ok(None);
                 };
-                self.session(sessions, &found, board, slots, free, context)
+                self.session(
+                    sessions,
+                    &found,
+                    board,
+                    slots,
+                    (free, sessions.max_starts - attempts),
+                    context,
+                )
             })();
             let started = matches!(
                 step,
@@ -339,9 +402,12 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     Step::Started(..) | Step::Failed(..) | Step::Capped(..)
                 ))
             );
+            attempts += usize::from(started);
             if !started && (bounds.reserved() || bounds.refused.get() > refused) {
-                self.line(format!("session {repo}: {}", self.reserved()));
-                break;
+                let why = self.reserved();
+                self.line(format!("session {repo}: {why}"));
+                stopped = Some(why);
+                continue;
             }
             match step {
                 Ok(Some(Step::Started(line, holds))) => {
@@ -381,7 +447,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         anchor: &ItemRef,
         board: &BoardRead,
         slots: &Slots,
-        free: usize,
+        (free, remaining): (usize, usize),
         (target, snapshot): (&Target, Option<&Value>),
     ) -> Result<Option<Step>> {
         let config = self.config;
@@ -419,7 +485,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             self.line(format!("session {repo}: its run is in flight, {run}"));
             return Ok(None);
         }
-        let due = sessions.due(self.now)?;
+        let due = sessions.due(repo, self.now)?;
         let comments = plan::issue_comments(&self.client, anchor)
             .with_context(|| format!("reading {at}'s comments"))?;
         let writers = self.writers();
@@ -476,6 +542,13 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 self.batch(sessions, anchor, facts, &comments, (record_id, due), board)?;
                 return Ok(None);
             }
+        }
+        if remaining == 0 {
+            self.line(format!(
+                "session {repo}: sessions.maxStarts={} reached; it waits for the next pass",
+                sessions.max_starts
+            ));
+            return Ok(None);
         }
         if free == 0 {
             self.line(format!("session {repo}: no slot free; it waits"));
@@ -715,6 +788,7 @@ mod tests {
     fn sessions(hour_utc: u8) -> Sessions {
         Sessions {
             hour_utc,
+            max_starts: default_max_starts(),
             issues: vec!["cgwalters-forge/agent-board#830".into()],
             repositories: vec![],
             apply: false,
@@ -856,6 +930,42 @@ mod tests {
     }
 
     #[test]
+    fn fifteen_repositories_have_stable_slots_across_the_day() {
+        let sessions = sessions(6);
+        let now = at("2026-11-09T06:00:00Z");
+        let start = sessions.window(now).unwrap();
+        let mut offsets = BTreeSet::new();
+        for n in 0..15 {
+            let repo = format!("example/repo-{n}");
+            let slot = sessions.slot(&repo, now).unwrap();
+            offsets.insert((slot - start).whole_hours());
+            assert!(slot >= start && slot < start + time::Duration::days(1));
+            assert_eq!(slot, sessions.slot(&repo.to_uppercase(), now).unwrap());
+            assert_eq!(sessions.due(&repo, slot).unwrap(), slot);
+            assert_eq!(
+                sessions
+                    .due(&repo, slot - time::Duration::seconds(1))
+                    .unwrap(),
+                slot - time::Duration::days(1)
+            );
+            assert_eq!(
+                sessions.slot(&repo, now + time::Duration::days(1)).unwrap(),
+                slot + time::Duration::days(1)
+            );
+        }
+        // Collisions are allowed, but these 15 names span the day rather than
+        // collecting at the window's start. Pin the hash's stable output too.
+        assert_eq!(
+            offsets,
+            BTreeSet::from([1, 3, 5, 6, 8, 10, 11, 12, 15, 16, 17, 20, 22])
+        );
+        assert_eq!(
+            sessions.slot("example/repo-12", now).unwrap(),
+            at("2026-11-10T04:00:00Z")
+        );
+    }
+
+    #[test]
     fn due_is_the_newest_day_hour() {
         for (hour, now, want) in [
             (6, "2026-11-09T14:45:00Z", "2026-11-09T06:00:00Z"),
@@ -865,7 +975,9 @@ mod tests {
             (23, "2026-11-01T22:00:00Z", "2026-10-31T23:00:00Z"),
         ] {
             assert_eq!(
-                sessions(hour).due(at(now)).unwrap(),
+                sessions(hour)
+                    .due("cgwalters-forge/agent-board", at(now))
+                    .unwrap(),
                 at(want),
                 "{hour} {now}"
             );

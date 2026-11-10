@@ -2928,8 +2928,13 @@ comment ([Forgejo](forges.md#the-weekly-sweep)):
 
 With `sessions` set (off unless set), stage 4 starts, before its per-item
 starts, one [session](sessions.md#daily-sessions) run a day on each
-configured repository's anchor issue, from `sessions.hourUtc`
-(agent-board#830). `sessions.repositories` names work repositories (strings
+configured repository's anchor issue, at its stable name-hashed hourly slot
+in the 24-hour window starting at `sessions.hourUtc` (agent-board#862).
+`sessions.maxStarts` is a positive per-pass cap, default 1; previews and failed
+attempts count too. Due sessions held by the cap or pool pace wait for another
+pass; every repository's slot and reason for waiting are logged. Initial
+enrollment catches up on the latest due slot under the same per-pass cap.
+`sessions.repositories` names work repositories (strings
 or organization entries). The pass finds or creates one open issue labelled
 `agent-board-session` in each; duplicate anchors refuse the session and are
 logged. For one release `sessions.issues` still names explicit anchors on
@@ -2956,7 +2961,7 @@ bot or the operator after the day's record. Without `sessions.apply` it
 is a person's to read (`session OWNER/REPO: batch ID is a person's to
 read; sessions.apply is off`). With it, the batch is checked against the
 same bounds the brief named and applied once a day (the day being the
-configured `hourUtc`'s, whatever plans and records follow on the anchor),
+repository slot's, whatever plans and records follow on the anchor),
 each issue it names resolved as an issue before the first write, as one
 write step for its receipt and one for each writing action, taken whole or held whole by
 `--max-writes` (`apply session OWNER/REPO batch=ID: Close …; Set …
@@ -4463,7 +4468,8 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `forgejoIntake.state` | Forgejo only: opt-in operator issue-comment routing with a separate per-instance cursor file, see [native issue intake](forges.md#native-issue-intake); section absent (off). Caller follow-up: tracker `.github/forgejo-pass.json`, `forgejoIntake: {"state": ".state/forgejo-intake.json"}`, only after #271 prerequisites; not the GitHub pass config |
 | `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs `triage`, either scope; section absent (off) |
 | `sweep.max`, `sweep.repository` | The most issues (1–100) one sweep lists; the work repository its issue is filed in; `40`, `epics.repository` |
-| `sessions.hourUtc`, `sessions.repositories`, `sessions.issues` | GitHub only: the hour (0–23 UTC) from which a day's [sessions](sessions.md#daily-sessions) are due, and work repositories (strings or organization entries); the pass manages each repository's labelled anchor, see [daily sessions](#daily-sessions); needs `triagePools` or `planPools`; section absent (off). Legacy `sessions.issues` remains for one release with a warning; do not combine the keys. |
+| `sessions.hourUtc`, `sessions.repositories`, `sessions.issues` | GitHub only: the start hour (0–23 UTC) of the 24-hour window for name-hashed repository [session](sessions.md#daily-sessions) slots, and work repositories (strings or organization entries); the pass manages each repository's labelled anchor, see [daily sessions](#daily-sessions); needs `triagePools` or `planPools`; section absent (off). Legacy `sessions.issues` remains for one release with a warning; do not combine the keys. |
+| `sessions.maxStarts` | Positive maximum session start attempts per pass (including preview, failures and dispatch-capped attempts); deferred sessions wait for another pass under ordinary pool pace and caps; `1` |
 | `sessions.apply` | Apply the batch a day's session answers with on its anchor, once, with a receipt there, within the bounds its brief named and `--max-writes`, see [daily sessions](#daily-sessions) and [applying a batch](sessions.md#applying-a-batch); off, a batch is a person's to read; `false` |
 | `sessions.compareAfter` | Optional trusted rollout timestamp, whole-second UTC ending `Z`; log per-repository triage/session dispatch creations in the equal 24-hour windows before and after it, with bounded reads and unknown coverage explicit; see [dispatch comparison](sessions.md#dispatch-comparison); absent (off) |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |

@@ -19088,6 +19088,207 @@ fn session_settings() -> Value {
 const SESSION_START: &str = "start session cgwalters-forge/agent-board#40 pool=claude";
 
 #[test]
+fn sessions_cap_starts_per_pass() {
+    for cap in [None, Some(1), Some(2)] {
+        let forge = Forge::new(None, false);
+        let mut settings = session_settings();
+        settings["sessions"]["issues"] = json!([
+            "cgwalters-forge/agent-board#40",
+            "cgwalters-forge/tracker#446"
+        ]);
+        if let Some(cap) = cap {
+            settings["sessions"]["maxStarts"] = cap.into();
+        }
+        let report = preview(&config(settings), &forge.replay);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(
+            report.planned_starts.get("session"),
+            Some(&cap.unwrap_or(1)),
+            "{:?}",
+            report.lines
+        );
+        assert_eq!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("sessions.maxStarts=1 reached")),
+            cap != Some(2),
+            "{:?}",
+            report.lines
+        );
+    }
+
+    let forge = Forge::new(None, false);
+    let mut settings = session_settings();
+    settings["sessions"]["issues"] = json!([
+        "cgwalters-forge/agent-board#40",
+        "cgwalters-forge/tracker#446"
+    ]);
+    let config = config(settings);
+    let first = apply(&forge, &config);
+    assert_eq!(first.failures, 0, "{:?}", first.lines);
+    assert!(first.lines.iter().any(|l| l.starts_with(SESSION_START)));
+    assert!(
+        !first
+            .lines
+            .iter()
+            .any(|l| l.starts_with("start session cgwalters-forge/tracker#446"))
+    );
+    let next = apply(&forge, &config);
+    assert_eq!(next.failures, 0, "{:?}", next.lines);
+    assert!(
+        next.lines
+            .iter()
+            .any(|l| l.starts_with("start session cgwalters-forge/tracker#446")),
+        "{:?}",
+        next.lines
+    );
+    assert!(!next.lines.iter().any(|l| l.starts_with(SESSION_START)));
+}
+
+#[test]
+fn sessions_due_but_over_pace_wait_for_a_later_pass() {
+    let mut forge = Forge::new(None, false);
+    let settings = session_settings();
+    let initial = usage(&mut forge.replay);
+    let mut paced = initial.clone();
+    paced["pools"]["claude"]["used_percent"] = 99.into();
+    paced["pools"]["claude"]["hold"] = true.into();
+    paced["pools"]["claude"]["reason"] = "pace".into();
+    set_usage(&mut forge.replay, &paced);
+    let report = preview(&config(settings.clone()), &forge.replay);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(!report.planned_starts.contains_key("session"));
+    assert!(
+        report.lines.iter().any(|l| l
+            .starts_with("session cgwalters-forge/agent-board: slot 00:00 UTC")
+            && l.contains("claude is held")),
+        "{:?}",
+        report.lines
+    );
+    assert!(forge.writes.borrow().is_empty());
+    set_usage(&mut forge.replay, &initial);
+    let report = preview(&config(settings), &forge.replay);
+    assert_eq!(
+        report.planned_starts.get("session"),
+        Some(&1),
+        "{:?}",
+        report.lines
+    );
+}
+
+#[test]
+fn sessions_new_anchor_catches_up_on_its_latest_due_slot() {
+    let forge = Forge::new(None, false);
+    let mut settings = session_settings();
+    settings["sessions"]["hourUtc"] = 10.into();
+    // tracker hashes to offset 8: today's 18:00 slot has not arrived at 15:15,
+    // but a fresh anchor's latest due slot was yesterday at 18:00.
+    settings["sessions"]["issues"] = json!(["cgwalters-forge/tracker#446"]);
+    let report = preview(&config(settings), &forge.replay);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert_eq!(report.planned_starts.get("session"), Some(&1));
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("start session cgwalters-forge/tracker#446")),
+        "{:?}",
+        report.lines
+    );
+}
+
+#[test]
+fn sessions_deferred_by_pace_stay_due_across_the_window_boundary() {
+    let mut forge = Forge::new(None, false);
+    let mut settings = session_settings();
+    settings["sessions"]["hourUtc"] = 16.into();
+    settings["sessions"]["issues"] = json!(["cgwalters-forge/tracker#446"]);
+    // Offset 8: due at 00:00, eight hours into the window starting yesterday.
+    anchor_plan_on(
+        &mut forge.replay,
+        ("cgwalters-forge/tracker", 446),
+        "session",
+        "cgwalters-bot",
+        Some("2026-10-22T06:05:00Z"),
+    );
+    let initial = usage(&mut forge.replay);
+    let mut paced = initial.clone();
+    paced["pools"]["claude"]["used_percent"] = 99.into();
+    paced["pools"]["claude"]["hold"] = true.into();
+    paced["pools"]["claude"]["reason"] = "pace".into();
+    set_usage(&mut forge.replay, &paced);
+    let config = config(settings);
+    let held = apply(&forge, &config);
+    assert_eq!(held.failures, 0, "{:?}", held.lines);
+    assert!(forge.dispatches().is_empty());
+
+    // Pace releases after hourUtc, when the *new* window's slot is tomorrow.
+    forge.replay.now = at("2026-10-23T16:15:10Z");
+    let mut refreshed = initial;
+    refreshed["updated_at"] = "2026-10-23T16:15:10Z".into();
+    set_usage(&mut forge.replay, &refreshed);
+    let start = "start session cgwalters-forge/tracker#446 pool=claude";
+    let released = apply(&forge, &config);
+    assert_eq!(released.failures, 0, "{:?}", released.lines);
+    assert!(
+        released.lines.iter().any(|l| l.starts_with(start)),
+        "{:?}",
+        released.lines
+    );
+    let again = apply(&forge, &config);
+    assert_eq!(again.failures, 0, "{:?}", again.lines);
+    assert!(!again.lines.iter().any(|l| l.starts_with(start)));
+    assert_eq!(
+        forge
+            .dispatches()
+            .iter()
+            .filter(|d| *d == "cgwalters-forge/tracker#446")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn sessions_first_dispatch_deferred_by_cap_survives_the_window_boundary() {
+    let mut forge = Forge::new(None, false);
+    let mut settings = session_settings();
+    settings["sessions"]["hourUtc"] = 16.into();
+    settings["sessions"]["issues"] = json!([
+        "cgwalters-forge/agent-board#40",
+        "cgwalters-forge/tracker#446"
+    ]);
+    let config = config(settings);
+    let initial = usage(&mut forge.replay);
+    // At 15:15 the first anchor takes the cap. At 16:15 its new daily slot
+    // takes it once more. At 17:15 the second anchor's first session must
+    // still be due, though its new window's slot is not until midnight.
+    for (now, expected) in [
+        ("2026-10-23T15:15:10Z", "cgwalters-forge/agent-board#40"),
+        ("2026-10-23T16:15:10Z", "cgwalters-forge/agent-board#40"),
+        ("2026-10-23T17:15:10Z", "cgwalters-forge/tracker#446"),
+    ] {
+        forge.replay.now = at(now);
+        let mut refreshed = initial.clone();
+        refreshed["updated_at"] = now.into();
+        set_usage(&mut forge.replay, &refreshed);
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        let starts: Vec<_> = report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("start session "))
+            .collect();
+        assert_eq!(starts.len(), 1, "{:?}", report.lines);
+        assert!(
+            starts[0].starts_with(&format!("start session {expected} pool=claude")),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
 fn sessions_discover_anchors_and_refuse_duplicates() {
     for count in [0, 1, 2] {
         let mut r = Forge::new(None, false).replay;
@@ -19306,12 +19507,29 @@ fn session_comparison_overlapping_pages_are_unknown() {
 /// `author`'s `kind` plan on agent-board#40, comment 9 of 2026-10-22, and
 /// the bot's dispatch record of it at `recorded`, if any.
 fn anchor_plan(replay: &mut Replay, kind: &str, author: &str, recorded: Option<&str>) {
-    let comments = &mut answer(replay, r#""name":"agent-board","number":40"#)["data"]["repository"]
-        ["issue"]["comments"]["nodes"];
-    let plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/agent-board", "item": 40,
+    anchor_plan_on(
+        replay,
+        ("cgwalters-forge/agent-board", 40),
+        kind,
+        author,
+        recorded,
+    );
+}
+
+fn anchor_plan_on(
+    replay: &mut Replay,
+    (repo, number): (&str, u64),
+    kind: &str,
+    author: &str,
+    recorded: Option<&str>,
+) {
+    let name = repo.split('/').nth(1).unwrap();
+    let comments = &mut answer(replay, &format!("\"name\":\"{name}\",\"number\":{number}"))["data"]
+        ["repository"]["issue"]["comments"]["nodes"];
+    let plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": repo, "item": number,
         "kind": kind, "runner": "hosted", "brief": "Triage the repository as a whole."});
     let created = "2026-10-22T06:00:00Z";
-    let at = "https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-";
+    let at = format!("https://github.com/{repo}/issues/{number}#issuecomment-");
     let nodes = comments.as_array_mut().unwrap();
     nodes.push(json!({
         "url": format!("{at}9"), "body": format!("```{PLAN_FENCE}\n{plan}\n```"),
@@ -19332,6 +19550,7 @@ fn anchor_plan(replay: &mut Replay, kind: &str, author: &str, recorded: Option<&
 fn session_lines(report: &Report) -> Vec<&str> {
     (report.lines.iter())
         .map(String::as_str)
+        .filter(|l| !l.contains(": slot "))
         .filter(|l| {
             l.starts_with("session ")
                 || l.starts_with("start session ")
@@ -19588,6 +19807,12 @@ fn sessions_config_table() {
             sessions(json!({"hourUtc": 24})),
             Some("sessions hourUtc is not 0 to 23"),
         ),
+        (
+            json!(["claude"]),
+            sessions(json!({"maxStarts": 0})),
+            Some("sessions maxStarts must be positive"),
+        ),
+        (json!(["claude"]), sessions(json!({"maxStarts": 3})), None),
         (
             json!(["claude"]),
             sessions(json!({"issues": []})),
