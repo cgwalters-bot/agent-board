@@ -207,6 +207,9 @@ const IDLE_REASON_CHARS: usize = 300;
 const IDLE_REASONS: &[&str] = &["hold ", "fail ", "held by --", "scan: "];
 /// The most `triageFollowUpDays` and `replanAfterDays` may be.
 const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
+/// The most `triageReplans` may be: a triage asked that many times in a
+/// row to plan an issue it planned nothing for is the operator's.
+const TRIAGE_REPLANS_LIMIT: u64 = 10;
 /// `overlap.staleDraftHours` when the key is left out, and the most it may
 /// be: a week, past which a draft nobody moves holds nothing anyway.
 pub const STALE_DRAFT_HOURS: u64 = 4;
@@ -588,6 +591,12 @@ pub struct Config {
     /// epic's planning backs off.
     #[serde(default)]
     pub triage_follow_up_days: u64,
+    /// Off at 0: else a triage that posted no plan is asked to plan again
+    /// once its follow-up wait passes, changed inputs or not, at most this
+    /// many times in a row, after which the issue waits on the operator
+    /// ([`Scheduler::follow_up`]); needs `triageFollowUpDays`.
+    #[serde(default)]
+    pub triage_replans: u64,
     /// Off unless set: caller-owned policy for asks on harness work. Without
     /// it, repository ownership alone never releases an operator wait.
     pub operator_ask: Option<OperatorAsk>,
@@ -1145,9 +1154,12 @@ pub struct Scan {
     /// held as unreadable; its parent's liveness reads and a start's own
     /// reads are not refused ([`Bounds::cause_capped`]).
     pub candidate_requests: Option<usize>,
-    /// The most candidates in a row stage 4 reads without starting one, 1
-    /// to [`SCAN_CANDIDATES_LIMIT`], after which the rest wait for the
-    /// next pass ([`Scheduler::start`]).
+    /// The most candidates in a row stage 4 reads, charged requests for,
+    /// without starting one, 1 to [`SCAN_CANDIDATES_LIMIT`], after which
+    /// the rest wait for the next pass, which resumes after the last read
+    /// where `state` keeps it ([`Scheduler::start`],
+    /// [`poll::State::scan_cursor`]); without `state`, each pass reads the
+    /// same candidates up to the bound.
     pub candidates: Option<usize>,
 }
 
@@ -1438,8 +1450,16 @@ impl Config {
             "triageFollowUpDays is not 0 to {FOLLOW_UP_DAYS_LIMIT}"
         );
         ensure!(
+            self.triage_replans <= TRIAGE_REPLANS_LIMIT,
+            "triageReplans is not 0 to {TRIAGE_REPLANS_LIMIT}"
+        );
+        ensure!(
             self.triage_follow_up_days == 0 || self.triage.is_some(),
             "triageFollowUpDays needs triage"
+        );
+        ensure!(
+            self.triage_replans == 0 || self.triage_follow_up_days > 0,
+            "triageReplans needs triageFollowUpDays"
         );
         if let Some(policy) = &self.operator_ask {
             ensure!(
@@ -3568,6 +3588,11 @@ pub struct Report {
     /// their hold kind's name, or [`NOT_READY_ERROR`] where their
     /// consideration failed: why nothing was startable (agent-board#864).
     pub not_ready: BTreeMap<String, usize>,
+    /// The last candidate stage 4's scan visited before ending early, under
+    /// [`Scan::candidates`], kept in `state` for the next pass to resume
+    /// after; none where the scan reached its end or has no such bound,
+    /// and the last pass's where this one scanned nothing.
+    pub scan_cursor: Option<String>,
     pub failures: usize,
     pub state: Option<State>,
     pub holds: Vec<Entry>,
@@ -3733,6 +3758,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
             state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
         }
         state.pass_responses = bounds.next_responses.take();
+        state.scan_cursor = report.scan_cursor.clone();
     }
     Ok(report)
 }
@@ -3750,7 +3776,11 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         Mode::Actions(own) => (true, Some(own), "actions"),
         Mode::Local => (true, None, "local"),
     };
-    let mut report = Report::default();
+    let mut report = Report {
+        // Kept as it was by a pass whose stage 4 scans nothing.
+        scan_cursor: state.scan_cursor.clone(),
+        ..Report::default()
+    };
     if config.skip_active_work {
         report
             .triage_skipped
@@ -3809,6 +3839,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         unconsidered: 0,
         unread: 0,
         budget_stop: None,
+        scan_cursor: state.scan_cursor.clone(),
         ended: RefCell::new(BTreeMap::new()),
         kept: RefCell::default(),
         read_pulls: RefCell::default(),
@@ -4279,6 +4310,9 @@ struct Scheduler<'a, C> {
     /// ([`epics::Scheduler::replan_held`]), whose start spends what the stop
     /// kept for one.
     budget_stop: Option<BudgetStop>,
+    /// Where the last pass's scan stopped ([`poll::State::scan_cursor`]):
+    /// this pass's scan resumes after it ([`Self::start`]).
+    scan_cursor: Option<String>,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
     ended: RefCell<BTreeMap<u64, bool>>,
     /// The reads of stage 4's look ahead at overlaps ([`Self::kept`]).
@@ -5064,22 +5098,55 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // order reached ready work at all (agent-board#864).
         let (mut first, mut ready) = (None, None);
         // With `scan`, each candidate's reads are capped, and after as many
-        // in a row that started nothing, the rest wait: a pass's cost then
-        // scales with its starts, not the open items (agent-board#864).
+        // read (charged a request) in a row that started nothing, the rest
+        // wait: a pass's cost then scales with its starts, not the open
+        // items (agent-board#864). The next pass resumes after the last
+        // candidate this one visited, where `state` keeps it, so the stops
+        // of a few passes cover the board; the focus epic's children still
+        // come first, and the candidates before the cursor last. The cursor
+        // is the last visited wherever the loop ends early, none past its
+        // end, and the last pass's where none was visited
+        // ([`Report::scan_cursor`]).
         let scan = self.config.scan.unwrap_or_default();
         let mut fruitless = 0;
-        for (n, (_, facts)) in candidates.iter().enumerate() {
-            let left = candidates.len() - n;
+        let children = self.focus.children;
+        let resume = scan
+            .candidates
+            .and(self.scan_cursor.take())
+            .and_then(|cursor| {
+                let at = (candidates.iter()).position(|(_, f)| f.issue.display() == cursor)?;
+                Some((cursor, (at + 1).max(children)))
+            });
+        let order: Vec<usize> = match &resume {
+            Some((_, at)) => ((0..children).chain(*at..candidates.len()))
+                .chain(children..*at)
+                .collect(),
+            None => (0..candidates.len()).collect(),
+        };
+        if let Some((cursor, _)) = &resume {
+            self.line(format!(
+                "schedule: scan resumed after {cursor}, where the last pass's scan stopped"
+            ));
+        }
+        let mut last: Option<String> = None;
+        let mut ended = true;
+        for (visited, n) in order.into_iter().enumerate() {
+            let (_, facts) = &candidates[n];
+            let left = candidates.len() - visited;
             if free == 0 {
                 self.unconsidered += left;
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
+                ended = false;
                 break;
             }
-            if scan.candidates.is_some_and(|limit| fruitless >= limit) {
+            if scan.candidates.is_some_and(|limit| fruitless >= limit)
+                && let Some(last) = &last
+            {
                 self.unconsidered += left;
                 self.line(format!(
-                    "scan: {fruitless} candidate(s) in a row held or failed and none started, the most a pass reads (scan.candidates); {left} more candidate(s) wait"
+                    "scan: {fruitless} candidate(s) read in a row held or failed and none started, the most a pass reads (scan.candidates); {left} more candidate(s) wait; the next pass resumes after {last}"
                 ));
+                ended = false;
                 break;
             }
             // The probes taken, no pool is left to start on.
@@ -5089,6 +5156,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.unconsidered += left;
                 let why = format!("{why}; {left} more candidate(s) wait");
                 self.pass_held(HoldKind::Pools, why);
+                ended = false;
                 break;
             }
             if Instant::now() > self.client.bounds.admit_by {
@@ -5097,16 +5165,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.line(format!(
                     "time: the pass ran past {PASS_SECONDS_LIMIT} seconds; {left} candidate(s) deferred"
                 ));
+                ended = false;
                 break;
             }
-            let focused = n < self.focus.children;
-            self.focus.reached = n + 1;
+            let focused = n < children;
+            self.focus.reached = visited + 1;
             if !focused {
                 self.focus.spillover = Some(true);
             }
             let issue = facts.issue.display();
+            last = Some(issue.clone());
             let limit = scan.candidate_requests.map(|n| (issue.clone(), n));
             *self.client.bounds.cause_limit.borrow_mut() = limit;
+            // Whether considering it charged a request, 304s refunded: only
+            // such a candidate counts towards `scan.candidates`, so a
+            // candidate screened out by the board's facts, or revalidated
+            // from the last pass's responses, costs the scan nothing.
+            let unspent = self.client.bounds.left.get();
             let step = self.caused(issue.clone(), |s| s.within_reserve(|s| {
                 if s.config.top_down && let Some(parent) = &facts.parent {
                 let held = match s.live(parent) {
@@ -5136,6 +5211,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let earlier = std::mem::replace(&mut self.considered, true);
             // A start under way finishes; the next waits for the time bound.
             self.client.bounds.end_start();
+            let read = usize::from(self.client.bounds.left.get() < unspent);
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
@@ -5146,7 +5222,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     // the candidates were not read rather than not ready.
                     if self.client.bounds.rate_limited.borrow().is_none() {
                         self.not_ready(NOT_READY_ERROR);
-                        fruitless += 1;
+                        fruitless += read;
                     }
                     self.line(format!("fail {issue}: {error:#}"));
                     continue;
@@ -5155,7 +5231,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fruitless = match &step {
                 Step::Hold(hold) => {
                     self.not_ready(hold.kind.name());
-                    fruitless + 1
+                    fruitless + read
                 }
                 Step::Stop(..) => fruitless,
                 Step::Started(..) | Step::Failed(..) | Step::Capped(_) => 0,
@@ -5192,10 +5268,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     self.report.failures += usize::from(halt.failed(earlier));
                     self.unconsidered += left;
                     let read = match halt {
-                        Halt::Budget if n > 0 => {
+                        Halt::Budget if visited > 0 => {
                             let spent = before.saturating_sub(self.client.bounds.left.get());
                             format!(
-                                "; {n} candidate(s) considered, starts included, for {spent} requests"
+                                "; {visited} candidate(s) considered, starts included, for {spent} requests"
                             )
                         }
                         Halt::Budget | Halt::Full | Halt::Time => String::new(),
@@ -5221,6 +5297,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         }
                     }
                     free = 0;
+                    ended = false;
                     break;
                 }
                 Step::Capped(line) => {
@@ -5240,6 +5317,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             taken += 1;
         }
         *self.client.bounds.cause_limit.borrow_mut() = None;
+        if scan.candidates.is_none() || ended {
+            self.report.scan_cursor = None;
+        } else if let Some(last) = last {
+            self.report.scan_cursor = Some(last);
+        }
         if taken == 0
             && let Some(first) = first
         {
@@ -7246,7 +7328,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// issue is triaged again once its [`fingerprint`] differs from the one
     /// its plan `from` carries, a day after the verdict, doubled for each
     /// follow-up in a row before it, up to
-    /// [`Config::triage_follow_up_days`]. No verdict, where the run may have
+    /// [`Config::triage_follow_up_days`]; with [`Config::triage_replans`],
+    /// changed or not, that many times in a row, after which an unchanged
+    /// issue waits on the operator. No verdict, where the run may have
     /// failed, or a plan posted before fingerprints, which carries none, is
     /// triaged again that many days after the verdict or the record.
     fn follow_up(
@@ -7345,32 +7429,41 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let days = time::Duration::days(config.triage_follow_up_days as i64);
         // Without a verdict the run may have failed: retried after the days.
         let carried = carried(&from.body).filter(|_| verdict.is_some());
+        // The triages in a row before this that planned nothing, each
+        // asked by the pass; the first ask is not one.
+        let planned = |c: &&plan::Comment| {
+            is(c.author.as_deref(), &writers) && plan::has_fence(&c.body, PLAN_FENCE)
+        };
+        let again = (comments.iter().rev())
+            .filter(planned)
+            .take_while(|c| {
+                [AGAIN, FOLLOW_THROUGH]
+                    .iter()
+                    .any(|s| c.body.starts_with(s))
+                    || replan.is_some_and(|s| c.body.starts_with(s))
+            })
+            .count();
         let wait = match carried {
             None => days,
             Some(_) => {
-                let planned = |c: &&plan::Comment| {
-                    is(c.author.as_deref(), &writers) && plan::has_fence(&c.body, PLAN_FENCE)
-                };
-                let again = (comments.iter().rev())
-                    .filter(planned)
-                    .take_while(|c| {
-                        [AGAIN, FOLLOW_THROUGH]
-                            .iter()
-                            .any(|s| c.body.starts_with(s))
-                            || replan.is_some_and(|s| c.body.starts_with(s))
-                    })
-                    .count();
                 let wait = backoff(FOLLOW_UP_SECONDS, again, days.whole_seconds());
                 time::Duration::seconds(wait)
             }
         };
+        // With `triageReplans`, a triage that planned nothing is asked
+        // again once its wait passes, changed inputs or not, that many
+        // times in a row; then the issue waits on the operator or a change
+        // (agent-board#864). Without it, an unchanged issue waits for a
+        // change or the operator (agent-board#383).
+        let replans = config.triage_replans as usize;
+        let replanned = carried.is_some() && replans > 0 && again < replans;
         let due = since.changed + wait;
         let from_due = due.format(&Rfc3339).unwrap_or_default();
         let operator = &config.operator;
         if self.now < due {
             let changed = match carried {
-                Some(_) => " if anything changed",
-                None => "",
+                Some(_) if !replanned => " if anything changed",
+                Some(_) | None => "",
             };
             let why = format!(
                 "{said}; triaged again from {from_due}{changed}, or once {operator} comments"
@@ -7378,8 +7471,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)));
         }
         if let Some(carried) = carried
+            && !replanned
             && self.inputs(facts, comments)? == carried
         {
+            if replans > 0 {
+                let why = format!(
+                    "{said}; nothing changed since its triage, the {} in a row that planned nothing (triageReplans); the operator decides, or it is triaged again once something changes or {operator} comments",
+                    again + 1
+                );
+                return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+            }
             let why = format!(
                 "{said}; nothing changed since its triage, triaged again once something does, or once {operator} comments"
             );

@@ -151,8 +151,9 @@ fn rest_comment_pages(replay: &mut Replay) {
     replay.requests.extend(pages);
 }
 
-#[test]
-fn warm_top_down_pass_revalidates_holds_and_reaches_ready_p0_children() {
+/// The top-down board with 80 P0 children held on an invalid plan ahead of
+/// its two ready ones, tracker#446 and #459, each hold two reads cold.
+fn hold_heavy_fixture() -> ConditionalFixture {
     let mut replay = top_down_fixture();
     let mut additions = Vec::new();
     for entry in &mut replay.requests {
@@ -184,7 +185,12 @@ fn warm_top_down_pass_revalidates_holds_and_reaches_ready_p0_children() {
     }
     replay.requests.extend(additions);
     rest_comment_pages(&mut replay);
-    let fixture = ConditionalFixture(replay);
+    ConditionalFixture(replay)
+}
+
+#[test]
+fn warm_top_down_pass_revalidates_holds_and_reaches_ready_p0_children() {
+    let fixture = hold_heavy_fixture();
     let cfg = config(json!({"topDown":true,"state":"pass-state.json","wip":4}));
     let first = block(run(
         &fixture,
@@ -228,6 +234,188 @@ fn warm_top_down_pass_revalidates_holds_and_reaches_ready_p0_children() {
     assert!(second.spent.revalidated >= 80);
     assert!(second.spent.requests < 30, "{}", second.spent);
     assert!(second.spent.revalidated > second.spent.requests * 2);
+}
+
+/// A pass of `fixture` from `state`, in preview, its failures none.
+fn pass_from(fixture: &ConditionalFixture, cfg: &Config, state: State) -> Report {
+    let report = block(run(
+        fixture,
+        fixture,
+        cfg,
+        state,
+        (Mode::Preview, Limits::default()),
+        fixture.0.now,
+    ))
+    .unwrap();
+    eprintln!("{}", report.summary_line());
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    report
+}
+
+/// The state `report` hands the next pass, as the file keeps it.
+fn next_state(report: &Report) -> State {
+    State::from_json(&report.state.as_ref().unwrap().to_json()).unwrap()
+}
+
+fn starts(report: &Report) -> Vec<String> {
+    (report.lines.iter().filter(|l| l.starts_with("start ")))
+        .cloned()
+        .collect()
+}
+
+/// A scan `scan.candidates` stops resumes after its last read in the next
+/// pass, around to where it stopped, so that the stops of a few passes
+/// cover the board (agent-board#864): on the hold-heavy board, a bound of
+/// 40 reads the first 40 held children cold and stops, the next pass the
+/// other 40, and the third reaches the ready children and starts them,
+/// filling the slots, which moves the cursor to the last it visited. A
+/// cursor naming no candidate scans in order, and a pass whose stage 4
+/// scans nothing keeps it as it was.
+#[test]
+fn a_stopped_scan_resumes_after_its_last_read_in_the_next_pass() {
+    let fixture = hold_heavy_fixture();
+    let cfg =
+        config(json!({"topDown":true,"state":"pass-state.json","wip":4,"scan":{"candidates":40}}));
+    let stop = |last: u64| {
+        format!(
+            "scan: 40 candidate(s) read in a row held or failed and none started, the most a pass reads (scan.candidates); 444 more candidate(s) wait; the next pass resumes after cgwalters-forge/tracker#{last}"
+        )
+    };
+    let resumed = |after: u64| {
+        format!(
+            "schedule: scan resumed after cgwalters-forge/tracker#{after}, where the last pass's scan stopped"
+        )
+    };
+    let stale = State {
+        scan_cursor: Some("cgwalters-forge/tracker#999".into()),
+        ..State::default()
+    };
+    let first = pass_from(&fixture, &cfg, stale);
+    assert!(!first.lines.iter().any(|l| l.contains("scan resumed")));
+    assert!(first.lines.contains(&stop(6039)), "{:#?}", first.lines);
+    assert_eq!(
+        first.scan_cursor.as_deref(),
+        Some("cgwalters-forge/tracker#6039")
+    );
+    assert!(starts(&first).is_empty());
+    let second = pass_from(&fixture, &cfg, next_state(&first));
+    assert!(second.lines.contains(&resumed(6039)), "{:#?}", second.lines);
+    assert!(second.lines.contains(&stop(6079)), "{:#?}", second.lines);
+    assert!(starts(&second).is_empty());
+    let third = pass_from(&fixture, &cfg, next_state(&second));
+    assert!(third.lines.contains(&resumed(6079)), "{:#?}", third.lines);
+    assert_eq!(
+        starts(&third),
+        [
+            "start triage cgwalters-forge/tracker#446 pool=claude",
+            "start triage cgwalters-forge/tracker#459 pool=claude"
+        ]
+    );
+    assert!(
+        !third.lines.iter().any(|l| l.starts_with("scan: 40")),
+        "{:#?}",
+        third.lines
+    );
+    assert!(
+        third
+            .lines
+            .iter()
+            .any(|l| l.starts_with("wip: no slot left")),
+        "{:#?}",
+        third.lines
+    );
+    let moved = Some("cgwalters-forge/tracker#459");
+    assert_eq!(third.scan_cursor.as_deref(), moved);
+    assert_eq!(next_state(&third).scan_cursor.as_deref(), moved);
+    // Each pass's reads: the first two 2 a held child, the third the
+    // starts' own.
+    assert!(first.spent.requests >= 80, "{}", first.spent);
+    assert!(second.spent.requests >= 80, "{}", second.spent);
+    assert!(third.spent.requests < 20, "{}", third.spent);
+    // A pass that never scans (its slots all taken) keeps the cursor.
+    let full =
+        config(json!({"topDown":true,"state":"pass-state.json","wip":0,"scan":{"candidates":40}}));
+    let idle = pass_from(&fixture, &full, next_state(&third));
+    assert!(starts(&idle).is_empty());
+    assert_eq!(next_state(&idle).scan_cursor.as_deref(), moved);
+}
+
+/// A scan that reaches its end clears the cursor it resumed from, so the
+/// next pass scans in order again; without `scan.candidates` there is
+/// none to keep.
+#[test]
+fn a_scan_that_reaches_its_end_clears_the_cursor() {
+    let mut replay = top_down_fixture();
+    rest_comment_pages(&mut replay);
+    let fixture = ConditionalFixture(replay);
+    let after_446 = State {
+        scan_cursor: Some("cgwalters-forge/tracker#446".into()),
+        ..State::default()
+    };
+    // Bounded beyond the board, so that the scan reaches its end.
+    let cfg = config(
+        json!({"topDown":true,"state":"pass-state.json","wip":100,"scan":{"candidates":1000}}),
+    );
+    let report = pass_from(&fixture, &cfg, after_446.clone());
+    assert!(
+        report.lines.contains(
+            &"schedule: scan resumed after cgwalters-forge/tracker#446, where the last pass's scan stopped".to_owned()
+        ),
+        "{:#?}",
+        report.lines
+    );
+    // The candidates after the cursor first, tracker#446 last of all.
+    assert_eq!(
+        starts(&report),
+        [
+            "start triage cgwalters-forge/tracker#459 pool=claude",
+            "start triage cgwalters-forge/tracker#533 pool=claude",
+            "start triage cgwalters-forge/tracker#446 pool=claude"
+        ],
+        "{:#?}",
+        report.lines
+    );
+    assert!(
+        !report.lines.iter().any(|l| l.starts_with("scan: ")),
+        "{:#?}",
+        report.lines
+    );
+    assert_eq!(next_state(&report).scan_cursor, None);
+    let unbounded = config(json!({"topDown":true,"state":"pass-state.json","wip":100,"scan":{}}));
+    let report = pass_from(&fixture, &unbounded, after_446);
+    assert!(!report.lines.iter().any(|l| l.contains("scan resumed")));
+    assert_eq!(next_state(&report).scan_cursor, None);
+}
+
+/// A `topDown` pass with no `scan` and no `state` scans unbounded: with
+/// nowhere to keep the cursor, a bound `scan` did not set would stop every
+/// pass at the same held candidates ahead of ready work, and never reach
+/// it (agent-board#875). On the hold-heavy board, pass after pass from no
+/// state reads all 80 held children and starts the two ready ones.
+#[test]
+fn a_stateless_top_down_pass_without_scan_reaches_ready_work_past_held_candidates() {
+    let fixture = hold_heavy_fixture();
+    let cfg = config(json!({"topDown":true,"wip":4}));
+    for _ in 0..2 {
+        let report = pass_from(&fixture, &cfg, State::default());
+        assert_eq!(
+            starts(&report),
+            [
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+                "start triage cgwalters-forge/tracker#459 pool=claude"
+            ],
+            "{:#?}",
+            report.lines
+        );
+        assert!(
+            !report.lines.iter().any(|l| l.starts_with("scan: ")),
+            "{:#?}",
+            report.lines
+        );
+        assert!(report.spent.requests >= 80, "{}", report.spent);
+        assert!(report.state.is_none());
+        assert_eq!(report.scan_cursor, None);
+    }
 }
 
 #[test]
@@ -1331,12 +1519,13 @@ fn replay_idle_board_starts_work() {
 /// `scan` bounds stage 4's reads on the idle board (agent-board#864):
 /// `candidateRequests` holds tracker#527, whose overlap check reads past
 /// it, as unreadable at that many reads, the candidates after it still
-/// read and started; `candidates` stops the scan after that many held in a
-/// row, two starts before them, the rest waiting with the slots left free.
+/// read and started; `candidates` stops the scan after that many read and
+/// held in a row, two starts before them, the rest waiting with the slots
+/// left free and the last read kept for the next pass to resume after.
 #[test]
 fn scan_caps_candidate_reads_and_stops_a_fruitless_run() {
     let capped = "hold cgwalters-forge/tracker#527: its reads reached 3 requests, the most one candidate may take (scan.candidateRequests); what else it waits on is unread";
-    let stopped = "scan: 3 candidate(s) in a row held or failed and none started, the most a pass reads (scan.candidates); 274 more candidate(s) wait";
+    let stopped = "scan: 3 candidate(s) read in a row held or failed and none started, the most a pass reads (scan.candidates); 274 more candidate(s) wait; the next pass resumes after cgwalters-forge/tracker#527";
     fn lines<'a>(replaced: &[(usize, &'a str)], upto: usize) -> Vec<&'a str> {
         let mut lines = STARTED[..upto].to_vec();
         for (at, line) in replaced {
@@ -1345,35 +1534,40 @@ fn scan_caps_candidate_reads_and_stops_a_fruitless_run() {
         lines
     }
     // The setting, the lines from stage 4's first candidate, the reads
-    // tracker#527 took, and the candidates not started by why.
+    // tracker#527 took, the candidates not started by why, and the cursor
+    // kept for the next pass.
     let cases = [
         (
             json!({"candidateRequests": 3}),
             lines(&[(4, capped)], STARTED.len()),
             3,
             vec![("dispatched", 2), ("epic-not-live", 22), ("unreadable", 1)],
+            None,
         ),
         (
             json!({"candidates": 3}),
             lines(&[(5, stopped)], 6),
             5,
             vec![("dispatched", 2), ("epic-not-live", 22), ("overlap", 1)],
+            Some("cgwalters-forge/tracker#527"),
         ),
         (
             json!({"candidates": 2}),
             lines(
                 &[(
                     4,
-                    "scan: 2 candidate(s) in a row held or failed and none started, the most a pass reads (scan.candidates); 275 more candidate(s) wait",
+                    "scan: 2 candidate(s) read in a row held or failed and none started, the most a pass reads (scan.candidates); 275 more candidate(s) wait; the next pass resumes after cgwalters-forge/tracker#468",
                 )],
                 5,
             ),
             0,
             vec![("dispatched", 2), ("epic-not-live", 22)],
+            Some("cgwalters-forge/tracker#468"),
         ),
     ];
-    for (scan, expected, reads, not_ready) in cases {
+    for (scan, expected, reads, not_ready, cursor) in cases {
         let report = preview(&config(json!({"scan": scan})), &replay());
+        assert_eq!(report.scan_cursor.as_deref(), cursor, "scan {scan}");
         let first = report.lines.iter().position(|l| l == STARTED[0]).unwrap();
         let after: Vec<&str> = report.lines[first..]
             .iter()
@@ -7158,6 +7352,48 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             false,
             "",
         ),
+        // The shape of 22 of the 34 triage-cooldown holds of tracker's pass
+        // 43003938732, tracker#1071's among them: a partly verdict that
+        // planned nothing, past its day, nothing changed (agent-board#864).
+        (
+            "with triageReplans, partly past its day is triaged again, changed or not",
+            vec![(bot, None, "partly", -4)],
+            (false, None),
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            "",
+        ),
+        (
+            "with triageReplans, partly within its day still waits, changed or not",
+            vec![(bot, None, "partly", 0)],
+            (false, None),
+            "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; triaged again from {due}, or once cgwalters comments",
+            false,
+            "",
+        ),
+        (
+            "with triageReplans, partly after that many asks in a row is the operator's",
+            vec![
+                (bot, None, "follow-through-plan", 0),
+                (bot, None, "partly", -4),
+            ],
+            (false, None),
+            "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; nothing changed since its triage, the 2 in a row that planned nothing (triageReplans); the operator decides, or it is triaged again once something changes or cgwalters comments",
+            false,
+            "",
+        ),
+        (
+            "with triageReplans, a change after that many asks still triages it again",
+            vec![
+                (bot, None, "follow-through-plan", 0),
+                (bot, None, "partly", -4),
+                ("visitor", None, "Fixed by #9?", -3),
+            ],
+            (false, None),
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            "",
+        ),
         (
             "a plan posted before fingerprints is triaged again after the days, changed or not",
             vec![("", None, "unmarked", 0), (bot, None, "partly", -4)],
@@ -7236,9 +7472,11 @@ fn apply_follows_up_a_triage_by_its_verdict() {
     ];
     for (name, answers, (close, writes), expected, again, held) in cases {
         let promoted = name.contains("promoted");
-        let mut config = outside_harness(config(
-            json!({"triageFollowUpDays": 3, "triageClose": close, "fixPlans": promoted}),
-        ));
+        let replans = u64::from(name.contains("triageReplans"));
+        let mut config = outside_harness(config(json!({
+            "triageFollowUpDays": 3, "triageClose": close, "fixPlans": promoted,
+            "triageReplans": replans,
+        })));
         let mut forge = Forge::new(None, false);
         let first = apply(&forge, &config);
         assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
@@ -15202,6 +15440,11 @@ fn config_table() {
         (
             json!({"scan": {"candidate": 1}}),
             "unknown field `candidate`",
+        ),
+        (json!({"triageReplans": 11}), "triageReplans is not 0 to 10"),
+        (
+            json!({"triageReplans": 1}),
+            "triageReplans needs triageFollowUpDays",
         ),
         (
             json!({"wip": 1, "workRepositories": ["o/r"]}),

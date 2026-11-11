@@ -1992,9 +1992,10 @@ held items, before its budget or the slots ran out (agent-board#864). With
 whose reads reach `scan.candidateRequests` is held as unreadable (`hold
 OWNER/REPO#N: its reads reached 20 requests, the most one candidate may take
 (scan.candidateRequests); what else it waits on is unread`), and after
-`scan.candidates` candidates in a row held or failed with none started the
-rest wait (`scan: 40 candidate(s) in a row held or failed and none started,
-the most a pass reads (scan.candidates); M more candidate(s) wait`), the free
+`scan.candidates` candidates read in a row held or failed with none started
+the rest wait (`scan: 40 candidate(s) read in a row held or failed and none
+started, the most a pass reads (scan.candidates); M more candidate(s) wait;
+the next pass resumes after OWNER/REPO#N`), the free
 slots left for the `idle:` line; it is not the budget stop below, so it plans
 no kept epic. Where every candidate it did read
 was held, `epics.heldPlanHours` may then plan an epic with what the stop kept
@@ -2151,7 +2152,9 @@ read about 125 candidates for 379 requests, one of them at 37 for the overlap
 check's reads of each open pull request its plan's paths meet, and ended
 with `starts {}` (agent-board#864). It is off by default and GitHub-only,
 and bounds only stage 4's reads of candidates; neither the request limit nor
-what a start may do changes.
+what a start may do changes. `topDown` alone turns nothing on: the live
+passes had it and not `scan`, and read every candidate for nothing until
+tracker set `scan` (tracker#1548).
 
 `scan.candidateRequests` (1–650) is the most charged requests considering
 one candidate may take, counted as the summary's `causes` count them, 304s
@@ -2166,20 +2169,38 @@ ready work.
 
 `scan.candidates` (1–1000) is the most candidates in a row stage 4 reads
 without starting one, failed considerations included; a start, a failed
-start or a start `--max-dispatch` held ends the run. At it, the rest wait
-for the next pass without a hold, as at a budget stop, and the pass says so
-(`scan: 40 candidate(s) in a row held or failed and none started, the most a
-pass reads (scan.candidates); M more candidate(s) wait`). The free slots stay
-free, so the `idle:` line names the stop and the later stages have what the
-scan did not spend; unlike a budget stop, it does not let
+start or a start `--max-dispatch` held ends the run. A candidate is read
+when considering it charged a request, 304s refunded: one the board's
+facts screen out (closed, dispatched, its pull request open), or one
+revalidated from the last pass's responses, costs the scan nothing. At the
+bound, the rest wait for the next pass without a hold, as at a budget
+stop, and the pass says so (`scan: 40 candidate(s) read in a row held or
+failed and none started, the most a pass reads (scan.candidates); M more
+candidate(s) wait; the next pass resumes after OWNER/REPO#N`). The free
+slots stay free, so the `idle:` line names the stop and the later stages
+have what the scan did not spend; unlike a budget stop, it does not let
 `epics.heldPlanHours` plan a kept epic, as the rest were not unread for the
-budget. The order is the same each pass, so a bound
-below the held candidates ahead of ready work defers that work until what
-holds the candidates before it moves; the `not ready` counts say what does.
+budget.
 
-Caller settings in `cgwalters-forge/tracker`: set `.github/pass.json`'s
-`scan` to `{"candidateRequests": 20, "candidates": 40}`. No tracker settings
-are changed here.
+The candidate the stop names is kept in `state` as `scan_cursor`, and the
+next pass's scan resumes after it (`schedule: scan resumed after
+OWNER/REPO#N, where the last pass's scan stopped`), the focus epic's
+children still first, the candidates before the cursor last: the stops of
+a few passes then cover the board instead of reading the same held
+candidates ahead of ready work every pass. Any early end of the scan (the
+bound, the WIP limit, the budget, the pools or the time) keeps the last
+candidate it visited, a scan that reaches its end clears the cursor, and a
+pass that scans nothing (every slot taken, every pool capped) keeps the
+cursor as it was. A cursor naming no candidate scans in order, and without
+`scan.candidates` none is kept. The cursor steers only the order of one
+pass's reads, never what is started. It lives in `state`: without one,
+every pass reads the same candidates up to the bound, so held candidates
+ahead of ready work defer that work until what holds them moves, and
+`scan.candidates` wants `state` set.
+
+Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` sets
+`scan` to `{"candidateRequests": 20, "candidates": 40}` and `state`
+(tracker#1548); no tracker settings are changed here.
 
 ### Candidate admission
 
@@ -2714,7 +2735,29 @@ nothing to do, and the issue is triaged again only once its inputs changed
 (agent-board#383), and no sooner than a day after the verdict, doubled for
 each follow-up triage in a row before it (one the operator's comment
 started included), up to `triageFollowUpDays`. An unchanged issue waits
-for a change or the operator. With no verdict, where the run may have
+for a change or the operator (`hold …: triage verdict partly, URL; nothing
+changed since its triage, triaged again once something does, or once
+OPERATOR comments`).
+
+With `triageReplans` (0–10, off at 0, needs `triageFollowUpDays`), the
+issue is instead triaged again once that wait passes, changed or not, at
+most that many times in a row (`hold …: triaged again from T, or once
+OPERATOR comments`, then `start triage …`, the brief asking again); an
+unchanged issue after them waits on the operator as `needs-operator`
+(`hold …: nothing changed since its triage, the N in a row that planned
+nothing (triageReplans); the operator decides, or it is triaged again once
+something changes or OPERATOR comments`), and a change or the operator's
+comment triages it again as before. The count is of the pass's re-requests
+in a row, as the backoff counts them, whatever asked for each: one a
+change or the operator's comment started counts too. The concrete failure it stops is an
+issue whose triage planned nothing waiting for a change nothing outside
+the issue makes, such as another repository's pull request merging, while
+the pools are under pace: of the 34 `triage-cooldown` holds of tracker's
+pass 43003938732, 32 were such verdicts (18 `partly`, 10 `not-done`), 22
+of them past their day with nothing changed (agent-board#864). Each
+re-request spends a triage run, so the bound is low, and the backoff
+between them stands. Caller settings in `cgwalters-forge/tracker`: set
+`.github/pass.json`'s `triageReplans` to `2`. With no verdict, where the run may have
 failed, the issue is triaged again `triageFollowUpDays` after the record,
 changed or not, as is one whose triage plan predates this and carries no
 fingerprint.
@@ -4662,10 +4705,11 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `epics.close` | Close as completed a due epic whose sub-issues are all closed, rather than ask the operator once, see [what is built](#what-is-built); `false` |
 | `epics.heldPlanHours` | GitHub only: where stage 4 held every candidate it read (the rest unread only for its budget) and a `planPools` pool is under pace, plan one unplanned live epic a pass whose last planning request is at least this many hours (0–168) old, see [what is built](#what-is-built); `0` (off) |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
-| `scan.candidateRequests`, `scan.candidates` | GitHub only: the most charged requests considering one stage 4 candidate may take (1–650) before it is held as unreadable, and the most candidates in a row stage 4 reads without starting one (1–1000) before the rest wait, see [scan bounds](#scan-bounds); each absent (unbounded but by the budget) |
+| `scan.candidateRequests`, `scan.candidates` | GitHub only: the most charged requests considering one stage 4 candidate may take (1–650) before it is held as unreadable, and the most candidates in a row stage 4 reads without starting one (1–1000) before the rest wait for the next pass, which resumes after the last read where `state` keeps it, see [scan bounds](#scan-bounds); each absent (unbounded but by the budget) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
+| `triageReplans` | GitHub only: a triage that planned nothing is asked to plan again once its wait passes, changed inputs or not, at most this many times (0–10) in a row, after which an unchanged issue waits on the operator, see [scheduling](#scheduling); needs `triageFollowUpDays`; `0` (off) |
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |

@@ -1607,6 +1607,11 @@ pub struct State {
     /// same pull requests are not left out every pass. None walks in order.
     /// Losing it only starts the walk over.
     pub share_cursor: Option<String>,
+    /// The candidate `OWNER/REPO#N` the pass's stage 4 scan stopped at
+    /// under `scan.candidates` ([`crate::pass::Scan`]): the next pass's
+    /// scan resumes after it, so that the stops of a few passes cover the
+    /// board. None scans in order. Losing it only starts the scan over.
+    pub scan_cursor: Option<String>,
     /// `notifications` ([`notify`]): the time the next listing starts at,
     /// and where the last one had pages left, the time it goes on before,
     /// for up to [`notify::NOTIFY_PAGES`]. Losing them costs requests: the
@@ -1647,6 +1652,7 @@ impl State {
                     "lock_refused",
                     "follow_cursor",
                     "share_cursor",
+                    "scan_cursor",
                     "notify_since",
                     "notify_before",
                     "maintain",
@@ -1794,6 +1800,14 @@ impl State {
                     .context("poll state share_cursor is not a repository or a pull request")
             })
             .transpose()?;
+        let scan_cursor = (object.get("scan_cursor"))
+            .map(|c| {
+                c.as_str()
+                    .filter(|c| c.contains('#') && self::share_cursor(c))
+                    .map(str::to_owned)
+                    .context("poll state scan_cursor is not an issue")
+            })
+            .transpose()?;
         let authored_cursor = cursor("authored_cursor")?;
         let notify_since = time("notify_since")?;
         let notify_before = time("notify_before")?;
@@ -1812,6 +1826,7 @@ impl State {
             lock_refused,
             follow_cursor,
             share_cursor,
+            scan_cursor,
             notify_since,
             notify_before,
             maintain,
@@ -1851,6 +1866,9 @@ impl State {
         }
         if let Some(cursor) = &self.share_cursor {
             state["share_cursor"] = cursor.as_str().into();
+        }
+        if let Some(cursor) = &self.scan_cursor {
+            state["scan_cursor"] = cursor.as_str().into();
         }
         if let Some(since) = &self.notify_since {
             state["notify_since"] = since.as_str().into();
@@ -8676,6 +8694,8 @@ pub fn run_capped<R: Rest, G: Transport>(
         lock_refused,
         follow_cursor,
         share_cursor,
+        // The pass's, kept by the pass ([`crate::pass::run`]).
+        scan_cursor: None,
         notify_since,
         notify_before,
         maintain: None,
@@ -12141,9 +12161,11 @@ mod tests {
         let mut with_cursor = good.clone();
         with_cursor["follow_cursor"] = json!("o/r");
         with_cursor["authored_cursor"] = json!("u/r");
+        with_cursor["scan_cursor"] = json!("o/r#12");
         let state = State::from_json(&with_cursor).unwrap();
         assert_eq!(state.follow_cursor.as_deref(), Some("o/r"));
         assert_eq!(state.authored_cursor.as_deref(), Some("u/r"));
+        assert_eq!(state.scan_cursor.as_deref(), Some("o/r#12"));
         assert_eq!(state.to_json(), with_cursor);
         // An older cache's `authored_priority` is accepted and dropped.
         let mut older = with_cursor.clone();
@@ -12172,6 +12194,8 @@ mod tests {
             ("follow_cursor", json!("not a repository")),
             ("follow_cursor", json!(1)),
             ("authored_cursor", json!("not a repository")),
+            ("scan_cursor", json!("o/r")),
+            ("scan_cursor", json!("o/r#0")),
             ("notify_since", json!("yesterday")),
             ("notify_since", json!(1)),
             ("notify_before", json!(true)),
