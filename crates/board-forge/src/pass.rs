@@ -540,8 +540,9 @@ pub struct Config {
     /// Off unless set: stage 2 also follows the repositories with this topic,
     /// and never merges in them, as if in `pr.noMerge` ([`midstream`]).
     pub midstream: Option<midstream::Midstream>,
-    /// Off unless set: search GitHub for operator comments mentioning the bot,
-    /// staging external work in a topic-selected midstream fork.
+    /// Off unless set: search GitHub for operator comments mentioning the bot
+    /// or on the bot's own items, staging external work in a topic-selected
+    /// midstream fork.
     #[serde(default)]
     pub notifications: bool,
     /// Off unless set: stage 2 also follows up to this many repositories a

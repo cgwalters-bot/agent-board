@@ -1577,6 +1577,9 @@ pub struct State {
     /// The page of the cursor's search that the next pass reads from, past
     /// the first; none for the first.
     pub operator_page: Option<u64>,
+    /// The pass's intake: as `operator_page`, of the cursor's search of the
+    /// bot's own items ([`comments::SEARCHES`]).
+    pub intake_page: Option<u64>,
     /// The pass's intake: searched threads whose operator direction waits
     /// for a midstream fork, `OWNER/REPO#N` to the `updated_at` it read,
     /// retried each pass ([`comments::INTAKE_WAITING_LIMIT`]). Losing them
@@ -1638,6 +1641,7 @@ impl State {
                     "pass_responses",
                     "operator_cursor",
                     "operator_page",
+                    "intake_page",
                     "intake_waiting",
                     "intake_refused",
                     "lock_refused",
@@ -1701,14 +1705,18 @@ impl State {
                 .transpose()
         };
         let operator_cursor = time("operator_cursor")?;
-        let operator_page = object
-            .get("operator_page")
-            .map(|p| {
-                p.as_u64()
-                    .filter(|p| (2..=comments::OPERATOR_PAGE_LIMIT).contains(p))
-                    .context("poll state operator_page is out of bounds")
-            })
-            .transpose()?;
+        let page = |key: &str| {
+            object
+                .get(key)
+                .map(|p| {
+                    p.as_u64()
+                        .filter(|p| (2..=comments::OPERATOR_PAGE_LIMIT).contains(p))
+                        .with_context(|| format!("poll state {key} is out of bounds"))
+                })
+                .transpose()
+        };
+        let operator_page = page("operator_page")?;
+        let intake_page = page("intake_page")?;
         let intake_waiting: BTreeMap<String, String> = match object.get("intake_waiting") {
             None => BTreeMap::new(),
             Some(waiting) => serde_json::from_value(waiting.clone())
@@ -1798,6 +1806,7 @@ impl State {
             pass_responses,
             operator_cursor,
             operator_page,
+            intake_page,
             intake_waiting,
             intake_refused,
             lock_refused,
@@ -1824,6 +1833,9 @@ impl State {
         }
         if let Some(page) = self.operator_page {
             state["operator_page"] = page.into();
+        }
+        if let Some(page) = self.intake_page {
+            state["intake_page"] = page.into();
         }
         if !self.intake_waiting.is_empty() {
             state["intake_waiting"] = json!(self.intake_waiting);
@@ -8647,6 +8659,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     let Cursors {
         operator_cursor,
         operator_page,
+        intake_page,
         intake_waiting,
         notify_since,
         notify_before,
@@ -8657,6 +8670,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         pass_responses: BTreeMap::new(),
         operator_cursor,
         operator_page,
+        intake_page,
         intake_waiting,
         intake_refused: pass.intake_refused,
         lock_refused,
@@ -8675,6 +8689,7 @@ pub fn run_capped<R: Rest, G: Transport>(
 struct Cursors {
     operator_cursor: Option<String>,
     operator_page: Option<u64>,
+    intake_page: Option<u64>,
     intake_waiting: BTreeMap<String, String>,
     notify_since: Option<String>,
     notify_before: Option<String>,
@@ -8682,17 +8697,19 @@ struct Cursors {
 
 impl Cursors {
     /// Taken from `state`: the search's cursor and page always, the intake's
-    /// waiting threads only with the pass's intake, and the notifications'
-    /// cursors only with `notifications`.
+    /// page and waiting threads only with the pass's intake, and the
+    /// notifications' cursors only with `notifications`.
     fn new(config: &Config, state: &mut State) -> Self {
         let notifications = config.policy.notifications.is_some();
+        let intake = config.policy.notification_intake.is_some();
         Self {
             operator_cursor: state.operator_cursor.take(),
             operator_page: state.operator_page.take(),
-            // As the cursor; without the pass's intake it is dropped.
-            intake_waiting: match &config.policy.notification_intake {
-                Some(_) => std::mem::take(&mut state.intake_waiting),
-                None => BTreeMap::new(),
+            // As the cursor; without the pass's intake they are dropped.
+            intake_page: state.intake_page.take().filter(|_| intake),
+            intake_waiting: match intake {
+                true => std::mem::take(&mut state.intake_waiting),
+                false => BTreeMap::new(),
             },
             notify_since: state.notify_since.take().filter(|_| notifications),
             notify_before: state.notify_before.take().filter(|_| notifications),
@@ -8715,14 +8732,18 @@ fn read_direction<R: Rest, G: Transport>(
     {
         let at = (
             cursors.operator_cursor.as_deref(),
-            cursors.operator_page.unwrap_or(1),
+            [
+                cursors.operator_page.unwrap_or(1),
+                cursors.intake_page.unwrap_or(1),
+            ],
         );
         pass.intaking = config.policy.notification_intake.is_some();
         let mut waiting = cursors.intake_waiting.clone();
         match pass.operator_comments(follow, at, &mut waiting, outcome) {
-            Ok((cursor, page)) if pass.apply.is_some() => {
+            Ok((cursor, [page, intake_page])) if pass.apply.is_some() => {
                 cursors.operator_cursor = Some(cursor);
                 cursors.operator_page = Some(page).filter(|p| *p > 1);
+                cursors.intake_page = Some(intake_page).filter(|p| *p > 1);
                 cursors.intake_waiting = waiting;
             }
             Ok(_) => {}

@@ -47,18 +47,38 @@ conversation into work, or thread text choosing a repository the bot may write.
 `notifications: true` opts the GitHub pass into bounded search-backed intake
 in stage 2, even with no `follow` entries. The historical setting name is retained.
 It is off by default, needs `triagePools` or `planPools`, and uses the pass token;
-it needs no new credential or notifications scope. The query is
-`commenter:OPERATOR updated:>=LAST mentions:BOT`, sorted by update oldest first.
-Search is discovery, not authority: the pass loads each thread and its complete
-comment history before routing it. Search/API denial is a pass failure, not an
-empty inbox. The standalone poll's optional [`notifications` source](poll.md)
+it needs no new credential or notifications scope. It makes two queries, each
+sorted by update oldest first: `commenter:OPERATOR updated:>=LAST mentions:BOT`
+finds the threads where the operator addressed the bot anywhere, and
+`commenter:OPERATOR updated:>=LAST author:BOT` the bot's own issues and pull
+requests the operator commented on, a draft the poll stopped following
+included (agent-board#840). The second is its own search so that the
+operator's unrelated conversation, which a query without the `author:`
+qualifier would list, cannot take the mention search's pages.
+Search is discovery, not authority: the pass loads each thread and reads its
+complete comment history before routing it; one GitHub answers for another
+(its repository or number differ from the hit's, as after a transfer) is left
+to a person with a line, as often as the search finds it, not retried as an
+error. Search/API denial is a pass failure, not an empty inbox. The standalone poll's optional [`notifications` source](poll.md)
 still uses `/notifications` for callers with a classic token; the pass never
 calls that endpoint or marks threads read.
 
 Only comments, reviews and inline review comments authored by the configured
-operator **and mentioning the bot** supply direction. A thread-level search hit
+operator supply direction, and only those **mentioning the bot** unless the
+loaded item's author is the bot: on its own issue or pull request, what the
+operator says within the last two days is to it. Once a thread is retained for
+retry, its saved update time anchors that admission window, so a question does
+not expire while waiting for a fork, a complete read or dispatch capacity.
+A pull request of the bot's
+in a followed repository stays the walk's, whose rounds take the operator's
+reviews, until the poll stops at it; there, as on an item it never followed,
+the unmentioned comment counts. The separate `operatorAnswers` setting still
+authorizes the walk to treat comments on a stop as permission to restart;
+this intake does not grant that permission.
+A thread-level search hit
 is insufficient: another author's mention cannot activate an unrelated operator
-comment, including a natural-language ask or a bare `/bot` command. Mentions are
+comment, including a natural-language ask or a bare `/bot` command, and a
+mention by anyone but the operator starts nothing. Mentions are
 case-insensitive whole logins, not email addresses or longer login prefixes.
 These asks start a **triage planner**, not
 an implement run; its brief quotes the comment as data and asks it to plan or
@@ -66,8 +86,15 @@ answer. Other search hits, including review requests and replies without an
 operator ask, produce a decision line without authorizing work. The standalone
 poll's optional peer-research behavior is not enabled by this pass setting.
 
-Our issues are planned directly; the bot's own PRs use existing bounded fix
-rounds. Other public upstream threads are staged as issues in the matching
+Our issues are planned directly; questions on the bot's own PRs go to
+read-only triage on a verified tracking issue, including stopped drafts with
+or without `needs-human`. Claims and dispatch records stay on the tracking
+issue; the intake neither resets fix rounds nor removes holds. Its brief
+permits an answer or plan on the tracking issue, not source-PR writes or code
+changes. The existing acknowledgement is allowed only in repositories the
+pass may write. Use `pr.directionFirst` where the followed repositories would
+otherwise spend the share first (below).
+Other public upstream threads are staged as issues in the matching
 `midstream` topic-selected fork. Matching uses GitHub's verified fork `parent`,
 not the thread body, title or a guessed repository name. One metadata read per
 selected repository (at most 50) resolves those routes; ambiguity or unreadable
@@ -84,7 +111,11 @@ still needs the normal checked plan/scheduling path; its fork must also be in
 `workRepositories` for stage 4 to schedule that plan.
 
 The reader reuses the operator-comment search's bounds (three pages of 20 per
-pass, at most 1,000 searchable hits), request/time budget and resumable page cursor.
+pass for each of the two queries, at most 1,000 searchable hits each),
+request/time budget and resumable page cursor: one time cursor is shared, and
+each query keeps its own page of it (the poll state's `operator_page` and
+`intake_page`), resumed where that query's own next read is the earliest, else
+from its first page again.
 It overlaps the cursor by ten minutes for search-index lag. First use, with
 no cursor saved, searches from two days back, as the operator-comment search
 does; after that there is no two-day cutoff, and a saved cursor is kept however
@@ -109,14 +140,16 @@ share, it is an `operator comments deferred:` line, and a pass that does so
 every time never answers: the operator's question on a draft the poll had
 stopped following (cgwalters-forge/composefs-rs#54) waited a day that way
 (agent-board#840). `pr.directionFirst: true` (off by default) runs the
-intake's search first, before those reads, within the same share and the
+intake's searches first, before those reads, within the same share and the
 same bounds; the walk then takes what is left, and the share cursor carries
 what it does not reach to the next pass as before. The trade-off is the
 mirror image: an intake with many waiting threads to retry can leave the
 walk too little to reach a repository, a `pull requests: the stage's request
 share is spent` line, until those threads settle. The intake's starts come
 before the walk's within the poll's three a pass. `operatorAnswers` on a
-followed pull request is still read in the walk.
+followed pull request is still read in the walk. A claim records that a run
+started, not that it answered: the control snapshot's list of the operator's
+unanswered direction is a later slice of agent-board#840.
 
 One thread's error is a `warning:` line, never a failure of the pass. A write
 GitHub will always refuse (HTTP 404 or 410, such as an issue in a repository
