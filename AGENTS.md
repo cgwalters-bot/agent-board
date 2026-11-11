@@ -25,6 +25,8 @@ that a feature or security boundary has been implemented.
 - `crates/agent-board/`: CLI, `agent-board` and `gh-agent-board` binaries, live fixture runner and offline CLI tests.
 - `fixtures/`: offline board snapshots shared by unit and CLI tests.
 - `.github/workflows/`: unprivileged PR/push CI.
+- `workflow/`: the review job's task and bounds, and the decision diff script
+  it and implement runs execute.
 - `live/`: protected staging workflow template, run from the staging repository.
 - `docs/`: design, security contracts and implementation limits; distinguish plans from current code.
 - `site/`: the Starlight documentation site, rendering `docs/` in place (no copies) under its own landing page, `site/index.md`; the README only points to it; `just site-test` and `just site-build`, as agentic-job's.
@@ -153,3 +155,21 @@ The PR description says what changed, exact commands and exit statuses verified,
 and what was left unverified or deferred. In a disposable worker, leave the tree
 uncommitted and supply the runner's requested report: the runner creates the commit
 and PR, not the worker.
+
+A change to the pass, its configuration or its fixtures is not done at `just
+check`: fixtures and review passed a day of fixes that then did little or
+nothing on the live caller (#887). Before handing back, run the changed
+command as a preview against the caller configuration where the run has the
+token, and otherwise replay the recorded live pass, as the README's first
+command does, and the decision diff against the start commit
+([compare two revisions](docs/setup.md#compare-two-revisions)):
+
+```sh
+git worktree add ../base <start commit>
+node workflow/decision-diff.cjs ../base .
+```
+
+Paste its output, at least both summary lines, in the hand-back. A fix for a
+live symptom must show the symptom change there; where the recording does not
+exercise it, or the head reads something the recording lacks and so fails
+replay, say so: a new recording takes the bot's token (`pass --record`).

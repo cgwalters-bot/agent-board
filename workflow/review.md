@@ -31,6 +31,23 @@ Do not run existing test suites, formatters or linters to confirm they pass.
 Build and run code when needed to test whether a specific concern holds,
 for example whether a function can fail under a condition no test covers.
 Report what you ran and what it showed, only for that concern.
+When the change touches the pass (crates/board-forge/src/pass.rs and pass/,
+crates/agent-board/src/pass.rs, the board-core rules they apply, or
+fixtures/pass/), also run the decision diff from the base checkout you
+started in, never the head's copy of the script:
+`node workflow/decision-diff.cjs . HEAD`, HEAD being the admitted head
+checkout. The base's script builds both checkouts, previews the recorded pass
+(fixtures/pass/board-2026-10-23.json with fixtures/pass/config.json) with each
+binary, with no token and nothing sent, and prints both summary lines and the
+diff of the two previews: starts, holds, writes, not-ready reasons and
+requests per stage. Its entire report, including build diagnostics and failure
+tails, is capped at 24 KiB to leave room for findings. Put its whole output in the review under a
+`Decision diff` heading, in a code block, and judge it: a pull request that
+says it fixes a live symptom must show the symptom change there, so an empty
+diff under such a claim, or a head whose replay fails, is an important
+finding unless the description says the recording does not exercise it. The
+base side is the base branch's tip, not the merge base, so a head behind it
+shows the branch's own pass changes too: say so rather than attribute them.
 Do not look up or report CI results. CI is a separate required check;
 the merge gate combines it with the review, not the reviewer.
 Focus on correctness, security,
