@@ -156,6 +156,14 @@ pub(super) struct Said {
     pub(super) key: String,
     pub(super) at: OffsetDateTime,
     pub(super) body: String,
+    /// Authenticated review state, never inferred from words in its body.
+    pub(super) changes_requested: bool,
+}
+
+/// Quoted imperative prose cannot authorize a fix; use GitHub review state.
+/// Mixed batches stay in triage rather than guessing which intent wins.
+pub(super) fn review_fix(policy: &PollPolicy, said: &[Said]) -> bool {
+    policy.operator_review_fixes && !said.is_empty() && said.iter().all(|s| s.changes_requested)
 }
 
 /// The comments that a round's marker of the bot's, or a winning triage
@@ -275,7 +283,7 @@ pub(super) struct Tracked(Vec<(Value, Vec<Value>)>);
 
 impl Tracked {
     /// The comments of every one: their claims are the thread's.
-    fn comments(&self) -> Vec<Value> {
+    pub(super) fn comments(&self) -> Vec<Value> {
         self.0.iter().flat_map(|(_, c)| c.iter().cloned()).collect()
     }
 
@@ -935,6 +943,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         pull: bool,
         since: OffsetDateTime,
     ) -> Result<Vec<Said>> {
+        let mut newest_review_requests_changes = false;
         let mut found: Vec<(&str, String, Value)> = comments
             .iter()
             .map(|c| {
@@ -950,6 +959,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 &format!("repos/{repo}/pulls/{number}/reviews?per_page=100"),
                 false,
             )?;
+            // Review state is direction even without prose: a later bare
+            // approval supersedes an earlier request to change the code.
+            newest_review_requests_changes = reviews
+                .iter()
+                .filter(|r| text(r, "/user/login") == self.config.operator)
+                .filter_map(|r| {
+                    Some((
+                        OffsetDateTime::parse(text(r, "/submitted_at"), &Rfc3339).ok()?,
+                        r["id"].as_u64()?,
+                        text(r, "/state"),
+                    ))
+                })
+                .max_by_key(|(at, id, _)| (*at, *id))
+                .is_some_and(|(_, _, state)| state == "CHANGES_REQUESTED");
             // An inline comment is posted with its review, so it is dated by
             // the later of creation and submission: one written before the
             // stop in a review submitted after it is part of that answer,
@@ -994,6 +1017,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     key: format!("{anchor}{}", c["id"].as_u64()?),
                     at: OffsetDateTime::parse(at, &Rfc3339).ok()?,
                     body: review_text(text(c, "/body")),
+                    changes_requested: *anchor == "pullrequestreview-"
+                        && text(c, "/state") == "CHANGES_REQUESTED"
+                        && newest_review_requests_changes,
                 })
             })
             .filter(|s| s.at >= since && !s.body.is_empty())
@@ -1444,12 +1470,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .filter(|s| !directed || !self.intake_skip.contains(&s.key))
             .filter(|s| !done.contains(&s.key))
             .collect();
-        // Intake questions on the bot's PRs are read-only tracking-issue
-        // triage, even in our space or on a stopped draft. The ordinary
-        // operatorComments route keeps its existing fix authorization.
+        // Only structured operator reviews authorize this route: imperative
+        // text in a quoted question must not turn read-only intake into a fix.
+        // Mixed batches stay in triage rather than guessing which intent wins.
+        // Other intake questions on the bot's PRs remain read-only triage.
+        // The ordinary operatorComments route keeps its fix authorization.
         // Tracking issues hold claims, read with any left on the source.
         // The checks that need no lookup go first, as each lookup is a search.
         let mine = pull && text(hit, "/user/login") == bot;
+        // Read old tracking receipts even for a newly enabled fix route, so
+        // enabling it cannot replay a review already handled by triage.
         let routed = !said.is_empty() && ((directed && mine) || (!mine && !self.config.ours(repo)));
         if routed && addressed && !said.iter().any(|s| explicit(&s.body, &bot)) {
             return Ok(None);
@@ -1508,6 +1538,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if addressed && !said.iter().any(|s| explicit(&s.body, &bot)) {
             return Ok(None);
         }
+        // Tracking claims may have removed earlier prose from a mixed batch.
+        let review_fix = directed && review_fix(&self.config.policy, &said);
         let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
         // A repository the operator did not name in `operatorComments`, where
         // a notification found them: a fix round's brief quotes them in the
@@ -1529,8 +1561,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let (done, what) = if let Some(why) = private {
             (true, why)
-        } else if mine && !directed {
-            self.comment_fix(repo, number, hit, comments, &said)?
+        } else if mine && (!directed || review_fix) {
+            let (done, what) = self.comment_fix(repo, number, hit, comments, &said)?;
+            let what = if review_fix {
+                format!("intent=requested-changes (review state): {what}")
+            } else {
+                what
+            };
+            (done, what)
         } else if let Some(tracked) = &tracked
             && !directed
             && !said.iter().any(|s| explicit(&s.body, &bot))
@@ -4230,6 +4268,7 @@ pub(super) mod tests {
                 key: "issuecomment-100".into(),
                 at: now(),
                 body: "Please rename.".into(),
+                changes_requested: false,
             }];
             let pull = json!({"number": 7, "headRefOid": "abcdef0123456789"});
             let apply = Apply {
@@ -4516,6 +4555,7 @@ pub(super) mod tests {
                 key: "issuecomment-1".into(),
                 at: now(),
                 body: body.into(),
+                changes_requested: false,
             }];
             assert_eq!(run_kind(&said, BOT), kind, "{body}");
         }

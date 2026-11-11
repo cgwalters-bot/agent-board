@@ -16078,6 +16078,13 @@ fn config_table() {
     let intake = config(json!({"notifications": true})).poll(None);
     assert!(intake.policy.notification_intake.is_some());
     assert!(intake.policy.notifications.is_none());
+    assert!(!intake.policy.operator_review_fixes);
+    assert!(
+        config(json!({"notifications": true, "pr": {"operatorReviewFixes": true}}))
+            .poll(None)
+            .policy
+            .operator_review_fixes
+    );
     let pace = poll.policy.pace.unwrap();
     assert_eq!(
         (pace.repository.as_str(), pace.issue, pace.bot.as_str()),

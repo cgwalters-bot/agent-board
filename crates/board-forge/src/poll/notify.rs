@@ -768,6 +768,28 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok((true, format!("notification: {why}")));
         }
         let external = !self.config.ours(repo) || mine;
+        // A fix of the bot's own PR needs neither a topic-selected fork nor
+        // a tracking issue. Its round marker is the acknowledgement/receipt.
+        let mut records = comments.to_vec();
+        if mine && self.config.policy.operator_review_fixes {
+            // The old route kept its receipts on the tracking issue. Classify
+            // only direction still open there before requiring a fork for it.
+            records.extend(self.tracked(repo, number, true)?.comments());
+        }
+        let (done, _) = handled(&records, &bot, self.now);
+        let unread: Vec<_> = said
+            .iter()
+            .filter(|s| !done.contains(&s.key))
+            .cloned()
+            .collect();
+        // Revisit a completed review through the same path too, rather than
+        // making a now-unnecessary fork admission hold its discovery cursor.
+        let candidates = if unread.is_empty() { &said } else { &unread };
+        if mine && comments::review_fix(&self.config.policy, candidates) {
+            return Ok(self
+                .thread_read_from(repo, issue, comments, false, (since, true, admission_floor))?
+                .unwrap_or((true, "notification: operator review already handled".into())));
+        }
         if self.awaits_fork(repo) {
             return Ok((
                 false,
@@ -930,6 +952,7 @@ fn peer_said(
                 key: format!("{anchor}{}", c["id"].as_u64()?),
                 at: OffsetDateTime::parse(text(c, "/created_at"), &Rfc3339).ok()?,
                 body: review_text(text(c, "/body")).replace('<', "&lt;"),
+                changes_requested: false,
             })
         })
         .filter(|s| s.at >= floor && !s.body.is_empty() && !done.contains(&s.key))
@@ -1935,6 +1958,315 @@ mod tests {
         assert_eq!(again.errors, 0, "{:?}", again.lines);
         assert_eq!(dispatches(&fake).len(), 1);
         assert_eq!(replies(&fake).len(), 1);
+    }
+
+    /// Structured review intent is sufficient for a fix, not arbitrary prose
+    /// that might quote a request or grant unrelated shipping/DCO permission.
+    #[test]
+    fn operator_review_fixes_policy_table() {
+        for (value, expected) in [
+            (json!({}), Some(false)),
+            (json!({"operatorReviewFixes": false}), Some(false)),
+            (json!({"operatorReviewFixes": true}), Some(true)),
+            (json!({"operatorReviewFixes": "true"}), None),
+            (json!({"operatorReviewFixes": null}), None),
+        ] {
+            assert_eq!(
+                PollPolicy::from_json(&value)
+                    .ok()
+                    .map(|p| p.operator_review_fixes),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn operator_review_fixes_route_only_changes_requested_on_our_pr() {
+        const SHIP: &str =
+            "…whatever let's ship. It can always clean it up later. You can add my DCO";
+        for (enabled, author, reviewer, state, body, mixed, fix) in [
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "CHANGES_REQUESTED",
+                "Please fix this typo.",
+                false,
+                true,
+            ),
+            (
+                false,
+                BOT,
+                OPERATOR,
+                "CHANGES_REQUESTED",
+                "Please fix this typo.",
+                false,
+                false,
+            ),
+            (
+                true,
+                "someone",
+                OPERATOR,
+                "CHANGES_REQUESTED",
+                "@worker please fix this typo.",
+                false,
+                false,
+            ),
+            (
+                true,
+                BOT,
+                "someone",
+                "CHANGES_REQUESTED",
+                "Please fix this typo.",
+                false,
+                false,
+            ),
+            (true, BOT, OPERATOR, "APPROVED", SHIP, false, false),
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "SUPERSEDED",
+                "Please fix this typo.",
+                false,
+                false,
+            ),
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "COMMENTED",
+                "They said 'please fix this'. What do you think?",
+                false,
+                false,
+            ),
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "DISMISSED",
+                "Please fix this typo.",
+                false,
+                false,
+            ),
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "CHANGES_REQUESTED",
+                "Please fix this typo.",
+                true,
+                false,
+            ),
+        ] {
+            let repo = "other/app";
+            let fake = intake_github(repo, true, "comment", OPERATOR);
+            let issue = format!("repos/{repo}/issues/2");
+            fake.rest
+                .borrow_mut()
+                .get_mut(&format!("{API_ROOT}{issue}"))
+                .unwrap()["user"]["login"] = author.into();
+            fake.page(
+                &format!("{issue}/comments?per_page=100"),
+                match mixed || !enabled {
+                    true => json!([said(11, OPERATOR, UPDATED, "Actually, wait for me.")]),
+                    false => json!([]),
+                },
+            );
+            let mut review = said(5862878257, reviewer, UPDATED, body);
+            review["state"] = if state == "SUPERSEDED" {
+                "CHANGES_REQUESTED"
+            } else {
+                state
+            }
+            .into();
+            let mut reviews = vec![review];
+            if state == "SUPERSEDED" {
+                let mut approval = said(5862878258, OPERATOR, "2026-10-16T11:30:00Z", "");
+                approval["state"] = "APPROVED".into();
+                reviews.push(approval);
+            }
+            fake.page(
+                &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
+                json!(reviews),
+            );
+            fake.page(
+                &format!("repos/{repo}/pulls/2/comments?per_page=100"),
+                json!([]),
+            );
+            fake.page(
+                &format!("repos/{repo}/pulls/2"),
+                json!({
+                "head": {"sha": "abcdef0123456789"}, "labels": []}),
+            );
+            let mut config = search_intake(&fake, repo);
+            config.policy.operator_review_fixes = enabled;
+            if !fix {
+                config.policy.notification_intake =
+                    Some(BTreeMap::from([(repo.into(), DISPATCH.into())]));
+            }
+            // This is not our space, but fixes on the bot's own PR are allowed.
+            config.policy.own_space_only = true;
+            let preview = pass(&fake, &config, State::default(), false);
+            assert_eq!(preview.errors, 0, "{:?}", preview.lines);
+            assert!(fake.writes.borrow().is_empty());
+            assert_eq!(
+                preview
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("intent=requested-changes")),
+                fix,
+                "{:?}",
+                preview.lines
+            );
+            let first = pass(&fake, &config, State::default(), true);
+            assert_eq!(first.errors, 0, "{:?}", first.lines);
+            let runs = dispatches(&fake);
+            assert_eq!(
+                runs.iter().any(|i| i["kind"] == "triage"),
+                !fix && reviewer == OPERATOR,
+                "{:?}",
+                first.lines
+            );
+            assert_eq!(
+                runs.iter().any(|i| i["kind"] == "fix"),
+                fix,
+                "{:?}",
+                first.lines
+            );
+            if fix {
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0]["repo"], repo);
+                assert_eq!(runs[0]["item"], "2");
+                assert!(text(&runs[0], "/task").contains(body));
+                assert!(
+                    !fake
+                        .writes
+                        .borrow()
+                        .iter()
+                        .any(|(w, _)| w.ends_with("/issues"))
+                );
+            }
+            // Claims survive a lost cursor: the same review starts no second run.
+            // Enabling the option must also honor prior tracking-triage receipts.
+            config.policy.operator_review_fixes = true;
+            let again = pass(&fake, &config, State::default(), true);
+            assert_eq!(again.errors, 0, "{:?}", again.lines);
+            assert_eq!(dispatches(&fake).len(), runs.len());
+            if !enabled {
+                // A new review follows prose already handled on the tracker.
+                // Losing the cursor must not turn it into a mixed batch or
+                // require a midstream fork that this own-PR fix doesn't need.
+                config.policy.notification_intake = Some(BTreeMap::new());
+                let mut review = said(
+                    5862878259,
+                    OPERATOR,
+                    "2026-10-16T11:45:00Z",
+                    "Please fix the remaining typo.",
+                );
+                review["state"] = "CHANGES_REQUESTED".into();
+                fake.rest
+                    .borrow_mut()
+                    .get_mut(&format!(
+                        "{API_ROOT}repos/{repo}/pulls/2/reviews?per_page=100"
+                    ))
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap()
+                    .push(review);
+                let next = pass(&fake, &config, State::default(), true);
+                assert_eq!(next.errors, 0, "{:?}", next.lines);
+                let runs = dispatches(&fake);
+                assert_eq!(runs.len(), 2, "{:?}", next.lines);
+                assert_eq!(runs[1]["kind"], "fix");
+                assert_eq!(runs[1]["repo"], repo);
+            }
+        }
+    }
+
+    #[test]
+    fn operator_review_fixes_keep_existing_holds_and_caps() {
+        for case in [
+            "label",
+            "rounds",
+            "running",
+            "dispatch cap",
+            "write cap",
+            "fix bounds",
+        ] {
+            let repo = "upstream/app";
+            let fake = intake_github(repo, true, "comment", OPERATOR);
+            let issue = format!("repos/{repo}/issues/2");
+            fake.rest
+                .borrow_mut()
+                .get_mut(&format!("{API_ROOT}{issue}"))
+                .unwrap()["user"]["login"] = BOT.into();
+            let state = match case {
+                "rounds" => json!({"rounds": MAX_FIX_ROUNDS, "sha": "old"}),
+                "running" => json!({"rounds": 1, "sha": "abcdef0123456789", "at": UPDATED}),
+                _ => Value::Null,
+            };
+            fake.page(
+                &format!("{issue}/comments?per_page=100"),
+                match state.is_null() {
+                    true => json!([]),
+                    false => json!([{"id": 5, "user": {"login": BOT}, "created_at": UPDATED,
+                    "body": marker_body(&state, "Fix round", &Footer::default())}]),
+                },
+            );
+            let mut review = said(22, OPERATOR, UPDATED, "Please fix the typo.");
+            review["state"] = "CHANGES_REQUESTED".into();
+            fake.page(
+                &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
+                json!([review]),
+            );
+            fake.page(
+                &format!("repos/{repo}/pulls/2/comments?per_page=100"),
+                json!([]),
+            );
+            fake.page(
+                &format!("repos/{repo}/pulls/2"),
+                json!({"head": {"sha": "abcdef0123456789"},
+                "labels": if case == "label" { json!([{"name": LABEL}]) } else { json!([]) }}),
+            );
+            let mut config = search_intake(&fake, repo);
+            config.policy.operator_review_fixes = true;
+            if case == "fix bounds" {
+                config.policy.fix_bounds = super::super::bounds::FixBoundsSet::new(vec![
+                        super::super::bounds::FixBounds::parse(
+                            "repos = [\"someone/app\"]\n[outputs.push_to_pull_request_branch]\nbranches = [\"dispatch/**\"]",
+                        ).unwrap(),
+                ]);
+            }
+            let caps = caps::Caps::new(caps::Limits {
+                dispatch: Some(if case == "dispatch cap" { 0 } else { 3 }),
+                writes: Some(if case == "write cap" { 0 } else { 20 }),
+                ..Default::default()
+            });
+            let outcome = run_capped(
+                &fake,
+                &fake,
+                &config,
+                State::default(),
+                (&[], &[]),
+                Some(Apply {
+                    dispatcher: &fake,
+                    workflow: "dispatch.yml".into(),
+                    pools: vec![],
+                    git_ref: None,
+                }),
+                Some(&caps),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            assert!(dispatches(&fake).is_empty(), "{case}: {:?}", outcome.lines);
+            assert!(
+                fake.writes.borrow().is_empty(),
+                "{case}: {:?}",
+                fake.writes.borrow()
+            );
+        }
     }
 
     #[test]
