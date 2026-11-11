@@ -20,7 +20,10 @@
 //! a completed claim and no dispatch; the issue waits for the board pass.
 //!
 //! A search a pass, of a few pages, finds the threads the operator commented
-//! on that were updated since a cursor in the state. Each new comment is
+//! on that were updated since a cursor in the state; the pass's intake makes
+//! two, one of the threads mentioning the bot and one of the bot's own items,
+//! on which the operator's comments need no mention ([`super::notify::directs`]),
+//! from the same cursor with the same pages each. Each new comment is
 //! claimed on its thread by the bot before its run starts, and a claim, or a
 //! round's marker, that names a comment's id is never acted on again, unless
 //! GitHub refused its run; the cursor only saves requests. Only the operator's comments count, as only their reviews do,
@@ -37,13 +40,17 @@ use crate::github::NotFound;
 use time::Duration;
 
 /// The most entries `operatorComments.repositories` may hold: each is a
-/// qualifier of the one search query a pass makes.
+/// qualifier of each search query a pass makes ([`SEARCHES`]).
 pub const OPERATOR_SCOPE_LIMIT: usize = 10;
 /// The threads a page of the search holds, oldest update first.
 const THREADS_PAGE: usize = 20;
 /// The pages one pass reads; the rest wait for the next pass, which resumes
 /// at a page saved with the cursor.
 const SEARCH_PAGES: u64 = 3;
+/// The searches a pass makes from the cursor, each with its own page: the
+/// operator's comments mentioning the bot, and with the pass's intake those
+/// on the bot's own items too.
+pub const SEARCHES: usize = 2;
 /// The last page a search gives: it finds at most 1000 results.
 pub const OPERATOR_PAGE_LIMIT: u64 = (1000 / THREADS_PAGE) as u64;
 /// The most threads the pass's intake search keeps to retry while their
@@ -446,7 +453,7 @@ fn triage_brief(
     };
     let answer = match tracking {
         Some(issue) => format!(
-            "then propose a plan as an `agent-board-plan` comment, or answer, on {issue}, the issue that tracks it, which is your item. The result stays on that issue: post nothing to the {what}"
+            "then propose a plan as an `agent-board-plan` comment, or answer, on {issue}, the issue that tracks it, which is your item. The result stays on that issue: post nothing to the {what}. This is read-only investigation of the source: do not change its code, branch, labels, holds or fix-round markers"
         ),
         None => "then propose a plan as an `agent-board-plan` comment, or answer there".into(),
     };
@@ -629,10 +636,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     pub(super) fn operator_comments(
         &mut self,
         follow: &BTreeSet<&String>,
-        (cursor, page): (Option<&str>, u64),
+        (cursor, pages): (Option<&str>, [u64; SEARCHES]),
         waiting: &mut BTreeMap<String, String>,
         outcome: &mut Outcome,
-    ) -> Result<(String, u64)> {
+    ) -> Result<(String, [u64; SEARCHES])> {
         let intake = self.config.policy.notification_intake.is_some();
         let retried: Vec<String> = waiting.keys().cloned().collect();
         // Share at most half the remaining requests among *all* waiting
@@ -653,7 +660,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 waiting.remove(key);
                 continue;
             };
-            let result = self.searched_direction(repo, number, retry_budget);
+            // Retried direction keeps the admission window of its saved update,
+            // rather than expiring while a fork, read or dispatch is unavailable.
+            let floor = timestamp(waiting.get(key).map(String::as_str))
+                .map(|at| at - Duration::seconds(LOOKBACK_SECONDS));
+            let result = self.searched_direction(repo, number, retry_budget, floor);
             match result {
                 Ok((done, line, fork)) => {
                     outcome.activity += 1;
@@ -693,120 +704,165 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // A page is one of the search of the cursor it was saved with: a
         // cursor clamped to the lookback or now is another search, read from
         // its start, else its first pages would be skipped for a pass.
-        let start = match saved {
+        let starts = pages.map(|page| match saved {
             Some(saved) if (floor..=self.now).contains(&saved) => {
                 page.clamp(1, OPERATOR_PAGE_LIMIT)
             }
             _ => 1,
-        };
+        });
         let scopes = &self.config.policy.operator_comments;
-        let mut query = format!(
-            "commenter:{} updated:>={}",
-            self.config.operator,
-            stamp(cursor - lag)?
-        );
+        let (operator, bot) = (&self.config.operator, &self.config.bot);
+        let since = stamp(cursor - lag)?;
+        // The intake's two searches (agent-board#840): the operator's comments
+        // mentioning the bot anywhere, and their comments on the bot's own
+        // items, mentioned or not. Each reads its own pages from the shared
+        // cursor, so that the operator's unrelated conversation, which the
+        // second would list without its `author:`, cannot take the first's.
+        let mut queries = vec![format!("commenter:{operator} updated:>={since}")];
         if intake {
-            query.push_str(&format!(" mentions:{}", self.config.bot));
+            queries[0].push_str(&format!(" mentions:{bot}"));
+            queries.push(format!(
+                "commenter:{operator} updated:>={since} author:{bot}"
+            ));
         }
         for scope in scopes {
-            match scope.strip_suffix("/*") {
-                Some(owner) => query.push_str(&format!(" org:{owner}")),
-                None => query.push_str(&format!(" repo:{scope}")),
+            for query in &mut queries {
+                match scope.strip_suffix("/*") {
+                    Some(owner) => query.push_str(&format!(" org:{owner}")),
+                    None => query.push_str(&format!(" repo:{scope}")),
+                }
             }
         }
-        let query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
-        // Each thread read, in order: when it was updated, and whether this
-        // pass is done with it.
-        let mut read: Vec<(Option<OffsetDateTime>, bool)> = Vec::new();
-        let mut end = false;
-        for page in start..=(start + SEARCH_PAGES - 1).min(OPERATOR_PAGE_LIMIT) {
-            let found = self.get(&format!(
-                "search/issues?q={query}&sort=updated&order=asc&per_page={THREADS_PAGE}&page={page}"
-            ))?;
-            let hits = found["items"]
-                .as_array()
-                .context("search items is not a list")?;
-            for hit in hits {
-                let updated = OffsetDateTime::parse(text(hit, "/updated_at"), &Rfc3339).ok();
-                let repo = text(hit, "/repository_url")
-                    .strip_prefix(&format!("{API_ROOT}repos/"))
-                    .unwrap_or("")
-                    .to_owned();
-                // The search found it; its scope is checked here all the same.
-                let done = if validate_repository(&repo).is_err()
-                    || (!intake && !in_scope(scopes, &repo))
-                {
-                    outcome.lines.push(format!(
-                        "operator comments: ignored {repo:?}, outside the scope"
-                    ));
-                    true
-                } else if !intake && follow.contains(&repo) {
-                    // The poll's own steps cover its followed pull requests.
-                    true
-                } else if intake
-                    && retried.contains(&waiting_key(&repo, hit["number"].as_u64().unwrap_or(0)))
-                {
-                    // Retried above, and still waiting where not done.
-                    true
-                } else if intake {
+        // The threads an earlier search of this pass read: the bot's item
+        // that mentions it is in both.
+        let mut listed: BTreeSet<String> = BTreeSet::new();
+        // Where each search would resume on its own.
+        let mut listings: Vec<(OffsetDateTime, u64)> = Vec::new();
+        for (index, query) in queries.iter().enumerate() {
+            let query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+            // The pages still to list this pass: this search's and those after it.
+            let pages = SEARCH_PAGES as usize * (queries.len() - index);
+            let start = starts[index];
+            // Each thread read, in order: when it was updated, and whether this
+            // pass is done with it.
+            let mut read: Vec<(Option<OffsetDateTime>, bool)> = Vec::new();
+            let mut end = false;
+            for page in start..=(start + SEARCH_PAGES - 1).min(OPERATOR_PAGE_LIMIT) {
+                let found = self.get(&format!(
+                    "search/issues?q={query}&sort=updated&order=asc&per_page={THREADS_PAGE}&page={page}"
+                ))?;
+                let hits = found["items"]
+                    .as_array()
+                    .context("search items is not a list")?;
+                for hit in hits {
+                    let updated = OffsetDateTime::parse(text(hit, "/updated_at"), &Rfc3339).ok();
+                    let repo = text(hit, "/repository_url")
+                        .strip_prefix(&format!("{API_ROOT}repos/"))
+                        .unwrap_or("")
+                        .to_owned();
                     let number = hit["number"].as_u64().unwrap_or_default();
-                    // An oversized new history, or the routing and recovery
-                    // reads after it, must leave requests to finish the
-                    // listing and save the threads that need retries.
-                    let listing = self.remaining.min(SEARCH_PAGES as usize);
-                    self.remaining -= listing;
-                    let found = self.searched_direction(&repo, number, self.remaining);
-                    self.remaining += listing;
-                    let (done, line, fork) = match found {
-                        Ok(found) => {
-                            outcome.activity += 1;
-                            found
-                        }
-                        Err(error) => {
-                            let (done, line) = self.intake_failed(&error);
-                            (done, line, false)
+                    let key = waiting_key(&repo, number);
+                    // The search found it; its scope is checked here all the same.
+                    let done = if validate_repository(&repo).is_err()
+                        || (!intake && !in_scope(scopes, &repo))
+                    {
+                        outcome.lines.push(format!(
+                            "operator comments: ignored {repo:?}, outside the scope"
+                        ));
+                        true
+                    } else if !intake && follow.contains(&repo) {
+                        // The poll's own steps cover its followed pull requests.
+                        true
+                    } else if intake && (retried.contains(&key) || listed.contains(&key)) {
+                        // Retried above, or read by the search before this
+                        // one, and still waiting where not done.
+                        true
+                    } else if intake {
+                        listed.insert(key.clone());
+                        // An oversized new history, or the routing and recovery
+                        // reads after it, must leave requests to finish the
+                        // listing and save the threads that need retries.
+                        let listing = self.remaining.min(pages);
+                        self.remaining -= listing;
+                        let found = self.searched_direction(&repo, number, self.remaining, None);
+                        self.remaining += listing;
+                        let (done, line, fork) = match found {
+                            Ok(found) => {
+                                outcome.activity += 1;
+                                found
+                            }
+                            Err(error) => {
+                                let (done, line) = self.intake_failed(&error);
+                                (done, line, false)
+                            }
+                        };
+                        let (done, kept) = match done {
+                            true => (true, String::new()),
+                            false => keep_waiting(
+                                (waiting, &mut forked),
+                                (key, text(hit, "/updated_at"), fork),
+                                outcome,
+                            ),
+                        };
+                        outcome.lines.push(format!("{repo}#{number} {line}{kept}"));
+                        done
+                    } else {
+                        match self.thread(&repo, hit) {
+                            Ok(None) => true,
+                            Ok(Some((done, line))) => {
+                                outcome.activity += 1;
+                                outcome.lines.push(format!("{repo}#{number} {line}"));
+                                done
+                            }
+                            Err(error) => {
+                                outcome.errors += 1;
+                                outcome.lines.push(format!(
+                                    "{repo}#{number} operator comments error: {error:#}"
+                                ));
+                                false
+                            }
                         }
                     };
-                    let (done, kept) = match done {
-                        true => (true, String::new()),
-                        false => keep_waiting(
-                            (waiting, &mut forked),
-                            (waiting_key(&repo, number), text(hit, "/updated_at"), fork),
-                            outcome,
-                        ),
-                    };
-                    outcome.lines.push(format!("{repo}#{number} {line}{kept}"));
-                    done
-                } else {
-                    let number = hit["number"].as_u64().unwrap_or_default();
-                    match self.thread(&repo, hit) {
-                        Ok(None) => true,
-                        Ok(Some((done, line))) => {
-                            outcome.activity += 1;
-                            outcome.lines.push(format!("{repo}#{number} {line}"));
-                            done
-                        }
-                        Err(error) => {
-                            outcome.errors += 1;
-                            outcome.lines.push(format!(
-                                "{repo}#{number} operator comments error: {error:#}"
-                            ));
-                            false
-                        }
-                    }
-                };
-                read.push((updated, done));
+                    read.push((updated, done));
+                }
+                // Threads may be missing anywhere in it: all read again, the
+                // search before this one too, whose claims make that cheap.
+                if found["incomplete_results"] != false {
+                    return Ok((stamp(cursor)?, starts));
+                }
+                let total = found["total_count"].as_u64();
+                if hits.len() < THREADS_PAGE
+                    || total.is_some_and(|t| t <= page * THREADS_PAGE as u64)
+                {
+                    end = true;
+                    break;
+                }
             }
-            // Threads may be missing anywhere in it: all read again.
-            if found["incomplete_results"] != false {
-                return Ok((stamp(cursor)?, start));
-            }
-            let total = found["total_count"].as_u64();
-            if hits.len() < THREADS_PAGE || total.is_some_and(|t| t <= page * THREADS_PAGE as u64) {
-                end = true;
-                break;
-            }
+            listings.push(self.resume(&read, end, (cursor, start), outcome)?);
         }
+        // The earliest of where each search would resume on its own is where
+        // both do: a page is one of the search of the cursor it was saved
+        // with, so the other starts at its first again, which costs requests
+        // and skips nothing.
+        let next = listings.iter().map(|(at, _)| *at).min().unwrap_or(self.now);
+        let mut pages = [1; SEARCHES];
+        for (index, (at, page)) in listings.into_iter().enumerate() {
+            pages[index] = if at == next { page } else { 1 };
+        }
+        Ok((stamp(next)?, pages))
+    }
+
+    /// Where the next pass resumes one search of [`Self::operator_comments`]
+    /// `read` from `(cursor, start)` this pass, each thread's update time and
+    /// whether the pass is done with it, to the search's `end` or not.
+    fn resume(
+        &self,
+        read: &[(Option<OffsetDateTime>, bool)],
+        end: bool,
+        (cursor, start): (OffsetDateTime, u64),
+        outcome: &mut Outcome,
+    ) -> Result<(OffsetDateTime, u64)> {
+        let lag = Duration::seconds(SEARCH_LAG_SECONDS);
         let open = match read.iter().position(|(_, done)| !done) {
             Some(open) => open,
             None if !end => read.len(),
@@ -823,9 +879,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     .and_then(|(at, _)| *at)
                     .is_some_and(|at| at < cursor) =>
             {
-                return Ok((stamp(self.now)?, 1));
+                return Ok((self.now, 1));
             }
-            None => return Ok((stamp(cursor)?, 1)),
+            None => return Ok((cursor, 1)),
         };
         let at = read.get(open).or(read.last()).and_then(|(at, _)| *at);
         let anchor = at.map_or(cursor, |at| at.clamp(cursor, self.now));
@@ -860,12 +916,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         "operator comments: unresolved search overflow at {}; hidden hits may remain; discovery cursor retained, human intervention required",
                         stamp(cursor - lag)?
                     ));
-                    return Ok((stamp(cursor)?, start));
+                    return Ok((cursor, start));
                 }
             };
-            return Ok((stamp(next)?, 1));
+            return Ok((next, 1));
         }
-        Ok((stamp(next)?, page))
+        Ok((next, page))
     }
 
     /// The operator's comments on a thread, its `comments` as read, and on a
@@ -1361,7 +1417,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             hit,
             comments,
             addressed,
-            (self.now - Duration::seconds(LOOKBACK_SECONDS), false),
+            (
+                self.now - Duration::seconds(LOOKBACK_SECONDS),
+                false,
+                self.now - Duration::seconds(LOOKBACK_SECONDS),
+            ),
         )
     }
 
@@ -1371,7 +1431,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         hit: &Value,
         comments: &[Value],
         addressed: bool,
-        (floor, directed): (OffsetDateTime, bool),
+        (floor, directed, admission_floor): (OffsetDateTime, bool, OffsetDateTime),
     ) -> Result<Option<Handled>> {
         let number = hit["number"].as_u64().context("search hit has no number")?;
         let pull = hit.get("pull_request").is_some_and(|p| !p.is_null());
@@ -1380,16 +1440,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut said: Vec<Said> = self
             .said(repo, number, comments, pull, floor)?
             .into_iter()
-            .filter(|s| !directed || super::notify::direction(&s.body, &bot))
+            .filter(|s| !directed || self.directs(repo, hit, comments, s, admission_floor))
             .filter(|s| !directed || !self.intake_skip.contains(&s.key))
             .filter(|s| !done.contains(&s.key))
             .collect();
-        // Outside our own space, a fix round on the bot's pull request is
-        // as anywhere; anything else is tracked in the tracker, whose
-        // issues hold the claims, read with any left on the thread before.
+        // Intake questions on the bot's PRs are read-only tracking-issue
+        // triage, even in our space or on a stopped draft. The ordinary
+        // operatorComments route keeps its existing fix authorization.
+        // Tracking issues hold claims, read with any left on the source.
         // The checks that need no lookup go first, as each lookup is a search.
         let mine = pull && text(hit, "/user/login") == bot;
-        let routed = !said.is_empty() && !mine && !self.config.ours(repo);
+        let routed = !said.is_empty() && ((directed && mine) || (!mine && !self.config.ours(repo)));
         if routed && addressed && !said.iter().any(|s| explicit(&s.body, &bot)) {
             return Ok(None);
         }
@@ -1468,7 +1529,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let (done, what) = if let Some(why) = private {
             (true, why)
-        } else if mine {
+        } else if mine && !directed {
             self.comment_fix(repo, number, hit, comments, &said)?
         } else if let Some(tracked) = &tracked
             && !directed
@@ -2288,6 +2349,27 @@ pub(super) mod tests {
                 .borrow_mut()
                 .insert(format!("{API_ROOT}{path}"), body);
         }
+
+        /// Whether a search hit's thread mentions `login`, as GitHub's
+        /// `mentions:` qualifier finds: in its body, or in a comment, review
+        /// or review comment of its recorded first pages.
+        fn mentioned(&self, hit: &Value, login: &str) -> bool {
+            let repo = text(hit, "/repository_url")
+                .strip_prefix(&format!("{API_ROOT}repos/"))
+                .unwrap_or("");
+            let number = hit["number"].as_u64().unwrap_or_default();
+            let rest = self.rest.borrow();
+            let pages = [
+                format!("{API_ROOT}repos/{repo}/issues/{number}/comments?per_page=100"),
+                format!("{API_ROOT}repos/{repo}/pulls/{number}/reviews?per_page=100"),
+                format!("{API_ROOT}repos/{repo}/pulls/{number}/comments?per_page=100"),
+            ];
+            let posted = (pages.iter().filter_map(|page| rest.get(page)))
+                .flat_map(|page| page.as_array().cloned().unwrap_or_default())
+                .map(|c| text(&c, "/body").to_owned());
+            (std::iter::once(text(hit, "/body").to_owned()).chain(posted))
+                .any(|body| mentions(&body, login))
+        }
     }
 
     impl Rest for Fake {
@@ -2382,15 +2464,23 @@ pub(super) mod tests {
                 {
                     bail!("GET {url}: GitHub HTTP status 422");
                 }
-                // The recorded results updated since the query's time, a page
-                // of them as the URL asks.
+                // The recorded results updated since the query's time, by
+                // its author and mentioning whom it says, a page of them as
+                // the URL asks.
                 let mut found = self.rest.borrow()[&format!("{API_ROOT}search")].clone();
                 let page: usize = url.rsplit_once("&page=").unwrap().1.parse().unwrap();
-                let (_, since) = url.split_once("updated%3A%3E%3D").unwrap();
-                let (since, _) = since.split_once('+').unwrap();
-                let since = since.replace("%3A", ":");
+                let q = query("q");
+                let qualifier =
+                    |name: &str| (q.split_whitespace()).find_map(|term| term.strip_prefix(name));
+                let since = qualifier("updated:>=").unwrap();
+                let author = qualifier("author:");
+                let mentions = qualifier("mentions:");
                 let mut items = found["items"].as_array().unwrap().clone();
-                items.retain(|hit| text(hit, "/updated_at") >= since.as_str());
+                items.retain(|hit| {
+                    text(hit, "/updated_at") >= since
+                        && author.is_none_or(|a| text(hit, "/user/login").eq_ignore_ascii_case(a))
+                        && mentions.is_none_or(|m| self.mentioned(hit, m))
+                });
                 found["total_count"] = items.len().into();
                 found["items"] = items
                     .into_iter()
@@ -2760,11 +2850,14 @@ pub(super) mod tests {
             let fake = github();
             pass_configured(&fake, &config, (cursor, None), false, now());
             let searched = fake.searched.borrow();
-            let since: String = url::form_urlencoded::byte_serialize(
-                format!("updated:>={since} mentions:{BOT}").as_bytes(),
-            )
-            .collect();
-            assert!(searched[0].contains(&since), "{cursor:?}: {searched:?}");
+            // The mention search, then the one of the bot's own items.
+            for (index, qualifier) in ["mentions", "author"].into_iter().enumerate() {
+                let since: String = url::form_urlencoded::byte_serialize(
+                    format!("updated:>={since} {qualifier}:{BOT}").as_bytes(),
+                )
+                .collect();
+                assert!(searched[index].contains(&since), "{cursor:?}: {searched:?}");
+            }
         }
     }
 
@@ -4435,6 +4528,7 @@ pub(super) mod tests {
             interval_seconds: MIN_INTERVAL_SECONDS,
             operator_cursor: Some("2026-10-16T12:00:00Z".into()),
             operator_page: Some(3),
+            intake_page: Some(2),
             intake_waiting: BTreeMap::from([("other/place#2".into(), UPDATED.into())]),
             ..State::default()
         };
@@ -4446,6 +4540,8 @@ pub(super) mod tests {
             ("operator_cursor", json!("yesterday")),
             ("operator_page", json!(1)),
             ("operator_page", json!(OPERATOR_PAGE_LIMIT + 1)),
+            ("intake_page", json!(1)),
+            ("intake_page", json!(OPERATOR_PAGE_LIMIT + 1)),
             ("intake_waiting", json!({"other/place": UPDATED})),
             ("intake_waiting", json!({"other#2": UPDATED})),
             ("intake_waiting", json!({"other/place#0": UPDATED})),

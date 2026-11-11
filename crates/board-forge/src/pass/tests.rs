@@ -17479,17 +17479,20 @@ fn notifications_run_without_followed_repositories_and_report_denied_reads() {
             .unwrap()
             .format(&Rfc3339)
             .unwrap();
-        let query: String = url::form_urlencoded::byte_serialize(
-            format!("commenter:cgwalters updated:>={since} mentions:cgwalters-bot").as_bytes(),
-        )
-        .collect();
         let body = match status {
             200 => json!({"items": [], "total_count": 0, "incomplete_results": false}),
             403 => json!({"message": "Resource not accessible by integration"}),
             _ => json!({"message": "Validation Failed"}),
         };
-        recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page=1")},
-            "answer": {"status": status, "link": null, "body": body}}));
+        // The mention search first, then the one of the bot's own items.
+        for qualifier in ["mentions:cgwalters-bot", "author:cgwalters-bot"] {
+            let query: String = url::form_urlencoded::byte_serialize(
+                format!("commenter:cgwalters updated:>={since} {qualifier}").as_bytes(),
+            )
+            .collect();
+            recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page=1")},
+                "answer": {"status": status, "link": null, "body": body}}));
+        }
         let report = preview(&config(json!({"wip": 0, "notifications": true})), &recorded);
         assert_eq!(report.failures, 0, "{status}: {:?}", report.lines);
         assert_eq!(

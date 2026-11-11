@@ -79,6 +79,37 @@ pub(super) fn direction(body: &str, bot: &str) -> bool {
     comments::mentions(body, bot)
 }
 
+impl<R: Rest, G: Transport> Pass<'_, R, G> {
+    /// Whether the operator's comment `said` on `issue` in `repo`, its
+    /// `comments` as read, directs the bot: one mentioning it anywhere
+    /// ([`direction`]); or, on an item the bot opened, an issue or a pull
+    /// request, one that does not, within the lookback: what the operator
+    /// says there is to it (agent-board#840). Except on a pull request the
+    /// walk reads, in a followed repository, whose rounds take the operator's
+    /// reviews, unless the poll's marker on it is a stop, as on the draft it
+    /// stopped following that the operator asked about. Intake routes those
+    /// questions to tracking-issue triage, not authorization to restart it.
+    pub(super) fn directs(
+        &self,
+        repo: &str,
+        issue: &Value,
+        comments: &[Value],
+        said: &Said,
+        admission_floor: OffsetDateTime,
+    ) -> bool {
+        let bot = &self.config.bot;
+        if direction(&said.body, bot) {
+            return true;
+        }
+        if text(issue, "/user/login") != bot || said.at < admission_floor {
+            return false;
+        }
+        let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
+        !(pull && self.followed.contains(&repo.to_ascii_lowercase()))
+            || find_marker(comments, bot).stopped
+    }
+}
+
 /// `notifications`: the reasons that count, and the peers.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Notifications {
@@ -231,6 +262,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         repo: &str,
         number: u64,
         read_budget: usize,
+        admission_floor: Option<OffsetDateTime>,
     ) -> Result<(bool, String, bool)> {
         // Bound only discovery reads, not the writes and recovery requests
         // needed to settle a claim once a complete history admits direction.
@@ -238,46 +270,65 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         self.remaining -= reserve;
         let history = self.searched_history(repo, number);
         self.remaining += reserve;
-        let Some(SearchedHistory {
+        let SearchedHistory {
             issue,
             comments,
             said,
-        }) = history?
-        else {
-            return Ok((true, "notification: left: the thread is gone".into(), false));
+        } = match history? {
+            Ok(history) => history,
+            Err(left) => return Ok((true, format!("notification: left: {left}"), false)),
         };
-        let (done, line) = self.notification_direction_said(repo, &issue, &comments, said, None)?;
-        let waiting = !done && self.awaits_fork(repo, &issue);
+        let floor =
+            admission_floor.unwrap_or(self.now - Duration::seconds(comments::LOOKBACK_SECONDS));
+        let (done, line) =
+            self.notification_direction_said(repo, &issue, &comments, said, None, floor)?;
+        let waiting = !done && self.awaits_fork(repo);
         Ok((done, line, waiting))
     }
 
-    fn searched_history(&mut self, repo: &str, number: u64) -> Result<Option<SearchedHistory>> {
+    /// The thread a search hit names, read whole; or why it is left: gone,
+    /// or not the one named.
+    fn searched_history(
+        &mut self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Result<SearchedHistory, String>> {
         ensure!(number > 0, "search hit has no number");
         let issue = match self.get(&format!("repos/{repo}/issues/{number}")) {
             Ok(issue) => issue,
             Err(error) if error.is::<crate::github::NotFound>() => {
-                return Ok(None);
+                return Ok(Err("the thread is gone".into()));
             }
             Err(error) => return Err(error),
         };
+        // The thread the search named, whose author decides what the
+        // operator's comments direct, not one GitHub answers for it after a
+        // transfer: that is left to a person, as reading it again would be
+        // the same.
+        if issue["number"].as_u64() != Some(number)
+            || text(&issue, "/repository_url") != format!("{API_ROOT}repos/{repo}")
+        {
+            return Ok(Err(format!(
+                "left to a person: GitHub answers {} for the thread the search named",
+                text(&issue, "/html_url")
+            )));
+        }
         let comments = self.thread_comments(repo, number)?;
         let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
         let said = self.said(repo, number, &comments, pull, OffsetDateTime::UNIX_EPOCH)?;
-        Ok(Some(SearchedHistory {
+        Ok(Ok(SearchedHistory {
             issue,
             comments,
             said,
         }))
     }
 
-    /// Whether direction on `issue` is outside our space with no
+    /// Whether direction in `repo` is outside our space with no
     /// topic-selected midstream fork to stage it in.
-    fn awaits_fork(&self, repo: &str, issue: &Value) -> bool {
-        let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
-        let mine = pull && text(issue, "/user/login") == self.config.bot;
+    fn awaits_fork(&self, repo: &str) -> bool {
         let routed = (self.config.policy.notification_intake.as_ref())
             .is_some_and(|routes| routes.contains_key(&repo.to_ascii_lowercase()));
-        !(self.config.ours(repo) || mine || routed)
+        !(self.config.ours(repo) || routed)
     }
 
     /// One pass over the bot's unread notifications from `since` on, and
@@ -635,7 +686,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             pull,
             last_read.unwrap_or(OffsetDateTime::UNIX_EPOCH),
         )?;
-        self.notification_direction_said(repo, issue, comments, said, last_read)
+        self.notification_direction_said(
+            repo,
+            issue,
+            comments,
+            said,
+            last_read,
+            self.now - Duration::seconds(comments::LOOKBACK_SECONDS),
+        )
     }
 
     fn notification_direction_said(
@@ -645,6 +703,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         comments: &[Value],
         said: Vec<Said>,
         last_read: Option<OffsetDateTime>,
+        admission_floor: OffsetDateTime,
     ) -> Result<(bool, String)> {
         let number = issue["number"]
             .as_u64()
@@ -652,7 +711,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let bot = self.config.bot.clone();
         let said: Vec<_> = said
             .into_iter()
-            .filter(|s| direction(&s.body, &bot))
+            .filter(|s| self.directs(repo, issue, comments, s, admission_floor))
             .collect();
         if said.is_empty() {
             return Ok((
@@ -679,7 +738,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         self.intake_skip = skip.into_iter().map(|s| s.key).collect();
         let keys = said.iter().map(|s| s.key.clone()).collect();
         let since = last_read.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        let result = self.notification_direction_admit(repo, issue, comments, said, since);
+        let result =
+            self.notification_direction_admit(repo, issue, comments, said, since, admission_floor);
         self.intake_skip.clear();
         result.map_err(|error| error.context(comments::Direction { thread, keys }))
     }
@@ -692,6 +752,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         comments: &[Value],
         said: Vec<Said>,
         since: OffsetDateTime,
+        admission_floor: OffsetDateTime,
     ) -> Result<(bool, String)> {
         let number = issue["number"]
             .as_u64()
@@ -699,21 +760,22 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
         let bot = self.config.bot.clone();
         let mine = pull && text(issue, "/user/login") == bot;
-        // A fix brief also copies comments to the dispatch repository. Natural
+        // A tracking triage copies comments to the dispatch repository. Natural
         // asks must not bypass the legacy notification path's public check.
         if !self.config.ours(repo)
             && let Some(why) = self.not_public(repo)?
         {
             return Ok((true, format!("notification: {why}")));
         }
-        let external = !(self.config.ours(repo) || mine);
-        if self.awaits_fork(repo, issue) {
+        let external = !self.config.ours(repo) || mine;
+        if self.awaits_fork(repo) {
             return Ok((
                 false,
                 "notification: waiting for a matching topic-selected midstream fork".into(),
             ));
         }
-        let result = self.thread_read_from(repo, issue, comments, false, (since, true))?;
+        let result =
+            self.thread_read_from(repo, issue, comments, false, (since, true, admission_floor))?;
         if result.as_ref().is_some_and(|(done, _)| !done) {
             return Ok(result.unwrap_or_else(|| (false, String::new())));
         }
@@ -944,6 +1006,7 @@ mod tests {
         );
         let path = if pull { "pull" } else { "issues" };
         let mut issue = json!({"id": 77, "number": 2, "state": "open", "user": {"login": "author"},
+            "repository_url": format!("{API_ROOT}repos/{repo}"),
             "created_at": "2026-10-01T00:00:00Z", "body": "An old issue.",
             "html_url": format!("https://github.com/{repo}/{path}/2")});
         if pull {
@@ -1280,23 +1343,20 @@ mod tests {
                 .iter()
                 .any(|url| url.contains("/notifications"))
         );
-        assert!(
-            fake.log
-                .borrow()
-                .iter()
-                .filter_map(|line| line.strip_prefix("GET "))
-                .any(|url| {
-                    let parsed = url::Url::parse(url).unwrap();
-                    let Some(query) = parsed
-                        .query_pairs()
-                        .find(|(k, _)| k == "q")
-                        .map(|(_, v)| v.into_owned())
-                    else {
-                        return false;
-                    };
-                    query.contains("commenter:op") && query.contains("mentions:worker")
-                })
-        );
+        // The two searches: the threads mentioning the bot, and its items.
+        let queries: Vec<String> = (fake.log.borrow().iter())
+            .filter_map(|line| line.strip_prefix("GET "))
+            .filter_map(|url| {
+                let parsed = url::Url::parse(url).unwrap();
+                (parsed.query_pairs().find(|(k, _)| k == "q")).map(|(_, v)| v.into_owned())
+            })
+            .collect();
+        for qualifier in ["mentions:worker", "author:worker"] {
+            assert!(
+                (queries.iter()).any(|q| q.contains("commenter:op") && q.contains(qualifier)),
+                "{qualifier}: {queries:?}"
+            );
+        }
         // Lose local state and redeliver the search hit after a pass crash.
         let again = pass(&fake, &config, State::default(), true);
         assert_eq!(again.errors, 0, "{:?}", again.lines);
@@ -1478,7 +1538,9 @@ mod tests {
     fn search_intake_retains_an_overflowing_second() {
         let fake = intake_github(OTHER, false, "mention", OPERATOR);
         let config = search_intake(&fake, OTHER);
-        let template = fake.rest.borrow()[&format!("{API_ROOT}repos/{OTHER}/issues/2")].clone();
+        let mut template = fake.rest.borrow()[&format!("{API_ROOT}repos/{OTHER}/issues/2")].clone();
+        // What the mention search finds: a body is no direction.
+        template["body"] = "An old issue for @worker.".into();
         let at = "2026-10-01T00:00:00Z";
         let mut hits = Vec::new();
         for number in 1..=1001 {
@@ -1549,7 +1611,8 @@ mod tests {
         let fake = intake_github(OTHER, false, "mention", OPERATOR);
         let config = search_intake(&fake, OTHER);
         let path = format!("repos/{OTHER}/issues/1");
-        let issue = fake.rest.borrow()[&format!("{API_ROOT}repos/{OTHER}/issues/2")].clone();
+        let mut issue = fake.rest.borrow()[&format!("{API_ROOT}repos/{OTHER}/issues/2")].clone();
+        issue["number"] = 1.into();
         fake.page(&path, issue);
         let comments = format!("{API_ROOT}{path}/comments?per_page=100");
         fake.page(&format!("{path}/comments?per_page=100"), json!([]));
@@ -1685,6 +1748,8 @@ mod tests {
         issue["updated_at"] = UPDATED.into();
         let eligible = issue.clone();
         issue["number"] = 1.into();
+        // What the mention search finds: a body is no direction.
+        issue["body"] = "An old issue for @worker.".into();
         fake.page(&format!("repos/{OTHER}/issues/1"), issue.clone());
         let path = format!("repos/{OTHER}/issues/1/comments?per_page=100");
         fake.page(&path, json!([]));
@@ -1972,19 +2037,23 @@ mod tests {
     /// the bot on a draft the poll had stopped following, and the intake
     /// found it every pass but ran after the followed repositories had spent
     /// the stage's share. With `directionFirst` it runs before them and
-    /// starts a fix round on the stop; without, it is still deferred.
+    /// starts tracking-issue triage; without, it is still deferred. The
+    /// same whether the question mentions the bot or not: the draft is its.
     #[test]
     fn direction_first_answers_a_stopped_draft_before_the_share_is_spent() {
         let repo = "upstream/app";
         let followed = "upstream/followed".to_owned();
-        for first in [false, true] {
+        for (first, mentioned) in [(false, true), (true, true), (false, false), (true, false)] {
             let fake = intake_github(repo, true, "mention", OPERATOR);
             let issue = format!("{API_ROOT}repos/{repo}/issues/2");
             fake.rest.borrow_mut().get_mut(&issue).unwrap()["user"]["login"] = BOT.into();
             let stop = json!({"rounds": 0, "sha": "abcdef0123456789", "stopped": true});
             let thread = format!("{issue}/comments?per_page=100");
-            fake.rest.borrow_mut().get_mut(&thread).unwrap()[0]["body"] =
-                "@worker why did this commit lose its authorship?".into();
+            fake.rest.borrow_mut().get_mut(&thread).unwrap()[0]["body"] = match mentioned {
+                true => "@worker why did this commit lose its authorship?",
+                false => "Why did this commit lose its authorship?",
+            }
+            .into();
             (fake
                 .rest
                 .borrow_mut()
@@ -2020,13 +2089,412 @@ mod tests {
                 now(),
             )
             .unwrap();
-            let fixes: Vec<Value> = (dispatches(&fake).into_iter())
-                .filter(|i| i["kind"] == "fix" && i["item"] == "2")
+            let triages: Vec<Value> = (dispatches(&fake).into_iter())
+                .filter(|i| i["kind"] == "triage" && i["repo"] == DISPATCH)
                 .collect();
-            assert_eq!(fixes.len(), usize::from(first), "{:?}", outcome.lines);
+            assert_eq!(
+                triages.len(),
+                usize::from(first),
+                "mentioned {mentioned}: {:?}",
+                outcome.lines
+            );
             let deferred =
                 (outcome.lines.iter()).any(|l| l.starts_with("operator comments deferred"));
             assert_eq!(deferred, !first, "{:?}", outcome.lines);
+        }
+    }
+
+    /// The operator's comments on the bot's own items need no mention
+    /// (agent-board#840): a question on its pull request starts tracking-issue
+    /// triage, on the draft the poll stopped following as on one it never
+    /// followed, and one on its issue the plan, in our space or staged in
+    /// the midstream fork. The walk keeps the bot's followed pull requests
+    /// until it stops at them, as it did before; only a mention reaches those,
+    /// or someone else's item, and only the operator's. Nothing starts on a
+    /// comment older than the lookback, one the bot answered by hand, or one
+    /// a pass before claimed.
+    #[test]
+    fn search_intake_admits_the_operators_unmentioned_comments_on_the_bots_items() {
+        const ASKED: &str = "Why did this commit lose its authorship?";
+        const MENTIONED: &str = "@worker why did this commit lose its authorship?";
+        const FORK: &str = "upstream/midstream";
+        /// Where, on a pull request or not, whose item, who said what, how
+        /// the thread is (`followed`, `stopped`, `old`, `answered`), and the
+        /// run kind and repository that starts.
+        type Case = (
+            &'static str,
+            bool,
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static [&'static str],
+            Option<(&'static str, &'static str)>,
+        );
+        let stop = json!({"rounds": 0, "sha": "abcdef0123456789", "stopped": true});
+        let cases: &[Case] = &[
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &["followed", "stopped", "labelled"],
+                Some(("triage", DISPATCH)),
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &["stopped"],
+                Some(("triage", DISPATCH)),
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &["followed", "stopped"],
+                Some(("triage", DISPATCH)),
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &["followed"],
+                None,
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                MENTIONED,
+                &["followed"],
+                Some(("triage", DISPATCH)),
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &[],
+                Some(("triage", DISPATCH)),
+            ),
+            (
+                OTHER,
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &["stopped"],
+                Some(("triage", FORK)),
+            ),
+            (
+                "upstream/app",
+                false,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &[],
+                Some(("triage", "upstream/app")),
+            ),
+            (
+                OTHER,
+                false,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &[],
+                Some(("triage", FORK)),
+            ),
+            (
+                "upstream/app",
+                true,
+                "author",
+                OPERATOR,
+                ASKED,
+                &["stopped"],
+                None,
+            ),
+            ("upstream/app", false, "author", OPERATOR, ASKED, &[], None),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                "someone",
+                MENTIONED,
+                &["stopped"],
+                None,
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &["stopped", "old"],
+                None,
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                MENTIONED,
+                &["stopped", "old"],
+                Some(("triage", DISPATCH)),
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &["stopped", "answered"],
+                None,
+            ),
+        ];
+        for (repo, pull, author, sender, body, flags, expected) in cases {
+            let case = format!("{repo} pull={pull} by {author}, {sender}: {body:?} {flags:?}");
+            let fake = intake_github(repo, *pull, "comment", sender);
+            let issue = format!("{API_ROOT}repos/{repo}/issues/2");
+            fake.rest.borrow_mut().get_mut(&issue).unwrap()["user"]["login"] = (*author).into();
+            reword(&fake, repo, body);
+            let thread = format!("{issue}/comments?per_page=100");
+            {
+                let mut rest = fake.rest.borrow_mut();
+                if flags.contains(&"labelled") {
+                    rest.get_mut(&issue).unwrap()["labels"] = json!([{"name": LABEL}]);
+                }
+                let comments = rest.get_mut(&thread).unwrap().as_array_mut().unwrap();
+                if flags.contains(&"old") {
+                    comments[0]["created_at"] = "2026-10-13T10:00:00Z".into();
+                }
+                if flags.contains(&"stopped") {
+                    comments.insert(0, json!({"id": 5, "user": {"login": BOT},
+                        "created_at": "2026-10-15T08:00:00Z",
+                        "body": marker_body(&stop, "a draft with no checkpoint", &Footer::default())}));
+                }
+                // Someone else's item is found by a visitor's mention, which
+                // activates nothing of the operator's; the bot's only by the
+                // search of its items.
+                if *author != BOT {
+                    comments.push(said(12, "visitor", UPDATED, "@worker see above"));
+                }
+                if flags.contains(&"answered") {
+                    comments.push(said(13, BOT, UPDATED, "The author was kept; see the log."));
+                }
+            }
+            fake.page(
+                &format!("repos/{repo}/pulls/2"),
+                json!({"head": {"sha": "abcdef0123456789"},
+                    "labels": if flags.contains(&"labelled") { json!([{"name": LABEL}]) } else { json!([]) },
+                    "draft": true}),
+            );
+            let config = search_intake(&fake, repo);
+            let followed: Vec<String> = (flags.contains(&"followed"))
+                .then(|| repo.to_string())
+                .into_iter()
+                .collect();
+            // Followed with nothing for the walk to read: what the intake
+            // starts there is its own.
+            fake.page(&format!("repos/{repo}/events?per_page=100"), json!([]));
+            fake.page(
+                &format!("repos/{repo}/pulls?state=open&per_page=100"),
+                json!([]),
+            );
+            let run_pass = |state: State| {
+                run_capped(
+                    &fake,
+                    &fake,
+                    &config,
+                    state,
+                    (&[], &followed),
+                    Some(Apply {
+                        dispatcher: &fake,
+                        workflow: "dispatch.yml".into(),
+                        pools: vec![],
+                        git_ref: None,
+                    }),
+                    None,
+                    now(),
+                )
+                .unwrap_or_else(|error| panic!("{case}: {error:#}: {:?}", fake.log.borrow()))
+            };
+            let first = run_pass(State::default());
+            assert_eq!(first.errors, 0, "{case}: {:?}", first.lines);
+            let started = dispatches(&fake);
+            assert_eq!(
+                (started.iter())
+                    .map(|i| (text(i, "/kind"), text(i, "/repo")))
+                    .collect::<Vec<_>>(),
+                expected.iter().copied().collect::<Vec<_>>(),
+                "{case}: {:?}",
+                first.lines
+            );
+            if let Some(input) = started.first() {
+                assert!(
+                    text(input, "/task").contains("lose its authorship"),
+                    "{case}: {input}"
+                );
+                if *pull {
+                    assert!(
+                        text(input, "/task").contains("read-only investigation"),
+                        "{case}: {input}"
+                    );
+                    assert!(
+                        text(input, "/task").contains("post nothing to the pull request"),
+                        "{case}: {input}"
+                    );
+                    // Claims and dispatch records belong to the tracking issue.
+                    // Only the existing bounded acknowledgement may touch source.
+                    for (path, body) in fake.writes.borrow().iter() {
+                        if path.contains(&format!("repos/{repo}/issues/2")) {
+                            assert!(
+                                text(body, "/body").contains(INTAKE_REPLY),
+                                "{case}: {path} {body}"
+                            );
+                        }
+                    }
+                    if flags.contains(&"stopped") {
+                        let comments = fake.rest.borrow()[&thread].as_array().unwrap().clone();
+                        assert!(find_marker(&comments, BOT).stopped, "{case}");
+                        assert_eq!(find_marker(&comments, BOT).rounds, 0, "{case}");
+                    }
+                }
+            }
+            if flags.contains(&"answered") {
+                assert!(
+                    (first.lines.iter()).any(|l| l.contains("already answered")),
+                    "{case}: {:?}",
+                    first.lines
+                );
+            }
+            assert!(
+                first.state.intake_waiting.is_empty(),
+                "{case}: {:?}",
+                first.state
+            );
+            // Read once, where the bot's item that mentions it is in both
+            // searches as anywhere.
+            let reads = || {
+                (fake.log.borrow().iter())
+                    .filter(|l| *l == &format!("GET {issue}"))
+                    .count()
+            };
+            assert_eq!(reads(), 1, "{case}");
+            // The comment is claimed: a pass that finds the thread again, as
+            // one that lost its state does, starts nothing on it.
+            let again = run_pass(State::default());
+            assert_eq!(reads(), 2, "{case}: {:?}", again.lines);
+            assert_eq!(
+                dispatches(&fake).len(),
+                started.len(),
+                "{case}: {:?}",
+                again.lines
+            );
+        }
+    }
+
+    /// Search is discovery: the thread it names is read, not one GitHub
+    /// answers for it after a transfer, whose author would decide what the
+    /// operator's comments direct. That is left to a person, with a line,
+    /// not retried: the answer would be the same every pass.
+    #[test]
+    fn search_intake_leaves_a_changed_item_identity_to_a_person() {
+        for (field, value) in [
+            ("number", json!(54)),
+            (
+                "repository_url",
+                json!(format!("{API_ROOT}repos/unrelated/thread")),
+            ),
+        ] {
+            let fake = intake_github(OTHER, false, "mention", OPERATOR);
+            let config = search_intake(&fake, OTHER);
+            fake.rest
+                .borrow_mut()
+                .get_mut(&format!("{API_ROOT}repos/{OTHER}/issues/2"))
+                .unwrap()[field] = value;
+            let outcome = pass(&fake, &config, State::default(), true);
+            assert_eq!(outcome.errors, 0, "{field}: {:?}", outcome.lines);
+            assert!(
+                (outcome.lines.iter()).any(|l| {
+                    l.starts_with(&format!("{OTHER}#2 notification: left: left to a person"))
+                        && l.contains("the thread the search named")
+                }),
+                "{field}: {:?}",
+                outcome.lines
+            );
+            assert!(dispatches(&fake).is_empty(), "{field}");
+            assert!(fake.writes.borrow().is_empty(), "{field}");
+            assert!(
+                outcome.state.intake_waiting.is_empty(),
+                "{field}: {:?}",
+                outcome.state
+            );
+            assert_eq!(
+                outcome.state.operator_cursor.as_deref(),
+                Some("2026-10-16T12:00:00Z"),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_intake_pending_unmentioned_questions_outlive_the_lookback() {
+        for pull in [false, true] {
+            let fake = intake_github(OTHER, pull, "comment", OPERATOR);
+            fake.rest
+                .borrow_mut()
+                .get_mut(&format!("{API_ROOT}repos/{OTHER}/issues/2"))
+                .unwrap()["user"]["login"] = BOT.into();
+            reword(&fake, OTHER, "Why did this commit lose its authorship?");
+            let mut config = search_intake(&fake, OTHER);
+            config.policy.notification_intake = Some(BTreeMap::new());
+            let first = pass(&fake, &config, State::default(), true);
+            assert_eq!(first.errors, 0, "{:?}", first.lines);
+            assert!(
+                first
+                    .state
+                    .intake_waiting
+                    .contains_key(&format!("{OTHER}#2")),
+                "{:?}",
+                first.lines
+            );
+            assert!(dispatches(&fake).is_empty());
+
+            config.policy.notification_intake = intake_config().policy.notification_intake;
+            // Discovery no longer finds this thread. Its saved retry must retain
+            // the question even though the initial two-day window has elapsed.
+            fake.page("search", json!({"items": [], "incomplete_results": false}));
+            let next = run_capped(
+                &fake,
+                &fake,
+                &config,
+                first.state,
+                (&[], &[]),
+                Some(Apply {
+                    dispatcher: &fake,
+                    workflow: "dispatch.yml".into(),
+                    pools: vec![],
+                    git_ref: None,
+                }),
+                None,
+                now() + Duration::days(3),
+            )
+            .unwrap();
+            assert_eq!(next.errors, 0, "{:?}", next.lines);
+            let started = dispatches(&fake);
+            assert_eq!(started.len(), 1, "{:?}", next.lines);
+            assert_eq!(started[0]["kind"], "triage");
+            assert_eq!(started[0]["repo"], "upstream/midstream");
+            assert!(next.state.intake_waiting.is_empty(), "{:?}", next.state);
         }
     }
 
