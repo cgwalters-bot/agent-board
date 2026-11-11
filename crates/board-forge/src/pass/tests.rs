@@ -1201,32 +1201,92 @@ fn replay_idle_board_starts_work() {
     expected.push("status: 0 change(s) of 0 item(s) read");
     assert_eq!(report.lines, expected);
     assert_eq!(report.failures, 0);
-    // Each stage's requests, which add up to the pass's.
-    let spent = report.spent;
+    // Each stage's requests, which add up to the pass's, as do the endpoint
+    // classes and the causes: each started candidate's reads are its own,
+    // the epics' theirs, and the rest the stage's.
+    let spent = &report.spent;
     assert_eq!(spent.by_stage, [0, 0, 0, 0, 16, 37, 3, 0]);
     assert_eq!(spent.by_stage.iter().sum::<usize>(), spent.requests);
+    assert_eq!(spent.by_class.values().sum::<usize>(), spent.requests);
+    assert_eq!(spent.by_cause.values().sum::<usize>(), spent.requests);
+    for (cause, requests) in [
+        ("cgwalters-forge/tracker#446", 1),
+        ("cgwalters-forge/tracker#527", 5),
+        ("epic cgwalters-forge/tracker#596", 2),
+        ("epics", 10),
+        ("schedule", 10),
+        ("status", 3),
+    ] {
+        let counted = spent.by_cause.get(cause).copied();
+        assert_eq!(
+            counted,
+            Some(requests),
+            "{cause} in {}",
+            report.summary_line()
+        );
+    }
+    assert!(
+        spent.by_class.contains_key("issues comments"),
+        "{}",
+        report.summary_line()
+    );
 }
 
 /// The summary names each stage that spent a request, in stage order, and
-/// leaves the rest out.
+/// leaves the rest out; then every endpoint class and the causes that spent
+/// the most, at most [`CAUSE_LINES`] of them and the rest as one count.
 #[test]
 fn spent_names_each_stage_that_spent() {
-    let cases: &[(ByStage, bool, &str)] = &[
-        ([0; 8], false, "requests 0, points 7"),
+    let counts = |pairs: &[(&str, usize)]| -> BTreeMap<String, usize> {
+        pairs.iter().map(|(k, n)| ((*k).to_owned(), *n)).collect()
+    };
+    let many: Vec<(String, usize)> = (0..CAUSE_LINES + 2)
+        .map(|n| (format!("o/r#{n}"), 2))
+        .collect();
+    let many: BTreeMap<String, usize> = many.into_iter().collect();
+    type Counts = BTreeMap<String, usize>;
+    let cases: &[(ByStage, bool, Counts, Counts, &str)] = &[
+        (
+            [0; 8],
+            false,
+            counts(&[]),
+            counts(&[]),
+            "requests 0, points 7",
+        ),
         (
             [1, 0, 0, 40, 0, 2, 0, 0],
             true,
+            counts(&[]),
+            counts(&[]),
             "requests 43 (setup 1, pull requests 40, schedule 2), points ~7",
         ),
         (
             [0, 1, 2, 3, 4, 5, 6, 7],
             false,
+            counts(&[]),
+            counts(&[]),
             "requests 28 (usage 1, maintain 2, pull requests 3, epics 4, schedule 5, status 6, holds 7), points 7",
+        ),
+        // Most requests first, then by name; the stage's own reads are a
+        // cause like a candidate's.
+        (
+            [0, 0, 0, 0, 0, 6, 0, 0],
+            false,
+            counts(&[("issues comments", 2), ("graphql repository.issue", 4)]),
+            counts(&[("o/r#2", 2), ("schedule", 2), ("o/r#1", 2)]),
+            r#"requests 6 (schedule 6), endpoints {"graphql repository.issue":4,"issues comments":2}, causes {"o/r#1":2,"o/r#2":2,"schedule":2}, points 7"#,
+        ),
+        (
+            [0, 0, 0, 0, 0, 24, 0, 0],
+            false,
+            counts(&[("issues", 24)]),
+            many.clone(),
+            r#"requests 24 (schedule 24), endpoints {"issues":24}, causes {"o/r#0":2,"o/r#1":2,"o/r#10":2,"o/r#11":2,"o/r#2":2,"o/r#3":2,"o/r#4":2,"o/r#5":2,"o/r#6":2,"o/r#7":2,"... 2 more":4}, points 7"#,
         ),
     ];
     // Each stage counts at its place in the summary's order.
     assert!(Stage::ALL.iter().enumerate().all(|(i, s)| *s as usize == i));
-    for (by_stage, estimated, expected) in cases {
+    for (by_stage, estimated, by_class, by_cause, expected) in cases {
         let spent = Spent {
             requests: by_stage.iter().sum(),
             by_stage: *by_stage,
@@ -1234,8 +1294,59 @@ fn spent_names_each_stage_that_spent() {
             estimated: *estimated,
             rate_limited: false,
             revalidated: 0,
+            by_class: by_class.clone(),
+            by_cause: by_cause.clone(),
         };
         assert_eq!(spent.to_string(), *expected);
+    }
+}
+
+/// A request's endpoint class: the path after the repository, owner or
+/// user, without numbers or the query; a GraphQL query's first nested
+/// fields, without arguments.
+#[test]
+fn endpoint_classes() {
+    let rest = [
+        (
+            "repos/o/r/issues/5/comments?per_page=100&page=2",
+            "issues comments",
+        ),
+        ("repos/o/r/issues?state=open", "issues"),
+        ("repos/o/r/actions/runs/12/jobs", "actions runs jobs"),
+        (
+            "repos/o/r/actions/workflows/x.yml/dispatches",
+            "actions workflows dispatches",
+        ),
+        ("repos/o/r", "root"),
+        ("search/issues?q=x", "search issues"),
+        ("orgs/o/repos?per_page=100", "repos"),
+        ("users/u/repos", "repos"),
+        ("user", "user"),
+    ];
+    for (path, expected) in rest {
+        assert_eq!(
+            endpoint_class(&format!("{API_ROOT}{path}")),
+            expected,
+            "{path}"
+        );
+    }
+    assert_eq!(endpoint_class("https://elsewhere.example/x"), "external");
+    let graphql = [
+        (ISSUE_QUERY, "graphql repository.issue"),
+        (BOARD_QUERY, "graphql repositoryOwner.projectV2"),
+        (KIND_QUERY, "graphql repository.issueOrPullRequest"),
+        // Leaves name no class: `login` here, `clientMutationId` there.
+        ("query { viewer { login } }", "graphql viewer"),
+        (
+            "mutation($id: ID!) { addComment(input: {subjectId: $id}) { clientMutationId } }",
+            "mutation addComment",
+        ),
+        ("query { viewer }", "graphql"),
+        // The first path only: a sibling's selection is not the first's.
+        ("query { a { b } c { d { e } } }", "graphql a"),
+    ];
+    for (query, expected) in graphql {
+        assert_eq!(graphql_class(query), expected, "{query}");
     }
 }
 
@@ -1645,10 +1756,44 @@ fn revalidated_reads_are_free_up_to_their_limit() {
     client.get("https://api.github.com/x", validator).unwrap();
     let spent = bounds.spent();
     assert_eq!((spent.requests, spent.revalidated), (2, REVALIDATED_LIMIT));
+    // The two charged reads, by endpoint and by the stage that read them.
     assert_eq!(
         spent.to_string(),
-        format!("requests 2 (pull requests 2), 304s {REVALIDATED_LIMIT}, points 0")
+        format!(
+            r#"requests 2 (pull requests 2), 304s {REVALIDATED_LIMIT}, endpoints {{"x":2}}, causes {{"pull requests":2}}, points 0"#
+        )
     );
+}
+
+/// A read counts to the cause under way, a nested one to its own, and the
+/// reads after it to the outer cause again; the stage's own to its name.
+#[test]
+fn reads_count_to_their_cause() {
+    let bounds = Bounds::new(10, Instant::now() + Duration::from_secs(60));
+    bounds.enter(Stage::Schedule);
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    let url = format!("{API_ROOT}repos/o/r/issues/1/comments?per_page=100");
+    let read = || client.get(&url, None).unwrap();
+    read();
+    bounds.caused("o/r#1".into(), || {
+        read();
+        bounds.caused("epic o/r#9".into(), read);
+        read();
+    });
+    read();
+    let counts = |pairs: &[(&str, usize)]| -> BTreeMap<String, usize> {
+        pairs.iter().map(|(k, n)| ((*k).to_owned(), *n)).collect()
+    };
+    let spent = bounds.spent();
+    assert_eq!(
+        spent.by_cause,
+        counts(&[("schedule", 2), ("o/r#1", 2), ("epic o/r#9", 1)])
+    );
+    assert_eq!(spent.by_class, counts(&[("issues comments", 5)]));
+    assert_eq!(spent.requests, 5);
 }
 
 /// `triage` true, or with the scope `all`, triages each candidate without a
@@ -12528,6 +12673,20 @@ fn caps_hold_starts_past_max_dispatch() {
             assert!(spent.contains(&format!("requests {} (", report.spent.requests)));
             assert!(report.spent.requests > 0 && report.spent.points > 0);
             assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            // Where the cap held every start, the `schedule:` line says the
+            // first candidate was ready; a pass that started one has none.
+            let schedule: Vec<&str> = (report.lines.iter())
+                .filter(|l| l.starts_with("schedule: no candidate started"))
+                .map(String::as_str)
+                .collect();
+            let expected: &[&str] = if started == 0 {
+                &[
+                    "schedule: no candidate started; first candidate cgwalters-forge/tracker#446: held by --max-dispatch; first ready to start: cgwalters-forge/tracker#446",
+                ]
+            } else {
+                &[]
+            };
+            assert_eq!(schedule, expected, "{limits:?}");
         }
         let issue = |line: &str| line.split(' ').nth(2).unwrap().to_owned();
         let expected: Vec<String> = starts[..started].iter().map(|l| issue(l)).collect();
@@ -12840,6 +12999,7 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             0,
             &[
                 "idle: claude is under pace and nothing started; stage 4's budget left 9 candidate(s) unread, first cgwalters-forge/tracker#446",
+                "schedule: no candidate started; first candidate cgwalters-forge/tracker#446: stopped: budget: 105 requests left, only what a start may take (109); first ready to start: none",
             ],
         ),
     ];
@@ -12849,7 +13009,7 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
         let after: Vec<&str> = (report.lines.iter())
             .skip_while(|l| *l != line)
             .skip(1)
-            .filter(|l| l.starts_with("idle: "))
+            .filter(|l| l.starts_with("idle: ") || l.starts_with("schedule: no candidate started"))
             .map(String::as_str)
             .collect();
         assert_eq!(after, idle, "limit {limit}: {:#?}", report.lines);
@@ -15893,7 +16053,7 @@ fn apply_stops_at_the_first_rate_limit() {
         assert_eq!(lines.last(), Some(limited[0]), "{lines:#?}");
         // The refused operation's failure, and nothing for what was not sent.
         assert_eq!(report.failures, 1, "{after}: {lines:#?}");
-        let spent = report.spent;
+        let spent = &report.spent;
         assert_eq!((spent.requests, spent.rate_limited), (after + 1, true));
         let line = report.summary_line();
         assert!(line.starts_with(&report.summary), "{line}");
