@@ -1,4 +1,4 @@
-//! Publication never moves a ref or closes a fork PR. A retry observes the
+//! Publication never moves the approved ref or closes a fork PR. A retry observes the
 //! upstream branch PR before writing, including after a lost POST response.
 use super::*;
 use serde_json::json;
@@ -6,13 +6,29 @@ use serde_json::json;
 const STATUS: &str = "<!-- agent-board-promote-status -->";
 const STEP_WRITES: usize = 3;
 
-/// Explicit caller permission plus --apply; at most one candidate and three
+/// Explicit caller permission plus --apply; at most one candidate and four
 /// writes per invocation. The caller's normal transport supplies credentials.
 pub fn apply<C: Rest + Transport>(
     client: &C,
     config: &Config,
     now: OffsetDateTime,
     max_writes: usize,
+) -> Result<Vec<String>> {
+    apply_with(
+        client,
+        config,
+        now,
+        max_writes,
+        &mut rewrite::Git::default(),
+    )
+}
+
+pub(super) fn apply_with<C: Rest + Transport>(
+    client: &C,
+    config: &Config,
+    now: OffsetDateTime,
+    max_writes: usize,
+    git: &mut impl rewrite::Rewrite,
 ) -> Result<Vec<String>> {
     let Some(settings) = config.promote.as_ref().filter(|_| enabled(config)) else {
         return Ok(vec!["promote: off".into()]);
@@ -81,10 +97,70 @@ pub fn apply<C: Rest + Transport>(
                     current == command,
                     "operator command changed before publication"
                 );
+                let mut publication_pull = fresh.clone();
+                let mut publication_command = Command {
+                    head: command.head.clone(),
+                    ..current
+                };
                 let owner = fresh["head"]["repo"]["owner"]["login"]
                     .as_str()
                     .context("missing head owner")?;
-                let branch = fresh["head"]["ref"]
+                let original_branch = fresh["head"]["ref"]
+                    .as_str()
+                    .context("missing head branch")?;
+                let mut compare = comparison(
+                    client,
+                    &format!(
+                        "repos/{}/compare/{}...{}",
+                        target.upstream,
+                        encode(&target.base),
+                        encode(&format!("{owner}:{original_branch}"))
+                    ),
+                    &command.head,
+                )?;
+                compare["base_commit"] = get(
+                    client,
+                    &format!(
+                        "repos/{}/branches/{}",
+                        target.upstream,
+                        encode(&target.base)
+                    ),
+                )?["commit"]
+                    .clone();
+                let (_, _, missing) = signoff_gate(config, &compare, &command.head)?;
+                let rewriting =
+                    missing > 0 || compare["behind_by"].as_u64().context("missing behind_by")? > 0;
+                let needed = STEP_WRITES + usize::from(rewriting);
+                if max_writes < needed {
+                    lines.push(format!(
+                        "held by --max-writes: promote {repo}#{number} (needs {needed})"
+                    ));
+                    return Ok(lines);
+                }
+                if rewriting {
+                    ensure!(
+                        upstream_pulls(client, &target.upstream, owner, original_branch)?
+                            .is_empty(),
+                        "existing upstream PR needs manual migration before rewriting"
+                    );
+                    let prepared = match git.prepare(config, target, &fresh, &compare) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            lines.push(format!("hold promote {repo}#{number}: {error:#}"));
+                            return Ok(lines);
+                        }
+                    };
+                    publication_pull["head"]["sha"] = json!(prepared.0);
+                    publication_pull["head"]["ref"] = json!(prepared.1);
+                    publication_command.head = publication_pull["head"]["sha"]
+                        .as_str()
+                        .context("missing prepared head")?
+                        .into();
+                }
+                let owner = publication_pull["head"]["repo"]["owner"]["login"]
+                    .as_str()
+                    .context("missing head owner")?;
+                let branch = publication_pull["head"]["ref"]
                     .as_str()
                     .context("missing head branch")?;
                 let existing = upstream_pulls(client, &target.upstream, owner, branch)?;
@@ -101,7 +177,13 @@ pub fn apply<C: Rest + Transport>(
                     .collect();
                 ensure!(receipts.len() <= 1, "multiple promote status comments");
                 if let Some(pr) = existing.first() {
-                    verify_pr(pr, &command, &fresh, &target.upstream, &target.base)?;
+                    verify_pr(
+                        pr,
+                        &publication_command,
+                        &publication_pull,
+                        &target.upstream,
+                        &target.base,
+                    )?;
                     let url = format!(
                         "https://github.com/{}/pull/{}",
                         target.upstream,
@@ -117,12 +199,6 @@ pub fn apply<C: Rest + Transport>(
                         // invocation's single publication slot indefinitely.
                         continue;
                     }
-                }
-                if max_writes < STEP_WRITES {
-                    lines.push(format!(
-                        "held by --max-writes: promote {repo}#{number} (needs {STEP_WRITES})"
-                    ));
-                    return Ok(lines);
                 }
                 let pending = format!(
                     "Promoting approved head {} to {}.\n\n{STATUS}",
@@ -152,19 +228,49 @@ pub fn apply<C: Rest + Transport>(
                         .filter(|n| *n > 0)
                         .context("missing promote status comment id")?
                 };
-                // Recheck the mutable branch at the publication boundary. Never
-                // update refs: even the supplied credential cannot make us push.
+                // Recheck the approved branch at the publication boundary.
+                // Rewrites only create a new ref; they never move this one.
                 let head_repo = fresh["head"]["repo"]["full_name"]
                     .as_str()
                     .context("missing head repository")?;
                 let publication = (|| {
                     let reference = get(
                         client,
-                        &format!("repos/{head_repo}/git/ref/heads/{}", encode(branch)),
+                        &format!(
+                            "repos/{head_repo}/git/ref/heads/{}",
+                            encode(
+                                fresh["head"]["ref"]
+                                    .as_str()
+                                    .context("missing approved branch")?
+                            )
+                        ),
                     )?;
                     ensure!(
                         reference["object"]["sha"] == command.head,
                         "branch moved before publication"
+                    );
+                    if rewriting {
+                        let base = get(
+                            client,
+                            &format!(
+                                "repos/{}/branches/{}",
+                                target.upstream,
+                                encode(&target.base)
+                            ),
+                        )?;
+                        ensure!(
+                            base["commit"]["sha"] == compare["base_commit"]["sha"],
+                            "upstream base moved before publication; retry"
+                        );
+                        git.publish(head_repo, branch, &publication_command.head)?;
+                    }
+                    let reference = get(
+                        client,
+                        &format!("repos/{head_repo}/git/ref/heads/{}", encode(branch)),
+                    )?;
+                    ensure!(
+                        reference["object"]["sha"] == publication_command.head,
+                        "publication branch moved"
                     );
                     let text = json!({"title":fresh["title"], "body":fresh["body"]});
                     let published = if let Some(pr) = existing.first() {
@@ -197,7 +303,13 @@ pub fn apply<C: Rest + Transport>(
                             payload,
                         )?
                     };
-                    verify_pr(&published, &command, &fresh, &target.upstream, &target.base)?;
+                    verify_pr(
+                        &published,
+                        &publication_command,
+                        &publication_pull,
+                        &target.upstream,
+                        &target.base,
+                    )?;
                     if let Some(pr) = existing.first() {
                         ensure!(
                             published["number"] == pr["number"],
@@ -290,13 +402,9 @@ fn validate(
         &target.base,
         false,
     )?;
-    let Gates::Ready { signoffs, .. } = gate else {
+    let Gates::Ready { .. } = gate else {
         anyhow::bail!("publication gates incomplete")
     };
-    ensure!(
-        signoffs == 0,
-        "DCO sign-off rewrite required; publication refuses to change the approved head"
-    );
     match policy::gate(client, config, &target.upstream)? {
         policy::Permitted::BotOk => {}
         policy::Permitted::HumanText => provenance::verify(client, config, repo, pull, &command)?,

@@ -94,7 +94,7 @@ fn read_failure(error: anyhow::Error) -> anyhow::Error {
     }
     ReadFailure(format!("{error:#}")).into()
 }
-pub const REMAINING: &str = "promote: preview only; publication requires promote.publish, --apply and --max-writes; DCO rewrites and fork closure not implemented; bot-fork heads require recorded staging verification";
+pub const REMAINING: &str = "promote: preview only; publication requires promote.publish, --apply and --max-writes; fork closure not implemented; bot-fork heads require recorded staging verification";
 
 /// Authenticated command selection and its observed branch binding, not output
 /// parsed back into authority. The pusher is from the newest activity event.
@@ -485,8 +485,8 @@ fn gates_impl(
     let behind = compare["behind_by"].as_u64().context("missing behind_by")?;
     hold!(ahead > 0, "already upstream (zero ahead)");
     hold!(
-        behind == 0,
-        "needs rebase and a fresh approval or command (behind_by={behind})"
+        !observe_existing || behind == 0,
+        "needs publication rebase (behind_by={behind})"
     );
     let stack = stack_gate(client, config, repo, pull, upstream, base)?;
     let dco = dco_gate(client, config, upstream, base, &compare, head)?;
@@ -525,6 +525,7 @@ fn gates_impl(
 }
 
 mod publish;
+mod rewrite;
 
 pub use publish::apply;
 
@@ -804,6 +805,10 @@ fn dco_gate(
     if !dco {
         return Ok(("dco=not-required".into(), "no DCO".into(), 0));
     }
+    signoff_gate(config, compare, head).context("dco=required")
+}
+
+fn signoff_gate(config: &Config, compare: &Value, head: &str) -> Result<(String, String, usize)> {
     (|| {
         let commits = compare["commits"]
             .as_array()
@@ -880,7 +885,6 @@ fn dco_gate(
             missing,
         ))
     })()
-    .context("dco=required")
 }
 
 /// Interpret and validate the same grammar, so malformed `next` cannot be

@@ -16860,7 +16860,7 @@ fn promotion_view_is_read_only_and_budgeted() {
         match case {
             "behind" => {
                 answer(&mut replay, "/compare/")["body"]["behind_by"] = json!(31);
-                expected = "needs rebase and a fresh approval or command (behind_by=31)";
+                expected = "needs publication rebase (behind_by=31)";
             }
             "needs-human" => {
                 let e = replay
