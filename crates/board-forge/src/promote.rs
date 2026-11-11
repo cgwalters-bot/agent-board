@@ -172,6 +172,8 @@ const RECORDED_FIELDS: &[&str] = &[
     "full_name",
     "fork",
     "archived",
+    "private",
+    "has_issues",
     "parent",
     "source",
     "owner",
