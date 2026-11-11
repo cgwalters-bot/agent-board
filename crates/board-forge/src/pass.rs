@@ -731,8 +731,8 @@ pub struct Config {
     pub cost: Option<crate::cost::Publish>,
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
-    /// Opt-in ledger path for one living status comment per issue. Durable,
-    /// serialized storage is required; this is not a disposable response cache.
+    /// Opt-in cache path for one living status comment per issue. GitHub is
+    /// authoritative; applying passes must still be serialized.
     pub living_status: Option<String>,
     /// Off by default: rank epic groups before reading their admission facts.
     #[serde(default)]
@@ -3617,7 +3617,7 @@ impl<C: Rest + Transport> Transport for Budget<'_, C> {
         let mut data =
             self.graphql_spent(mutation, self.inner.graphql(query, variables.clone()))?;
         if query == plan::COMMENTS_QUERY
-            && let Some(store) = self.bounds.living.borrow().as_ref()
+            && let Some(store) = self.bounds.living.borrow_mut().as_mut()
         {
             store.expand(&variables, &mut data)?;
         }
@@ -4657,7 +4657,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .as_ref()
             .map(living::Store::pending)
             .unwrap_or_default();
-        if pending.is_empty() {
+        if pending.is_empty()
+            && self
+                .client
+                .bounds
+                .living
+                .borrow()
+                .as_ref()
+                .is_none_or(|store| store.duplicates().is_empty())
+        {
             return;
         }
         if let Some(why) = self.other_holds() {
@@ -4673,10 +4681,24 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 // Recheck the author/editor before retrying an idempotent PATCH.
                 let issue = living::Store::issue(&write)?;
                 plan::issue_comments(&self.client, &issue)?;
+                let refreshed = self
+                    .client
+                    .bounds
+                    .living
+                    .borrow()
+                    .as_ref()
+                    .map(living::Store::pending)
+                    .unwrap_or_default();
+                let Some(write) = refreshed
+                    .iter()
+                    .find(|w| living::Store::issue(w).ok().as_ref() == Some(&issue))
+                else {
+                    return Ok(());
+                };
                 self.caps.count(Kind::Write);
                 plan::send(&self.client, write.method, &write.url, &write.body, 0)?;
                 if let Some(store) = self.client.bounds.living.borrow_mut().as_mut() {
-                    store.acknowledge(&write)?;
+                    store.acknowledge(write)?;
                 }
                 Ok(())
             })();
@@ -4686,6 +4708,53 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     self.report.failures += 1;
                     self.line(format!("living status error: {error:#}"));
                 }
+            }
+        }
+        let duplicates = self
+            .client
+            .bounds
+            .living
+            .borrow()
+            .as_ref()
+            .map(living::Store::duplicates)
+            .unwrap_or_default();
+        for (key, id) in duplicates {
+            if self.caps.check(Kind::Write).is_some() {
+                break;
+            }
+            let result = (|| -> Result<()> {
+                let (repo, _) = key.rsplit_once('#').context("status issue key")?;
+                let response = self.client.get(
+                    &format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
+                    None,
+                )?;
+                ensure!(
+                    response.status == 200,
+                    "duplicate status lookup: HTTP {}",
+                    response.status
+                );
+                ensure!(
+                    text(&response.body, "/user/login").eq_ignore_ascii_case(&self.config.bot),
+                    "duplicate status author changed"
+                );
+                let node = response.body["node_id"]
+                    .as_str()
+                    .context("duplicate status node id missing")?;
+                let state = self.client.graphql(living::MINIMIZED, json!({"id":node}))?;
+                let minimized = state
+                    .pointer("/node/isMinimized")
+                    .and_then(Value::as_bool)
+                    .context("duplicate status minimized state missing")?;
+                if minimized {
+                    return Ok(());
+                }
+                self.caps.count(Kind::Write);
+                self.client.graphql(living::MINIMIZE, json!({"id":node}))?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.report.failures += 1;
+                self.line(format!("living status duplicate error: {error:#}"));
             }
         }
     }

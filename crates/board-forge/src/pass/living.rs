@@ -1,24 +1,29 @@
-//! One public status comment; durable replay records stay in the caller's ledger.
-//!
-//! The ledger is written before the forge write. An interrupted first POST is
-//! deliberately not retried: a person must reconcile its unknown comment id.
+//! One bot-owned status comment. GitHub is authoritative; the local file is a cache.
 use super::*;
 use crate::epic_apply;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub(crate) const MARKER: &str = "<!-- agent-board-status v1 -->";
+const ORIGINAL_MARKER: &str = "<!-- agent-board-status -->";
+pub(super) const RECORDS: &str = "<!-- agent-board-status-records\n";
+const COMMENT_BYTES: usize = 60_000;
+pub(super) const MINIMIZE: &str = "mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }";
+pub(super) const MINIMIZED: &str =
+    "query($id: ID!) { node(id: $id) { ... on IssueComment { isMinimized } } }";
 const SCHEMA: &str = "agent-board/status/v1";
 const MAX_RECORDS: usize = 1000;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DISPLAY_CHARS: usize = 2000;
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
     id: Option<u64>,
     records: Vec<Value>,
     published: Option<String>,
+    #[serde(default)]
+    prose: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -55,6 +60,9 @@ mod tests {
                 !write.body["body"]
                     .as_str()
                     .unwrap()
+                    .split(RECORDS)
+                    .next()
+                    .unwrap()
                     .contains("agent-board-dispatch")
             );
             store.finish(&write, &mut (200, json!({"id": 30}))).unwrap();
@@ -87,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_state_and_foreign_edits_refuse_without_a_write() {
+    fn cold_start_edits_existing_marker_and_foreign_edits_refuse() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut store = Store::load(path.to_str().unwrap(), "bot", at()).unwrap();
@@ -96,19 +104,118 @@ mod tests {
             "body":MARKER,"url":"https://github.com/o/r/issues/1#issuecomment-30",
             "author":{"login":"bot"},"lastEditedAt":null
         }]}}}});
-        assert!(store.expand(&variables, &mut data).is_err());
+        let original = data.clone();
+        store.expand(&variables, &mut data).unwrap();
         let write = store
             .prepare("POST", URL, &dispatched(10))
             .unwrap()
             .unwrap();
-        assert!(
-            Store::load(path.to_str().unwrap(), "bot", at()).is_err(),
-            "ambiguous first POST must not be retried"
-        );
+        assert_eq!(write.method, "PATCH");
+        assert!(write.url.ends_with("/issues/comments/30"));
         store.finish(&write, &mut (201, json!({"id":30}))).unwrap();
+        data = original;
         data["repository"]["issue"]["comments"]["nodes"][0]["lastEditedAt"] =
             "2026-11-01T01:00:00Z".into();
         assert!(store.expand(&variables, &mut data).is_err());
+    }
+
+    #[test]
+    fn stale_cache_and_paginated_duplicates_use_first_bot_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            Store::load(dir.path().join("cache.json").to_str().unwrap(), "bot", at()).unwrap();
+        let write = store
+            .prepare("POST", URL, &dispatched(10))
+            .unwrap()
+            .unwrap();
+        store.finish(&write, &mut (201, json!({"id":1}))).unwrap();
+        let page = |id, bot, marker, section| {
+            json!({"repository":{"issue":{"comments":{
+                "nodes":[{"body":format!("{marker}\n## Board status\n\n### {section}\nKept prose.\n"),
+                    "url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),
+                    "author":{"login":bot},"lastEditedAt":null}],
+                "pageInfo":{"hasNextPage":true,"endCursor":"next"}
+            }}}})
+        };
+        let vars = json!({"owner":"o","name":"r","number":1,"after":null});
+        store
+            .expand(&vars, &mut page(2, "someone", MARKER, "Current plan"))
+            .unwrap();
+        let later = json!({"owner":"o","name":"r","number":1,"after":"next"});
+        store
+            .expand(
+                &later,
+                &mut page(30, "bot", ORIGINAL_MARKER, "Current plan"),
+            )
+            .unwrap();
+        store
+            .expand(&later, &mut page(40, "bot", MARKER, "Last apply"))
+            .unwrap();
+        assert_eq!(store.ledger.entries["o/r#1"].id, Some(30));
+        assert!(
+            store.duplicates().is_empty(),
+            "merge must be published first"
+        );
+        let write = store.pending().pop().unwrap();
+        assert!(text(&write.body, "/body").contains("### Current plan"));
+        assert!(text(&write.body, "/body").contains("### Last apply"));
+        store.acknowledge(&write).unwrap();
+        assert_eq!(store.duplicates(), vec![("o/r#1".into(), 40)]);
+    }
+
+    #[test]
+    fn duplicate_relocation_preserves_plan_identity_and_routes_edits_to_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = Store::load(
+            dir.path().join("source.json").to_str().unwrap(),
+            "bot",
+            at(),
+        )
+        .unwrap();
+        let plan = json!({"body":format!("Plan.\n```{}\n{{}}\n```", plan::PLAN_FENCE)});
+        let write = source.prepare("POST", URL, &plan).unwrap().unwrap();
+        source.finish(&write, &mut (201, json!({"id":40}))).unwrap();
+        let logical = format!("40@{}", source.at);
+        let dispatch =
+            json!({"body":format!("<!-- agent-board-dispatch: {logical} -->\nDispatched.")});
+        let write = source.prepare("POST", URL, &dispatch).unwrap().unwrap();
+        source.finish(&write, &mut (200, json!({}))).unwrap();
+        let mut target = Store::load(
+            dir.path().join("target.json").to_str().unwrap(),
+            "bot",
+            at(),
+        )
+        .unwrap();
+        let node = |id, body: &str| json!({"url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),"body":body,"author":{"login":"bot"},"lastEditedAt":null});
+        let mut data = json!({"repository":{"issue":{"comments":{"nodes":[node(30, MARKER),node(40, text(&write.body,"/body"))]}}}});
+        target
+            .expand(&json!({"owner":"o","name":"r","number":1}), &mut data)
+            .unwrap();
+        let records: Vec<_> = target.ledger.entries["o/r#1"]
+            .records
+            .iter()
+            .map(|r| plan::comment(r).unwrap())
+            .collect();
+        assert_eq!(plan::plan_id(&records[0]).unwrap(), logical);
+        assert_eq!(plan::records(&records, &["bot"], &logical).len(), 1);
+        let write = target
+            .prepare(
+                "PATCH",
+                "https://api.github.com/repos/o/r/issues/comments/40",
+                &plan,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(write.url.ends_with("/comments/30"));
+        let before = target.ledger.entries["o/r#1"].records.len();
+        assert!(target.prepare("POST", URL, &json!({"body":format!("{}\n```{}\n{{}}\n```", "x".repeat(COMMENT_BYTES), plan::PLAN_FENCE)})).is_err());
+        assert_eq!(target.ledger.entries["o/r#1"].records.len(), before);
+        assert!(
+            target
+                .pending()
+                .iter()
+                .all(|w| text(&w.body, "/body").len() <= COMMENT_BYTES)
+        );
     }
 
     #[test]
@@ -257,6 +364,9 @@ pub(super) struct Store {
     ledger: Ledger,
     at: String,
     pub saved: usize,
+    duplicates: BTreeMap<String, BTreeSet<u64>>,
+    discovered: BTreeMap<String, u64>,
+    written: BTreeSet<String>,
 }
 
 /// A prepared public write. The full machine record is already durable.
@@ -275,7 +385,7 @@ pub(super) fn check_paths(path: &str, cache: Option<&str>) -> Result<()> {
         let path = Path::new(path);
         ensure!(
             !path.as_os_str().is_empty(),
-            "livingStatus must name a durable ledger file"
+            "livingStatus must name a cache file"
         );
         match std::fs::symlink_metadata(path) {
             Ok(metadata) => {
@@ -351,9 +461,31 @@ fn public_body(entry: &Entry) -> String {
                 .join("\n");
             let prose: String = prose.chars().take(DISPLAY_CHARS).collect();
             out.push_str(&format!("\n### {section}\n{}\n", prose.trim()));
+        } else if let Some(prose) = entry.prose.get(section) {
+            out.push_str(&format!("\n### {section}\n{prose}\n"));
         }
     }
+    // Escape HTML delimiters so arbitrary plan prose cannot terminate the comment.
+    let mut records = Vec::new();
+    for record in &entry.records {
+        let mut record = record.clone();
+        if plan::comment_id(text(&record, "/url")) == entry.id {
+            record["url"] = Value::Null;
+        }
+        if !records.contains(&record) {
+            records.push(record);
+        }
+    }
+    let records = Value::Array(records)
+        .to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
+    out.push_str(&format!("\n{RECORDS}{records}\n-->"));
     out
+}
+
+fn marked(body: &str) -> bool {
+    body.starts_with(MARKER) || body.starts_with(ORIGINAL_MARKER)
 }
 
 impl Store {
@@ -394,10 +526,6 @@ impl Store {
                 <= MAX_RECORDS,
             "status ledger record bound exceeded"
         );
-        ensure!(
-            ledger.entries.values().all(|e| e.id.is_some()),
-            "status comment creation was interrupted; reconcile the ledger before continuing"
-        );
         for (key, entry) in &ledger.entries {
             let (repo, number) = key
                 .rsplit_once('#')
@@ -409,16 +537,19 @@ impl Store {
             );
             let url = format!(
                 "https://github.com/{repo}/issues/{number}#issuecomment-{}",
-                entry.id.context("missing status id")?
-            );
-            ensure!(
-                !entry.records.is_empty(),
-                "status ledger entry has no records"
+                entry.id.unwrap_or_default()
             );
             for record in &entry.records {
-                let comment = plan::comment(record).context("invalid status ledger record")?;
+                let mut record = record.clone();
+                if entry.id.is_none() {
+                    record["url"] = url.clone().into();
+                }
+                let comment = plan::comment(&record).context("invalid status ledger record")?;
                 ensure!(
-                    comment.url == url && plan::written_by(&comment, bot),
+                    comment.url.starts_with(&format!(
+                        "https://github.com/{repo}/issues/{number}#issuecomment-"
+                    )) && plan::comment_id(&comment.url).is_some()
+                        && plan::written_by(&comment, bot),
                     "status ledger record identity differs"
                 );
             }
@@ -428,11 +559,23 @@ impl Store {
             ledger,
             at: now.format(&time::format_description::well_known::Rfc3339)?,
             saved: 0,
+            duplicates: BTreeMap::new(),
+            discovered: BTreeMap::new(),
+            written: BTreeSet::new(),
         })
     }
 
     fn save(&self) -> Result<()> {
         use std::io::Write;
+        ensure!(
+            self.ledger
+                .entries
+                .values()
+                .map(|e| e.records.len())
+                .sum::<usize>()
+                <= MAX_RECORDS,
+            "status ledger record bound exceeded"
+        );
         let bytes = serde_json::to_vec(&self.ledger)?;
         ensure!(
             bytes.len() as u64 <= MAX_BYTES,
@@ -454,10 +597,19 @@ impl Store {
     }
 
     pub fn prepare(&mut self, method: &str, url: &str, body: &Value) -> Result<Option<Write>> {
+        let before = self.ledger.entries.clone();
+        let result = self.prepare_inner(method, url, body);
+        if result.is_err() {
+            self.ledger.entries = before;
+        }
+        result
+    }
+
+    fn prepare_inner(&mut self, method: &str, url: &str, body: &Value) -> Result<Option<Write>> {
         let Some(text) = body["body"].as_str() else {
             return Ok(None);
         };
-        if text.starts_with(MARKER) {
+        if marked(text) {
             return Ok(None);
         }
         let parts: Vec<_> = url
@@ -476,12 +628,13 @@ impl Store {
             ("PATCH", ["repos", owner, repo, "issues", "comments", id]) => {
                 let id = id.parse::<u64>().context("status comment id")?;
                 let prefix = format!("{owner}/{repo}#");
-                let Some((key, _)) = self
-                    .ledger
-                    .entries
-                    .iter()
-                    .find(|(k, e)| k.starts_with(&prefix) && e.id == Some(id))
-                else {
+                let Some((key, _)) = self.ledger.entries.iter().find(|(k, e)| {
+                    k.starts_with(&prefix)
+                        && (e.id == Some(id)
+                            || e.records
+                                .iter()
+                                .any(|r| plan::comment_id(super::text(r, "/url")) == Some(id)))
+                }) else {
                     return Ok(None);
                 };
                 key.clone()
@@ -541,6 +694,10 @@ impl Store {
             index
         };
         let public = public_body(entry);
+        ensure!(
+            public.len() <= COMMENT_BYTES,
+            "status comment is full; nothing sent"
+        );
         let public_url = match id {
             Some(id) => format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
             None => url.to_owned(),
@@ -573,12 +730,16 @@ impl Store {
             entry.id = Some(id);
             let (repo, number) = write.key.rsplit_once('#').context("status issue key")?;
             for record in &mut entry.records {
-                record["url"] =
-                    format!("https://github.com/{repo}/issues/{number}#issuecomment-{id}").into();
+                if record["url"].is_null() {
+                    record["url"] =
+                        format!("https://github.com/{repo}/issues/{number}#issuecomment-{id}")
+                            .into();
+                }
             }
             self.save()?;
         }
         self.acknowledge(write)?;
+        self.written.insert(write.key.clone());
         self.saved += usize::from(write.replaced_post);
         let id = self
             .ledger
@@ -610,6 +771,9 @@ impl Store {
             .filter_map(|(key, entry)| {
                 let id = entry.id?;
                 let body = public_body(entry);
+                if body.len() > COMMENT_BYTES {
+                    return None;
+                }
                 if entry.published.as_ref() == Some(&body) {
                     return None;
                 }
@@ -640,9 +804,23 @@ impl Store {
         self.save()
     }
 
-    /// Replace only our verified status node with the durable protocol records.
-    /// Missing state or a foreign editor is a refusal, never an empty history.
-    pub fn expand(&self, variables: &Value, data: &mut Value) -> Result<()> {
+    /// Discover by marker and authenticated ownership, never by a cached id alone.
+    pub fn expand(&mut self, variables: &Value, data: &mut Value) -> Result<()> {
+        let before = (
+            self.ledger.entries.clone(),
+            self.duplicates.clone(),
+            self.discovered.clone(),
+        );
+        let result = self.expand_inner(variables, data);
+        if result.is_err() {
+            (self.ledger.entries, self.duplicates, self.discovered) = before;
+        }
+        result
+    }
+
+    fn expand_inner(&mut self, variables: &Value, data: &mut Value) -> Result<()> {
+        let complete = data.pointer("/repository/issue/comments/pageInfo/hasNextPage")
+            == Some(&Value::Bool(false));
         let Some(nodes) = data
             .pointer_mut("/repository/issue/comments/nodes")
             .and_then(Value::as_array_mut)
@@ -656,16 +834,14 @@ impl Store {
             variables["number"]
         );
         let mut expanded = Vec::new();
+        let previous_records = self.ledger.entries.get(&key).map_or(0, |e| e.records.len());
+        if variables["after"].is_null() {
+            self.discovered.remove(&key);
+            self.duplicates.remove(&key);
+        }
         for node in nodes.iter() {
             let body = text(node, "/body");
-            let known = self
-                .ledger
-                .entries
-                .get(&key)
-                .is_some_and(|entry| plan::comment_id(text(node, "/url")) == entry.id);
-            if !known
-                && (!body.starts_with(MARKER)
-                    || !text(node, "/author/login").eq_ignore_ascii_case(&self.ledger.bot))
+            if !marked(body) || !text(node, "/author/login").eq_ignore_ascii_case(&self.ledger.bot)
             {
                 expanded.push(node.clone());
                 continue;
@@ -676,22 +852,121 @@ impl Store {
                         || text(node, "/editor/login").eq_ignore_ascii_case(&self.ledger.bot)),
                 "status comment has a foreign or unknown editor"
             );
-            let entry = self.ledger.entries.get(&key).context(
-                "status comment exists but its ledger is missing; reconcile before continuing",
-            )?;
+            let id = plan::comment_id(text(node, "/url")).context("status comment id missing")?;
+            let entry = self.ledger.entries.entry(key.clone()).or_default();
+            let first = self
+                .discovered
+                .get(&key)
+                .copied()
+                .map_or(id, |old| old.min(id));
+            if let Some(old) = self.discovered.get(&key).copied().filter(|old| *old != id) {
+                self.duplicates
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(old.max(id));
+            }
+            self.discovered.insert(key.clone(), first);
+            entry.id = Some(first);
+            if let Some((_, encoded)) = body.split_once(RECORDS) {
+                let encoded = encoded
+                    .strip_suffix("\n-->")
+                    .context("invalid status records")?;
+                ensure!(encoded.len() <= COMMENT_BYTES, "status records too large");
+                let records: Vec<Value> =
+                    serde_json::from_str(encoded).context("decode status records")?;
+                for mut record in records {
+                    if record["url"].is_null() {
+                        record["url"] = node["url"].clone();
+                    }
+                    let comment = plan::comment(&record).context("invalid status record")?;
+                    ensure!(
+                        plan::written_by(&comment, &self.ledger.bot)
+                            && comment.url.starts_with(
+                                text(node, "/url")
+                                    .split("#issuecomment-")
+                                    .next()
+                                    .unwrap_or_default()
+                            )
+                            && plan::comment_id(&comment.url).is_some(),
+                        "foreign status record"
+                    );
+                    // Keep a pending newer revision rather than appending the
+                    // older public claim after its completed receipt.
+                    if let Some(old) = entry.records.iter_mut().find(|r| {
+                        r["createdAt"] == record["createdAt"]
+                            && r["url"] == record["url"]
+                            && (identity(text(r, "/body")).ok().flatten()
+                                == identity(text(&record, "/body")).ok().flatten())
+                            && kind(text(r, "/body")) == kind(text(&record, "/body"))
+                    }) {
+                        if text(&record, "/lastEditedAt") > text(old, "/lastEditedAt") {
+                            *old = record;
+                        }
+                    } else {
+                        entry.records.push(record);
+                    }
+                }
+            }
+            for section in ["Current plan", "Last dispatch", "Last apply"] {
+                if let Some((_, prose)) = body.split_once(&format!("\n### {section}\n")) {
+                    let prose = prose
+                        .split("\n### ")
+                        .next()
+                        .unwrap_or_default()
+                        .split(RECORDS)
+                        .next()
+                        .unwrap_or_default()
+                        .trim();
+                    entry
+                        .prose
+                        .insert(section.into(), prose.chars().take(DISPLAY_CHARS).collect());
+                }
+            }
             ensure!(
-                plan::comment_id(text(node, "/url")) == entry.id,
-                "status comment id differs from ledger"
+                entry.records.len() <= MAX_RECORDS,
+                "status record bound exceeded"
             );
+            ensure!(
+                public_body(entry).len() <= COMMENT_BYTES,
+                "status comment is full; nothing sent"
+            );
+            if id == first {
+                entry.published = Some(body.into());
+            }
+        }
+        if complete
+            && !self.discovered.contains_key(&key)
+            && !self.written.contains(&key)
+            && let Some(entry) = self.ledger.entries.get_mut(&key)
+        {
+            entry.id = None;
+            entry.published = None;
         }
         // A read immediately after our write may not show the status yet.
         // Keep local claims authoritative even during that visibility window.
-        if variables["after"].is_null()
-            && let Some(entry) = self.ledger.entries.get(&key)
-        {
-            expanded.extend(entry.records.iter().cloned());
+        if let Some(entry) = self.ledger.entries.get(&key) {
+            let skip = if variables["after"].is_null() {
+                0
+            } else {
+                previous_records
+            };
+            expanded.extend(entry.records.iter().skip(skip).cloned());
         }
         *nodes = expanded;
+        self.save()?;
         Ok(())
+    }
+
+    pub fn duplicates(&self) -> Vec<(String, u64)> {
+        self.duplicates
+            .iter()
+            .filter(|(key, _)| {
+                self.ledger
+                    .entries
+                    .get(*key)
+                    .is_some_and(|e| e.published.as_deref() == Some(public_body(e).as_str()))
+            })
+            .flat_map(|(key, ids)| ids.iter().map(move |id| (key.clone(), *id)))
+            .collect()
     }
 }
