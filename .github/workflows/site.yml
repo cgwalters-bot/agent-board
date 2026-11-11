@@ -47,7 +47,7 @@ jobs:
       # (tracker#1212). Keep the default hosted config and strict check;
       # the action verifies the digest-pinned v0.6.4 image's signer first.
       - uses: cgwalters-forge/actions/secure-host@c763a8950778743f51857a37b2a59daf9e96ee23 # secure-host:v0.6.4; stops acpid
-      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: just@1.58.0
       - run: just site-test
