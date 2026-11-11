@@ -72,12 +72,6 @@ fn top_down_fixture() -> Replay {
     other_labelling["request"]["variables"]["number"] = 136.into();
     replay.requests.push(other_labelling);
     for entry in &replay.requests {
-        let query = board_query(false, false);
-        if entry["request"]["graphql"] == fnv(&query) {
-            let mut slim = entry.clone();
-            slim["request"]["graphql"] = fnv(&query.replace(BOARD_PULLS, "")).into();
-            additions.push(slim);
-        }
         if let Some(nodes) = entry["answer"]
             .pointer("/data/repositoryOwner/projectV2/items/nodes")
             .and_then(Value::as_array)
@@ -130,6 +124,193 @@ fn top_down_fills_slots_before_reading_unrelated_parents() {
 /// A recorded REST fixture with live conditional semantics. Every validator
 /// is checked; 304s contain no body or pagination headers.
 struct ConditionalFixture(Replay);
+
+/// The same histories via REST, including timestamps used to bind GraphQL's
+/// editor evidence. No private usage or holds history is copied into these.
+fn rest_comment_pages(replay: &mut Replay) {
+    let mut pages = Vec::new();
+    for entry in &replay.requests {
+        if entry["request"]["graphql"] != fnv(plan::COMMENTS_QUERY)
+            || !entry["request"]["variables"]["after"].is_null()
+        {
+            continue;
+        }
+        let variables = &entry["request"]["variables"];
+        let connection = &entry["answer"]["data"]["repository"]["issue"]["comments"];
+        if connection["pageInfo"]["hasNextPage"] != false {
+            continue;
+        }
+        let body: Vec<_> = connection["nodes"].as_array().unwrap().iter().map(|g| {
+            json!({"html_url":g["url"], "body":g["body"], "user":g["author"],
+                "created_at":g["createdAt"], "updated_at": if g["lastEditedAt"].is_null() { &g["createdAt"] } else { &g["lastEditedAt"] }})
+        }).collect();
+        pages.push(json!({"request":{"get":format!("{API_ROOT}repos/{}/{}/issues/{}/comments?per_page=100&page=1",
+            variables["owner"].as_str().unwrap(), variables["name"].as_str().unwrap(), variables["number"])},
+            "answer":{"status":200,"body":body}}));
+    }
+    replay.requests.extend(pages);
+}
+
+#[test]
+fn warm_top_down_pass_revalidates_holds_and_reaches_ready_p0_children() {
+    let mut replay = top_down_fixture();
+    let mut additions = Vec::new();
+    for entry in &mut replay.requests {
+        let Some(nodes) = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let Some(template) = nodes
+            .iter()
+            .find(|n| n["content"]["number"] == 446)
+            .cloned()
+        else {
+            continue;
+        };
+        for number in 6000..6080 {
+            let mut node = template.clone();
+            node["content"]["number"] = number.into();
+            node["priority"]["name"] = "P0".into();
+            nodes.push(node);
+            let comment = comment_node(number, "cgwalters", &format!("```{PLAN_FENCE}\n{{\n```"));
+            let vars =
+                json!({"owner":"cgwalters-forge","name":"tracker","number":number,"after":null});
+            additions.push(json!({"request":graphql_key(plan::COMMENTS_QUERY, &vars),
+                "answer":{"data":{"repository":{"issue":{"comments":{"nodes":[comment],
+                    "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}}));
+        }
+    }
+    replay.requests.extend(additions);
+    rest_comment_pages(&mut replay);
+    let fixture = ConditionalFixture(replay);
+    let cfg = config(json!({"topDown":true,"state":"pass-state.json","wip":4}));
+    let first = block(run(
+        &fixture,
+        &fixture,
+        &cfg,
+        State::default(),
+        (Mode::Preview, Limits::default()),
+        fixture.0.now,
+    ))
+    .unwrap();
+    let state = State::from_json(&first.state.as_ref().unwrap().to_json()).unwrap();
+    let second = block(run(
+        &fixture,
+        &fixture,
+        &cfg,
+        state,
+        (Mode::Preview, Limits::default()),
+        fixture.0.now,
+    ))
+    .unwrap();
+    eprintln!(
+        "hold-heavy cold: {}\nhold-heavy warm: {}",
+        first.summary_line(),
+        second.summary_line()
+    );
+    for report in [&first, &second] {
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        let starts: Vec<_> = report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("start "))
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+                "start triage cgwalters-forge/tracker#459 pool=claude"
+            ]
+        );
+    }
+    assert!(second.spent.revalidated >= 80);
+    assert!(second.spent.requests < 30, "{}", second.spent);
+    assert!(second.spent.revalidated > second.spent.requests * 2);
+}
+
+#[test]
+fn comment_cache_preserves_editor_evidence_and_refuses_changed_histories() {
+    let mut replay = top_down_fixture();
+    let variables = json!({"owner":"cgwalters-forge","name":"tracker","number":446,"after":null});
+    let request = graphql_key(plan::COMMENTS_QUERY, &variables);
+    let mut edited = comment_node(1, "cgwalters", "an edited plan");
+    edited["lastEditedAt"] = "2026-10-21T00:00:00Z".into();
+    edited["editor"] = json!({"login":"visitor"});
+    let recorded = replay
+        .requests
+        .iter_mut()
+        .find(|e| e["request"] == request)
+        .unwrap();
+    recorded["answer"]["data"]["repository"]["issue"]["comments"]["nodes"] = json!([edited]);
+    rest_comment_pages(&mut replay);
+    let fixture = ConditionalFixture(replay);
+    let cold = Bounds::new(100, Instant::now() + Duration::from_secs(60));
+    cold.cache_enabled.set(true);
+    let client = Budget {
+        inner: &fixture,
+        bounds: &cold,
+    };
+    let expected = client
+        .graphql(plan::COMMENTS_QUERY, variables.clone())
+        .unwrap();
+    assert_eq!(
+        expected["repository"]["issue"]["comments"]["nodes"][0]["editor"]["login"],
+        "visitor"
+    );
+    let saved = cold.next_responses.borrow().clone();
+    assert!(saved.values().any(|e| e["comment_evidence"] == expected));
+    let warm = Bounds::new(100, Instant::now() + Duration::from_secs(60));
+    let client = Budget {
+        inner: &fixture,
+        bounds: &warm,
+    };
+    client.seed_cache(saved.clone());
+    assert_eq!(
+        client
+            .graphql(plan::COMMENTS_QUERY, variables.clone())
+            .unwrap(),
+        expected
+    );
+    assert_eq!((warm.spent().requests, warm.spent().revalidated), (0, 1));
+    // A fresh 200, even with an equal body, must re-read editor evidence.
+    let fresh = Bounds::new(100, Instant::now() + Duration::from_secs(60));
+    let client = Budget {
+        inner: &fixture.0,
+        bounds: &fresh,
+    };
+    client.seed_cache(saved.clone());
+    assert_eq!(
+        client
+            .graphql(plan::COMMENTS_QUERY, variables.clone())
+            .unwrap(),
+        expected
+    );
+    assert_eq!((fresh.spent().requests, fresh.spent().revalidated), (2, 0));
+    // A cached REST history without matching evidence must not authorize reuse.
+    for field in ["body", "html_url", "created_at", "updated_at", "user"] {
+        let mut saved = saved.clone();
+        let entry = saved
+            .values_mut()
+            .find(|e| e["comment_evidence"].is_object())
+            .unwrap();
+        entry["body"][0][field] = "changed".into();
+        let bounds = Bounds::new(100, Instant::now() + Duration::from_secs(60));
+        let client = Budget {
+            inner: &fixture,
+            bounds: &bounds,
+        };
+        client.seed_cache(saved);
+        assert_eq!(
+            client
+                .graphql(plan::COMMENTS_QUERY, variables.clone())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(bounds.spent().requests, 1);
+    }
+}
 
 impl Rest for ConditionalFixture {
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
@@ -16623,6 +16804,7 @@ fn authored_repositories_take_turns() {
             }
             _ => {}
         }
+        rest_comment_pages(&mut forge.replay);
         let mode = if applies {
             Mode::Actions(&own)
         } else {

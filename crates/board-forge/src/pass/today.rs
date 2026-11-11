@@ -61,7 +61,7 @@ impl<C> Reads<'_, C> {
     }
 }
 
-impl<C: Transport> Transport for &Reads<'_, C> {
+impl<C: Rest + Transport> Transport for &Reads<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         ensure!(!is_mutation(query), "today is read-only");
         self.spend()?;

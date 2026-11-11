@@ -144,7 +144,7 @@ impl<C: Rest> Rest for Reads<'_, '_, C> {
     }
 }
 
-impl<C: Transport> Transport for Reads<'_, '_, C> {
+impl<C: Rest + Transport> Transport for Reads<'_, '_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         ensure!(!is_mutation(query), "promotion pass view is read-only");
         self.admit()?;
