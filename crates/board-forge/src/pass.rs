@@ -150,6 +150,10 @@ type HoldComments = (Option<Value>, Vec<Value>, usize);
 /// The reads before the hold snapshot's write: its comments' pages, the
 /// repository and the account.
 const HOLDS_READS: usize = HOLDS_PAGES + 2;
+/// Reporting must not consume the pass it describes. No new reads are
+/// reserved from scheduling; publication gets at most this share of leftovers.
+const HOLDS_SHARE: usize = 15;
+pub(super) const HOLDS_PENDING_LIMIT: usize = 1000;
 /// The start of a line that holds every new run on the WIP limit.
 const WIP_HOLD: &str = "hold wip: ";
 /// Pages of open board issues read, 100 each; a larger board is incomplete.
@@ -2630,6 +2634,16 @@ type ByStage = [usize; Stage::ALL.len()];
 /// What a pass may still spend, in requests and in time, both stages
 /// together, and what it spent.
 struct Bounds {
+    /// Successful pass-local reads, reused only by the reporting stage, never
+    /// by a start or merge recheck. Unlike decision reads, writes do not evict
+    /// these observations: publication reports what the pass saw.
+    publication_reads: RefCell<BTreeMap<String, KeptRead>>,
+    publication_bytes: Cell<usize>,
+    publication_runs: RefCell<Option<Option<BTreeMap<u64, Value>>>>,
+    publication_pending: RefCell<Vec<String>>,
+    publication_summary_cursor: RefCell<Option<String>>,
+    /// Physical requests, including conditional reads refunded elsewhere.
+    publication_requests: Cell<usize>,
     cache_enabled: Cell<bool>,
     responses: RefCell<BTreeMap<String, Value>>,
     next_responses: RefCell<BTreeMap<String, Value>>,
@@ -2686,6 +2700,12 @@ struct Bounds {
 impl Bounds {
     fn new(limit: usize, admit_by: Instant) -> Self {
         Self {
+            publication_reads: RefCell::default(),
+            publication_bytes: Cell::new(0),
+            publication_runs: RefCell::default(),
+            publication_pending: RefCell::default(),
+            publication_summary_cursor: RefCell::default(),
+            publication_requests: Cell::new(0),
             cache_enabled: Cell::new(false),
             responses: RefCell::default(),
             next_responses: RefCell::default(),
@@ -2806,7 +2826,16 @@ impl Bounds {
     /// What the stage under way may still read before it reaches what it
     /// keeps for the stages after it; all that is left where it keeps none.
     fn available(&self) -> usize {
-        self.left.get().saturating_sub(self.kept.get())
+        let available = self.left.get().saturating_sub(self.kept.get());
+        if self.stage.get() == Stage::Holds {
+            available.min(self.publication_left())
+        } else {
+            available
+        }
+    }
+
+    fn publication_left(&self) -> usize {
+        (self.limit * HOLDS_SHARE / 100).saturating_sub(self.publication_requests.get())
     }
 
     /// Whether a step decided from what was read, an epic apply, fits in
@@ -3088,6 +3117,37 @@ pub(crate) fn preview_reads<C, R>(
 }
 
 impl<C> Budget<'_, C> {
+    fn publication_read(&self, key: &str) -> Option<KeptRead> {
+        (self.bounds.stage.get() == Stage::Holds)
+            .then(|| self.bounds.publication_reads.borrow().get(key).cloned())
+            .flatten()
+    }
+
+    fn keep_publication_read(&self, key: String, answer: KeptRead) {
+        let size_of = |answer: &KeptRead| {
+            key.len()
+                + match answer {
+                    KeptRead::Rest(r) => {
+                        r.body.to_string().len() + r.link.as_ref().map_or(0, String::len)
+                    }
+                    KeptRead::GraphQl(v) => v.to_string().len(),
+                }
+        };
+        let size = size_of(&answer);
+        let mut reads = self.bounds.publication_reads.borrow_mut();
+        let old_size = reads.get(&key).map_or(0, size_of);
+        let total = self
+            .bounds
+            .publication_bytes
+            .get()
+            .saturating_sub(old_size)
+            .saturating_add(size);
+        if size <= RESPONSE_BYTES && total <= CACHE_BYTES {
+            self.bounds.publication_bytes.set(total);
+            reads.insert(key, answer);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn seed_cache(&self, responses: BTreeMap<String, Value>) {
         self.bounds.cache_enabled.set(true);
@@ -3109,6 +3169,13 @@ impl<C> Budget<'_, C> {
             "the pass's time bound ({PASS_SECONDS_LIMIT} seconds) is spent"
         );
         let left = bounds.left.get();
+        if bounds.stage.get() == Stage::Holds {
+            let reserve = if write { 0 } else { WRITE_RESERVE };
+            ensure!(
+                bounds.publication_left() > reserve,
+                "holds publication's {HOLDS_SHARE}% request share is spent"
+            );
+        }
         let floor = if write { 0 } else { WRITE_RESERVE };
         ensure!(
             left > floor,
@@ -3137,6 +3204,11 @@ impl<C> Budget<'_, C> {
             );
         }
         bounds.left.set(left - 1);
+        if bounds.stage.get() == Stage::Holds {
+            bounds
+                .publication_requests
+                .set(bounds.publication_requests.get() + 1);
+        }
         bounds.writes.set(bounds.writes.get() + usize::from(write));
         let mut by_stage = bounds.by_stage.get();
         by_stage[bounds.stage.get() as usize] += 1;
@@ -3186,13 +3258,22 @@ fn is_mutation(query: &str) -> bool {
 impl<C: Rest> Rest for Budget<'_, C> {
     fn get_fresh(&self, url: &str) -> Result<RestResponse> {
         self.spend(false, &endpoint_class(url))?;
-        self.observe(self.inner.get_fresh(url))
+        let response = self.observe(self.inner.get_fresh(url))?;
+        if response.status == 200 {
+            self.keep_publication_read(url.to_owned(), KeptRead::Rest(response.clone()));
+        }
+        Ok(response)
     }
     fn start_kind(&self, kind: &str) {
         *self.bounds.start_kind.borrow_mut() = kind.to_owned();
     }
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        if validator.is_none()
+            && let Some(KeptRead::Rest(response)) = self.publication_read(url)
+        {
+            return Ok(response);
+        }
         let class = endpoint_class(url);
         self.spend(false, &class)?;
         let enabled = self.bounds.cache_enabled.get()
@@ -3258,6 +3339,9 @@ impl<C: Rest> Rest for Budget<'_, C> {
                     .borrow_mut()
                     .insert(url.to_owned(), entry);
             }
+        }
+        if response.status == 200 {
+            self.keep_publication_read(url.to_owned(), KeptRead::Rest(response.clone()));
         }
         Ok(response)
     }
@@ -3437,12 +3521,21 @@ fn comments_match(rest: &Value, data: &Value) -> bool {
 
 impl<C: Rest + Transport> Transport for Budget<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        if let Some(data) = self.plan_comments(query, &variables)? {
+        let mutation = is_mutation(query);
+        let key = graphql_key(query, &variables).to_string();
+        if !mutation && let Some(KeptRead::GraphQl(data)) = self.publication_read(&key) {
             return Ok(data);
         }
-        let mutation = is_mutation(query);
+        if let Some(data) = self.plan_comments(query, &variables)? {
+            self.keep_publication_read(key, KeptRead::GraphQl(data.clone()));
+            return Ok(data);
+        }
         self.spend(mutation, &graphql_class(query))?;
-        self.graphql_spent(mutation, self.inner.graphql(query, variables))
+        let data = self.graphql_spent(mutation, self.inner.graphql(query, variables))?;
+        if !mutation {
+            self.keep_publication_read(key, KeptRead::GraphQl(data.clone()));
+        }
+        Ok(data)
     }
 }
 
@@ -3726,6 +3819,8 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
 ) -> Result<Report> {
     bounds.cache_enabled.set(config.state.is_some());
     *bounds.responses.borrow_mut() = state.pass_responses.clone();
+    *bounds.publication_pending.borrow_mut() = state.holds_pending.clone();
+    *bounds.publication_summary_cursor.borrow_mut() = state.holds_summary_cursor.clone();
     let previous = state.clone();
     let caps = Caps::new(limits);
     let mut lines = Vec::new();
@@ -3759,6 +3854,8 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         }
         state.pass_responses = bounds.next_responses.take();
         state.scan_cursor = report.scan_cursor.clone();
+        state.holds_pending = bounds.publication_pending.take();
+        state.holds_summary_cursor = bounds.publication_summary_cursor.take();
     }
     Ok(report)
 }

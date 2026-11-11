@@ -1612,6 +1612,10 @@ pub struct State {
     /// scan resumes after it, so that the stops of a few passes cover the
     /// board. None scans in order. Losing it only starts the scan over.
     pub scan_cursor: Option<String>,
+    /// Optional holds descendant context left unread at the publication share.
+    /// Reporting only; these item names never authorize work.
+    pub holds_pending: Vec<String>,
+    pub holds_summary_cursor: Option<String>,
     /// `notifications` ([`notify`]): the time the next listing starts at,
     /// and where the last one had pages left, the time it goes on before,
     /// for up to [`notify::NOTIFY_PAGES`]. Losing them costs requests: the
@@ -1653,6 +1657,8 @@ impl State {
                     "follow_cursor",
                     "share_cursor",
                     "scan_cursor",
+                    "holds_pending",
+                    "holds_summary_cursor",
                     "notify_since",
                     "notify_before",
                     "maintain",
@@ -1809,6 +1815,28 @@ impl State {
             })
             .transpose()?;
         let authored_cursor = cursor("authored_cursor")?;
+        let holds_summary_cursor = object
+            .get("holds_summary_cursor")
+            .map(|c| {
+                c.as_str()
+                    .filter(|c| c.contains('#') && self::share_cursor(c))
+                    .map(str::to_owned)
+                    .context("poll state holds_summary_cursor is not an issue")
+            })
+            .transpose()?;
+        let holds_pending: Vec<String> = object
+            .get("holds_pending")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("poll state holds_pending is not a list of issues")?
+            .unwrap_or_default();
+        ensure!(
+            holds_pending.len() <= crate::pass::HOLDS_PENDING_LIMIT
+                && holds_pending
+                    .iter()
+                    .all(|i| i.contains('#') && self::share_cursor(i)),
+            "poll state holds_pending is too large or contains an invalid issue"
+        );
         let notify_since = time("notify_since")?;
         let notify_before = time("notify_before")?;
         let maintain = (object.get("maintain"))
@@ -1827,6 +1855,8 @@ impl State {
             follow_cursor,
             share_cursor,
             scan_cursor,
+            holds_pending,
+            holds_summary_cursor,
             notify_since,
             notify_before,
             maintain,
@@ -1869,6 +1899,12 @@ impl State {
         }
         if let Some(cursor) = &self.scan_cursor {
             state["scan_cursor"] = cursor.as_str().into();
+        }
+        if !self.holds_pending.is_empty() {
+            state["holds_pending"] = json!(self.holds_pending);
+        }
+        if let Some(cursor) = &self.holds_summary_cursor {
+            state["holds_summary_cursor"] = json!(cursor);
         }
         if let Some(since) = &self.notify_since {
             state["notify_since"] = since.as_str().into();
@@ -8696,6 +8732,8 @@ pub fn run_capped<R: Rest, G: Transport>(
         share_cursor,
         // The pass's, kept by the pass ([`crate::pass::run`]).
         scan_cursor: None,
+        holds_pending: Vec::new(),
+        holds_summary_cursor: None,
         notify_since,
         notify_before,
         maintain: None,

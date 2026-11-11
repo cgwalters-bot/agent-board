@@ -805,7 +805,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         }
         // Stage 4 may have stopped on these, which is not a failure.
         let bounds = self.client.bounds;
-        if bounds.left.get() < WRITE_RESERVE + HOLDS_READS || Instant::now() > bounds.admit_by {
+        if bounds.available() < WRITE_RESERVE + HOLDS_READS || Instant::now() > bounds.admit_by {
             let why = "the pass's request budget or time is spent";
             self.line(format!("holds: not published; {why}"));
             return;
