@@ -129,6 +129,33 @@ pub(super) fn decorate(list: &mut NeedsYou, nodes: &BTreeMap<String, Node>) {
 }
 
 impl<C: Rest + Transport> Scheduler<'_, C> {
+    /// One recent page for the configured dispatch workflow, shared by all
+    /// descendant activity checks. A run outside that page is unknown, not
+    /// evidence of inactivity; never fall back to a request per record.
+    fn publication_runs(&self) -> Option<BTreeMap<u64, Value>> {
+        if let Some(runs) = &*self.client.bounds.publication_runs.borrow() {
+            return runs.clone();
+        }
+        let url = format!(
+            "{API_ROOT}repos/{}/actions/workflows/{}/runs?per_page={RUNS_PER_PAGE}",
+            self.config.dispatch_repo, self.config.dispatch_workflow
+        );
+        let runs = self.client.get(&url, None).ok().and_then(|r| {
+            (r.status == 200).then_some(r.body).and_then(|body| {
+                body["workflow_runs"].as_array().and_then(|runs| {
+                    if runs.len() > RUNS_PER_PAGE as usize {
+                        return None;
+                    }
+                    runs.iter()
+                        .map(|run| Some((run["id"].as_u64()?, run.clone())))
+                        .collect()
+                })
+            })
+        });
+        *self.client.bounds.publication_runs.borrow_mut() = Some(runs.clone());
+        runs
+    }
+
     /// Breadth-first, deduplicated upward reads. Activity never takes the
     /// requests needed to establish another identity's parentage.
     pub(super) fn inbox_chains(
@@ -271,6 +298,20 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
             return;
         }
+        let mut raw = raw.clone();
+        if expand {
+            let starts = self
+                .client
+                .bounds
+                .publication_pending
+                .borrow()
+                .iter()
+                .take(BATCH_SIZE)
+                .filter_map(|at| pull_ref(at).map(|(r, n)| on_github(&r, n)))
+                .collect();
+            let mut attempted = raw.keys().cloned().collect();
+            self.inbox_chains(starts, &mut raw, &mut attempted);
+        }
         let mut nodes: BTreeMap<_, _> = raw
             .iter()
             .filter_map(|(at, value)| {
@@ -290,13 +331,29 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     .filter(|(_, live)| **live == Ok(true))
                     .filter_map(|(k, _)| pull_ref(k).map(|(r, n)| on_github(&r, n))),
             );
+            // Pop the prior pass's deferred context first; fresh roots remain
+            // behind it. The state is a work queue, not trusted evidence.
+            pending.extend(
+                self.client
+                    .bounds
+                    .publication_pending
+                    .take()
+                    .iter()
+                    .rev()
+                    .filter_map(|at| pull_ref(at).map(|(r, n)| on_github(&r, n))),
+            );
         }
         let mut attempted = BTreeSet::new();
         while let Some(issue) = pending.pop() {
             let at = key(&issue);
-            if !attempted.insert(at.clone()) || !self.room() {
+            if attempted.contains(&at) {
                 continue;
             }
+            if !self.room() {
+                pending.push(issue);
+                break;
+            }
+            attempted.insert(at.clone());
             match self.inbox_node(&issue) {
                 Ok((node, refs)) => {
                     // Only downward activity expansion remains. Upward
@@ -308,6 +365,30 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     "needs-you epic context error: {}: {error:#}",
                     issue.display()
                 )),
+            }
+        }
+        if expand {
+            let mut seen = BTreeSet::new();
+            *self.client.bounds.publication_pending.borrow_mut() = pending
+                .iter()
+                .rev()
+                .map(key)
+                .filter(|at| !attempted.contains(at) && seen.insert(at.clone()))
+                .take(HOLDS_PENDING_LIMIT)
+                .collect();
+        }
+        // A resumed descendant may be read before its root's optional context.
+        // Link its freshly validated parent chain so its positive activity can
+        // still reach that epic; the incomplete ancestor stays incomplete.
+        let edges: Vec<_> = nodes
+            .iter()
+            .filter_map(|(at, node)| node.parent.as_ref().map(|p| (p.clone(), at.clone())))
+            .collect();
+        for (parent, child) in edges {
+            if let Some(node) = nodes.get_mut(&parent)
+                && !node.children.contains(&child)
+            {
+                node.children.push(child);
             }
         }
         // Inventory/ancestor reads already resolved every identity, before
@@ -439,24 +520,15 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 result.complete = false;
                 break;
             }
-            let run = self.client.get(
-                &format!(
-                    "{API_ROOT}repos/{}/actions/runs/{run}",
-                    self.config.dispatch_repo
-                ),
-                None,
-            );
-            let run = match run {
-                Ok(run) if run.status == 200 => run,
-                _ => {
-                    result.complete = false;
-                    continue;
-                }
+            let runs = self.publication_runs();
+            let Some(run) = runs.as_ref().and_then(|runs| runs.get(&run)) else {
+                result.complete = false;
+                continue;
             };
             if ["run_started_at", "updated_at"].iter().any(|field| {
-                (*field != "updated_at" || run.body["status"] == "completed")
+                (*field != "updated_at" || run["status"] == "completed")
                     && recent(
-                        run.body[*field].as_str(),
+                        run[*field].as_str(),
                         self.now,
                         time::Duration::hours(RUN_HOURS),
                     )

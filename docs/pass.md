@@ -731,6 +731,30 @@ stage 3 did not list them; `runs` and `board` are `complete` or `unread`.
 no change; past the snapshot's size the section goes whole before any
 other, and the line says `without the epic focus, over the comments' size`.
 
+The concrete failure bounded here is optional report enrichment spending hundreds
+of requests on old holds and dispatch records. GitHub holds publication, including
+all its optional sections, gets at most 15% of the pass's request limit (97 of
+650 requests), or what remains after work, whichever is smaller. Conditional
+reads count even when a 304 refunds the main budget. Its final writes fit inside
+that share; no requests are reserved from starts or merges for reporting.
+This adds no option: publication remains off without `holds`.
+
+Publication reuses successful REST and identical GraphQL reads made earlier in
+this pass, within a bounded in-memory cache. These observations are for reporting
+only; scheduling, merge and start rechecks never use this cache. Optional epic
+activity reads one page of recent runs (100) for the configured dispatch workflow,
+not one request per dispatch record. A missing run means unknown activity, never
+proof of inactivity. Incomplete context remains explicitly incomplete.
+
+When enrichment reaches the share, the snapshot publishes what was read and uses
+the existing verified carry rules for unread asks and summaries. With `state`,
+`holds_summary_cursor` rotates summary reads and `holds_pending` keeps up to 1,000
+unread descendant-context item names, attempted first on the next pass. Neither
+is evidence or authority to act; losing the state starts enrichment over. Summary
+reads leave half their remaining share for optional context. Private publication,
+editor checks, write caps and time bounds are unchanged. No caller setting is
+needed for callers already publishing holds.
+
 With `holds.needsYou` set (off unless set; tracker#976), the snapshot also
 has `needs_you`, after `pass` and any `leases`: the ranked list of what waits
 on the operator, for review's needs-you view, so that review need not work

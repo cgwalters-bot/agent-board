@@ -465,7 +465,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// reads, with the hold snapshot's own left.
     fn room(&self) -> bool {
         let bounds = self.client.bounds;
-        bounds.left.get() > NEEDS_READS && Instant::now() <= bounds.admit_by
+        bounds.available() > NEEDS_READS && Instant::now() <= bounds.admit_by
     }
 
     /// The needs-you list of `snapshot`, reading its own sources and then
@@ -575,7 +575,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         // not read could be carried.
         let bounds = self.client.bounds;
         let room =
-            bounds.left.get() > WRITE_RESERVE + HOLDS_READS && Instant::now() <= bounds.admit_by;
+            bounds.available() > WRITE_RESERVE + HOLDS_READS && Instant::now() <= bounds.admit_by;
         let read = match (comment["node_id"].as_str(), room) {
             (Some(id), true) => self.client.graphql(EDITS_QUERY, json!({"id": id})),
             (None, _) => Err(anyhow::anyhow!("it has no node id")),
@@ -707,16 +707,30 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// editors: a foreign edit must invalidate a previously trusted summary.
     fn summaries(&mut self, list: &NeedsYou) -> (Read, BTreeMap<String, Option<Summary>>) {
         let (mut read, mut said) = (Read::Complete, BTreeMap::new());
-        let held = (list.items.iter())
-            .filter(|a| a.source_ref.kind == RefKind::Hold && a.source != "pass");
+        let mut held: Vec<_> = (list.items.iter())
+            .filter(|a| a.source_ref.kind == RefKind::Hold && a.source != "pass")
+            .collect();
+        let bounds = self.client.bounds;
+        if let Some(cursor) = bounds.publication_summary_cursor.borrow().as_deref()
+            && let Some(n) = held.iter().position(|a| a.item == cursor)
+        {
+            let len = held.len();
+            held.rotate_left((n + 1) % len);
+        }
+        // Leave optional descendant context some of this same share too.
+        let floor = bounds.publication_left() / 2;
+        let mut complete = true;
         for ask in held {
             let issue = on_github(&ask.source_ref.repository, ask.source_ref.number);
             if !self.room()
                 || self.client.bounds.left.get() <= NEEDS_READS + plan::PLAN_COMMENT_PAGES
+                || bounds.publication_left() <= floor
             {
                 read = Read::Partial;
+                complete = false;
                 break;
             }
+            *bounds.publication_summary_cursor.borrow_mut() = Some(ask.item.clone());
             // A blocking hold is on a pull request, whose summary an issue
             // read cannot find.
             let pull = ask.action.kind == RefKind::PullRequest;
@@ -737,6 +751,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     self.line(format!("needs-you summary error: {item}: {error:#}"));
                 }
             }
+        }
+        if complete {
+            bounds.publication_summary_cursor.borrow_mut().take();
         }
         (read, said)
     }

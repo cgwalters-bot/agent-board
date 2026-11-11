@@ -5087,6 +5087,163 @@ fn apply_publishes_the_pass_view() {
     }
 }
 
+#[test]
+fn publication_reuses_observations_but_never_decision_rechecks() {
+    let mut forge = Forge::new(None, false);
+    forge.holds_destination(true);
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+    let client = Budget {
+        inner: &forge,
+        bounds: &bounds,
+    };
+    let url = format!("{API_ROOT}user");
+    let query = "query { viewer { login } }";
+    let first = client.get(&url, None).unwrap();
+    let data = client.graphql(query, json!({})).unwrap();
+    let before = bounds.left.get();
+    // Starts and merges still make fresh reads, including after a write.
+    bounds.writes.set(1);
+    bounds.enter(Stage::Schedule);
+    client.get(&url, None).unwrap();
+    client.graphql(query, json!({})).unwrap();
+    assert_eq!(bounds.left.get(), before - 2);
+    bounds.enter(Stage::Holds);
+    assert_eq!(client.get(&url, None).unwrap().body, first.body);
+    assert_eq!(client.graphql(query, json!({})).unwrap(), data);
+    assert_eq!(bounds.left.get(), before - 2);
+}
+
+#[test]
+fn publication_share_bounds_reads_writes_and_refunds() {
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    bounds.enter(Stage::Holds);
+    // Neither a start's bypass nor a 304 refund can enlarge publication.
+    bounds.starting.set(true);
+    bounds.finishing.set(true);
+    let share = PASS_REQUEST_LIMIT * HOLDS_SHARE / 100;
+    for _ in 0..share - WRITE_RESERVE {
+        client.spend(false, "conditional").unwrap();
+        bounds.refund("conditional");
+    }
+    assert!(client.spend(false, "conditional").is_err());
+    for _ in 0..WRITE_RESERVE {
+        client.spend(true, "write").unwrap();
+    }
+    assert!(client.spend(true, "write").is_err());
+    assert_eq!(bounds.publication_requests.get(), share);
+    // Unspent pass capacity remains available to work, not earmarked for reports.
+    bounds.enter(Stage::Schedule);
+    assert!(client.spend(false, "work").is_ok());
+}
+
+#[test]
+fn sixty_holds_and_twenty_runs_publish_within_the_share() {
+    let mut forge = Forge::new(None, false);
+    forge.replay = without_epics(replay());
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    let mut at = forge.holds_destination(true);
+    at["needsYou"] = true.into();
+    at["passView"] = true.into();
+    let mut cfg = config(json!({"wip":32,"holds":at,"state":"pass-state.json"}));
+    cfg.epics = None;
+    for entry in &mut forge.replay.requests {
+        if let Some(nodes) = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut)
+        {
+            let Some(template) = nodes
+                .iter()
+                .find(|n| n["content"]["number"] == 446)
+                .cloned()
+            else {
+                continue;
+            };
+            *nodes = (1000..1060)
+                .map(|number| {
+                    let mut node = template.clone();
+                    node["content"]["number"] = number.into();
+                    node["content"]["parent"] = Value::Null;
+                    node["content"]["labels"] =
+                        json!({"nodes":[{"name":"needs-human"}],"totalCount":1});
+                    node
+                })
+                .collect();
+        }
+        if entry["request"]["get"]
+            .as_str()
+            .is_some_and(|url| url.contains("/runs?status=in_progress&"))
+        {
+            let template = entry["answer"]["body"]["workflow_runs"][0].clone();
+            let runs: Vec<_> = (100..120)
+                .map(|id| {
+                    let mut run = template.clone();
+                    run["id"] = id.into();
+                    run["display_title"] =
+                        format!("implement cgwalters-forge/tracker#{}", id + 2000).into();
+                    run
+                })
+                .collect();
+            entry["answer"]["body"] = json!({"workflow_runs":runs,"total_count":20});
+        }
+    }
+    for number in 1000..1060 {
+        inventory_on(
+            &mut forge.replay,
+            "cgwalters-forge/tracker",
+            number,
+            NEEDS_HUMAN,
+        );
+    }
+    let report = apply(&forge, &cfg);
+    let body = forge
+        .holds_publication()
+        .unwrap_or_else(|| panic!("{:?}", report.lines));
+    let published = holds::published(&body).unwrap();
+    assert_eq!(
+        published["holds"].as_array().unwrap().len(),
+        60,
+        "{:?}",
+        report.lines
+    );
+    assert_eq!(
+        published["pass_view"]["in_flight"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+    assert!(report.spent.by_stage[Stage::Holds as usize] <= PASS_REQUEST_LIMIT * HOLDS_SHARE / 100);
+    assert_eq!(published["needs_you"]["summaries"], "partial");
+    let state = report.state.unwrap();
+    assert!(state.holds_summary_cursor.is_some());
+    assert_eq!(State::from_json(&state.to_json()).unwrap(), state);
+    let second = block(run(
+        &forge,
+        &forge,
+        &cfg,
+        state.clone(),
+        (Mode::Actions(&own()), Limits::default()),
+        forge.replay.now,
+    ))
+    .unwrap();
+    assert_ne!(
+        second.state.unwrap().holds_summary_cursor,
+        state.holds_summary_cursor
+    );
+    for pending in [
+        json!(["not-an-item"]),
+        json!(vec!["example/repo#1"; HOLDS_PENDING_LIMIT + 1]),
+    ] {
+        let mut invalid = state.to_json();
+        invalid["holds_pending"] = pending;
+        assert!(State::from_json(&invalid).is_err());
+    }
+}
+
 /// With `holds.epicFocus`, the hold snapshot has the recorded board's P0
 /// epics, read in the requests a pass without it makes, and every source
 /// read; off, the epic queries are the recorded ones and there is none.
@@ -5590,8 +5747,8 @@ fn apply_publishes_what_needs_you() {
                 &json!({"owner":owner,"name":name,"number":number})),
                 "answer":{"data":{"repository":{"issueOrPullRequest":node}}}}));
         }
-        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{tracker}/actions/runs/1234")},
-            "answer":{"status":200,"body":{"status":"completed","run_started_at":"2026-10-23T12:00:00Z","updated_at":"2026-10-23T13:00:00Z"}}}));
+        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{tracker}/actions/workflows/{}/runs?per_page={RUNS_PER_PAGE}", config.dispatch_workflow)},
+            "answer":{"status":200,"body":{"workflow_runs":[{"id":1234,"status":"completed","run_started_at":"2026-10-23T12:00:00Z","updated_at":"2026-10-23T13:00:00Z"}]}}}));
         forge
     };
     let published = |config: &Config| {
@@ -5646,10 +5803,10 @@ fn apply_publishes_what_needs_you() {
     );
     let mut missing_history = with_context(forge_with(None));
     for entry in &mut missing_history.replay.requests {
-        if entry["request"]["get"]
-            .as_str()
-            .is_some_and(|url| url.ends_with("/actions/runs/1234"))
-        {
+        if entry["request"]["get"].as_str().is_some_and(|url| {
+            url.contains("/actions/workflows/")
+                && url.ends_with(&format!("/runs?per_page={RUNS_PER_PAGE}"))
+        }) {
             entry["answer"]["status"] = json!(404);
         }
     }
@@ -6223,7 +6380,6 @@ fn apply_publishes_what_needs_you() {
         let report = block(run_within(forge, forge, &full, within, &bounds)).unwrap();
         (report, limit - bounds.left.get())
     };
-    let (_, used) = within(&forge_with(Some(&body)), PASS_REQUEST_LIMIT);
     let busy_context = || {
         let mut forge = with_context(forge_with(Some(&body)));
         let children: Vec<_> = (100..130)
@@ -6256,27 +6412,106 @@ fn apply_publishes_what_needs_you() {
         forge
     };
     let baseline = busy_context();
-    let (baseline_report, context_used) = within(&baseline, PASS_REQUEST_LIMIT);
+    let (baseline_report, _) = within(&baseline, PASS_REQUEST_LIMIT);
     assert_eq!(
         edited(&baseline, &baseline_report)["epics"]["cgwalters-forge/tracker#766"]["complete"],
         true
     );
-    let summary_before_activity =
-        (context_used - 20..=context_used + needs::NEEDS_READS).any(|limit| {
-            let limited_context = busy_context();
-            let (report, _) = within(&limited_context, limit);
-            let list = edited(&limited_context, &report);
-            list["summaries"] == "complete"
-                && list["epics"]["cgwalters-forge/tracker#766"]["complete"] == false
-        });
+    // A deferred child's newly read activity must reach its validated epic
+    // even when this pass cannot afford to expand the root again.
+    let mut deferred = busy_context();
+    for entry in &mut deferred.replay.requests {
+        if entry["request"]["graphql"] == fnv(needs::epics::CONTEXT_QUERY) {
+            let node = &mut entry["answer"]["data"]["repository"]["issueOrPullRequest"];
+            node["comments"] = json!({"nodes":[],"totalCount":0});
+            node["closedByPullRequestsReferences"]["totalCount"] = 0.into();
+        }
+    }
+    let mut resumed_config = with_wip(2);
+    resumed_config.state = Some("pass-state.json".into());
+    let resume = |forge: &Forge, state| {
+        let bounds = Bounds::new(300, Instant::now() + Duration::from_secs(60));
+        let report = block(run_within(
+            forge,
+            forge,
+            &resumed_config,
+            (
+                state,
+                Mode::Actions(&own()),
+                Limits::default(),
+                forge.replay.now,
+            ),
+            &bounds,
+        ))
+        .unwrap();
+        assert!(bounds.publication_requests.get() <= 300 * HOLDS_SHARE / 100);
+        report
+    };
+    let first = resume(&deferred, State::default());
+    let state = first.state.unwrap();
+    let child = state.holds_pending.first().unwrap();
+    assert!(child.starts_with("example/activity#"), "{child}");
+    let number = child.split_once('#').unwrap().1.parse::<u64>().unwrap();
+    let comments: Vec<_> = (0..20)
+        .map(|_| {
+            json!({"author":{"login":"cgwalters-bot"},
+        "createdAt":"2026-10-23T12:00:00Z", "body":format!(
+            "<!-- {}: 1@x -->\nhttps://github.com/cgwalters-forge/tracker/actions/runs/1234",
+            plan::DISPATCH_MARKER)})
+        })
+        .collect();
+    for entry in &mut deferred.replay.requests {
+        if entry["request"]["graphql"] == fnv(needs::epics::CONTEXT_QUERY)
+            && entry["request"]["variables"]["number"] == number
+        {
+            entry["answer"]["data"]["repository"]["issueOrPullRequest"]["comments"] =
+                json!({"nodes":comments,"totalCount":20});
+        }
+    }
+    let reads = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let observed = reads.clone();
+    deferred.on_get = Some(Box::new(move |url, _| {
+        observed.borrow_mut().push(url.to_owned())
+    }));
+    deferred.writes.borrow_mut().clear();
+    let second = resume(&deferred, State::from_json(&state.to_json()).unwrap());
+    let list = edited(&deferred, &second);
+    let activity = &list["epics"]["cgwalters-forge/tracker#766"];
+    assert!(
+        activity["activeWhy"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("recent-run")),
+        "{activity}; child={child}; reads={:?}; lines={:?}",
+        reads.borrow(),
+        second.lines
+    );
+    assert_eq!(activity["complete"], false);
+    let reads = reads.borrow();
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|url| url.contains("/actions/workflows/")
+                && url.ends_with(&format!("/runs?per_page={RUNS_PER_PAGE}")))
+            .count(),
+        1
+    );
+    assert!(!reads.iter().any(|url| url.ends_with("/actions/runs/1234")));
+    let summary_before_activity = (200..=PASS_REQUEST_LIMIT).step_by(25).any(|limit| {
+        let limited_context = busy_context();
+        let (report, _) = within(&limited_context, limit);
+        let list = edited(&limited_context, &report);
+        list["summaries"] == "complete"
+            && list["epics"]["cgwalters-forge/tracker#766"]["complete"] == false
+    });
     assert!(
         summary_before_activity,
         "summary enrichment must precede optional activity reads"
     );
-    // The hold comment's edits, the listing, its issue and two summaries
-    // are the last reads of an unchanged pass: leave room for the first.
+    // A small publication share leaves proposals and summaries unread while
+    // still publishing the verified carry records.
     let forge = forge_with(Some(&body));
-    let (report, _) = within(&forge, used - 5 + needs::NEEDS_READS - 4);
+    let (report, _) = within(&forge, 100);
     let list = edited(&forge, &report);
     let read = json!([
         list["sources"]["proposals"],

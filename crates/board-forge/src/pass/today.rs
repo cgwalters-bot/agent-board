@@ -53,7 +53,7 @@ impl<C> Reads<'_, C> {
         );
         ensure!(Instant::now() <= self.deadline, "today time bound is spent");
         ensure!(
-            self.client.bounds.left.get() > WRITE_RESERVE + HOLDS_READS,
+            self.client.bounds.available() > WRITE_RESERVE + HOLDS_READS,
             "today leaves the holds publication reserve"
         );
         self.left.set(self.left.get() - 1);
