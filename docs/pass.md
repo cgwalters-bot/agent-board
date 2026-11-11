@@ -92,8 +92,8 @@ or without `needs-human`. Claims and dispatch records stay on the tracking
 issue; the intake neither resets fix rounds nor removes holds. Its brief
 permits an answer or plan on the tracking issue, not source-PR writes or code
 changes. The existing acknowledgement is allowed only in repositories the
-pass may write. Use `pr.directionFirst` where the followed repositories would
-otherwise spend the share first (below).
+pass may write. Operator direction runs before the followed repositories'
+activity and pull request reads (below).
 Other public upstream threads are staged as issues in the matching
 `midstream` topic-selected fork. Matching uses GitHub's verified fork `parent`,
 not the thread body, title or a guessed repository name. One metadata read per
@@ -134,15 +134,24 @@ reports completion.
 Search is still not a complete inventory: lag beyond the overlap, or within
 such a skipped overlap, can hide direction.
 
-The intake reads within stage 2's request share, after the followed
-repositories' activity and pull requests by default. Where those spend the
-share, it is an `operator comments deferred:` line, and a pass that does so
-every time never answers: the operator's question on a draft the poll had
-stopped following (cgwalters-forge/composefs-rs#54) waited a day that way
-(agent-board#840). `pr.directionFirst: true` (off by default) runs the
-intake's searches first, before those reads, within the same share and the
-same bounds; the walk then takes what is left, and the share cursor carries
-what it does not reach to the next pass as before. The trade-off is the
+When enabled, intake runs first within stage 2, before the followed
+repositories' activity and pull requests, hence before epics and scheduling.
+`pr.directionFirst` no longer changes a pass's ordering; the standalone poll
+retains that option. With `notifications`, maintain leaves at least 100
+requests (plus the write reserve), and intake and its routing setup get their
+own turn of up to 100 requests, or all remaining read capacity if less, before
+authored-PR discovery (including its epic reads) and review ranking.
+Later stages cannot reserve that share away, even with `reserveScheduling`.
+The retries of waiting threads share at most half of that turn, as they do of
+the standalone poll's budget, so one long history leaves the searches theirs.
+This fixes passes that never read operator answers because scheduling kept
+all the remaining requests (agent-board#876). Intake remains off by default;
+its existing search, history, dispatch and write bounds remain in force, as
+do the pass's global request and time limits. Verified midstream routing
+still precedes the searches. Comment decision lines name the thread, comment
+IDs and action or reason it was not started; a dispatch line includes its run URL.
+The walk takes what is left, and the share cursor carries what it does not
+reach to the next pass as before. The trade-off is the
 mirror image: an intake with many waiting threads to retry can leave the
 walk too little to reach a repository, a `pull requests: the stage's request
 share is spent` line, until those threads settle. The intake's starts come

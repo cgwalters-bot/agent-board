@@ -81,6 +81,11 @@ const LEASE_RECHECK_REQUESTS: usize = 2;
 /// Requests only writes may spend: a claim already posted is still sent or
 /// noted when its reads have spent the rest.
 const WRITE_RESERVE: usize = 4;
+
+/// Bounded first turn for operator intake and its required routing reads.
+/// Scheduling may not reserve these requests away.
+const OPERATOR_REQUESTS: usize = 100;
+
 /// The percentage of the pass's requests that stage 2's reads leave to the
 /// stages after it: epics, scheduling and its starts, Status and the holds
 /// (agent-board#748), 377 of [`PASS_REQUEST_LIMIT`]. Without it a sweep of
@@ -1928,6 +1933,9 @@ impl Config {
             ..PollPolicy::default()
         };
         self.pr.poll.apply(&mut policy);
+        // Operator answers must not wait behind the PR walk (#876). The
+        // standalone poll retains its configurable ordering.
+        policy.direction_first = true;
         poll::Config {
             operator: self.operator.clone(),
             bot: self.bot.clone(),
@@ -3904,6 +3912,10 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
             0
         },
     );
+    if config.notifications {
+        // A due digest must leave the operator intake its turn too.
+        bounds.kept.set(bounds.kept.get().max(OPERATOR_REQUESTS));
+    }
     let maintained = scheduler.maintain(state.maintain.take(), &git_ref);
     if let Some(line) = bounds.share_line() {
         scheduler.line(line);
@@ -4554,8 +4566,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Stage 2: the followed pull requests, paced by stage 1's reading where
     /// it has one, after the `earlier` runs this pass started. How many runs
     /// it started.
-    fn follow(&mut self, state: State, git_ref: &str, earlier: usize) -> usize {
+    fn follow(&mut self, mut state: State, git_ref: &str, earlier: usize) -> usize {
         let config = self.config;
+        let bounds = self.client.bounds;
+        let later_share = bounds.kept.get();
+        if config.notifications {
+            bounds.kept.set(
+                bounds
+                    .left
+                    .get()
+                    .saturating_sub(WRITE_RESERVE + OPERATOR_REQUESTS),
+            );
+        }
         // [`Config::check`]'s refusals of these in `follow`: a run on the
         // direction would steer every brief. Promotion forks owned by midstream
         // may be followed: stage 2's midstream policy prevents merges/rebases.
@@ -4650,6 +4672,63 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         }
+        let mut fresh = self.snapshot.clone().flatten();
+        if let Some(why) = self.budget_hold(1.0 + FOLLOW_MARGIN) {
+            self.line(format!("budget: {why}; pull requests' fix rounds wait"));
+            let held = json!({"hold": true, "reason": "budget", "next_dispatch_at": null});
+            let pools: serde_json::Map<String, Value> = (config.pools.0.iter())
+                .map(|(name, _)| (name.clone(), held.clone()))
+                .collect();
+            let at = self.now.format(&Rfc3339).unwrap_or_default();
+            fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
+        }
+        let mut poll = config.poll(fresh.as_ref());
+        poll.policy.notification_intake = routes.as_ref().map(|r| r.staging.clone());
+        poll.policy.no_merge.extend(midstreams);
+        let mut direction = None;
+        let mut intake_starts = 0;
+        if config.notifications {
+            // Give intake its own bounded turn before authored_named's epic
+            // reads and review ranking. Later stages cannot reserve it away.
+            // The intake reserves half of what it is given for discovery
+            // ahead of the retries of waiting threads: that must be its
+            // share here, what routing left of it, not the standalone poll's
+            // budget, or one long history spends the share before discovery.
+            let share = bounds.available().saturating_sub(WRITE_RESERVE);
+            let result = poll::run_direction_capped(
+                &self.client,
+                &self.client,
+                &poll,
+                state.clone(),
+                &self.follows,
+                self.apply.then(|| poll::Apply {
+                    dispatcher: &self.dispatcher,
+                    workflow: config.dispatch_workflow.clone(),
+                    pools: config.pr.fix_pools.clone(),
+                    git_ref: Some(git_ref.to_owned()),
+                }),
+                self.caps,
+                self.now,
+                share,
+            );
+            bounds.kept.set(later_share);
+            match result {
+                Ok((mut outcome, requests)) => {
+                    intake_starts = outcome.dispatched;
+                    state = std::mem::take(&mut outcome.state);
+                    self.report.lines.append(&mut outcome.lines);
+                    self.report.failures += outcome.errors;
+                    outcome.errors = 0;
+                    self.report.state = Some(state.clone());
+                    direction = Some((outcome, requests));
+                }
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("operator comments error: {error:#}"));
+                    return intake_starts;
+                }
+            }
+        }
         // Unread, the repositories it added last pass would be decided as
         // gone, and what was held there dropped.
         let (mut swept, mut waiting) = (Vec::new(), Vec::new());
@@ -4669,12 +4748,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     self.line(format!(
                         "budget: pull requests stopped at its share; authored pull requests wait for the next pass: {error:#}"
                     ));
-                    return 0;
+                    return intake_starts;
                 }
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("follow error: authored pull requests: {error:#}"));
-                    return 0;
+                    return intake_starts;
                 }
             };
             let found = read.len();
@@ -4696,7 +4775,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("follow error: authored turn: {error:#}"));
-                    return 0;
+                    return intake_starts;
                 }
             };
             // As with `repositoriesPerPass`, only a pass that applies moves
@@ -4726,27 +4805,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         if self.follows.is_empty() && !config.notifications {
             self.line("follow: no repositories".into());
-            return 0;
+            return intake_starts;
         }
-        let mut fresh = self.snapshot.clone().flatten();
-        if let Some(why) = self.budget_hold(1.0 + FOLLOW_MARGIN) {
-            self.line(format!("budget: {why}; pull requests' fix rounds wait"));
-            // Every pool held, as the poll paces fix rounds by the snapshot:
-            // a pool it lacks would be unpaced room.
-            let held = json!({"hold": true, "reason": "budget", "next_dispatch_at": null});
-            let pools: serde_json::Map<String, Value> = (config.pools.0.iter())
-                .map(|(name, _)| (name.clone(), held.clone()))
-                .collect();
-            let at = self.now.format(&Rfc3339).unwrap_or_default();
-            fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
-        }
-        let mut poll = config.poll(fresh.as_ref());
-        poll.policy.notification_intake = routes.map(|r| r.staging);
-        poll.policy.no_merge.extend(midstreams);
         poll.policy.no_merge.extend(swept.iter().cloned());
         poll.policy.bot_only = swept;
         if !config.pr.poll.review_pools.is_empty() {
-            let (wip, ranks) = self.review_bounds(git_ref, earlier);
+            let (wip, ranks) = self.review_bounds(git_ref, earlier + intake_starts);
             poll.policy.review_wip = wip;
             poll.policy.review_caller_workflow = Some(config.dispatch_workflow.clone());
             poll.policy.review_ranks = ranks;
@@ -4759,7 +4823,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         });
         let follow = &self.follows;
         let deferred_state = state.clone();
-        match poll::run_capped(
+        match poll::run_capped_after_direction(
             &self.client,
             &self.client,
             &poll,
@@ -4768,6 +4832,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             apply,
             Some(self.caps),
             self.now,
+            direction,
         ) {
             Ok(mut outcome) => {
                 // Out of its turn, as outside the envelope: what the last
@@ -4812,12 +4877,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     "budget: pull requests stopped at its share; discovery waits for the next pass"
                         .into(),
                 );
-                0
+                intake_starts
             }
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("follow error: {error:#}"));
-                0
+                intake_starts
             }
         }
     }

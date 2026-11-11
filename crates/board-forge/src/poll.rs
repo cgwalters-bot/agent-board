@@ -8409,11 +8409,39 @@ pub fn run_capped<R: Rest, G: Transport>(
     rest: &R,
     graphql: &G,
     config: &Config,
+    state: State,
+    (watch, follow): (&[String], &[String]),
+    apply: Option<Apply<'_, R>>,
+    caps: Option<&caps::Caps>,
+    now: OffsetDateTime,
+) -> Result<Outcome> {
+    run_capped_after_direction(
+        rest,
+        graphql,
+        config,
+        state,
+        (watch, follow),
+        apply,
+        caps,
+        now,
+        None,
+    )
+}
+
+/// Continue stage 2 after its separately budgeted operator intake. Its starts
+/// still count against the poll's three-start limit and its cursors and logs
+/// remain part of the same outcome.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
+    rest: &R,
+    graphql: &G,
+    config: &Config,
     mut state: State,
     (watch, follow): (&[String], &[String]),
     apply: Option<Apply<'_, R>>,
     caps: Option<&caps::Caps>,
     now: OffsetDateTime,
+    direction: Option<(Outcome, usize)>,
 ) -> Result<Outcome> {
     let policy = &config.policy;
     ensure!(
@@ -8471,6 +8499,12 @@ pub fn run_capped<R: Rest, G: Transport>(
         apply,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps,
+        dispatched: direction.as_ref().map_or(0, |(o, _)| o.dispatched),
+        remaining: direction
+            .as_ref()
+            .map_or(POLL_REQUEST_LIMIT, |(_, requests)| {
+                POLL_REQUEST_LIMIT.saturating_sub(*requests)
+            }),
         ..Pass::new(rest, graphql, config, now)
     };
     // Markers and claims count only as the bot's: written by another
@@ -8485,7 +8519,8 @@ pub fn run_capped<R: Rest, G: Transport>(
             config.bot
         );
     }
-    let mut outcome = Outcome::default();
+    let direction_read = direction.is_some();
+    let mut outcome = direction.map(|(outcome, _)| outcome).unwrap_or_default();
     // Only an applying pass writes, so only it records refusals.
     if config.policy.notification_intake.is_some() {
         pass.intake_refused = std::mem::take(&mut state.intake_refused);
@@ -8494,7 +8529,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     // What the operator asks the bot is answered within the pass: before the
     // followed repositories' reads, whose share would otherwise leave the
     // intake nothing pass after pass (agent-board#840).
-    if config.policy.direction_first {
+    if config.policy.direction_first && !direction_read {
         read_direction(&mut pass, config, &follow, &mut cursors, &mut outcome);
     }
     // A listed repository that is not there, as one a merged configuration
@@ -8647,7 +8682,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     pass.rest.under_way(false);
     // After the followed pull requests, which come first for the runs a pass
     // may start, unless `directionFirst` read it before them.
-    if !config.policy.direction_first {
+    if !config.policy.direction_first && !direction_read {
         read_direction(&mut pass, config, &follow, &mut cursors, &mut outcome);
     }
     if let Some(line) = pass.pace_line() {
@@ -8713,6 +8748,64 @@ struct Cursors {
     intake_waiting: BTreeMap<String, String>,
     notify_since: Option<String>,
     notify_before: Option<String>,
+}
+
+/// The pass's enabled intake, before optional authored-PR discovery and review
+/// ranking. The caller supplies a validated pass config and its own request
+/// `share`, the reads its client admits the intake, which bounds the intake's
+/// reservations ([`Pass::operator_comments`]) in place of
+/// [`POLL_REQUEST_LIMIT`]; all intake writes use the same caps as the rest of
+/// stage 2. How many requests it spent, of the poll's budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
+    rest: &R,
+    graphql: &G,
+    config: &Config,
+    mut state: State,
+    follow: &[String],
+    apply: Option<Apply<'_, R>>,
+    caps: &caps::Caps,
+    now: OffsetDateTime,
+    share: usize,
+) -> Result<(Outcome, usize)> {
+    let budget = share.min(POLL_REQUEST_LIMIT);
+    let mut pass = Pass {
+        apply,
+        followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
+        caps: Some(caps),
+        intake_refused: std::mem::take(&mut state.intake_refused),
+        remaining: budget,
+        ..Pass::new(rest, graphql, config, now)
+    };
+    if pass.apply.is_some() {
+        let user = pass.get("user")?;
+        ensure!(
+            text(&user, "/login") == config.bot,
+            "--apply writes as GH_TOKEN's user {:?}, not the bot {:?}",
+            text(&user, "/login"),
+            config.bot
+        );
+    }
+    let mut cursors = Cursors::new(config, &mut state);
+    let mut outcome = Outcome::default();
+    read_direction(
+        &mut pass,
+        config,
+        &follow.iter().collect(),
+        &mut cursors,
+        &mut outcome,
+    );
+    pass.rest.under_way(false);
+    state.operator_cursor = cursors.operator_cursor;
+    state.operator_page = cursors.operator_page;
+    state.intake_page = cursors.intake_page;
+    state.intake_waiting = cursors.intake_waiting;
+    state.notify_since = cursors.notify_since;
+    state.notify_before = cursors.notify_before;
+    state.intake_refused = pass.intake_refused;
+    outcome.dispatched = pass.dispatched;
+    outcome.state = state;
+    Ok((outcome, budget - pass.remaining))
 }
 
 impl Cursors {

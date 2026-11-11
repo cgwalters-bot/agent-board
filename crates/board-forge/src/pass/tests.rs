@@ -15064,7 +15064,6 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
             p.rebase_rounds,
             p.check_reruns,
             p.unstall,
-            p.direction_first,
             p.owner_branches,
             p.own_space_only,
             p.fold_rounds,
@@ -15088,6 +15087,13 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
         "conflictFixPool": "claude", "mergeQueue": {"tries": 2}, "rebaseRounds": 1,
     });
     let unset = shared(&PollPolicy::default());
+    assert!(pass(&json!({})).unwrap().direction_first);
+    assert!(
+        pass(&json!({"directionFirst": false}))
+            .unwrap()
+            .direction_first
+    );
+    assert!(!poll(&json!({})).unwrap().direction_first);
     for (pr, ok) in [
         (json!({}), true),
         (every.clone(), true),
@@ -18227,6 +18233,251 @@ fn notifications_run_without_followed_repositories_and_report_denied_reads() {
             report.lines
         );
         assert!(!report.lines.iter().any(|l| l == "follow: no repositories"));
+    }
+}
+
+/// An operator answer must be read before PR activity even when scheduling's
+/// reservation is larger than the pass's entire remaining budget (#876).
+#[test]
+fn operator_action_answer_precedes_prs_with_a_nearly_spent_budget() {
+    for (reserve, authored, reviews, routing) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (true, true, false, false),
+        (true, false, true, false),
+        (true, true, true, true),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let repo = "cgwalters-forge/tracker";
+        let issue = json!({"number": 1540, "repository_url": format!("{API_ROOT}repos/{repo}"),
+            "html_url": format!("https://github.com/{repo}/issues/1540"),
+            "user": {"login": "cgwalters-bot"}, "state": "open", "title": "Operator action",
+            "body": "Please answer this question.", "labels": [{"name": "operator-action"}],
+            "updated_at": forge.replay.now.format(&Rfc3339).unwrap()});
+        let at = forge.replay.now.format(&Rfc3339).unwrap();
+        let since = (forge.replay.now - time::Duration::days(2) - time::Duration::minutes(10))
+            .replace_nanosecond(0)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        for qualifier in ["mentions:cgwalters-bot", "author:cgwalters-bot"] {
+            let query: String = url::form_urlencoded::byte_serialize(
+                format!("commenter:cgwalters updated:>={since} {qualifier}").as_bytes(),
+            )
+            .collect();
+            forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page=1")},
+                "answer": {"status": 200, "link": null, "body": {"items": [issue], "total_count": 1, "incomplete_results": false}}}));
+        }
+        for (path, body) in [
+            ("user".into(), json!({"login": "cgwalters-bot"})),
+            (format!("repos/{repo}/issues/1540"), issue),
+            (
+                format!("repos/{repo}/issues/1540/comments?per_page=100"),
+                json!([
+                    {"id": 87601, "user": {"login": "cgwalters"}, "created_at": at, "updated_at": at,
+                     "body": "@cgwalters-bot Please plan the fix."}
+                ]),
+            ),
+        ] {
+            forge
+                .replay
+                .requests
+                .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+                "answer": {"status": 200, "link": null, "body": body}}));
+        }
+        followed(&mut forge.replay, (AUTHORED_REPO, 1), json!({}), json!([]));
+        let mut cfg = config(json!({"notifications": true, "reserveScheduling": reserve,
+            "follow": [AUTHORED_REPO], "pr": {"fixPools": ["claude"], "directionFirst": false}}));
+        if authored {
+            cfg.authored = Some(3);
+        }
+        if reviews {
+            cfg.pr.poll.review_pools = vec!["claude".into()];
+        }
+        if routing {
+            cfg.midstream = Some(midstream::Midstream {
+                owner: "cgwalters-forge".into(),
+                topic: "bot-midstream".into(),
+            });
+            forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}orgs/cgwalters-forge/repos?per_page=100")},
+                "answer": {"status": 200, "link": null, "body": []}}));
+        }
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        bounds.left.set(80);
+        let report = block(run_within(
+            &forge,
+            &forge,
+            &cfg,
+            (
+                State::default(),
+                Mode::Actions(&own()),
+                Limits::default(),
+                forge.replay.now,
+            ),
+            &bounds,
+        ))
+        .unwrap();
+        assert_eq!(report.tally.1.started, 1, "{:#?}", report.lines);
+        let answer = report
+            .lines
+            .iter()
+            .position(|l| l.contains("operator comments issuecomment-87601: triage ->"));
+        assert!(answer.is_some(), "{:#?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .skip(answer.unwrap() + 1)
+                .any(|l| l.contains(AUTHORED_REPO)
+                    || l.contains("pull requests stopped at its share")),
+            "{:#?}",
+            report.lines
+        );
+        assert!(
+            forge.dispatches().contains(&format!("{repo}#1540")),
+            "{:#?}",
+            report.lines
+        );
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("operator comments deferred:")),
+            "{:#?}",
+            report.lines
+        );
+        assert!(bounds.left.get() > 0);
+    }
+}
+
+/// A waiting thread whose history is longer than the intake's turn must not
+/// spend the half of that turn kept for discovery: the intake reserves
+/// against the share the pass gives it, not the standalone poll's budget, so
+/// a fresh answer elsewhere is still found pass after pass while the history
+/// stays waiting.
+#[test]
+fn an_oversized_waiting_history_leaves_the_intake_turn_its_discovery() {
+    let repo = "cgwalters-forge/tracker";
+    let mut forge = Forge::new(None, false);
+    let now = forge.replay.now;
+    let at = now.format(&Rfc3339).unwrap();
+    let issue = json!({"number": 1540, "repository_url": format!("{API_ROOT}repos/{repo}"),
+        "html_url": format!("https://github.com/{repo}/issues/1540"),
+        "user": {"login": "cgwalters-bot"}, "state": "open", "title": "Operator action",
+        "body": "Please answer this question.", "labels": [{"name": "operator-action"}],
+        "updated_at": at});
+    let answer = json!([
+        {"id": 87601, "user": {"login": "cgwalters"}, "created_at": at, "updated_at": at,
+         "body": "@cgwalters-bot Please plan the fix."}
+    ]);
+    for (path, body) in [
+        ("user".into(), json!({"login": "cgwalters-bot"})),
+        (format!("repos/{repo}/issues/1540"), issue.clone()),
+        (
+            format!("repos/{repo}/issues/1540/comments?per_page=100"),
+            answer,
+        ),
+        (
+            format!("repos/{repo}/issues/1500"),
+            json!({"number": 1500, "repository_url": format!("{API_ROOT}repos/{repo}"),
+                "html_url": format!("https://github.com/{repo}/issues/1500"),
+                "user": {"login": "cgwalters-bot"}, "state": "open", "title": "Long thread",
+                "body": "", "labels": [], "updated_at": at}),
+        ),
+    ] {
+        forge
+            .replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+            "answer": {"status": 200, "link": null, "body": body}}));
+    }
+    // More pages than the whole turn admits, each linking to the next.
+    let pages = OPERATOR_REQUESTS + 20;
+    let history = format!("{API_ROOT}repos/{repo}/issues/1500/comments?per_page=100");
+    for page in 1..=pages {
+        let url = match page {
+            1 => history.clone(),
+            _ => format!("{history}&page={page}"),
+        };
+        let next = (page < pages).then(|| format!("<{history}&page={}>; rel=\"next\"", page + 1));
+        let body = json!([{"id": 1_500_000 + page, "user": {"login": "cgwalters"},
+            "created_at": at, "updated_at": at, "body": format!("note {page}")}]);
+        forge.replay.requests.push(json!({"request": {"get": url},
+            "answer": {"status": 200, "link": next, "body": body}}));
+    }
+    followed(&mut forge.replay, (AUTHORED_REPO, 1), json!({}), json!([]));
+    let cfg = config(json!({"notifications": true, "follow": [AUTHORED_REPO],
+        "pr": {"fixPools": ["claude"]}}));
+    let waiting = format!("{repo}#1500");
+    let mut state = State::default();
+    state.intake_waiting.insert(waiting.clone(), at.clone());
+    let lag = time::Duration::minutes(10);
+    for pass in 1..=2 {
+        // The searches of this pass, from the cursor the last one saved.
+        let since = state
+            .operator_cursor
+            .as_deref()
+            .map(|c| OffsetDateTime::parse(c, &Rfc3339).unwrap())
+            .unwrap_or(now - time::Duration::days(2))
+            .replace_nanosecond(0)
+            .unwrap()
+            - lag;
+        let since = since.format(&Rfc3339).unwrap();
+        let starts = [state.operator_page, state.intake_page].map(|p| p.unwrap_or(1));
+        for (qualifier, start) in ["mentions:cgwalters-bot", "author:cgwalters-bot"]
+            .into_iter()
+            .zip(starts)
+        {
+            let query: String = url::form_urlencoded::byte_serialize(
+                format!("commenter:cgwalters updated:>={since} {qualifier}").as_bytes(),
+            )
+            .collect();
+            forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page={start}")},
+                "answer": {"status": 200, "link": null, "body": {"items": [issue], "total_count": 1, "incomplete_results": false}}}));
+        }
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        let report = block(run_within(
+            &forge,
+            &forge,
+            &cfg,
+            (state.clone(), Mode::Actions(&own()), Limits::default(), now),
+            &bounds,
+        ))
+        .unwrap();
+        let lines = &report.lines;
+        assert_eq!(report.failures, 0, "pass {pass}: {lines:#?}");
+        // The retry stopped at the intake's own budget, not the pass's share.
+        assert!(
+            lines.iter().any(|l| l.contains(&waiting)
+                && l.contains("warning: operator comments error: poll request budget")),
+            "pass {pass}: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("operator comments issuecomment-87601: triage ->")),
+            "pass {pass}: {lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("operator comments deferred:")),
+            "pass {pass}: {lines:#?}"
+        );
+        assert_eq!(
+            forge
+                .dispatches()
+                .iter()
+                .filter(|d| *d == &format!("{repo}#1540"))
+                .count(),
+            pass,
+            "pass {pass}: {lines:#?}"
+        );
+        state = report.state.unwrap();
+        assert!(
+            state.intake_waiting.contains_key(&waiting),
+            "pass {pass}: {lines:#?}"
+        );
     }
 }
 
