@@ -10,6 +10,315 @@ const CONFIG: &str = include_str!("../../../../fixtures/pass/config.json");
 /// appended by hand, finding none ([`merged`] gives tracker#468's one).
 const BOARD: &str = include_str!("../../../../fixtures/pass/board-2026-10-23.json");
 
+/// Same recorded board for both algorithms, with two ready children of
+/// the first P0 epic, a competing P0 orphan, and 400 unrelated parents.
+fn top_down_fixture() -> Replay {
+    let mut replay = without_epics(replay());
+    sub_issue(&mut replay, "cgwalters-forge/tracker", "cgwalters");
+    let labelling = replay.requests.last().unwrap().clone();
+    let mut additions = Vec::new();
+    for entry in &mut replay.requests {
+        let Some(nodes) = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let Some(first) = nodes.iter_mut().find(|n| n["content"]["number"] == 446) else {
+            continue;
+        };
+        first["content"]["author"]["login"] = "cgwalters".into();
+        first["priority"]["name"] = "P2".into();
+        let template = first.clone();
+        let mut second = template.clone();
+        second["content"]["number"] = 459.into();
+        nodes.push(second);
+        let mut orphan = template.clone();
+        orphan["content"]["number"] = 533.into();
+        orphan["content"]["parent"] = Value::Null;
+        orphan["priority"]["name"] = "P0".into();
+        nodes.push(orphan);
+        let mut epic = template.clone();
+        epic["content"]["number"] = 135.into();
+        epic["content"]["parent"] = Value::Null;
+        epic["content"]["labels"] = json!({"nodes":[{"name":"epic"}],"totalCount":1});
+        epic["priority"]["name"] = "P0".into();
+        epic["content"]["createdAt"] = "2026-01-01T00:00:00Z".into();
+        let mut other_epic = epic.clone();
+        other_epic["content"]["number"] = 136.into();
+        other_epic["content"]["createdAt"] = "2026-02-01T00:00:00Z".into();
+        nodes.push(other_epic);
+        let mut other_child = template.clone();
+        other_child["content"]["number"] = 540.into();
+        other_child["content"]["parent"]["number"] = 136.into();
+        other_child["priority"]["name"] = "P0".into();
+        nodes.push(other_child);
+        nodes.push(epic);
+        for number in 1000..1400 {
+            let mut child = template.clone();
+            child["content"]["number"] = number.into();
+            child["content"]["parent"]["number"] = (number + 1000).into();
+            nodes.push(child);
+            let mut label = labelling.clone();
+            label["request"]["variables"]["number"] = (number + 1000).into();
+            additions.push(label);
+        }
+    }
+    replay.requests.extend(additions);
+    // Translate recorded facts into the new endpoint/query shapes, without
+    // inventing a different board for the optimized run.
+    let mut additions = Vec::new();
+    let mut other_labelling = labelling.clone();
+    other_labelling["request"]["variables"]["number"] = 136.into();
+    replay.requests.push(other_labelling);
+    for entry in &replay.requests {
+        let query = board_query(false, false);
+        if entry["request"]["graphql"] == fnv(&query) {
+            let mut slim = entry.clone();
+            slim["request"]["graphql"] = fnv(&query.replace(BOARD_PULLS, "")).into();
+            additions.push(slim);
+        }
+        if let Some(nodes) = entry["answer"]
+            .pointer("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array)
+        {
+            for node in nodes {
+                let issue = &node["content"];
+                let repo = text(issue, "/repository/nameWithOwner");
+                let (owner, name) = repo.split_once('/').unwrap();
+                let mut refs = issue["closedByPullRequestsReferences"].clone();
+                refs["pageInfo"] = json!({"hasNextPage":false,"endCursor":null});
+                additions.push(json!({"request":graphql_key(PULLS_QUERY, &json!({"owner":owner,"name":name,"number":issue["number"],"cursor":null})),
+                    "answer":{"data":{"repository":{"issue":{"closedByPullRequestsReferences":refs}}}}}));
+            }
+        }
+    }
+    additions.push(json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/135/events?per_page=100&page=1")},
+        "answer":{"status":200,"etag":"epic-events","body":[{"event":"labeled","label":{"name":"epic"},"actor":{"type":"User","login":"cgwalters"}}]}}));
+    replay.requests.extend(additions);
+    replay
+}
+
+#[test]
+fn top_down_fills_slots_before_reading_unrelated_parents() {
+    for top_down in [false, true] {
+        let replay = top_down_fixture();
+        let cfg = config(json!({"topDown":top_down,"wip":4}));
+        let report = preview(&cfg, &replay);
+        eprintln!("topDown={top_down}: {}", report.summary_line());
+        if top_down {
+            assert_eq!(report.failures, 0, "{:?}", report.lines);
+            let starts: Vec<_> = report
+                .lines
+                .iter()
+                .filter(|l| l.starts_with("start "))
+                .collect();
+            assert_eq!(
+                starts,
+                [
+                    "start triage cgwalters-forge/tracker#446 pool=claude",
+                    "start triage cgwalters-forge/tracker#459 pool=claude"
+                ]
+            );
+            assert!(report.spent.requests < 100, "{}", report.spent);
+        } else {
+            assert!(report.spent.requests > 300, "{}", report.spent);
+        }
+    }
+}
+
+/// A recorded REST fixture with live conditional semantics. Every validator
+/// is checked; 304s contain no body or pagination headers.
+struct ConditionalFixture(Replay);
+
+impl Rest for ConditionalFixture {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        let mut response = self.0.get(url, None)?;
+        if let Some(validator) = validator {
+            ensure!(
+                validator == ("If-None-Match", "fixture-version"),
+                "wrong validator"
+            );
+            return Ok(RestResponse {
+                status: 304,
+                etag: None,
+                last_modified: None,
+                link: None,
+                body: Value::Null,
+            });
+        }
+        response.etag = Some("fixture-version".into());
+        Ok(response)
+    }
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.0.send(method, url, body)
+    }
+}
+
+impl Transport for ConditionalFixture {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(&self.0, query, variables)
+    }
+}
+
+impl crate::github::GraphQl for ConditionalFixture {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
+impl Broker for ConditionalFixture {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.0.usage(url)
+    }
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.0.grant(url)
+    }
+}
+
+#[test]
+fn persisted_cache_revalidates_an_unchanged_recorded_pass() {
+    let fixture = ConditionalFixture(replay());
+    // Busy steady state: no new start, but all run reads must still reach
+    // GitHub. Projects v2 status queries are not conditionally cacheable.
+    let mut cfg = config(json!({"state":"pass-state.json", "wip":2}));
+    cfg.epics = None;
+    let first = block(run(
+        &fixture,
+        &fixture,
+        &cfg,
+        State::default(),
+        (Mode::Preview, Limits::default()),
+        fixture.0.now,
+    ))
+    .unwrap();
+    let state = State::from_json(&first.state.as_ref().unwrap().to_json()).unwrap();
+    assert!(!state.pass_responses.is_empty());
+    let second = block(run(
+        &fixture,
+        &fixture,
+        &cfg,
+        state,
+        (Mode::Preview, Limits::default()),
+        fixture.0.now,
+    ))
+    .unwrap();
+    eprintln!(
+        "cold: {}\nwarm: {}",
+        first.summary_line(),
+        second.summary_line()
+    );
+    assert_eq!(first.failures + second.failures, 0, "{:?}", second.lines);
+    assert_eq!(first.lines, second.lines);
+    assert_eq!(second.spent.requests, 7);
+    assert_eq!(second.spent.revalidated, 5);
+    assert_eq!(
+        first.spent.requests,
+        second.spent.requests + second.spent.revalidated
+    );
+    assert!(second.summary_line().contains("304s"));
+    // Persistence is opt-in even if a caller passes a warm State.
+    let mut cfg = config(json!({"wip":2}));
+    cfg.epics = None;
+    let uncached = preview(&cfg, &fixture.0);
+    assert_eq!(uncached.spent.requests, first.spent.requests);
+    assert_eq!(uncached.spent.revalidated, 0);
+}
+
+#[test]
+fn cache_preserves_links_but_rechecks_full_final_pages() {
+    let fixture = ConditionalFixture(replay());
+    let url = format!("{API_ROOT}repos/cgwalters-forge/bot-ops/issues/1/comments?per_page=100");
+    for (body, link, refunds) in [
+        (
+            json!([{"id":1}]),
+            Some("<https://api.github.com/next>; rel=\"next\""),
+            1,
+        ),
+        (json!(vec![json!({"id":1}); 100]), None, 0),
+    ] {
+        let bounds = Bounds::new(100, Instant::now() + Duration::from_secs(60));
+        let client = Budget {
+            inner: &fixture,
+            bounds: &bounds,
+        };
+        client.seed_cache(BTreeMap::from([(
+            url.clone(),
+            json!({"etag":"fixture-version", "body":body, "link":link}),
+        )]));
+        let response = client.get(&url, None).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(bounds.spent().revalidated, refunds);
+        if refunds > 0 {
+            assert_eq!(response.body, body);
+            assert_eq!(response.link.as_deref(), link);
+        } else {
+            assert_ne!(response.body, body);
+        }
+    }
+}
+
+#[test]
+fn top_down_parent_reads_stop_at_the_start_reserve() {
+    let mut replay = top_down_fixture();
+    let event = answer(&mut replay, "/issues/135/events?")["body"][0].clone();
+    answer(&mut replay, "/issues/135/events?")["body"] = json!(vec![event; 100]);
+    let limit = START_RESERVE + WRITE_RESERVE + 11;
+    let report = preview_within(&config(json!({"topDown":true,"wip":4})), &replay, limit);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("budget:") && l.contains("more candidate(s) wait")),
+        "{:?}",
+        report.lines
+    );
+    assert!(
+        !report
+            .holds
+            .iter()
+            .any(|h| h.hold.kind == HoldKind::Unreadable),
+        "{:?}",
+        report.lines
+    );
+    assert!(
+        !report.lines.iter().any(|l| l.starts_with("start ")),
+        "{:?}",
+        report.lines
+    );
+    assert!(report.spent.requests <= limit);
+}
+
+#[test]
+fn top_down_does_not_trust_a_label_without_its_author() {
+    for (status, actor) in [(200, "visitor"), (200, "app"), (403, "cgwalters")] {
+        let mut replay = top_down_fixture();
+        only(
+            &mut replay,
+            &["cgwalters-forge/tracker#446", "cgwalters-forge/tracker#459"],
+        );
+        let events = answer(&mut replay, "/issues/135/events?");
+        events["status"] = status.into();
+        events["body"][0]["actor"]["login"] = actor.into();
+        if actor == "app" {
+            events["body"][0]["actor"] = json!({"type":"Bot", "login":"cgwalters"});
+        }
+        let report = preview(&config(json!({"topDown":true,"wip":4})), &replay);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert!(
+            !report.lines.iter().any(|l| l.starts_with("start ")),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .holds
+                .iter()
+                .any(|h| matches!(h.hold.kind, HoldKind::EpicNotLive | HoldKind::Unreadable))
+        );
+    }
+}
+
 fn at(stamp: &str) -> OffsetDateTime {
     OffsetDateTime::parse(stamp, &Rfc3339).unwrap()
 }

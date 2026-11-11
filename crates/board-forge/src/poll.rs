@@ -1435,6 +1435,11 @@ pub trait Rest {
     fn start_kind(&self, _kind: &str) {}
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse>;
+    /// Bypass every conditional cache, including a pass-wide wrapper. Claims
+    /// need current pagination even when the first page's body is unchanged.
+    fn get_fresh(&self, url: &str) -> Result<RestResponse> {
+        self.get(url, None)
+    }
     /// A write, or a GET whose 404 is an answer; any status comes back,
     /// for the caller to judge.
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)>;
@@ -1563,6 +1568,8 @@ pub struct State {
     pub interval_seconds: i64,
     /// Responses by URL: `etag`, `last_modified`, `next` and `body`.
     pub responses: BTreeMap<String, Value>,
+    /// Raw pass GET responses, separate from the poll's slimmed bodies.
+    pub pass_responses: BTreeMap<String, Value>,
     /// Where the search for the operator's comments resumes ([`comments`]):
     /// like the cache, losing it costs requests, as the claims on the threads
     /// keep a comment from being acted on twice.
@@ -1628,6 +1635,7 @@ impl State {
                     "schema",
                     "interval_seconds",
                     "responses",
+                    "pass_responses",
                     "operator_cursor",
                     "operator_page",
                     "intake_waiting",
@@ -1665,6 +1673,22 @@ impl State {
                 Ok((url.clone(), entry.clone()))
             })
             .collect::<Result<_>>()?;
+        let pass_responses: BTreeMap<String, Value> = object
+            .get("pass_responses")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("invalid pass response cache")?
+            .unwrap_or_default();
+        ensure!(
+            pass_responses.len() <= 2 * crate::pass::PASS_REQUEST_LIMIT,
+            "too many cached pass responses"
+        );
+        for (url, entry) in &pass_responses {
+            ensure!(
+                url.starts_with(API_ROOT) && entry.get("body").is_some(),
+                "invalid cached pass response"
+            );
+        }
         let time = |key: &str| {
             object
                 .get(key)
@@ -1771,6 +1795,7 @@ impl State {
         Ok(Self {
             interval_seconds,
             responses,
+            pass_responses,
             operator_cursor,
             operator_page,
             intake_waiting,
@@ -1791,6 +1816,9 @@ impl State {
             "interval_seconds": self.interval_seconds,
             "responses": self.responses,
         });
+        if !self.pass_responses.is_empty() {
+            state["pass_responses"] = json!(self.pass_responses);
+        }
         if let Some(cursor) = &self.operator_cursor {
             state["operator_cursor"] = cursor.as_str().into();
         }
@@ -6508,7 +6536,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     .as_str()
                     .map(|v| ("If-Modified-Since", v)))
         });
-        let response = self.rest.get(url, validator)?;
+        let response = if fresh {
+            self.rest.get_fresh(url)?
+        } else {
+            self.rest.get(url, validator)?
+        };
         let entry = match (response.status, cached) {
             // The ETag covers the body only: a list that grew past this page
             // answers 304 with a new `Link`. Without one, the cached pages stand.
@@ -8622,6 +8654,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     outcome.state = State {
         interval_seconds: next_interval(previous, active),
         responses: pass.used,
+        pass_responses: BTreeMap::new(),
         operator_cursor,
         operator_page,
         intake_waiting,
@@ -13413,7 +13446,7 @@ mod tests {
         }
     }
 
-    fn applying(dispatcher: &Fake) -> Option<Apply<'_, Fake>> {
+    fn applying<R: Rest>(dispatcher: &R) -> Option<Apply<'_, R>> {
         Some(Apply {
             dispatcher,
             workflow: "dispatch.yml".into(),
@@ -18550,54 +18583,75 @@ mod tests {
     /// from before the list grew.
     #[test]
     fn claims_are_judged_on_comments_read_without_the_cache() {
-        let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
-        let second = format!("{comments}&page=2");
-        let read = json!({"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 1, "sha": "older"}), "Fix round 1 of 2.")});
-        let claim = format!(
-            "<!-- {CLAIM}: {} -->\nclaimed",
-            json!({"from": "5", "round": 2, "sha": HEAD})
-        );
-        let mut fake = github();
-        fake.pulls.insert(
-            470,
-            pull(
-                "pull-470",
-                json!({"contexts": {"review": {"state": "FAILURE"}}}),
-            ),
-        );
-        fake.rest.get_mut(&comments).unwrap().3 = json!([read]);
-        fake.rest.get_mut(&second).unwrap().3 = json!([
-            {"id": 50, "user": {"login": BOT}, "created_at": "2026-10-12T01:59:00Z", "body": claim}
-        ]);
-        // The page as an earlier pass kept it, when it was the only one; a
-        // 304 for it says nothing of the second.
-        fake.bare_304 = true;
-        let state = State {
-            interval_seconds: MIN_INTERVAL_SECONDS,
-            responses: [(
-                comments.clone(),
-                json!({"etag": "\"c1\"", "next": null, "body": [read]}),
-            )]
-            .into(),
-            ..State::default()
-        };
-        let dispatcher = Fake::default();
-        let outcome = applied_after(&fake, &dispatcher, state);
-        assert!(
-            outcome.lines.last().unwrap().ends_with(
-                "-> not started: another pass went first with fix round 2, in comment 50"
-            ),
-            "{:?}",
-            outcome.lines
-        );
-        assert_eq!(dispatcher.writes.borrow().len(), 0);
-        assert!(
-            fake.sent
-                .borrow()
-                .iter()
-                .filter(|(url, _)| url.starts_with(&comments))
-                .all(|(_, validator)| validator.is_none())
-        );
+        for persistent in [false, true] {
+            let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+            let second = format!("{comments}&page=2");
+            let read = json!({"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 1, "sha": "older"}), "Fix round 1 of 2.")});
+            let claim = format!(
+                "<!-- {CLAIM}: {} -->\nclaimed",
+                json!({"from": "5", "round": 2, "sha": HEAD})
+            );
+            let mut fake = github();
+            fake.pulls.insert(
+                470,
+                pull(
+                    "pull-470",
+                    json!({"contexts": {"review": {"state": "FAILURE"}}}),
+                ),
+            );
+            fake.rest.get_mut(&comments).unwrap().3 = json!([read]);
+            fake.rest.get_mut(&second).unwrap().3 = json!([
+                {"id": 50, "user": {"login": BOT}, "created_at": "2026-10-12T01:59:00Z", "body": claim}
+            ]);
+            // The page as an earlier pass kept it, when it was the only one; a
+            // 304 for it says nothing of the second.
+            fake.bare_304 = true;
+            let state = State {
+                interval_seconds: MIN_INTERVAL_SECONDS,
+                responses: [(
+                    comments.clone(),
+                    json!({"etag": "\"c1\"", "next": null, "body": [read]}),
+                )]
+                .into(),
+                ..State::default()
+            };
+            let dispatcher = Fake::default();
+            let outcome = if persistent {
+                crate::pass::preview_reads(&fake, |client| {
+                    client.seed_cache(state.responses.clone());
+                    crate::pass::preview_reads(&dispatcher, |dispatcher| {
+                        run(
+                            client,
+                            &fake,
+                            &config(),
+                            state,
+                            &[],
+                            &[REPO.to_owned()],
+                            applying(dispatcher),
+                            now(),
+                        )
+                    })
+                })
+                .unwrap()
+            } else {
+                applied_after(&fake, &dispatcher, state)
+            };
+            assert!(
+                outcome.lines.last().unwrap().ends_with(
+                    "-> not started: another pass went first with fix round 2, in comment 50"
+                ),
+                "{:?}",
+                outcome.lines
+            );
+            assert_eq!(dispatcher.writes.borrow().len(), 0);
+            assert!(
+                fake.sent
+                    .borrow()
+                    .iter()
+                    .filter(|(url, _)| url.starts_with(&comments))
+                    .all(|(_, validator)| validator.is_none())
+            );
+        }
     }
 
     /// Each stop is a marker of its own, so each removal of the label is a

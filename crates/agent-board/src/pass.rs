@@ -405,12 +405,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                         );
                     }
                     // Only an applying pass writes the cache; a preview reads it.
-                    let state = match config.state.as_deref().map(PathBuf::from) {
-                        Some(path) if path.exists() => {
-                            State::from_json(&serde_json::from_str(&read(&path)?)?)?
-                        }
-                        _ => State::default(),
-                    };
+                    let state = config.state.as_deref().map(load_state).unwrap_or_default();
                     let mode = match &own {
                         None => Mode::Preview,
                         Some(Some(own)) => Mode::Actions(own),
@@ -435,6 +430,29 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     print_report(&report, out)
 }
 
+/// This file is supplied only by the trusted previous pass in the chain.
+/// Missing, oversized or unreadable state costs requests, not availability.
+fn load_state(path: &str) -> State {
+    let load = || -> Result<State> {
+        use std::io::Read;
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(pass::STATE_BYTES + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= pass::STATE_BYTES,
+            "pass state is too large"
+        );
+        State::from_json(&serde_json::from_slice(&bytes)?)
+    };
+    match load() {
+        Ok(state) => state,
+        Err(_) => {
+            eprintln!("warning: missing or unreadable pass state; starting cold");
+            State::default()
+        }
+    }
+}
+
 fn print_report(report: &Report, out: &mut impl Write) -> Result<()> {
     for line in &report.lines {
         writeln!(out, "{line}")?;
@@ -452,6 +470,32 @@ fn print_report(report: &Report, out: &mut impl Write) -> Result<()> {
 mod next_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn pass_state_is_optional_bounded_and_cold_on_decode_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-board-pass-state-{}.json",
+            std::process::id()
+        ));
+        let name = path.to_str().unwrap();
+        assert_eq!(load_state(name), State::default());
+        std::fs::write(&path, b"not JSON").unwrap();
+        assert_eq!(load_state(name), State::default());
+        let state = State {
+            interval_seconds: board_forge::poll::MIN_INTERVAL_SECONDS,
+            ..State::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&state.to_json()).unwrap()).unwrap();
+        assert_eq!(load_state(name), state);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(pass::STATE_BYTES + 1)
+            .unwrap();
+        assert_eq!(load_state(name), State::default());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[derive(Parser)]
     struct Args {

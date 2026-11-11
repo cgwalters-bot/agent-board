@@ -2001,6 +2001,65 @@ does not change the apply cache.
 
 ## Scheduling
 
+### Persisting conditional responses
+
+The concrete trust threat is a forged cached body steering scheduling after
+GitHub validates only its ETag, not the body in the local file. The existing
+`state` path opts into persistence; absent it, nothing is kept across passes.
+Only an applying, non-recording pass writes that file. Preview can read it;
+replay remains entirely offline. Missing, unreadable, oversized or malformed
+state starts cold with a warning. The CLI reads at most 32 MiB.
+
+The file now keeps raw REST validators, pagination headers and bodies for all
+budgeted stages, separately from the PR poll's slimmed responses and cursors.
+Each read still reaches GitHub. A 304 restores the matching body and missing
+pagination headers and refunds the request within the existing 650-refund cap;
+changed responses replace it. Only this pass's successful reads are carried,
+at most 1 MiB per response and 16 MiB of raw responses. The summary retains
+charged requests by phase and its 304 count. Projects v2 and closing-PR
+relationships still need GraphQL and cannot be conditionally cached.
+Claim reads and reads inside a start bypass conditional caching. A full final
+array page is also read unconditionally: its body can remain unchanged while
+new comments add a successor page.
+
+**The caller must supply trusted state.** Do not restore it from an Actions
+cache writable by unrelated default-branch jobs. Tracker should upload the
+state as a short-lived artifact of the applying `poll.yml` pass and pass its
+run ID through `next` to the next invocation. Download only that exact run's
+artifact after verifying it belongs to this repository's `poll.yml` workflow
+on the default branch; missing or unreadable artifacts mean cold state. Do
+not search for the newest artifact by name across workflows. Keep this
+potentially private response data out of public logs and artifacts.
+
+### Top-down discovery
+
+The concrete failure `topDown: true` prevents is spending scheduling's
+requests proving unrelated parents live before reading a ready P0 child's
+plan. It is off by default and GitHub-only. It walks epic groups by board
+Priority (P0 first), then epic creation time and identity; within each group,
+children retain Priority/age order. Unparented work follows epics at the same
+Priority. Explicit `epics.focus` still takes precedence.
+
+The board read keeps the fields needed to screen and rank but omits closing
+PR details. Parent authorization and complete closing-PR reads happen only
+when the walk reaches a child, after slot and pool admission. The walk starts
+ready work immediately and stops at WIP, pool, time or request bounds, rather
+than validating all parents before starting anything. Parent authorization
+uses revalidatable REST issue events, at most three pages of 100; an unreadable
+or longer history holds work, never authorizes it. A present `epic` label
+alone still cannot authorize a stranger's children. Existing plan, dependency,
+freshness, lease and write/dispatch checks are unchanged.
+Completed closing-PR reads are retained for revisits and Status. Unvisited
+items retain unknown closing-PR coverage; Status cannot reset those to Todo
+on an assumed absence of activity.
+
+Caller activation in `cgwalters-forge/tracker`: set `.github/pass.json`'s
+`topDown` to `true` and `state` to `.state/pass.json`, and pair the state setting
+with the trusted previous-run artifact handoff in `.github/workflows/poll.yml`.
+No tracker settings or workflow are changed here.
+
+### Candidate admission
+
 There is one candidate set: open board issues in explicitly configured work
 repositories, excluding epics and the usage issue. An epic child qualifies
 only through a live epic whose latest `epic` label event is the operator's

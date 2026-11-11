@@ -106,6 +106,11 @@ const EPICS_SHARE: usize = 20;
 /// against the rate limit, so a revalidated read that answers from the cache
 /// is free, but only this many, so that they still bound a runaway loop.
 const REVALIDATED_LIMIT: usize = PASS_REQUEST_LIMIT;
+/// Bound the persisted cache independently of the network request budget.
+pub const STATE_BYTES: u64 = 32 * 1024 * 1024;
+const RESPONSE_BYTES: usize = 1024 * 1024;
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
+const EPIC_EVENT_PAGES: usize = 3;
 // Each of the hold snapshot's comments is a write past its reads.
 const _: () = assert!(holds::MAX_PARTS <= WRITE_RESERVE);
 /// GraphQL points a query and a mutation are taken to cost where the
@@ -339,6 +344,11 @@ const FACTS: &str = r#"fragment Facts on Issue {
   }
   parent { number state repository { nameWithOwner } labels(first: 50) { nodes { name } totalCount } }
 }"#;
+
+const BOARD_PULLS: &str = r#"  closedByPullRequestsReferences(first: 10, includeClosedPrs: false) {
+    nodes { number state updatedAt repository { nameWithOwner } author { login } } totalCount
+  }
+"#;
 
 /// The open issues of the board with their Priority, Status and Why, a page at a time.
 const BOARD_QUERY: &str = r#"query($owner: String!, $number: Int!, $field: String!, $cursor: String) {
@@ -682,6 +692,9 @@ pub struct Config {
     pub cost: Option<crate::cost::Publish>,
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
+    /// Off by default: rank epic groups before reading their admission facts.
+    #[serde(default)]
+    pub top_down: bool,
     #[serde(default)]
     pub pr: Pr,
     /// Off unless its `forks` are set: stage 4b, approved fork pull requests
@@ -2528,6 +2541,10 @@ type ByStage = [usize; Stage::ALL.len()];
 /// What a pass may still spend, in requests and in time, both stages
 /// together, and what it spent.
 struct Bounds {
+    cache_enabled: Cell<bool>,
+    responses: RefCell<BTreeMap<String, Value>>,
+    next_responses: RefCell<BTreeMap<String, Value>>,
+    response_bytes: Cell<usize>,
     effects: RefCell<Effects>,
     start_kind: RefCell<String>,
     /// The runs started whose dispatch named them, for the pass view.
@@ -2569,6 +2586,10 @@ struct Bounds {
 impl Bounds {
     fn new(limit: usize, admit_by: Instant) -> Self {
         Self {
+            cache_enabled: Cell::new(false),
+            responses: RefCell::default(),
+            next_responses: RefCell::default(),
+            response_bytes: Cell::new(0),
             effects: RefCell::default(),
             start_kind: RefCell::default(),
             started: RefCell::default(),
@@ -2788,6 +2809,12 @@ pub(crate) fn preview_reads<C, R>(
 }
 
 impl<C> Budget<'_, C> {
+    #[cfg(test)]
+    pub(crate) fn seed_cache(&self, responses: BTreeMap<String, Value>) {
+        self.bounds.cache_enabled.set(true);
+        *self.bounds.responses.borrow_mut() = responses;
+    }
+
     fn spend(&self, write: bool) -> Result<()> {
         let bounds = self.bounds;
         if bounds.rate_limited.borrow().is_some() {
@@ -2870,15 +2897,79 @@ fn is_mutation(query: &str) -> bool {
 }
 
 impl<C: Rest> Rest for Budget<'_, C> {
+    fn get_fresh(&self, url: &str) -> Result<RestResponse> {
+        self.spend(false)?;
+        self.observe(self.inner.get_fresh(url))
+    }
     fn start_kind(&self, kind: &str) {
         *self.bounds.start_kind.borrow_mut() = kind.to_owned();
     }
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         self.spend(false)?;
-        let response = self.observe(self.inner.get(url, validator))?;
-        if validator.is_some() && response.status == 304 {
+        let enabled = self.bounds.cache_enabled.get()
+            && !self.bounds.starting.get()
+            && !self.bounds.finishing.get();
+        let cached = enabled
+            .then(|| self.bounds.responses.borrow().get(url).cloned())
+            .flatten()
+            .filter(|entry| {
+                // A full final array page can acquire a successor without
+                // changing its body/ETag. Read its current Link header fresh.
+                let per_page = url
+                    .split("per_page=")
+                    .nth(1)
+                    .and_then(|s| s.split('&').next())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(30);
+                entry["body"].as_array().is_none_or(|a| a.len() < per_page)
+                    || entry["link"]
+                        .as_str()
+                        .is_some_and(|l| l.contains("rel=\"next\""))
+            });
+        let condition = cached.as_ref().and_then(|c| {
+            c["etag"]
+                .as_str()
+                .map(|v| ("If-None-Match", v))
+                .or_else(|| {
+                    c["last_modified"]
+                        .as_str()
+                        .map(|v| ("If-Modified-Since", v))
+                })
+        });
+        let mut response = self.observe(self.inner.get(url, condition.or(validator)))?;
+        if condition.or(validator).is_some() && response.status == 304 {
             self.bounds.refund();
+        }
+        if response.status == 304
+            && condition.is_some()
+            && let Some(cached) = &cached
+        {
+            response.status = 200;
+            response.body = cached["body"].clone();
+            response.etag = response
+                .etag
+                .or_else(|| cached["etag"].as_str().map(str::to_owned));
+            response.last_modified = response
+                .last_modified
+                .or_else(|| cached["last_modified"].as_str().map(str::to_owned));
+            response.link = response
+                .link
+                .or_else(|| cached["link"].as_str().map(str::to_owned));
+        }
+        if enabled && response.status == 200 {
+            let entry = json!({"body": response.body, "etag": response.etag,
+                "last_modified": response.last_modified, "link": response.link});
+            // Keep only this pass's reads, bounded by its request/304 limits.
+            let size = entry.to_string().len();
+            let total = self.bounds.response_bytes.get() + size;
+            if size <= RESPONSE_BYTES && total <= CACHE_BYTES {
+                self.bounds.response_bytes.set(total);
+                self.bounds
+                    .next_responses
+                    .borrow_mut()
+                    .insert(url.to_owned(), entry);
+            }
         }
         Ok(response)
     }
@@ -3036,6 +3127,9 @@ impl<C> Kept<'_, C> {
 }
 
 impl<C: Rest> Rest for Kept<'_, C> {
+    fn get_fresh(&self, url: &str) -> Result<RestResponse> {
+        self.inner.get_fresh(url)
+    }
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         let key = json!({"get": url, "validator": validator});
         let read = || Ok(KeptRead::Rest(self.inner.get(url, validator)?));
@@ -3225,6 +3319,9 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     (state, mode, limits, now): (State, Mode<'_>, Limits, OffsetDateTime),
     bounds: &Bounds,
 ) -> Result<Report> {
+    bounds.cache_enabled.set(config.state.is_some());
+    *bounds.responses.borrow_mut() = state.pass_responses.clone();
+    let previous = state.clone();
     let caps = Caps::new(limits);
     let mut lines = Vec::new();
     let resolved = config.resolve(
@@ -3250,6 +3347,13 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     report.summary = caps.summary();
     report.spent = bounds.spent();
     report.effects = bounds.effects.borrow().clone();
+    if config.state.is_some() {
+        let state = report.state.get_or_insert(previous);
+        if state.interval_seconds == 0 {
+            state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
+        }
+        state.pass_responses = bounds.next_responses.take();
+    }
     Ok(report)
 }
 
@@ -3327,6 +3431,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         budget_stop: None,
         ended: RefCell::new(BTreeMap::new()),
         kept: RefCell::default(),
+        read_pulls: RefCell::default(),
         ignored: RefCell::default(),
         failed: BTreeMap::new(),
         failed_listed: false,
@@ -3786,6 +3891,8 @@ struct Scheduler<'a, C> {
     ended: RefCell<BTreeMap<u64, bool>>,
     /// The reads of stage 4's look ahead at overlaps ([`Self::kept`]).
     kept: RefCell<KeptReads>,
+    /// Closing references actually read in this pass, for revisit and Status.
+    read_pulls: RefCell<BTreeMap<String, (Vec<ClosingPull>, bool)>>,
     /// The overlaps [`Config::overlap`] waived for the candidate considered,
     /// which its hold snapshot shows as `overlap-ignored`.
     ignored: RefCell<Vec<String>>,
@@ -4376,7 +4483,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(());
         }
         let board = self.board();
-        let Ok(board) = board else {
+        let Ok(mut board) = board else {
             self.board = Some(None);
             return board.map(|_| ());
         };
@@ -4438,6 +4545,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut taken = sessions + started + revisited + swept;
         let ranked: Vec<ItemRef> = candidates.iter().map(|(_, f)| f.issue.clone()).collect();
         drop(candidates);
+        for facts in board.items.values_mut() {
+            self.restore_pulls(facts);
+        }
         self.free = holds::free(Some(&ranked), &self.report.holds[holds..]);
         self.blockers(&board);
         self.board = Some(Some(board));
@@ -4571,8 +4681,25 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.focus.spillover = Some(true);
             }
             let issue = facts.issue.display();
-            let step =
-                self.within_reserve(|s| s.consider_waiting(facts, board, slots, snapshot, target));
+            let step = self.within_reserve(|s| {
+                if s.config.top_down && let Some(parent) = &facts.parent {
+                let held = match s.live(parent) {
+                    Ok(true) => None,
+                    Ok(false) => Some(Hold::new(
+                        HoldKind::EpicNotLive,
+                        format!(
+                            "its parent {} is not a live epic (open and labelled epic by the operator or the bot)",
+                            parent.issue.display()
+                        ),
+                    )),
+                    Err(why) => Some(Hold::new(HoldKind::Unreadable, why)),
+                };
+                if let Some(held) = held {
+                    return Ok(Step::Hold(held));
+                }
+                }
+                s.consider_waiting(facts, board, slots, snapshot, target)
+            });
             for why in self.ignored.take() {
                 self.held(facts, Hold::new(HoldKind::OverlapIgnored, why));
             }
@@ -4602,7 +4729,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             let (line, holds, failed) = match step {
                 Step::Hold(hold) => {
-                    self.held(facts, hold);
+                    if hold.kind == HoldKind::EpicNotLive
+                        && let Some(parent) = &facts.parent
+                    {
+                        self.record(Entry {
+                            scope: Scope::Under(facts.issue.clone(), parent.issue.clone()),
+                            hold: hold.operator(top_priority(&board.options, facts)),
+                            priority: facts.priority.clone(),
+                            why: facts.why.clone(),
+                        });
+                    } else {
+                        self.held(facts, hold);
+                    }
                     continue;
                 }
                 Step::Stop(why, halt) => {
@@ -5049,7 +5187,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let board = self.config.github_board().context("no GitHub board")?;
         let config = self.config;
         let revisit = config.revisit.is_some() || config.sweep.is_some();
-        let query = board_query(revisit, config.assign_holds);
+        let mut query = board_query(revisit, config.assign_holds);
+        if config.top_down {
+            query = query.replace(BOARD_PULLS, "");
+        }
         let mut cursor = Value::Null;
         let mut options = None;
         let mut items = BTreeMap::new();
@@ -5089,7 +5230,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     Some(_) => continue,
                     None => bail!("a board item could not be read; the board is incomplete"),
                 }
-                let mut facts = Facts::from_node(content)?;
+                let mut content = content.clone();
+                if config.top_down {
+                    // Unread, not an empty set: complete_pulls reads only
+                    // candidates actually reached by the start walk.
+                    content["closedByPullRequestsReferences"] =
+                        json!({"nodes": [], "totalCount": 1});
+                }
+                let mut facts = Facts::from_node(&content)?;
                 facts.priority = node["priority"]["name"].as_str().map(str::to_owned);
                 facts.status = node["status"]["name"].as_str().map(str::to_owned);
                 facts.why = node["why"]["text"].as_str().map(str::to_owned);
@@ -5151,6 +5299,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     None
                 }
                 Screen::Child(parent) => {
+                    if config.top_down {
+                        let epic = board.items.get(&key(&parent.issue));
+                        let rank = rank(
+                            &board.options,
+                            epic.and_then(|e| e.priority.as_deref()),
+                            facts.priority.as_deref(),
+                            facts,
+                        );
+                        ranked.push((rank, facts));
+                        continue;
+                    }
                     // Local facts and cached parents cost no requests: keep
                     // ranking them even once further discovery must wait.
                     let at = key(&parent.issue);
@@ -5200,6 +5359,27 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.candidates_deferred(deferred);
         }
         ranked.sort_by(|a, b| a.0.cmp(&b.0));
+        if config.top_down {
+            // Finish one epic before opening another at the same Priority.
+            // Unparented items follow the epics at their own Priority.
+            let group = |facts: &Facts| {
+                facts.parent.as_ref().map(|p| {
+                    let epic = board.items.get(&key(&p.issue));
+                    (
+                        epic.map(|e| e.created)
+                            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                        key(&p.issue),
+                    )
+                })
+            };
+            ranked.sort_by(|a, b| {
+                a.0.0
+                    .cmp(&b.0.0)
+                    .then_with(|| a.1.parent.is_none().cmp(&b.1.parent.is_none()))
+                    .then_with(|| group(a.1).cmp(&group(b.1)))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+        }
         self.report.tally.1.candidates = Some(ranked.len());
         let line = candidates_line(config, ranked.len(), (visitors, outside.len(), unparented));
         self.line(line);
@@ -5234,6 +5414,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .labels
             .iter()
             .any(|l| l.eq_ignore_ascii_case(EPIC_LABEL));
+        let refused = self.client.bounds.refused.get();
         let covered = config.epic_repository(&parent.issue.repository);
         let live = if !covered || !parent.open {
             Ok(false)
@@ -5245,17 +5426,70 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         } else if !labelled {
             Ok(false)
         } else {
-            epic_labelled_by(&self.client, &parent.issue)
-                .map(|by| is(by.as_deref(), &[&config.operator, &config.bot]))
-                .map_err(|e| {
-                    format!(
-                        "whether {} is a live epic is unknown: {e:#}",
-                        parent.issue.display()
-                    )
-                })
+            (if config.top_down {
+                self.epic_labeller(&parent.issue)
+            } else {
+                epic_labelled_by(&self.client, &parent.issue)
+            })
+            .map(|by| is(by.as_deref(), &[&config.operator, &config.bot]))
+            .map_err(|e| {
+                format!(
+                    "whether {} is a live epic is unknown: {e:#}",
+                    parent.issue.display()
+                )
+            })
         };
-        self.epics.insert(at, live.clone());
+        if self.client.bounds.refused.get() == refused {
+            self.epics.insert(at, live.clone());
+        }
         live
+    }
+
+    /// REST events can be revalidated, unlike the GraphQL labeling query.
+    /// Read the whole bounded history: a partial page cannot authorize work.
+    fn epic_labeller(&self, issue: &ItemRef) -> Result<Option<String>> {
+        let mut newest = None;
+        for page in 1..=EPIC_EVENT_PAGES {
+            let url = format!(
+                "{API_ROOT}repos/{}/issues/{}/events?per_page=100&page={page}",
+                issue.repository, issue.number
+            );
+            let response = self.client.get(&url, None)?;
+            ensure!(
+                response.status == 200,
+                "epic events: HTTP {}",
+                response.status
+            );
+            let events = response
+                .body
+                .as_array()
+                .context("epic events are not an array")?;
+            for event in events {
+                if event["event"] == "labeled"
+                    && event["label"]["name"]
+                        .as_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(EPIC_LABEL))
+                {
+                    newest = Some(
+                        (event["actor"]["type"] == "User")
+                            .then(|| event["actor"]["login"].as_str().map(str::to_owned))
+                            .flatten(),
+                    );
+                }
+            }
+            if events.len() < 100
+                && !response
+                    .link
+                    .as_deref()
+                    .is_some_and(|l| l.contains("rel=\"next\""))
+            {
+                return newest.context("epic has no labeling event");
+            }
+        }
+        bail!(
+            "epic labeling history exceeds {} events",
+            EPIC_EVENT_PAGES * 100
+        )
     }
 
     fn facts(&self, issue: &ItemRef, board: &BoardRead) -> Result<Facts> {
@@ -5532,6 +5766,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Some(false) => {
                     facts.pulls = open;
                     facts.pulls_complete = read == total;
+                    self.read_pulls.borrow_mut().insert(
+                        key(&facts.issue),
+                        (facts.pulls.clone(), facts.pulls_complete),
+                    );
                     return Ok(());
                 }
                 Some(true) => cursor = refs["pageInfo"]["endCursor"].clone(),
@@ -5540,7 +5778,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         // Still incomplete, which holds, unless a trusted one read holds it.
         facts.pulls = open;
+        self.read_pulls.borrow_mut().insert(
+            key(&facts.issue),
+            (facts.pulls.clone(), facts.pulls_complete),
+        );
         Ok(())
+    }
+
+    fn restore_pulls(&self, facts: &mut Facts) {
+        if let Some((pulls, complete)) = self.read_pulls.borrow().get(&key(&facts.issue)) {
+            facts.pulls = pulls.clone();
+            facts.pulls_complete = *complete;
+        }
     }
 
     /// Read again just before a start's first write, since the board and
