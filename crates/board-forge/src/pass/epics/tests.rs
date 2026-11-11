@@ -75,7 +75,14 @@ fn living_planning_dispatch_edits_the_plan_comment() {
     assert!(comments[0].contains("### Current plan"), "{comments:#?}");
     assert!(comments[0].contains("### Last dispatch"), "{comments:#?}");
     assert!(comments[0].contains("[run]"), "{comments:#?}");
-    assert!(!comments[0].contains("```"), "{comments:#?}");
+    assert!(
+        !comments[0]
+            .split(living::RECORDS)
+            .next()
+            .unwrap()
+            .contains("```"),
+        "{comments:#?}"
+    );
     assert!(
         report.lines.contains(&"writes saved by edit: 1".into()),
         "{:#?}",
@@ -1066,6 +1073,7 @@ struct Forge {
     changed_plan: Cell<Option<(u64, usize)>>,
     link_fails: Cell<bool>,
     receipt_fails: Cell<bool>,
+    minimized: RefCell<BTreeSet<String>>,
 }
 
 impl Forge {
@@ -1082,6 +1090,7 @@ impl Forge {
             changed_plan: Cell::new(None),
             link_fails: Cell::new(false),
             receipt_fails: Cell::new(false),
+            minimized: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -1116,6 +1125,17 @@ impl Broker for Forge {
 
 impl Rest for Forge {
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        if let Some(id) = url.strip_prefix(&format!(
+            "{API_ROOT}repos/cgwalters-forge/tracker/issues/comments/"
+        )) {
+            return Ok(RestResponse {
+                status: 200,
+                body: json!({"node_id":id,"user":{"login":"cgwalters-bot"}}),
+                etag: None,
+                last_modified: None,
+                link: None,
+            });
+        }
         self.replay.get(url, validator)
     }
 
@@ -1164,6 +1184,18 @@ impl crate::github::GraphQl for Forge {
 
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if query == living::MINIMIZED {
+            return Ok(
+                json!({"node":{"isMinimized":self.minimized.borrow().contains(text(&variables,"/id"))}}),
+            );
+        }
+        if query == living::MINIMIZE {
+            self.minimized
+                .borrow_mut()
+                .insert(text(&variables, "/id").into());
+            self.kept("graphql minimizeComment".into(), variables);
+            return Ok(json!({"minimizeComment":{"clientMutationId":null}}));
+        }
         if query.contains("viewer {") {
             return Ok(json!({"viewer": {"login": "cgwalters-bot"}}));
         }
@@ -1710,7 +1742,7 @@ fn apply_creates_once_with_final_priorities() {
 }
 
 #[test]
-fn living_apply_keeps_machine_receipt_off_the_issue_and_replays_nothing() {
+fn living_apply_recovers_machine_receipt_after_cache_loss_and_replays_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("status.json");
     let settings = json!({"livingStatus": ledger});
@@ -1729,9 +1761,29 @@ fn living_apply_keeps_machine_receipt_off_the_issue_and_replays_nothing() {
     let body = text(receipts[0], "/body");
     assert!(body.starts_with(living::MARKER), "{body}");
     assert!(body.contains("Applied [this epic plan]"), "{body}");
-    assert!(!body.contains("```"), "{body}");
-    assert!(!body.contains("fingerprint"), "{body}");
+    let prose = body.split(living::RECORDS).next().unwrap();
+    assert!(!prose.contains("```"), "{body}");
+    assert!(!prose.contains("fingerprint"), "{body}");
     drop(comments);
+    std::fs::remove_file(ledger).unwrap();
+    forge.added.borrow_mut().push(posted(
+        &forge.replay,
+        890,
+        900,
+        "cgwalters-bot",
+        0,
+        "<!-- agent-board-status -->",
+    ));
+    let before = forge.written().len();
+    let report = local_with(&forge, 10, settings.clone());
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        &forge.written()[before..],
+        &[
+            "PATCH repos/cgwalters-forge/tracker/issues/comments/900",
+            "graphql minimizeComment"
+        ]
+    );
     let before = forge.written().len();
     let report = local_with(&forge, 10, settings);
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
