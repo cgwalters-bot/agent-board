@@ -131,6 +131,35 @@ class ReviewContracts(unittest.TestCase):
         for contract in ("hostile", "Do not modify code", "exact admitted head SHA", "VERDICT: APPROVE", "VERDICT: CHANGES", "never a GitHub approval"):
             with self.subTest(contract=contract):
                 self.assertIn(contract, task)
+        # The decision diff (#887): the base's script, on pass changes, with
+        # its output in the review. AGENTS.md asks the same of implement runs.
+        self.assertIn("`node workflow/decision-diff.cjs . HEAD`", task)
+        self.assertIn("`Decision diff` heading", task)
+        self.assertIn("node workflow/decision-diff.cjs ../base .", (ROOT / "AGENTS.md").read_text())
+
+    def test_decision_diff_of_one_tree_is_empty(self):
+        # The same checkout on both sides: both previews run (the build is
+        # the one specs-check already made), nothing differs, exit 0. A
+        # preview that fails is shown with its exit status and last lines,
+        # still at exit 0; bad arguments exit 1 and say the usage.
+        script = ROOT / "workflow/decision-diff.cjs"
+        for args, code, expected in (
+            ([ROOT, ROOT], 0, ("base: exit 0, summary: dispatched", "head: exit 0, summary: dispatched", "no change in ")),
+            ([ROOT, ROOT, "fixtures/pass/config.json", "missing.json"], 0, ("head: exit 1, no summary line", "head output, last 2 line(s):\n  pass: preview\n  error: read ")),
+            ([ROOT], 1, ("usage: node workflow/decision-diff.cjs BASE HEAD",)),
+        ):
+            with self.subTest(args=len(args)):
+                run = subprocess.run(["node", script, *args], cwd=ROOT, text=True, capture_output=True)
+                self.assertEqual(run.returncode, code, run.stderr)
+                for text in expected:
+                    self.assertIn(text, run.stdout if code == 0 else run.stderr)
+
+    def test_decision_diff_resource_bounds(self):
+        run = subprocess.run(
+            ["node", "--test", "workflow/decision-diff.test.cjs"],
+            cwd=ROOT, text=True, capture_output=True, timeout=20,
+        )
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
     def test_merge_queue_sentinel_fails_closed(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()

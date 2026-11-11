@@ -140,6 +140,43 @@ in CI and checks the pass's decisions and summary. Nothing here proves live
 token access, dispatch, inference, review, container isolation or a scheduled
 loop. Every flag is in the [CLI reference](cli.md).
 
+### Compare two revisions
+
+A change to the pass can pass its fixtures and review and still do nothing on
+the live caller: a day's run of fixes did (#887), because nobody had run the
+changed pass against the caller's configuration before merging. The decision
+diff previews the same recording with two checkouts' binaries, so the only
+input that differs is the code:
+
+```sh
+node workflow/decision-diff.cjs BASE HEAD [CONFIG [RECORDING]]
+```
+
+It builds agent-board in both checkouts (`cargo build --locked`), runs the
+rehearsal above with each binary, with `GH_TOKEN`, `GITHUB_TOKEN` and
+`DISPATCH_TOKEN` removed from its environment, and prints both summary lines
+and the unified diff of the two previews: starts, holds, writes, not-ready
+reasons, requests per stage and the summary itself, or `no change`. CONFIG and
+RECORDING default to BASE's `fixtures/pass/config.json` and
+`fixtures/pass/board-2026-10-23.json`. It exits 0 whenever both previews ran,
+whatever they decided; a head whose replay fails is shown with its exit
+status and last lines. Each build may take 20 minutes and each preview 60
+seconds, and what is printed is cut at 400 diff lines, 16 KiB of diff and
+4 KiB a line, so a head that hangs or prints without end is reported as cut
+rather than stopping the job or losing the review comment to GitHub's size
+limit.
+
+The review job runs it on every pull request that touches the pass and pastes
+the output in the review; an implement run does the same against its start
+commit before handing back ([AGENTS.md](../AGENTS.md)). The diff
+shows only what the recording exercises: the committed one is a preview of
+2026-10-23 with that day's configuration copy. A head that reads something it
+lacks fails replay, and a symptom the recording lacks cannot change in it. A
+fresher recording is a live preview with the caller's configuration and the
+bot's token, `agent-board pass --config pass.json --record FILE`; look at it
+before committing it, since it keeps comment bodies
+([recording and replay](forges.md#recording-and-replay)).
+
 ## This repository's runner maintenance
 
 `.github/renovate.json` adopts the published
