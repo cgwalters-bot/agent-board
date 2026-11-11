@@ -109,6 +109,9 @@ const REVALIDATED_LIMIT: usize = PASS_REQUEST_LIMIT;
 /// The most causes the summary names, by their requests ([`Spent::by_cause`]):
 /// a candidate or an epic each, the rest counted together.
 const CAUSE_LINES: usize = 10;
+/// The reason [`Report::not_ready`] counts a candidate whose consideration
+/// failed under, beside the hold kinds' names.
+const NOT_READY_ERROR: &str = "error";
 /// How many path segments name a REST endpoint's class ([`endpoint_class`]).
 const CLASS_SEGMENTS: usize = 3;
 /// How many nested fields name a GraphQL query's class ([`graphql_class`]).
@@ -201,7 +204,7 @@ const IDLE_REASON_LIMIT: usize = 5;
 const IDLE_REASON_CHARS: usize = 300;
 /// The prefixes of the lines an idle summary names: holds, failures and
 /// the caps' `held by --…` lines ([`Caps::check`]).
-const IDLE_REASONS: &[&str] = &["hold ", "fail ", "held by --"];
+const IDLE_REASONS: &[&str] = &["hold ", "fail ", "held by --", "scan: "];
 /// The most `triageFollowUpDays` and `replanAfterDays` may be.
 const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 /// `overlap.staleDraftHours` when the key is left out, and the most it may
@@ -700,6 +703,8 @@ pub struct Config {
     /// Off by default: rank epic groups before reading their admission facts.
     #[serde(default)]
     pub top_down: bool,
+    /// Off unless set: bounds on stage 4's scan of its candidates ([`Scan`]).
+    pub scan: Option<Scan>,
     #[serde(default)]
     pub pr: Pr,
     /// Off unless its `forks` are set: stage 4b, approved fork pull requests
@@ -1127,6 +1132,28 @@ fn broker_url(url: &str) -> bool {
     })
 }
 
+/// `scan`: bounds on stage 4's scan of its candidates, each off unless set
+/// (agent-board#864). The threat they stop is a pass that spends its whole
+/// request budget reading held candidates, one of them at the overlap
+/// check's dozens of reads, and starts nothing: its cost then scales with
+/// the open items, not with the starts.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Scan {
+    /// The most charged requests, writes included, considering one
+    /// candidate may take, 1 to [`PASS_REQUEST_LIMIT`], past which it is
+    /// held as unreadable; its parent's liveness reads and a start's own
+    /// reads are not refused ([`Bounds::cause_capped`]).
+    pub candidate_requests: Option<usize>,
+    /// The most candidates in a row stage 4 reads without starting one, 1
+    /// to [`SCAN_CANDIDATES_LIMIT`], after which the rest wait for the
+    /// next pass ([`Scheduler::start`]).
+    pub candidates: Option<usize>,
+}
+
+/// The most `scan.candidates` may be: more than a board has candidates.
+const SCAN_CANDIDATES_LIMIT: usize = 1000;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Pr {
@@ -1326,6 +1353,22 @@ impl Config {
             );
         }
         ensure!(self.wip <= WIP_LIMIT, "wip is not 0 to {WIP_LIMIT}");
+        if let Some(scan) = &self.scan {
+            ensure!(self.forgejo_board().is_none(), "scan supports only GitHub");
+            for (what, value, limit) in [
+                (
+                    "candidateRequests",
+                    scan.candidate_requests,
+                    PASS_REQUEST_LIMIT,
+                ),
+                ("candidates", scan.candidates, SCAN_CANDIDATES_LIMIT),
+            ] {
+                ensure!(
+                    value.is_none_or(|n| (1..=limit).contains(&n)),
+                    "scan {what} is not 1 to {limit}"
+                );
+            }
+        }
         if self.work() && self.forgejo_board().is_none() {
             let board = self
                 .github_board()
@@ -2613,6 +2656,11 @@ struct Bounds {
     /// Requests by endpoint class and by cause ([`Spent`]).
     by_class: RefCell<BTreeMap<String, usize>>,
     by_cause: RefCell<BTreeMap<String, usize>>,
+    /// The cause whose charged requests are capped, the candidate under
+    /// consideration, and its cap ([`Scan::candidate_requests`]), or none;
+    /// and how many reads that refused ([`Self::cause_capped`]).
+    cause_limit: RefCell<Option<(String, usize)>>,
+    capped: Cell<usize>,
 }
 
 impl Bounds {
@@ -2645,6 +2693,8 @@ impl Bounds {
             cause: RefCell::new(None),
             by_class: RefCell::default(),
             by_cause: RefCell::default(),
+            cause_limit: RefCell::new(None),
+            capped: Cell::new(0),
         }
     }
 
@@ -2670,6 +2720,20 @@ impl Bounds {
         let out = read();
         *self.cause.borrow_mut() = before;
         out
+    }
+
+    /// The limit a read now would pass ([`Scan::candidate_requests`]): the
+    /// capped cause is under way and has been charged that many requests
+    /// already, 304s refunded. Another cause, an epic's liveness read under
+    /// the candidate included, or a start's own reads are never capped.
+    fn cause_capped(&self) -> Option<usize> {
+        let limit = self.cause_limit.borrow();
+        let (capped, limit) = limit.as_ref()?;
+        if self.starting.get() || self.cause.borrow().as_deref() != Some(capped) {
+            return None;
+        }
+        let spent = self.by_cause.borrow().get(capped).copied().unwrap_or(0);
+        (spent >= *limit).then_some(*limit)
     }
 
     /// Counts a request of `class` to it and to its cause, the stage under
@@ -3045,6 +3109,12 @@ impl<C> Budget<'_, C> {
                 bounds.kept.get()
             ))
             .into());
+        }
+        if !write && let Some(limit) = bounds.cause_capped() {
+            bounds.capped.set(bounds.capped.get() + 1);
+            bail!(
+                "the candidate's reads reached {limit} requests, the most one may take (scan.candidateRequests)"
+            );
         }
         bounds.left.set(left - 1);
         bounds.writes.set(bounds.writes.get() + usize::from(write));
@@ -3494,6 +3564,10 @@ pub struct Report {
     pub lines: Vec<String>,
     pub summary: String,
     pub spent: Spent,
+    /// Stage 4's candidates it screened out or read and did not start, by
+    /// their hold kind's name, or [`NOT_READY_ERROR`] where their
+    /// consideration failed: why nothing was startable (agent-board#864).
+    pub not_ready: BTreeMap<String, usize>,
     pub failures: usize,
     pub state: Option<State>,
     pub holds: Vec<Entry>,
@@ -3510,8 +3584,15 @@ pub struct Report {
 impl Report {
     /// The pass's last line: its caps' summary and what it spent, as
     /// `summary: dispatched 1/1, writes 3/5, held 12, requests 80 (epics 30,
-    /// schedule 50), endpoints {…}, causes {…}, points ~95`.
+    /// schedule 50), endpoints {…}, causes {…}, points ~95, starts {…},
+    /// comments created 2, edited 1, not ready {"pr-open":3,…}`, the last
+    /// only where stage 4 held a candidate.
     pub fn summary_line(&self) -> String {
+        let not_ready = if self.not_ready.is_empty() {
+            String::new()
+        } else {
+            format!(", not ready {}", ranked(&self.not_ready, usize::MAX))
+        };
         let planned = if self.tally.1.mode == "preview" {
             format!(", planned starts {}", json!(self.planned_starts))
         } else {
@@ -3523,7 +3604,7 @@ impl Report {
             format!(", triages skipped {}", json!(*self.triage_skipped.borrow()))
         };
         format!(
-            "{}, {}, starts {}, comments created {}, edited {}{planned}{skipped}",
+            "{}, {}, starts {}, comments created {}, edited {}{not_ready}{planned}{skipped}",
             self.summary,
             self.spent,
             json!(self.effects.starts),
@@ -4290,6 +4371,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         });
     }
 
+    /// Counts a stage 4 candidate not started for `reason`, a hold kind's
+    /// name or [`NOT_READY_ERROR`] ([`Report::not_ready`]).
+    fn not_ready(&mut self, reason: &str) {
+        *self.report.not_ready.entry(reason.to_owned()).or_default() += 1;
+    }
+
     /// A hold of every new run, `hold wip|pools|budget: why`.
     fn pass_held(&mut self, kind: HoldKind, why: impl Into<String>) {
         self.record(Entry {
@@ -4976,11 +5063,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // line names them where no candidate started, to say whether the
         // order reached ready work at all (agent-board#864).
         let (mut first, mut ready) = (None, None);
+        // With `scan`, each candidate's reads are capped, and after as many
+        // in a row that started nothing, the rest wait: a pass's cost then
+        // scales with its starts, not the open items (agent-board#864).
+        let scan = self.config.scan.unwrap_or_default();
+        let mut fruitless = 0;
         for (n, (_, facts)) in candidates.iter().enumerate() {
             let left = candidates.len() - n;
             if free == 0 {
                 self.unconsidered += left;
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
+                break;
+            }
+            if scan.candidates.is_some_and(|limit| fruitless >= limit) {
+                self.unconsidered += left;
+                self.line(format!(
+                    "scan: {fruitless} candidate(s) in a row held or failed and none started, the most a pass reads (scan.candidates); {left} more candidate(s) wait"
+                ));
                 break;
             }
             // The probes taken, no pool is left to start on.
@@ -5006,6 +5105,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.focus.spillover = Some(true);
             }
             let issue = facts.issue.display();
+            let limit = scan.candidate_requests.map(|n| (issue.clone(), n));
+            *self.client.bounds.cause_limit.borrow_mut() = limit;
             let step = self.caused(issue.clone(), |s| s.within_reserve(|s| {
                 if s.config.top_down && let Some(parent) = &facts.parent {
                 let held = match s.live(parent) {
@@ -5040,9 +5141,24 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Err(error) => {
                     self.report.failures += 1;
                     self.unconsidered += 1;
+                    // Past a rate limit nothing is sent: those failures are
+                    // collapsed into one line ([`Bounds::collapse`]), and
+                    // the candidates were not read rather than not ready.
+                    if self.client.bounds.rate_limited.borrow().is_none() {
+                        self.not_ready(NOT_READY_ERROR);
+                        fruitless += 1;
+                    }
                     self.line(format!("fail {issue}: {error:#}"));
                     continue;
                 }
+            };
+            fruitless = match &step {
+                Step::Hold(hold) => {
+                    self.not_ready(hold.kind.name());
+                    fruitless + 1
+                }
+                Step::Stop(..) => fruitless,
+                Step::Started(..) | Step::Failed(..) | Step::Capped(_) => 0,
             };
             if focused {
                 let focus = &mut self.focus;
@@ -5123,6 +5239,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             free -= 1;
             taken += 1;
         }
+        *self.client.bounds.cause_limit.borrow_mut() = None;
         if taken == 0
             && let Some(first) = first
         {
@@ -5145,18 +5262,31 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// What `consider` decides, or stage 4's stop for the budget where the
     /// reserve leaves it nothing to read, or refused one of its reads and it
     /// started nothing: then it decided nothing, like those after it, and
-    /// holds nothing; the stop is a failure only before any candidate.
+    /// holds nothing; the stop is a failure only before any candidate. A
+    /// candidate whose reads `scan.candidateRequests` cut short is held as
+    /// unreadable, whatever its reads so far decided: what it waits on is
+    /// unknown, and the rest are read.
     fn within_reserve(&mut self, consider: impl FnOnce(&mut Self) -> Result<Step>) -> Result<Step> {
         let bounds = self.client.bounds;
         if bounds.reserved() {
             return Ok(Step::Stop(self.reserved(), Halt::Budget));
         }
-        let refused = bounds.refused.get();
+        let (refused, capped) = (bounds.refused.get(), bounds.capped.get());
         match consider(self) {
             step @ Ok(Step::Started(..) | Step::Failed(..) | Step::Capped(..)) => step,
             _ if bounds.refused.get() > refused => {
                 self.ignored.take();
                 Ok(Step::Stop(self.reserved(), Halt::Budget))
+            }
+            _ if bounds.capped.get() > capped => {
+                self.ignored.take();
+                let limit = (bounds.cause_limit.borrow().as_ref()).map_or(0, |(_, n)| *n);
+                Ok(Step::Hold(Hold::new(
+                    HoldKind::Unreadable,
+                    format!(
+                        "its reads reached {limit} requests, the most one candidate may take (scan.candidateRequests); what else it waits on is unread"
+                    ),
+                )))
             }
             step => step,
         }
@@ -5624,6 +5754,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let epic = match screen(facts, config, &control, &people) {
                 Screen::Out => continue,
                 Screen::Held(hold) => {
+                    self.not_ready(hold.kind.name());
                     self.held(facts, hold);
                     continue;
                 }
@@ -5666,6 +5797,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                                 parent.issue.display()
                             );
                             let top = top_priority(&board.options, facts);
+                            self.not_ready(HoldKind::EpicNotLive.name());
                             outside.push(Entry {
                                 scope: Scope::Under(facts.issue.clone(), parent.issue.clone()),
                                 hold: Hold::new(HoldKind::EpicNotLive, why).operator(top),
@@ -5682,6 +5814,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                                 deferred += 1;
                                 continue;
                             }
+                            self.not_ready(HoldKind::Unreadable.name());
                             self.held(facts, Hold::new(HoldKind::Unreadable, why));
                             continue;
                         }

@@ -13,6 +13,9 @@ fn fixture() -> String {
 /// endpoint class and the ten causes with the most requests.
 const REPLAY_SPENT: &str = r#"requests 57 (epics 17, schedule 37, status 3), endpoints {"graphql repository.issue":31,"actions workflows runs":12,"graphql repositoryOwner.projectV2":6,"graphql repository.defaultBranchRef":2,"actions runs jobs":1,"graphql node.fields":1,"graphql node.items":1,"graphql repository.issues":1,"graphql repository.pullRequests":1,"issues comments":1}, causes {"epics":11,"schedule":10,"cgwalters-forge/tracker#527":5,"status":3,"cgwalters-forge/agentic-job#188":2,"cgwalters-forge/tracker#468":2,"epic cgwalters-forge/tracker#596":2,"epic cgwalters-forge/tracker#766":2,"epic cgwalters-forge/tracker#890":2,"cgwalters-forge/agent-board#40":1,"... 17 more":17}, points ~43"#;
 
+/// The recorded pass's candidates stage 4 did not start, by why.
+const REPLAY_NOT_READY: &str = r#"not ready {"epic-not-live":22,"dispatched":2,"overlap":1}"#;
+
 #[test]
 fn review_setup_rejects_invalid_config_before_token_lookup() {
     let dir = std::env::temp_dir().join(format!("agent-board-review-setup-{}", std::process::id()));
@@ -431,7 +434,7 @@ fn setup_credential_free_rehearsal() {
             assert!(text.starts_with("pass: preview\n"), "{text}");
             assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 1);
             assert!(text.contains("held by --max-dispatch: start "), "{text}");
-            assert!(text.ends_with(&format!("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, planned starts {{\"triage\":1}}\n")), "{text}");
+            assert!(text.ends_with(&format!("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":1}}\n")), "{text}");
             assert!(output.stderr.is_empty(), "{line}");
         }
         count += 1;
@@ -2996,7 +2999,7 @@ fn pass_replay_previews_without_credentials() {
     // sub-issues are all closed: it is asked about, three writes, not planned.
     assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 6);
     assert!(
-        text.ends_with(&format!("\nsummary: dispatched 6, writes 3, held 0, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, planned starts {{\"triage\":6}}\n")),
+        text.ends_with(&format!("\nsummary: dispatched 6, writes 3, held 0, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":6}}\n")),
         "{text}"
     );
     for refused in [

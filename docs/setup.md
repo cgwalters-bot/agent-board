@@ -122,14 +122,15 @@ two lines are:
 
 ```text
 status: 0 change(s) of 0 item(s) read
-summary: dispatched 1/1, writes 3/3, held 5, requests 57 (epics 17, schedule 37, status 3), endpoints {…}, causes {…}, points ~43
+summary: dispatched 1/1, writes 3/3, held 5, requests 57 (epics 17, schedule 37, status 3), endpoints {…}, causes {…}, points ~43, starts {}, comments created 0, edited 0, not ready {…}, planned starts {"triage":1}
 ```
 
 These are **planned** dispatch/write steps, not completed mutations. `held` counts
 cap-held steps, not every `hold` line; requests are replayed reads, counted by
 the stage that read them, then by endpoint and by the candidate or epic they
-were read for ([what is built](pass.md#what-is-built)), and `~` marks
-estimated GraphQL points. This recording does not exercise Status changes.
+were read for ([what is built](pass.md#what-is-built)), `~` marks
+estimated GraphQL points, and `not ready` counts the candidates not started
+by why. This recording does not exercise Status changes.
 The caps limit the proposal; preview is what prevents writes. A `fail …` or
 `… error: …` line means an operation failed; the pass exits nonzero after its
 summary, and a partial preview is not an approval to apply.
