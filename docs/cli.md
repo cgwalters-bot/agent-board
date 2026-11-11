@@ -39,7 +39,7 @@ Commands:
 - [`cost`](#agent-board-cost): What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md)
 - [`ci-health`](#agent-board-ci-health): Rolling 30-day CI observations for explicit repositories/workflows; read-only, opt-in (docs/ci-health.md)
 - [`prune`](#agent-board-prune): Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
-- [`promote`](#agent-board-promote): Preview operator /promote command evidence on configured forks, or with promote.onApproval the operator's current-head approval of a draft; standalone, not a pass stage. Policy and human-text provenance must pass. With promote.publish=true, --apply and --max-writes, revalidate all gates and the operator's current-head approval, then create an upstream draft or update an existing same-head PR with unchanged fork title/body. At most one candidate and three writes; one fork status comment, no ref pushes, readiness changes or fork closure. DCO rewrites hold. Bot-fork acceptance still needs recorded staging verification (docs/architecture.md#promote)
+- [`promote`](#agent-board-promote): Preview operator /promote command evidence on configured forks, or with promote.onApproval the operator's current-head approval of a draft; standalone, not a pass stage. Policy and human-text provenance must pass. With promote.publish=true, --apply and --max-writes, revalidate all gates and the operator's current-head approval, rebase cleanly and add operator sign-offs where needed, then create an upstream draft or update an existing same-head PR with unchanged fork title/body. At most one candidate and four writes; one fork status comment and a create-only publication branch, no approved-ref updates, readiness changes or fork closure. Conflicting rebases hold. Bot-fork acceptance still needs recorded staging verification (docs/architecture.md#promote)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
@@ -917,7 +917,7 @@ Options:
 
 ## agent-board promote
 
-Preview operator /promote command evidence on configured forks, or with promote.onApproval the operator's current-head approval of a draft; standalone, not a pass stage. Policy and human-text provenance must pass. With promote.publish=true, --apply and --max-writes, revalidate all gates and the operator's current-head approval, then create an upstream draft or update an existing same-head PR with unchanged fork title/body. At most one candidate and three writes; one fork status comment, no ref pushes, readiness changes or fork closure. DCO rewrites hold. Bot-fork acceptance still needs recorded staging verification (docs/architecture.md#promote)
+Preview operator /promote command evidence on configured forks, or with promote.onApproval the operator's current-head approval of a draft; standalone, not a pass stage. Policy and human-text provenance must pass. With promote.publish=true, --apply and --max-writes, revalidate all gates and the operator's current-head approval, rebase cleanly and add operator sign-offs where needed, then create an upstream draft or update an existing same-head PR with unchanged fork title/body. At most one candidate and four writes; one fork status comment and a create-only publication branch, no approved-ref updates, readiness changes or fork closure. Conflicting rebases hold. Bot-fork acceptance still needs recorded staging verification (docs/architecture.md#promote)
 
 ```text
 agent-board promote [OPTIONS] --config <FILE>
@@ -926,7 +926,7 @@ agent-board promote [OPTIONS] --config <FILE>
 Options:
 
 - `--apply`: Publish at most one approved candidate; also requires promote.publish
-- `--max-writes <MAX_WRITES>`: Whole-step publication cap (three writes reserved per candidate)
+- `--max-writes <MAX_WRITES>`: Whole-step publication cap (three writes, or four with a rebase/sign-off branch)
 - `--config <FILE>`: Trusted shared pass configuration; promote.forks absent or empty means off, with no forge reads or token lookup. The pass uses it only for read-only awaiting-candidate diagnostics, never publication. With forks, GH_TOKEN reads within the pass's request/time bounds and ten 100-row pages per listing
 - `--record <FILE>`: Save live read responses projected to the evidence fields used here for offline replay. No forge writes. Record public repositories only before publishing the file; comment bodies remain in it
 - `--replay <FILE>`: Preview recorded reads at their recorded clock, without credentials

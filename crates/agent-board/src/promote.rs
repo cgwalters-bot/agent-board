@@ -16,7 +16,7 @@ pub struct Promote {
     /// Publish at most one approved candidate; also requires promote.publish.
     #[arg(long, conflicts_with_all = ["record", "replay"], requires = "max_writes")]
     pub apply: bool,
-    /// Whole-step publication cap (three writes reserved per candidate).
+    /// Whole-step publication cap (three writes, or four with a rebase/sign-off branch).
     #[arg(long, requires = "apply")]
     pub max_writes: Option<usize>,
     /// Trusted shared pass configuration; promote.forks absent or empty means off, with no forge reads or token lookup. The pass uses it only for read-only awaiting-candidate diagnostics, never publication. With forks, GH_TOKEN reads within the pass's request/time bounds and ten 100-row pages per listing.

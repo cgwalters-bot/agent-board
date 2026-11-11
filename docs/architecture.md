@@ -316,8 +316,8 @@ approved work visible without granting the pass upstream write authority.
 * **Candidate read gates.** Only after command/head evidence passes, read in
   order: all upstream PRs for the head repository owner's branch (same open
   head is already promoted; different, closed or merged holds); upstream-base
-  comparison (zero ahead or any behind holds, needing a rebase and fresh
-  approval or command); the issue's accepted plan's `stacks_on`; DCO facts from required
+  comparison (zero ahead holds; preview reports behind heads as needing a
+  publication rebase); the issue's accepted plan's `stacks_on`; DCO facts from required
   base-branch checks or base-head check runs; and unchanged title/body text.
   This prevents duplicate publication, stale bases, unmerged dependencies,
   unsafe sign-off rewrites and references changing meaning upstream. Only a
@@ -390,7 +390,7 @@ approved work visible without granting the pass upstream write authority.
   human-text; provenance verified)`, not live publication. No labels or notices
   are written, and title/body text is never altered or supplemented.
 * **Kept.** The upstream contribution-policy gate; the operator's sign-off
-  added at promote where the upstream wants DCO; the stacked wait (a pull
+  added to every promoted commit, whether or not upstream checks DCO; the stacked wait (a pull
   request whose dependency is not yet upstream waits); one notice per reason
   on the fork pull request; and `--human-text`, the one marker that the
   operator wrote the text, in the `/promote --human-text` command. That marker
@@ -402,8 +402,11 @@ approved work visible without granting the pass upstream write authority.
   and its attempts cache.
 * **Commits.** Their existing trailers stay; no commit is rewritten to change
   an older generated-by trailer. The only allowed rewrite adds the
-  operator's sign-off for DCO. This rewrite refuses merge commits and commits
-  by anyone other than the bot or the operator.
+  operator's sign-off and cleanly rebases onto the current upstream base.
+  A behind approved head needs no fresh approval after a clean rebase; a
+  conflict holds without publishing. Rewriting requires a linear chain of
+  commits by the bot or operator; other authors and merge commits hold.
+  Original authors, author dates and existing trailers are preserved.
 * **Noise.** The upstream repository gets the pull request and nothing else.
   The fork pull request, first-party, gets readable state with its machine
   detail alongside ([bookkeeping](#bookkeeping)).
@@ -414,17 +417,36 @@ approved work visible without granting the pass upstream write authority.
   latest deciding review approving the exact current head. A comment-only review
   does not cancel approval. Before the first write it re-reads the PR and every
   gate, including uncached policy and human-text provenance; changed command,
-  title/body, readiness, labels or head refuses. It reserves three writes as a
+  title/body, readiness, labels or head refuses. It reserves three writes (four
+  when creating a rebase/sign-off branch) as a
   whole step and handles at most one candidate per invocation, in repository/PR
   number order, within the existing request/time budget. Record/replay remains
   preview-only; apply uses the caller's `GH_TOKEN` through the existing transport.
+  Git preparation uses an isolated bare repository: no candidate code, hooks,
+  filters or configuration is executed. Fetches use the configured repositories
+  and exact object ids, depth 1001, with one 120-second Git deadline. Git must
+  be installed. The existing `GH_TOKEN` (or `GITHUB_TOKEN`) is passed to Git
+  through its environment, never a URL, argument or persisted credential.
   To prevent orphaned receipts and edited operator comments blocking recovery,
   `/user` must identify the configured bot before any publication reads/writes.
 * **Publication effects.** Create a **draft** upstream PR from `OWNER:BRANCH`,
   or update the title/body of the unique open same-head upstream PR. Send the
   fork title/body bytes unchanged, including for human-text; add no attribution
   or sign-off paragraph. Existing readiness is unchanged. There is no ready,
-  merge, reopen, ref update or push operation. Draft creation is deliberate:
+  merge, reopen or approved-ref update operation. If any commit lacks the
+  configured operator trailer, or the head is behind, Git replays every commit
+  onto the observed upstream base and adds the trailer wherever missing,
+  regardless of detected DCO checks. It creates a deterministic
+  `bot/promote/APPROVED_OID` branch in the same head repository,
+  never overwriting an existing ref. The approved fork branch remains untouched;
+  approval and human-text provenance stay bound to that original head. A retry
+  reconstructs the same branch/head and observes its upstream PR before writing.
+  If the upstream base changed since creating that branch, a different prepared
+  head holds for inspection instead of overwriting it or creating a duplicate PR.
+  An existing upstream PR on the original branch that needs rewriting holds for
+  manual migration, rather than creating a duplicate PR. The upstream base and
+  approved head are checked again before pushing the new branch.
+  Draft creation is deliberate:
   GitHub's branch-based POST can race a push, so it must not mark an unapproved
   head ready. Verify the branch immediately before publication and verify the
   returned head, branch, base, repository and text before recording success.
@@ -441,8 +463,9 @@ approved work visible without granting the pass upstream write authority.
   Concurrent invocations still need caller serialization; GitHub does not offer
   an atomic create-if-absent status comment. Nothing except the PR is posted
   upstream. Fork PRs remain open until the Status/scheduling handoff is built.
-  DCO candidates needing any rewrite hold: this path only publishes the approved
-  oid, never rewrites it or adds sign-off trailers.
+  No unsigned head is published: sign-off completeness is checked independently
+  of DCO detection before publication. Live publication and bot-fork staging
+  verification remain unverified by the offline fixtures.
 
 The answers to the brief's open questions:
 

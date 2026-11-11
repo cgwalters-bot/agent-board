@@ -187,7 +187,7 @@ fn awaiting_read_gates() {
         (
             "behind",
             (|r: &mut Replay| body(r, "/compare/")["behind_by"] = json!(31)) as fn(&mut Replay),
-            "needs rebase and a fresh approval or command (behind_by=31)",
+            "needs publication rebase (behind_by=31)",
         ),
         (
             "needs-human",
@@ -1231,7 +1231,7 @@ fn candidate_read_gates() {
         (
             "behind",
             |r| body(r, "/compare/")["behind_by"] = json!(1),
-            gate_hold("needs rebase and a fresh approval or command (behind_by=1)"),
+            gate_hold("needs publication rebase (behind_by=1)"),
         ),
         (
             "zero ahead",
@@ -1496,8 +1496,12 @@ impl Rest for PublishingForge {
                 requests: self.replay.requests.clone(),
             };
             Some(body(&mut replay, "pulls?state=open")[1].clone())
+        } else if url.contains("/pulls?state=all&head=cgwalters-bot%3Abot%2Fpromote") {
+            Some(json!([]))
         } else if url.contains("/git/ref/heads/") {
-            Some(json!({"object":{"sha":if self.moved { "a".repeat(40) } else { HEAD.into() }}}))
+            Some(
+                json!({"object":{"sha":if self.moved { "a".repeat(40) } else if url.contains("bot%2Fpromote") { "c".repeat(40) } else { HEAD.into() }}}),
+            )
         } else {
             None
         };
@@ -1526,6 +1530,9 @@ impl Rest for PublishingForge {
             result["body"] = body["body"].clone();
             if let Some(head) = body["head"].as_str() {
                 result["head"]["ref"] = json!(head.split_once(':').unwrap().1);
+                if head.contains(":bot/promote") {
+                    result["head"]["sha"] = json!("c".repeat(40));
+                }
             }
             if self.returned_head {
                 result["head"]["sha"] = json!("b".repeat(40));
@@ -1616,6 +1623,66 @@ fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
                 .contains("Published approved head")
         );
         assert!(writes.iter().all(|(_, url, _)| !url.contains("/git/")));
+    }
+}
+
+#[test]
+fn publication_rebases_and_signs_independently_of_dco() {
+    struct ReplayRewrite {
+        conflict: bool,
+        pushed: bool,
+    }
+    impl rewrite::Rewrite for ReplayRewrite {
+        fn prepare(
+            &mut self,
+            _: &Config,
+            _: &pass::promote::Fork,
+            _: &Value,
+            compare: &Value,
+        ) -> Result<(String, String)> {
+            assert_eq!(compare["commits"].as_array().unwrap().len(), 2);
+            ensure!(!self.conflict, "rebase conflict");
+            Ok(("c".repeat(40), "bot/promote/fixture".into()))
+        }
+        fn publish(&mut self, _: &str, _: &str, _: &str) -> Result<()> {
+            self.pushed = true;
+            Ok(())
+        }
+    }
+    for dco in [false, true] {
+        for behind in [0, 1] {
+            for conflict in [false, true] {
+                let (mut forge, config) = publication();
+                if !dco {
+                    *body(&mut forge.replay, "/rules/branches/") = json!([]);
+                    body(&mut forge.replay, "/check-runs")["check_runs"] = json!([]);
+                    body(&mut forge.replay, "/check-runs")["total_count"] = json!(0);
+                }
+                let compare = body(&mut forge.replay, "/compare/");
+                compare["behind_by"] = json!(behind);
+                let mut first = compare["commits"][0].clone();
+                first["sha"] = json!("a".repeat(40));
+                first["commit"]["message"] = json!("First unsigned");
+                let mut second = first.clone();
+                second["sha"] = json!(HEAD);
+                second["parents"] = json!([{"sha":"a".repeat(40)}]);
+                compare["commits"] = json!([first, second]);
+                compare["ahead_by"] = json!(2);
+                compare["total_commits"] = json!(2);
+                let mut git = ReplayRewrite {
+                    conflict,
+                    pushed: false,
+                };
+                let lines =
+                    publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+                assert_eq!(git.pushed, !conflict, "{lines:?}");
+                assert_eq!(forge.writes.borrow().len(), if conflict { 0 } else { 3 });
+                assert!(
+                    lines[0].starts_with(if conflict { "hold promote" } else { "promoted" }),
+                    "{lines:?}"
+                );
+            }
+        }
     }
 }
 
