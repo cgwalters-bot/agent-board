@@ -2075,8 +2075,11 @@ It uses the same discovery-share mechanism: maintain and PR discovery leave
 for scheduling and the later Status/holds stages. Unused requests remain
 available to later stages; neither the total limit nor mutation authority
 changes. The existing finish exceptions above still apply, so this is not a
-hard partition for writes or a guarantee of starts. A deferred maintain read
-keeps its cached state for the next pass, not a successful empty digest.
+hard partition for writes or a guarantee of starts. With `scan.reserve`, both
+shares give way to what the scan bounds say the later stages need, where that
+is less ([sizing the reserve](#sizing-the-reserve-from-the-scan)). A deferred
+maintain read keeps its cached state for the next pass, not a successful
+empty digest.
 Before posting a digest's plan, maintain also requires that the pass has
 enough requests and time left for the whole start and receipt (`budget:
 maintain stopped; a digest start and record need N requests, M left, before
@@ -2234,6 +2237,49 @@ ahead of ready work defer that work until what holds them moves, and
 Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` sets
 `scan` to `{"candidateRequests": 20, "candidates": 40}` and `state`
 (tracker#1548); no tracker settings are changed here.
+
+#### Sizing the reserve from the scan
+
+The concrete failure `scan.reserve: true` stops is the pull-request stage
+stopping at a fixed share while the requests it kept sit unused, so that
+approved pull requests wait pass after pass: with `reserveScheduling`, the
+stage stopped at 110 requests to keep 520 for the stages after it, which then
+used 254, and the whole pass spent 386 of the 646 its reads may take, the
+limit past the writes' reserve, as every count a stage "has" below is
+(agent-board#878). It is
+off by default, GitHub-only, and needs both scan bounds. With it, stages 2
+and 3 keep for the stages after them what those are bounded to need rather
+than their fixed share: `scan.candidates` times `scan.candidateRequests`, a
+start (its recheck and 104 requests, 109), with `reserveScheduling` the
+candidate reads stage 4 holds back before its parent discovery (104 more),
+and the later stages' own reads (the board's 20 pages at most, a dozen Status
+changes and the holds, 47); the leases a start's recheck reads again are not
+known in advance. Stage 3 keeps that need; stage 2 keeps it and stage 3's own
+room, the fixed shares' difference (130), as before, and the pass says so
+(`budget: scan.reserve keeps 326 requests for the stages after pull requests
+and 196 after epics, the scan's need in place of the fixed shares`). The need
+never raises a share: where it is stage 3's fixed share (247, or 390 with
+`reserveScheduling`) or more, as with tracker's 40 candidates at 20 (800 and
+a start), the fixed shares hold, nothing changes and no line says so. With
+`{"candidateRequests": 20, "candidates": 2, "reserve": true}` and no
+`reserveScheduling`, stage 3 keeps 196 instead of 247 and stage 2 326 instead
+of 377, so stage 2 has 320 (setup, usage and maintain included) instead of
+269; with `reserveScheduling` and 5 candidates, stage 3 keeps 360 instead of
+390 and stage 2 490, so stage 2 has 156 instead of 126. The product bounds
+one scan to a start; the scan after a start has what the earlier stages did
+not spend. Neither the request limit nor what a stage may write changes, and
+the finish exceptions above still apply.
+
+Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` sets
+`scan` to `{"candidateRequests": 20, "candidates": 3, "reserve": true}` and
+`reserveScheduling` to `false`: with `reserveScheduling` the sized reserve
+leaves stage 2 156 at 5 candidates and 196 at 3, which the test of thirty
+approved pull requests shows is not enough, where 3 candidates without it
+leave it 300. Turning `reserveScheduling` off also gives up what else it
+does: maintain's share, stage 4's hold-back before its parent discovery, and
+deferring the candidates that hold-back leaves unread rather than holding
+them as unreadable; the sized reserve keeps scheduling's requests in its
+place, not those. No tracker settings are changed here.
 
 ### Candidate admission
 
@@ -4739,6 +4785,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `epics.heldPlanHours` | GitHub only: where stage 4 held every candidate it read (the rest unread only for its budget) and a `planPools` pool is under pace, plan one unplanned live epic a pass whose last planning request is at least this many hours (0–168) old, see [what is built](#what-is-built); `0` (off) |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `scan.candidateRequests`, `scan.candidates` | GitHub only: the most charged requests considering one stage 4 candidate may take (1–650) before it is held as unreadable, and the most candidates in a row stage 4 reads without starting one (1–1000) before the rest wait for the next pass, which resumes after the last read where `state` keeps it, see [scan bounds](#scan-bounds); each absent (unbounded but by the budget) |
+| `scan.reserve` | GitHub only, needs both scan bounds: stages 2 and 3 keep for the stages after them what those are bounded to need, the scan, a start and their own reads, where that is less than their fixed share, see [sizing the reserve](#sizing-the-reserve-from-the-scan); `false` |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |

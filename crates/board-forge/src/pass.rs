@@ -107,6 +107,19 @@ const SCHEDULE_SHARE: usize = 60;
 
 const EPICS_SHARE: usize = 20;
 
+/// The requests Status is kept for a pass ([`LATER_READS`]): a read and a
+/// write for each of a dozen changes; it read 22 in the pass of
+/// agent-board#878.
+const STATUS_READS: usize = 24;
+
+/// What the stages after the scan read besides its candidates and a start
+/// ([`START_RESERVE`]), which a sized reserve keeps too ([`Scan::reserve`]):
+/// the board's pages, [`BOARD_PAGES`] at most, Status's reads of the items
+/// it changes ([`STATUS_READS`]) and the holds' ([`HOLDS_READS`]). Stage 4's
+/// run, lease and failed-run listings, a page each, ride on a board shorter
+/// than its most pages.
+const LATER_READS: usize = BOARD_PAGES + STATUS_READS + HOLDS_READS;
+
 /// 304s a pass does not charge to its budget: GitHub does not count them
 /// against the rate limit, so a revalidated read that answers from the cache
 /// is free, but only this many, so that they still bound a runaway loop.
@@ -1170,6 +1183,36 @@ pub struct Scan {
     /// [`poll::State::scan_cursor`]); without `state`, each pass reads the
     /// same candidates up to the bound.
     pub candidates: Option<usize>,
+    /// Off by default: with both bounds set, stages 2 and 3 keep for the
+    /// stages after them what those are bounded to need ([`Self::need`])
+    /// where that is less than their fixed share, instead of the share
+    /// (agent-board#878). The failure it stops is the pull-request stage
+    /// stopping at a fixed share while the requests it kept sit unused, so
+    /// that approved pull requests wait pass after pass.
+    #[serde(default)]
+    pub reserve: bool,
+}
+
+impl Scan {
+    /// What the stages after stage 3 are bounded to need, with `reserve`
+    /// and both bounds set: a scan of `candidates` candidates at
+    /// `candidateRequests` each, a start ([`START_RESERVE`]), with
+    /// `reserve_scheduling` the candidate reads stage 4 holds back before
+    /// its parent discovery too ([`START_REQUESTS`]), and the stages' own
+    /// reads ([`LATER_READS`]); else none, and the fixed shares hold. The
+    /// leases a start's recheck reads again are not known in advance.
+    fn need(&self, reserve_scheduling: bool) -> Option<usize> {
+        if !self.reserve {
+            return None;
+        }
+        let scan = self.candidates?.saturating_mul(self.candidate_requests?);
+        let discovery = if reserve_scheduling {
+            START_REQUESTS
+        } else {
+            0
+        };
+        Some(scan.saturating_add(START_RESERVE + discovery + LATER_READS))
+    }
 }
 
 /// The most `scan.candidates` may be: more than a board has candidates.
@@ -1389,6 +1432,10 @@ impl Config {
                     "scan {what} is not 1 to {limit}"
                 );
             }
+            ensure!(
+                !scan.reserve || (scan.candidates.is_some() && scan.candidate_requests.is_some()),
+                "scan reserve needs both scan candidates and scan candidateRequests"
+            );
         }
         if self.work() && self.forgejo_board().is_none() {
             let board = self
@@ -2820,12 +2867,17 @@ impl Bounds {
         self.enter_keeping(stage, 0);
     }
 
+    /// `percent` of the pass's limit, a stage's fixed share ([`kept_shares`]).
+    fn share(&self, percent: usize) -> usize {
+        self.limit * percent / 100
+    }
+
     /// Counts the requests from here on to `stage`, whose reads leave
-    /// `percent` of the pass's limit to the stages after it.
-    fn enter_keeping(&self, stage: Stage, percent: usize) {
+    /// `kept` requests to the stages after it.
+    fn enter_keeping(&self, stage: Stage, kept: usize) {
         self.stage.set(stage);
         self.start_kind.borrow_mut().clear();
-        self.kept.set(self.limit * percent / 100);
+        self.kept.set(kept);
         self.cut.set(0);
         // A step a stage left under way does not carry into the next.
         self.finishing.set(false);
@@ -3991,16 +4043,12 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if state.interval_seconds == 0 {
         state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
     }
-    let after_epics = if config.reserve_scheduling {
-        SCHEDULE_SHARE
-    } else {
-        AFTER_EPICS
-    };
-    let after_pulls = if config.reserve_scheduling {
-        SCHEDULE_SHARE + EPICS_SHARE
-    } else {
-        AFTER_PULL_REQUESTS
-    };
+    let (after_pulls, after_epics, sized) = kept_shares(config, bounds);
+    if sized {
+        scheduler.line(format!(
+            "budget: scan.reserve keeps {after_pulls} requests for the stages after pull requests and {after_epics} after epics, the scan's need in place of the fixed shares"
+        ));
+    }
     bounds.enter_keeping(
         Stage::Maintain,
         if config.reserve_scheduling {
@@ -4074,6 +4122,30 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         cost::stage(unbudgeted, config, within, caps, &mut report);
     }
     report
+}
+
+/// What stages 2 and 3 keep for the stages after them, in requests: their
+/// fixed shares ([`AFTER_PULL_REQUESTS`] and [`AFTER_EPICS`], or
+/// `reserveScheduling`'s), or with `scan.reserve` what those stages are
+/// bounded to need ([`Scan::need`]) where that is less, stage 3 keeping the
+/// need and stage 2 the need and stage 3's own room, the fixed shares'
+/// difference. The need never raises a share: a scan bound larger than the
+/// pass keeps what the fixed share does. The third is whether the need
+/// sized them.
+fn kept_shares(config: &Config, bounds: &Bounds) -> (usize, usize, bool) {
+    let (pulls, epics) = if config.reserve_scheduling {
+        (SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE)
+    } else {
+        (AFTER_PULL_REQUESTS, AFTER_EPICS)
+    };
+    let (pulls, epics) = (bounds.share(pulls), bounds.share(epics));
+    match config
+        .scan
+        .and_then(|scan| scan.need(config.reserve_scheduling))
+    {
+        Some(need) if need < epics => (need + (pulls - epics), need, true),
+        _ => (pulls, epics, false),
+    }
 }
 
 fn default_branch(client: &impl Rest, repo: &str) -> Result<String> {
