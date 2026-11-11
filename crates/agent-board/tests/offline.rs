@@ -2988,6 +2988,7 @@ fn pass_replay_previews_without_credentials() {
         .current_dir(root)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
+        .env("PATH", "")
         .assert()
         .success()
         .get_output()
@@ -3019,6 +3020,20 @@ fn pass_replay_previews_without_credentials() {
     let output = command().args(unknown).current_dir(root).assert().code(1);
     let error = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
+}
+
+#[test]
+fn pass_without_environment_tokens_or_gh_reports_authentication_required() {
+    let result = command()
+        .args(["pass", "--config", "fixtures/pass/config.json"])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env("PATH", "")
+        .assert()
+        .code(4);
+    let error = String::from_utf8_lossy(&result.get_output().stderr);
+    assert!(error.contains("gh auth login for github.com"), "{error}");
 }
 
 #[test]

@@ -10,6 +10,24 @@ layer. Existing [PR follow-up](poll.md),
 [job-plan](job-plans.md) and [epic-plan](epic-plans.md) protocols remain the
 authority for their operations. The differences below are intentional.
 
+## Local GitHub credentials
+
+`pass --config FILE` uses the first nonempty token from `GH_TOKEN`, then
+`GITHUB_TOKEN`, then `gh auth token --hostname github.com`. Install `gh` and log
+in to github.com first to use the last fallback. An explicit environment token
+is never replaced because a forge request fails. `DISPATCH_TOKEN`, when set,
+still overrides the pass token for starts; otherwise starts use the pass token.
+The fallback does not export credentials or change other commands' token lookup.
+`--check-config` uses it only when repository sources require live resolution;
+ordinary config checks and unseeded `--replay` remain credential-free.
+
+The explicit hostname prevents a `GH_HOST` enterprise login's credential from
+being sent to this client's github.com API. Helper output and errors are never
+printed. Preview remains the default; `--apply` still checks the configured bot's
+identity and requires the existing local caps outside Actions. Caller configs
+and reviewed bounds files still come from a trusted checkout; fetching them
+without a checkout is not implemented yet.
+
 ## Review setup diagnostic
 
 The concrete failure this check catches is a dispatch target whose review wrapper

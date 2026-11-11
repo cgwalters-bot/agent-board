@@ -14,7 +14,7 @@ use tokio::runtime::Runtime;
 pub struct Pass {
     #[command(subcommand)]
     pub command: Option<PassCommand>,
-    /// The pass configuration (docs/pass.md), from a trusted default-branch checkout. Credentials come from GH_TOKEN (the bot's) and DISPATCH_TOKEN, never the file.
+    /// The pass configuration (docs/pass.md), from a trusted default-branch checkout. Credentials come from GH_TOKEN, GITHUB_TOKEN or gh auth token (in that order), never the file; DISPATCH_TOKEN overrides the token for starts.
     #[arg(long, value_name = "FILE", required = true)]
     pub config: Option<PathBuf>,
     /// The caller's agentic-job bounds file for its `fix` kind (such as .github/agentic-job/fix.toml), from the same trusted checkout, never a dispatched head or workflow input: a pull request whose repository is outside its `repos` (unless push_to_pull_request_branch's `own_author` is the pull request's author), or whose head branch is outside its push_to_pull_request_branch `branches`, gets no fix, rebase or continuation round and is left to the operator. Repeatable: a pull request is inside where any one file admits both its repository and its head branch. The policy step stays the boundary.
@@ -334,7 +334,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     config.fix_bounds = FixBoundsSet::read(&args.fix_bounds)?;
     if args.check_config {
         if config.has_repository_sources() {
-            let client = Client::from_env()?.retry_within(
+            let client = pass_client()?.retry_within(
                 Instant::now()
                     + Duration::from_secs(board_forge::repository_lists::RESOLUTION_SECONDS),
             );
@@ -385,7 +385,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             // No wait under a rate limit outlasts the pass's time bound,
             // which starts with it.
             let deadline = Instant::now() + Duration::from_secs(pass::PASS_SECONDS_LIMIT);
-            let client = Client::from_env()?.retry_within(deadline);
+            let client = pass_client()?.retry_within(deadline);
             match (seed, record) {
                 (Some(seed), Some(path)) => {
                     let seeded = Seeded {
@@ -430,6 +430,38 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     print_report(&report, out)
 }
 
+fn pass_client() -> Result<Client> {
+    Client::from_env_or_else(|| {
+        let mut command = std::process::Command::new("gh");
+        // This client talks to api.github.com, even when gh's default host
+        // (GH_HOST) is an enterprise instance. Never borrow that host's token.
+        command.args(["auth", "token", "--hostname", "github.com"]);
+        gh_token(command)
+            .map_err(|_| anyhow::Error::from(board_forge::github::AuthenticationRequired))
+            .context("pass needs GH_TOKEN, GITHUB_TOKEN or a working gh auth login for github.com")
+    })
+}
+
+/// Do not forward gh's stdout/stderr, including on failure: either may contain
+/// credentials. This is a local credential lookup, not a forge request.
+fn gh_token(mut command: std::process::Command) -> Result<String> {
+    use std::process::Stdio;
+
+    let output = command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("run gh auth token")?;
+    ensure!(output.status.success(), "gh auth token failed");
+    let token = String::from_utf8(output.stdout).context("gh token is not UTF-8")?;
+    let token = token.trim();
+    ensure!(
+        !token.is_empty() && !token.chars().any(char::is_whitespace),
+        "gh token is empty or contains whitespace"
+    );
+    Ok(token.to_owned())
+}
+
 /// This file is supplied only by the trusted previous pass in the chain.
 /// Missing, oversized or unreadable state costs requests, not availability.
 fn load_state(path: &str) -> State {
@@ -470,6 +502,35 @@ fn print_report(report: &Report, out: &mut impl Write) -> Result<()> {
 mod next_tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_token_is_trimmed_and_failures_do_not_reveal_output() {
+        for (script, expected) in [
+            ("printf 'local-login-token\\n'", Some("local-login-token")),
+            ("exit 0", None),
+            ("printf 'two tokens'", None),
+            ("printf '\\377'", None),
+            (
+                "printf 'private-output'; printf 'private-error' >&2; exit 1",
+                None,
+            ),
+        ] {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            let result = gh_token(command);
+            match expected {
+                Some(token) => assert_eq!(result.unwrap(), token),
+                None => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(!error.contains("private-output"));
+                    assert!(!error.contains("private-error"));
+                    assert!(!error.contains("two tokens"));
+                }
+            }
+        }
+        assert!(gh_token(std::process::Command::new("/nonexistent/agent-board-gh")).is_err());
+    }
 
     #[test]
     fn pass_state_is_optional_bounded_and_cold_on_decode_failure() {
