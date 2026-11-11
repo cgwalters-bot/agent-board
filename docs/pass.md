@@ -1618,8 +1618,17 @@ counts what a preview plans and what an apply did (an uncapped kind has no
 `/N`), the steps the caps held plus stage 4's stop on the weekly budget, and the pass's budgeted requests, with each
 stage's share where it spent any (`setup` is the direction and dispatch-ref
 reads before stage 1, `maintain` the maintain digest, `holds` the hold
-snapshot), and GraphQL points; `~` marks points estimated as 1 a query and 5 a mutation where the
-response reads no `rateLimit { cost }`. The final `starts`, `comments created`
+snapshot), then where those requests went, and GraphQL points; `~` marks
+points estimated as 1 a query and 5 a mutation where the
+response reads no `rateLimit { cost }`. Where the requests went is
+`endpoints {"graphql repository.issue":31,"issues comments":12,…}, causes
+{"schedule":10,"cgwalters-forge/tracker#527":5,"epic cgwalters-forge/tracker#596":2,…}`
+(agent-board#864): every endpoint class (a REST path's segments after the
+repository, without numbers, or a GraphQL query's first nested fields), and
+the ten causes that spent the most, the rest as one `"... N more"` count. A
+cause is a candidate stage 4 considered, an epic stage 3 planned or whose
+liveness was read, or else the stage whose own reads they were, by its name.
+Both add up to `requests`, 304s refunded as for the stages. The final `starts`, `comments created`
 and `edited` are confirmed per-pass effects as defined above, also available
 on the pass's `Report.effects`. A preview leaves these zero (`starts {}`)
 and appends separately labelled `planned starts {"triage":1}`
@@ -1968,7 +1977,12 @@ reads: the board, run listings and leases (agent-board#789). A stop before
 any candidate started leaves no slot for the `idle:` line, so it adds one line
 for each pool still under pace (`idle: POOL is under pace and nothing started;
 stage 4's budget left M candidate(s) unread, first OWNER/REPO#N`), naming the
-candidate it stopped at (agent-board#803). Where every candidate it did read
+candidate it stopped at (agent-board#803). Whenever no candidate started,
+stage 4 also says which candidate came first in its order and what became of
+it, and the first found ready, which only `--max-dispatch` leaves unstarted
+(`schedule: no candidate started; first candidate OWNER/REPO#N: held: …; first
+ready to start: none`): whether its order reached ready work at all, or only
+held items, before its budget or the slots ran out (agent-board#864). Where every candidate it did read
 was held, `epics.heldPlanHours` may then plan an epic with what the stop kept
 ([what is built](#what-is-built)). Revisits, daily sessions, the weekly sweep and blocker reads
 that meet the reserve wait too, saying so (`sweep: budget: …`); none holds,

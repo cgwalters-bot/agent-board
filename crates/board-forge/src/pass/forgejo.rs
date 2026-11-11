@@ -69,19 +69,30 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The endpoint class of a Forgejo API `url` ([`super::Spent::by_class`]):
+/// its path after the API's, as GitHub's.
+fn forgejo_class(url: &url::Url) -> String {
+    let path = url.path();
+    let path = path.split_once(FORGEJO_API).map_or(path, |(_, rest)| rest);
+    super::path_class(path)
+}
+
+/// The API's path within a Forgejo address, which [`forgejo_class`] skips.
+const FORGEJO_API: &str = "/api/v1/";
+
 impl<C: ForgejoTransport> ForgejoTransport for Budget<'_, C> {
     fn get(&self, url: &url::Url) -> Result<crate::forgejo::Response> {
-        self.spend(false)?;
+        self.spend(false, &forgejo_class(url))?;
         self.observe(self.inner.get(url))
     }
 
     fn send(&self, method: &str, url: &url::Url, body: &Value) -> Result<(u16, Value)> {
-        self.spend(true)?;
+        self.spend(true, &forgejo_class(url))?;
         self.observe(self.inner.send(method, url, body))
     }
 
     fn write(&self, method: &str, url: &url::Url, body: &Value) -> Result<Value> {
-        self.spend(true)?;
+        self.spend(true, &forgejo_class(url))?;
         self.observe(self.inner.write(method, url, body))
     }
 }
@@ -1905,18 +1916,21 @@ fn outcome_line(outcome: &StartOutcome) -> String {
     }
 }
 
+/// The endpoint class of a broker read ([`super::Spent::by_class`]).
+const BROKER_CLASS: &str = "broker";
+
 /// Bound each broker read as well as forge reads. A slow read cannot admit a
 /// second request after the deadline; HTTP transports also bound each call.
 struct BrokerReads<'a, B>(&'a Budget<'a, B>);
 
 impl<B: Broker> Broker for BrokerReads<'_, B> {
     fn usage(&self, url: &str) -> Result<Value> {
-        self.0.spend(false)?;
+        self.0.spend(false, BROKER_CLASS)?;
         self.0.inner.usage(url)
     }
 
     fn grant(&self, url: &str) -> Result<Value> {
-        self.0.spend(false)?;
+        self.0.spend(false, BROKER_CLASS)?;
         self.0.inner.grant(url)
     }
 }

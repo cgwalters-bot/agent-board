@@ -1537,7 +1537,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 ));
                 break;
             }
-            self.epic(facts, project.as_ref(), slots.as_ref(), &target, turn);
+            self.caused(format!("epic {}", facts.issue.display()), |s| {
+                s.epic(facts, project.as_ref(), slots.as_ref(), &target, turn);
+            });
         }
         for waited in self.waited.iter_mut().chain(&mut self.held_epic) {
             waited.later = Some((project.clone(), slots.clone(), target.clone()));

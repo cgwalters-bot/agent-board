@@ -106,6 +106,15 @@ const EPICS_SHARE: usize = 20;
 /// against the rate limit, so a revalidated read that answers from the cache
 /// is free, but only this many, so that they still bound a runaway loop.
 const REVALIDATED_LIMIT: usize = PASS_REQUEST_LIMIT;
+/// The most causes the summary names, by their requests ([`Spent::by_cause`]):
+/// a candidate or an epic each, the rest counted together.
+const CAUSE_LINES: usize = 10;
+/// How many path segments name a REST endpoint's class ([`endpoint_class`]).
+const CLASS_SEGMENTS: usize = 3;
+/// How many nested fields name a GraphQL query's class ([`graphql_class`]).
+const GRAPHQL_FIELDS: usize = 2;
+/// The class of a download, a GET off the API ([`Rest::download`]).
+const DOWNLOAD_CLASS: &str = "download";
 /// Bound the persisted cache independently of the network request budget.
 pub const STATE_BYTES: u64 = 32 * 1024 * 1024;
 const RESPONSE_BYTES: usize = 1024 * 1024;
@@ -2598,6 +2607,12 @@ struct Bounds {
     cut: Cell<usize>,
     /// 304s refunded, up to [`REVALIDATED_LIMIT`].
     revalidated: Cell<usize>,
+    /// What the requests from here on are read for, a candidate or an epic
+    /// ([`Scheduler::caused`]), or none: the stage's own.
+    cause: RefCell<Option<String>>,
+    /// Requests by endpoint class and by cause ([`Spent`]).
+    by_class: RefCell<BTreeMap<String, usize>>,
+    by_cause: RefCell<BTreeMap<String, usize>>,
 }
 
 impl Bounds {
@@ -2627,6 +2642,9 @@ impl Bounds {
             kept: Cell::new(0),
             cut: Cell::new(0),
             revalidated: Cell::new(0),
+            cause: RefCell::new(None),
+            by_class: RefCell::default(),
+            by_cause: RefCell::default(),
         }
     }
 
@@ -2639,6 +2657,36 @@ impl Bounds {
             estimated: self.estimated.get(),
             rate_limited: self.rate_limited.borrow().is_some(),
             revalidated: self.revalidated.get(),
+            by_class: self.by_class.borrow().clone(),
+            by_cause: self.by_cause.borrow().clone(),
+        }
+    }
+
+    /// What `read` returns, its requests counted to `cause` instead of the
+    /// stage's own ([`Spent::by_cause`]); what they were counted to before,
+    /// an outer cause or none, counts again after it.
+    fn caused<T>(&self, cause: String, read: impl FnOnce() -> T) -> T {
+        let before = self.cause.replace(Some(cause));
+        let out = read();
+        *self.cause.borrow_mut() = before;
+        out
+    }
+
+    /// Counts a request of `class` to it and to its cause, the stage under
+    /// way where none is named, or takes one back (`add` false) for a
+    /// refund, which leaves no count at zero.
+    fn account(&self, class: &str, add: bool) {
+        let cause = (self.cause.borrow().clone()).unwrap_or_else(|| self.stage.get().name().into());
+        for (counts, key) in [(&self.by_class, class), (&self.by_cause, cause.as_str())] {
+            let mut counts = counts.borrow_mut();
+            if add {
+                *counts.entry(key.to_owned()).or_default() += 1;
+            } else if let Some(n) = counts.get_mut(key) {
+                *n -= 1;
+                if *n == 0 {
+                    counts.remove(key);
+                }
+            }
         }
     }
 
@@ -2710,8 +2758,9 @@ impl Bounds {
         })
     }
 
-    /// Gives back the request a 304 spent, up to [`REVALIDATED_LIMIT`].
-    fn refund(&self) {
+    /// Gives back the request of `class` a 304 spent, up to
+    /// [`REVALIDATED_LIMIT`].
+    fn refund(&self, class: &str) {
         let revalidated = self.revalidated.get();
         let stage = self.stage.get() as usize;
         let mut by_stage = self.by_stage.get();
@@ -2720,6 +2769,7 @@ impl Bounds {
         }
         by_stage[stage] -= 1;
         self.by_stage.set(by_stage);
+        self.account(class, false);
         self.left.set(self.left.get() + 1);
         self.revalidated.set(revalidated + 1);
     }
@@ -2745,7 +2795,7 @@ impl Bounds {
 /// What a pass spent ([`Report::summary_line`]): its budgeted requests,
 /// each stage's that spent any, GraphQL points, `~` where some are
 /// estimates (1 a query, 5 a mutation), and whether a rate limit stopped it.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Spent {
     pub requests: usize,
     by_stage: ByStage,
@@ -2754,6 +2804,12 @@ pub struct Spent {
     pub rate_limited: bool,
     /// 304s, which are not among `requests` ([`REVALIDATED_LIMIT`]).
     pub revalidated: usize,
+    /// `requests` by endpoint class ([`endpoint_class`], [`graphql_class`]).
+    pub by_class: BTreeMap<String, usize>,
+    /// `requests` by what they were read for: a candidate (`OWNER/REPO#N`),
+    /// an epic (`epic OWNER/REPO#N`), or else the stage under way, by its
+    /// [`Stage::name`].
+    pub by_cause: BTreeMap<String, usize>,
 }
 
 impl std::fmt::Display for Spent {
@@ -2770,11 +2826,133 @@ impl std::fmt::Display for Spent {
         if self.revalidated > 0 {
             write!(f, ", 304s {}", self.revalidated)?;
         }
+        if !self.by_class.is_empty() {
+            write!(f, ", endpoints {}", ranked(&self.by_class, usize::MAX))?;
+        }
+        if !self.by_cause.is_empty() {
+            write!(f, ", causes {}", ranked(&self.by_cause, CAUSE_LINES))?;
+        }
         write!(f, ", points {about}{}", self.points)?;
         if self.rate_limited {
             f.write_str(", rate-limited")?;
         }
         Ok(())
+    }
+}
+
+/// `counts` as a JSON object, most requests first, at most `limit` of them
+/// and the rest as one `"... N more": requests` member: how a summary names
+/// what spent the most without naming every candidate.
+fn ranked(counts: &BTreeMap<String, usize>, limit: usize) -> String {
+    let mut entries: Vec<(&String, &usize)> = counts.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let (named, rest) = entries.split_at(limit.min(entries.len()));
+    let mut members: Vec<String> = named
+        .iter()
+        .map(|(name, n)| format!("{}:{n}", json!(name)))
+        .collect();
+    if !rest.is_empty() {
+        let more: usize = rest.iter().map(|(_, n)| **n).sum();
+        members.push(format!(
+            "{}:{more}",
+            json!(format!("... {} more", rest.len()))
+        ));
+    }
+    format!("{{{}}}", members.join(","))
+}
+
+/// The endpoint class of a REST `url`, for [`Spent::by_class`]: its path
+/// segments after the repository, organization or user, numbers, file names
+/// and the query left out, at most [`CLASS_SEGMENTS`] of them, as `issues
+/// comments`, `actions runs` or `search issues`; `external` off the API.
+fn endpoint_class(url: &str) -> String {
+    let Some(path) = url.strip_prefix(API_ROOT) else {
+        return "external".into();
+    };
+    path_class(path.split('?').next().unwrap_or_default())
+}
+
+/// [`endpoint_class`] of an API `path`, the query left out.
+pub(crate) fn path_class(path: &str) -> String {
+    let mut segments = path.split('/').filter(|s| !s.is_empty()).peekable();
+    // The repository, organization or user the path is under.
+    let owned = match segments.peek() {
+        Some(&"repos") => 3,
+        Some(&"orgs" | &"users") => 2,
+        _ => 0,
+    };
+    let class: Vec<&str> = segments
+        .skip(owned)
+        .filter(|s| !(s.bytes().all(|b| b.is_ascii_digit()) || s.contains('.')))
+        .take(CLASS_SEGMENTS)
+        .collect();
+    if class.is_empty() {
+        "root".into()
+    } else {
+        class.join(" ")
+    }
+}
+
+/// The class of a GraphQL `query`, for [`Spent::by_class`]: `graphql`, or
+/// `mutation`, and its first [`GRAPHQL_FIELDS`] nested fields, arguments
+/// left out, as `graphql repository.issue`.
+fn graphql_class(query: &str) -> String {
+    let kind = if is_mutation(query) {
+        "mutation"
+    } else {
+        "graphql"
+    };
+    let body = query.split_once('{').map_or("", |(_, body)| body);
+    let (mut fields, mut word) = (Vec::<String>::new(), String::new());
+    // The word before a `{` is its field, unless a `...` fragment's, whose
+    // selection nests nothing of its own; a space ends a word only where
+    // another follows, as a field's arguments may come between it and `{`.
+    // The first field's selection closing ends the first path.
+    let (mut parens, mut gap, mut fragment) = (0usize, false, false);
+    // Each open brace: whether it is a field's selection.
+    let mut open: Vec<bool> = Vec::new();
+    for c in body.chars() {
+        match c {
+            '(' => parens += 1,
+            ')' => parens = parens.saturating_sub(1),
+            _ if parens > 0 => {}
+            '{' => {
+                let field = !fragment && !word.is_empty();
+                if field {
+                    fields.push(std::mem::take(&mut word));
+                }
+                open.push(field);
+                (gap, fragment) = (false, false);
+                word.clear();
+            }
+            '}' => {
+                if open.pop() == Some(true) {
+                    break;
+                }
+                word.clear();
+            }
+            '.' => {
+                fragment = true;
+                word.clear();
+            }
+            c if c.is_alphanumeric() || c == '_' => {
+                if gap {
+                    word.clear();
+                    gap = false;
+                }
+                word.push(c);
+            }
+            c if c.is_whitespace() => gap = !word.is_empty(),
+            _ => word.clear(),
+        }
+        if fields.len() == GRAPHQL_FIELDS {
+            break;
+        }
+    }
+    if fields.is_empty() {
+        kind.into()
+    } else {
+        format!("{kind} {}", fields.join("."))
     }
 }
 
@@ -2832,7 +3010,8 @@ impl<C> Budget<'_, C> {
         *self.bounds.responses.borrow_mut() = responses;
     }
 
-    fn spend(&self, write: bool) -> Result<()> {
+    /// Spends one request of endpoint `class`, a write or a read.
+    fn spend(&self, write: bool, class: &str) -> Result<()> {
         let bounds = self.bounds;
         if bounds.rate_limited.borrow().is_some() {
             bounds.not_sent.set(bounds.not_sent.get() + 1);
@@ -2872,6 +3051,7 @@ impl<C> Budget<'_, C> {
         let mut by_stage = bounds.by_stage.get();
         by_stage[bounds.stage.get() as usize] += 1;
         bounds.by_stage.set(by_stage);
+        bounds.account(class, true);
         Ok(())
     }
 
@@ -2915,7 +3095,7 @@ fn is_mutation(query: &str) -> bool {
 
 impl<C: Rest> Rest for Budget<'_, C> {
     fn get_fresh(&self, url: &str) -> Result<RestResponse> {
-        self.spend(false)?;
+        self.spend(false, &endpoint_class(url))?;
         self.observe(self.inner.get_fresh(url))
     }
     fn start_kind(&self, kind: &str) {
@@ -2923,7 +3103,8 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
-        self.spend(false)?;
+        let class = endpoint_class(url);
+        self.spend(false, &class)?;
         let enabled = self.bounds.cache_enabled.get()
             && !self.bounds.starting.get()
             && !self.bounds.finishing.get();
@@ -2956,7 +3137,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
         });
         let mut response = self.observe(self.inner.get(url, condition.or(validator)))?;
         if condition.or(validator).is_some() && response.status == 304 {
-            self.bounds.refund();
+            self.bounds.refund(&class);
         }
         if response.status == 304
             && condition.is_some()
@@ -3005,7 +3186,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
-        self.spend(true)?;
+        self.spend(true, &endpoint_class(url))?;
         let response = self.observe(self.inner.send(method, url, body))?;
         if (200..300).contains(&response.0) {
             let mut effects = self.bounds.effects.borrow_mut();
@@ -3061,7 +3242,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 
     fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
-        self.spend(false)?;
+        self.spend(false, DOWNLOAD_CLASS)?;
         self.observe(self.inner.download(url, limit))
     }
 }
@@ -3111,7 +3292,7 @@ impl<C: Rest + Transport> Budget<'_, C> {
         let data = if let Some(old) = evidence {
             old["comment_evidence"].clone()
         } else {
-            self.spend(false)?;
+            self.spend(false, &graphql_class(query))?;
             self.graphql_spent(false, self.inner.graphql(query, variables.clone()))?
         };
         if comments_match(&response.body, &data)
@@ -3170,7 +3351,7 @@ impl<C: Rest + Transport> Transport for Budget<'_, C> {
             return Ok(data);
         }
         let mutation = is_mutation(query);
-        self.spend(mutation)?;
+        self.spend(mutation, &graphql_class(query))?;
         self.graphql_spent(mutation, self.inner.graphql(query, variables))
     }
 }
@@ -3179,7 +3360,7 @@ impl<C: Rest + Transport> Transport for Budget<'_, C> {
 impl<C: crate::github::GraphQl> crate::github::GraphQl for Budget<'_, C> {
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let mutation = is_mutation(query);
-        self.spend(mutation)?;
+        self.spend(mutation, &graphql_class(query))?;
         let result = self.inner.graphql(query, variables).await;
         self.graphql_spent(mutation, result)
     }
@@ -3329,7 +3510,7 @@ pub struct Report {
 impl Report {
     /// The pass's last line: its caps' summary and what it spent, as
     /// `summary: dispatched 1/1, writes 3/5, held 12, requests 80 (epics 30,
-    /// schedule 50), points ~95`.
+    /// schedule 50), endpoints {…}, causes {…}, points ~95`.
     pub fn summary_line(&self) -> String {
         let planned = if self.tally.1.mode == "preview" {
             format!(", planned starts {}", json!(self.planned_starts))
@@ -3811,6 +3992,18 @@ enum Step {
     /// takes the slot it would have had, so the pass reads no further than
     /// it would have without the cap.
     Capped(String),
+}
+
+/// How stage 4's consideration of a candidate ended, for the `schedule:`
+/// line of a pass whose candidates started nothing: so never a start.
+fn outcome(step: &Result<Step>) -> String {
+    match step {
+        Ok(Step::Started(..) | Step::Failed(..)) => "started".into(),
+        Ok(Step::Capped(_)) => "held by --max-dispatch".into(),
+        Ok(Step::Hold(hold)) => format!("held: {}", hold.reason),
+        Ok(Step::Stop(why, _)) => format!("stopped: {why}"),
+        Err(error) => format!("failed: {error:#}"),
+    }
 }
 
 impl Step {
@@ -4778,6 +4971,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // What considering the candidates spent, which a budget stop says,
         // to tell it from the stage's other reads (agent-board#789).
         let before = self.client.bounds.left.get();
+        // The first candidate in order and what became of it, and the first
+        // found ready, which only a cap leaves unstarted: the `schedule:`
+        // line names them where no candidate started, to say whether the
+        // order reached ready work at all (agent-board#864).
+        let (mut first, mut ready) = (None, None);
         for (n, (_, facts)) in candidates.iter().enumerate() {
             let left = candidates.len() - n;
             if free == 0 {
@@ -4808,7 +5006,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.focus.spillover = Some(true);
             }
             let issue = facts.issue.display();
-            let step = self.within_reserve(|s| {
+            let step = self.caused(issue.clone(), |s| s.within_reserve(|s| {
                 if s.config.top_down && let Some(parent) = &facts.parent {
                 let held = match s.live(parent) {
                     Ok(true) => None,
@@ -4826,7 +5024,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
                 }
                 s.consider_waiting(facts, board, slots, snapshot, target)
-            });
+            }));
+            if matches!(step, Ok(Step::Capped(_))) {
+                ready.get_or_insert_with(|| issue.clone());
+            }
+            first.get_or_insert_with(|| format!("{issue}: {}", outcome(&step)));
             for why in self.ignored.take() {
                 self.held(facts, Hold::new(HoldKind::OverlapIgnored, why));
             }
@@ -4921,7 +5123,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             free -= 1;
             taken += 1;
         }
+        if taken == 0
+            && let Some(first) = first
+        {
+            let first: String = first.chars().take(IDLE_REASON_CHARS).collect();
+            self.line(format!(
+                "schedule: no candidate started; first candidate {first}; first ready to start: {}",
+                ready.as_deref().unwrap_or("none")
+            ));
+        }
         (free, taken)
+    }
+
+    /// What `read` returns, its requests counted to `cause`, a candidate's
+    /// `OWNER/REPO#N` or an epic's `epic OWNER/REPO#N` ([`Bounds::caused`]).
+    fn caused<T>(&mut self, cause: String, read: impl FnOnce(&mut Self) -> T) -> T {
+        let bounds = self.client.bounds;
+        bounds.caused(cause, || read(self))
     }
 
     /// What `consider` decides, or stage 4's stop for the budget where the
@@ -5545,10 +5763,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         } else if !labelled {
             Ok(false)
         } else {
-            (if config.top_down {
-                self.epic_labeller(&parent.issue)
-            } else {
-                epic_labelled_by(&self.client, &parent.issue)
+            self.caused(format!("epic {}", parent.issue.display()), |s| {
+                if config.top_down {
+                    s.epic_labeller(&parent.issue)
+                } else {
+                    epic_labelled_by(&s.client, &parent.issue)
+                }
             })
             .map(|by| is(by.as_deref(), &[&config.operator, &config.bot]))
             .map_err(|e| {
