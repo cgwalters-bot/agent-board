@@ -19621,10 +19621,21 @@ fn session_settings() -> Value {
 
 const SESSION_START: &str = "start session cgwalters-forge/agent-board#40 pool=claude";
 
+fn session_forge(fail: Option<&str>) -> Forge {
+    let mut forge = Forge::new(fail, false);
+    for repo in ["cgwalters-forge/agent-board", "cgwalters-forge/tracker"] {
+        forge.replay.requests.push(
+            json!({"request": {"get": format!("{API_ROOT}repos/{repo}")},
+            "answer": {"status": 200, "body": {"has_issues": true}}}),
+        );
+    }
+    forge
+}
+
 #[test]
 fn sessions_busiest_first_and_bounded_per_pass() {
     for cap in [None, Some(1), Some(2)] {
-        let forge = Forge::new(None, false);
+        let forge = session_forge(None);
         let mut settings = session_settings();
         settings["sessions"]["issues"] = json!([
             "cgwalters-forge/agent-board#40",
@@ -19656,7 +19667,7 @@ fn sessions_busiest_first_and_bounded_per_pass() {
             cap != Some(2)
         );
     }
-    let forge = Forge::new(None, false);
+    let forge = session_forge(None);
     let settings = config(json!({"triagePools": ["claude"], "wip": 12,
     "sessions": {"activity": {"threshold": 1}, "issues": [
         "cgwalters-forge/agent-board#40", "cgwalters-forge/tracker#446"
@@ -19683,7 +19694,7 @@ fn sessions_busiest_first_and_bounded_per_pass() {
 
 #[test]
 fn sessions_due_but_over_pace_wait_for_a_later_pass() {
-    let mut forge = Forge::new(None, false);
+    let mut forge = session_forge(None);
     let initial = usage(&mut forge.replay);
     let mut paced = initial.clone();
     paced["pools"]["claude"]["used_percent"] = 99.into();
@@ -19727,7 +19738,7 @@ fn sessions_activity_floor_and_weekly_idle_replay() {
         ),
         ("2026-10-16T06:00:00Z", false, true, "idleDays=7 elapsed"),
     ] {
-        let mut forge = Forge::new(None, false);
+        let mut forge = session_forge(None);
         anchor_plan(
             &mut forge.replay,
             "session",
@@ -19769,7 +19780,7 @@ fn sessions_activity_floor_and_weekly_idle_replay() {
 #[test]
 fn sessions_expired_foreign_edits_do_not_erase_the_interval_floor() {
     for edit_plan in [false, true] {
-        let mut forge = Forge::new(None, false);
+        let mut forge = session_forge(None);
         anchor_plan(
             &mut forge.replay,
             "session",
@@ -19823,7 +19834,7 @@ fn sessions_expired_foreign_edits_do_not_erase_the_interval_floor() {
 
 #[test]
 fn sessions_due_but_start_capped_still_apply_the_existing_batch() {
-    let mut forge = Forge::new(None, false);
+    let mut forge = session_forge(None);
     anchor_plan(
         &mut forge.replay,
         "session",
@@ -19873,7 +19884,7 @@ fn sessions_due_but_start_capped_still_apply_the_existing_batch() {
 #[test]
 fn sessions_failed_or_dispatch_capped_attempt_spends_the_pass_cap() {
     for failed in [false, true] {
-        let forge = Forge::new(failed.then_some("dispatches"), false);
+        let forge = session_forge(failed.then_some("dispatches"));
         let settings = config(json!({"triagePools": ["claude"], "wip": 12,
         "sessions": {"activity": {"threshold": 1}, "issues": [
             "cgwalters-forge/agent-board#40", "cgwalters-forge/tracker#446"
@@ -19897,9 +19908,105 @@ fn sessions_failed_or_dispatch_capped_attempt_spends_the_pass_cap() {
 }
 
 #[test]
+fn sessions_skip_issues_disabled_members_without_failing_or_writing() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/pass/org-visibility.json"
+    ))
+    .unwrap();
+    for applying in [false, true] {
+        for legacy in [false, true] {
+            let mut forge = session_forge(None);
+            forge
+                .replay
+                .requests
+                .extend(fixture["requests"].as_array().unwrap().clone());
+            let mut settings = session_settings();
+            settings["workRepositories"] =
+                json!(["cgwalters-forge/agent-board", "cgwalters-forge/.github"]);
+            settings["sessions"] = if legacy {
+                json!({"issues": ["cgwalters-forge/.github#1"]})
+            } else {
+                json!({"repositories": [{"org":"cgwalters-forge", "forks":false}]})
+            };
+            let mut value: Value =
+                serde_json::from_str(include_str!("../../../../fixtures/pass/config.json"))
+                    .unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(settings.as_object().unwrap().clone());
+            let unresolved = Config::parse_sources(&value.to_string()).unwrap();
+            let resolved = unresolved.resolve(&forge.replay, &mut Vec::new()).unwrap();
+            let config = resolved.as_ref().unwrap_or(&unresolved);
+            if !legacy {
+                forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/agent-board/issues?state=open&labels=agent-board-session&per_page=2")}, "answer": {"status": 200, "body": [{"number":40,"state":"open"}]}}));
+            }
+            let report = if applying {
+                apply(&forge, config)
+            } else {
+                preview(config, &forge.replay)
+            };
+            assert_eq!(report.failures, 0, "{:?}", report.lines);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l == "session cgwalters-forge/.github: skipped; issues are disabled"),
+                "{:?}",
+                report.lines
+            );
+            assert!(
+                !forge
+                    .writes
+                    .borrow()
+                    .iter()
+                    .any(|(_, url, _)| url.contains("repos/cgwalters-forge/.github/"))
+            );
+        }
+    }
+}
+
+#[test]
+fn sessions_do_not_treat_unreadable_issue_settings_as_disabled() {
+    for (status, body) in [
+        (403, json!({"has_issues": false})),
+        (200, json!({})),
+        (200, json!({"has_issues": null})),
+        (200, json!({"has_issues": "false"})),
+    ] {
+        let mut forge = session_forge(None);
+        let metadata = forge
+            .replay
+            .requests
+            .iter_mut()
+            .find(|r| r["request"]["get"] == format!("{API_ROOT}repos/cgwalters-forge/agent-board"))
+            .unwrap();
+        metadata["answer"] = json!({"status": status, "body": body});
+        let mut settings = session_settings();
+        settings["sessions"] = json!({"repositories": ["cgwalters-forge/agent-board"]});
+        let report = apply(&forge, &config(settings));
+        assert_eq!(report.failures, 1, "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("session cgwalters-forge/agent-board error:")),
+            "{:?}",
+            report.lines
+        );
+        assert!(!report.lines.iter().any(|l| l.contains("skipped; issues are disabled") || l.starts_with(SESSION_START)));
+        assert!(forge.writes.borrow().iter().all(|(_, url, body)| {
+            !url.ends_with("/labels")
+                && !url.ends_with("/issues")
+                && body["inputs"]["kind"] != "session"
+        }));
+    }
+}
+
+#[test]
 fn sessions_discover_anchors_and_refuse_duplicates() {
     for count in [0, 1, 2] {
-        let mut r = Forge::new(None, false).replay;
+        let mut r = session_forge(None).replay;
         let mut settings = session_settings();
         settings["sessions"] =
             json!({"hourUtc": 0, "idleDays": 1, "repositories": ["cgwalters-forge/agent-board"]});
@@ -19964,7 +20071,7 @@ fn sessions_repository_config_and_anchor_screening() {
 #[test]
 fn sessions_anchor_apply_counts_writes_and_preserves_control_roles() {
     for cap in [0, 1] {
-        let mut forge = Forge::new(None, false);
+        let mut forge = session_forge(None);
         for (url, body) in [
             (
                 format!(
@@ -20011,7 +20118,7 @@ fn sessions_anchor_apply_counts_writes_and_preserves_control_roles() {
         }
     }
     for role in ["usage", "holds"] {
-        let mut forge = Forge::new(None, false);
+        let mut forge = session_forge(None);
         if role == "usage" {
             let mut snapshot = forge
                 .replay
@@ -20160,7 +20267,7 @@ fn session_lines(report: &Report) -> Vec<&str> {
 #[test]
 fn sessions_start_once_a_day_on_the_anchor() {
     let settings = session_settings();
-    let forge = Forge::new(None, false);
+    let forge = session_forge(None);
     let report = preview(&config(settings.clone()), &forge.replay);
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
     let starts: Vec<&str> = (report.lines.iter())
@@ -20220,7 +20327,7 @@ fn sessions_start_once_a_day_on_the_anchor() {
 
     // Tomorrow, with yesterday's recorded plan on the anchor: started again
     // through the start's recheck and the plan protocol, under a new plan.
-    let mut forge = Forge::new(None, false);
+    let mut forge = session_forge(None);
     anchor_plan(
         &mut forge.replay,
         "session",
@@ -20298,7 +20405,7 @@ fn sessions_wait_on_the_anchors_plan_or_a_person() {
             edited_today,
         ),
     ] {
-        let mut forge = Forge::new(None, false);
+        let mut forge = session_forge(None);
         if let Some((kind, author, recorded)) = plan {
             anchor_plan(&mut forge.replay, kind, author, recorded);
         }
@@ -20324,7 +20431,7 @@ fn sessions_wait_on_the_anchors_plan_or_a_person() {
     // Off the board: the anchor must be an open issue the pass reads.
     let mut settings = session_settings();
     settings["sessions"]["issues"] = json!(["cgwalters-forge/agent-board#4040"]);
-    let forge = Forge::new(None, false);
+    let forge = session_forge(None);
     let report = preview(&config(settings), &forge.replay);
     assert_eq!(
         session_lines(&report),
@@ -20334,7 +20441,7 @@ fn sessions_wait_on_the_anchors_plan_or_a_person() {
     );
 
     // A run in flight on the anchor, a session's or any other.
-    let mut forge = Forge::new(None, false);
+    let mut forge = session_forge(None);
     let run = "https://github.com/cgwalters-forge/tracker/actions/runs/4040";
     in_flight(
         &mut forge.replay,
@@ -20352,7 +20459,7 @@ fn sessions_wait_on_the_anchors_plan_or_a_person() {
     );
 
     // Held by --max-dispatch where it would start.
-    let forge = Forge::new(None, false);
+    let forge = session_forge(None);
     let limits = Limits {
         dispatch: Some(0),
         ..Limits::default()
@@ -20591,7 +20698,7 @@ fn session_writes(forge: &Forge) -> Vec<String> {
 /// nothing more, however often it runs.
 #[test]
 fn sessions_apply_an_accepted_batch_once() {
-    let mut forge = Forge::new(None, false);
+    let mut forge = session_forge(None);
     anchor_plan(
         &mut forge.replay,
         "session",
@@ -20764,7 +20871,7 @@ fn sessions_apply_an_accepted_batch_once() {
 fn sessions_apply_one_batch_a_day_whatever_the_record() {
     let mut settings = session_settings();
     settings["sessions"]["apply"] = json!(true);
-    let mut forge = Forge::new(None, false);
+    let mut forge = session_forge(None);
     anchor_plan(
         &mut forge.replay,
         "session",
@@ -20842,7 +20949,7 @@ fn sessions_apply_one_batch_a_day_whatever_the_record() {
 fn sessions_stop_a_batch_naming_a_pull_request_before_any_write() {
     let mut settings = session_settings();
     settings["sessions"]["apply"] = json!(true);
-    let mut forge = Forge::new(None, false);
+    let mut forge = session_forge(None);
     forge.pulls = vec![701];
     anchor_plan(
         &mut forge.replay,
@@ -20921,7 +21028,7 @@ fn sessions_hold_refused_batches_and_cut_short_applies() {
         ("a visitor's batch", "visitor", None, batch_actions(), None),
         ("the operator's batch", "cgwalters", None, ask, None),
     ] {
-        let mut forge = Forge::new(None, false);
+        let mut forge = session_forge(None);
         anchor_plan(
             &mut forge.replay,
             "session",
@@ -20957,7 +21064,7 @@ fn sessions_hold_refused_batches_and_cut_short_applies() {
 
     // A failed request after the claim: the receipt says what was done,
     // and the next pass holds the anchor rather than replaying.
-    let mut forge = Forge::new(Some("addSubIssue("), false);
+    let mut forge = session_forge(Some("addSubIssue("));
     anchor_plan(
         &mut forge.replay,
         "session",
@@ -21007,7 +21114,7 @@ fn sessions_hold_refused_batches_and_cut_short_applies() {
 fn sessions_skip_an_action_whose_issue_changed_since_the_session_read_it() {
     let mut settings = session_settings();
     settings["sessions"]["apply"] = json!(true);
-    let mut forge = Forge::new(None, false);
+    let mut forge = session_forge(None);
     forge.changed = vec![683];
     anchor_plan(
         &mut forge.replay,

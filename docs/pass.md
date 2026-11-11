@@ -4387,6 +4387,11 @@ The pinned executable/build reference belongs in the workflow, not this file.
 ### Organization repository entries
 
 Repository lists can mix explicit names with `{"org":"cgwalters-forge","forks":false}`.
+The concrete threat is a pass PAT implicitly enrolling private repositories and
+copying their content into public tracker runs or comments. Organization entries
+default to `"visibility":"public"`; this is the only supported visibility filter.
+A private repository can be included only by naming it explicitly, not through
+organization discovery.
 This applies to `follow`, `workRepositories`, `holds.proposals.repositories`,
 `operatorAsk.harness.repositories`, `budget.harnessRepositories`,
 `pr.reviewDispatchRepositories`, `pr.draftReviewRepositories`, `pr.noMerge`,
@@ -4397,7 +4402,7 @@ The standalone poll, supervisor, status and trusted-config readers use the same
 expansion. Forgejo does not support organization entries.
 
 This is off unless an organization entry is configured. Each GitHub pass reads
-the organization's repository list afresh, excludes forks and archived
+the organization's public repository list afresh (`type=public`), excludes forks and archived
 repositories, and logs both the organization's resolved set and each expanded
 list. Lists containing organizations are sorted and deduplicated without regard
 to case. Repeated organizations share one listing within a configuration read.
@@ -4412,7 +4417,7 @@ inventory consuming the pass or silently narrowing its policy. Resolution
 allows at most ten distinct organizations and ten pages of 100 repositories
 per organization, stopping new reads after 120 seconds (an in-flight read may
 finish later). It uses constructed GitHub API paths, never a response's `Link`
-URL. Missing fork/archive facts, foreign-owner names, denied reads or a listing
+URL. Missing private/fork/archive facts, foreign-owner names, denied reads or a listing
 that does not finish within these bounds fail before any pass stage. Existing
 list-size and policy checks apply to the complete expanded result, not a
 truncated subset. Pass discovery also consumes its normal request/time budget.
@@ -4423,6 +4428,16 @@ it needs the usual `GH_TOKEN` (or `GITHUB_TOKEN`) with repository-list read
 access, and performs the same bounded resolution and full policy validation,
 without writes or dispatches. Do not give untrusted PR CI a privileged token
 to check a proposed organization policy; check that policy in a trusted context.
+For the same organization entry, the CI job token and the pass's PAT now resolve
+the same public repository set; extra private access does not expand it.
+
+Sessions read each configured repository's `has_issues` metadata before reading
+or creating its anchor, within the existing pass request/time budget. A repository
+with issues disabled is skipped with `session OWNER/REPO: skipped; issues are disabled`,
+not a pass failure. Missing or unreadable metadata remains an error. This applies
+to explicit session repositories and legacy anchors as well as organization
+members. Work and follow lists are unaffected: issues-disabled repositories
+remain in those lists.
 
 Caller activation: in `cgwalters-forge/tracker`, `.github/pass.json`, add
 `{"org":"cgwalters-forge","forks":false}` to `follow`, `workRepositories`,

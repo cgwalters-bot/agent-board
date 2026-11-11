@@ -465,6 +465,19 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
             bounds.reserve.set(reserve + 1);
             let read = (|| -> Result<_> {
+                let response = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
+                ensure!(
+                    response.status == 200,
+                    "repository metadata HTTP {}",
+                    response.status
+                );
+                if !response.body["has_issues"]
+                    .as_bool()
+                    .context("repository metadata missing has_issues")?
+                {
+                    self.line(format!("session {repo}: skipped; issues are disabled"));
+                    return Ok(None);
+                }
                 let found = match explicit {
                     Some(found) => Some(found),
                     None => anchor(&self.client, &repo, self.apply, self.caps)?,

@@ -93,6 +93,16 @@ pub const RESOLUTION_SECONDS: u64 = 120;
 struct Organization {
     org: String,
     forks: bool,
+    #[serde(default)]
+    visibility: Visibility,
+}
+
+// Private repositories must be named explicitly, never enrolled by discovery.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Visibility {
+    #[default]
+    Public,
 }
 
 /// Original lists containing organizations, indexed by JSON pointer. Runtime
@@ -138,6 +148,7 @@ impl Sources {
                                 let org: Organization = serde_json::from_value(entry.clone())
                                     .with_context(|| format!("{path}: organization entry"))?;
                                 ensure!(is_github_login(&org.org), "{path}: invalid organization");
+                                let Visibility::Public = org.visibility;
                                 ensure!(
                                     !org.forks,
                                     "{path}: organization entries require forks: false"
@@ -233,7 +244,7 @@ fn listing(client: &impl Rest, org: &str, deadline: Instant) -> Result<Vec<Strin
             "organization resolution deadline reached"
         );
         let url = format!(
-            "{API_ROOT}orgs/{org}/repos?type=all&sort=full_name&per_page={PAGE_SIZE}&page={page}"
+            "{API_ROOT}orgs/{org}/repos?type=public&sort=full_name&per_page={PAGE_SIZE}&page={page}"
         );
         let response = client
             .get(&url, None)
@@ -267,7 +278,10 @@ fn listing(client: &impl Rest, org: &str, deadline: Instant) -> Result<Vec<Strin
             let archived = value["archived"]
                 .as_bool()
                 .context("org repository missing archived")?;
-            if !fork && !archived {
+            let private = value["private"]
+                .as_bool()
+                .context("org repository missing private")?;
+            if !fork && !archived && !private {
                 repos.insert(name.to_ascii_lowercase(), name.to_owned());
             }
         }
@@ -292,8 +306,54 @@ mod tests {
     use crate::poll::RestResponse;
     use std::cell::Cell;
 
-    // Recorded 2026-11-10, projected to the three fields resolution uses.
+    // Recorded 2026-11-10, projected to the fields resolution uses.
     const RECORDING: &str = include_str!("../../../fixtures/pass/org-repositories.json");
+
+    #[test]
+    fn public_discovery_keeps_issues_disabled_members_and_explicit_private_names() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../fixtures/pass/org-visibility.json"))
+                .unwrap();
+        let replay = Replay::from_json(&fixture).unwrap();
+        for visibility in [None, Some("public")] {
+            let mut org = json!({"org":"cgwalters-forge", "forks":false});
+            if let Some(visibility) = visibility {
+                org["visibility"] = json!(visibility);
+            }
+            let mut value = json!({
+                "follow": [org], "workRepositories": [org],
+                "sessions": {"repositories": [org]},
+                "holds": {"proposals": {"repositories": [org]}},
+            });
+            let sources = Sources::take(&mut value).unwrap();
+            sources
+                .resolve(&mut value, &replay, &mut Vec::new())
+                .unwrap();
+            for path in [
+                "/follow",
+                "/workRepositories",
+                "/sessions/repositories",
+                "/holds/proposals/repositories",
+            ] {
+                assert_eq!(
+                    value.pointer(path).unwrap(),
+                    &json!(["cgwalters-forge/.github", "cgwalters-forge/agent-board"]),
+                    "{path}"
+                );
+            }
+            let mut value = json!({"follow": [org, "cgwalters-forge/private"]});
+            let sources = Sources::take(&mut value).unwrap();
+            sources
+                .resolve(&mut value, &replay, &mut Vec::new())
+                .unwrap();
+            assert!(
+                value["follow"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("cgwalters-forge/private"))
+            );
+        }
+    }
 
     #[test]
     fn recorded_org_lists_are_additive_and_shared_across_fields() {
@@ -398,6 +458,24 @@ mod tests {
                 1,
             ),
             (
+                json!([{"full_name":"team/repo","fork":false,"archived":false}]),
+                200,
+                None,
+                1,
+            ),
+            (
+                json!([{"full_name":"team/repo","fork":false,"archived":false,"private":null}]),
+                200,
+                None,
+                1,
+            ),
+            (
+                json!([{"full_name":"team/repo","fork":false,"archived":false,"private":"false"}]),
+                200,
+                None,
+                1,
+            ),
+            (
                 json!([]),
                 200,
                 Some("<https://evil.invalid/>; rel=\"next\"".into()),
@@ -429,8 +507,8 @@ mod tests {
             status: 200,
             link: None,
             body: json!([
-                {"full_name":"team/old","fork":false,"archived":true},
-                {"full_name":"team/fork","fork":true,"archived":false}
+                {"full_name":"team/old","fork":false,"archived":true,"private":false},
+                {"full_name":"team/fork","fork":true,"archived":false,"private":false}
             ]),
         };
         let mut value = json!({"follow":[{"org":"team","forks":false}, "team/fork"]});
@@ -448,6 +526,9 @@ mod tests {
             json!({"org":"team","forks":true}),
             json!({"org":"team"}),
             json!({"org":"team","forks":false,"extra":true}),
+            json!({"org":"team","forks":false,"visibility":"private"}),
+            json!({"org":"team","forks":false,"visibility":"all"}),
+            json!({"org":"team","forks":false,"visibility":null}),
             json!({"org":null,"forks":false}),
         ] {
             assert!(Sources::take(&mut json!({"follow":[entry]})).is_err());
@@ -528,7 +609,7 @@ mod tests {
                 calls: Cell::new(0),
                 status: 200,
                 link: None,
-                body: json!([{"full_name":format!("cgwalters-forge/{name}"),"fork":false,"archived":false}]),
+                body: json!([{"full_name":format!("cgwalters-forge/{name}"),"fork":false,"archived":false,"private":false}]),
             };
             sources
                 .resolve(&mut value, &pages, &mut Vec::new())
@@ -549,7 +630,7 @@ mod tests {
                 (0..first_size)
                     .map(|n| json!({
                         "full_name": format!("cgwalters-forge/repo{n:03}"),
-                        "fork": false, "archived": false
+                        "fork": false, "archived": false, "private": false
                     }))
                     .collect::<Vec<_>>()
             );
@@ -557,11 +638,10 @@ mod tests {
             first["answer"]["link"] = json!("<https://other.invalid/anything>; rel=\"next\"");
             let mut second = first.clone();
             second["request"]["get"] = json!(format!(
-                "{API_ROOT}orgs/cgwalters-forge/repos?type=all&sort=full_name&per_page={PAGE_SIZE}&page=2"
+                "{API_ROOT}orgs/cgwalters-forge/repos?type=public&sort=full_name&per_page={PAGE_SIZE}&page=2"
             ));
             second["answer"]["link"] = Value::Null;
-            second["answer"]["body"] =
-                json!([{"full_name":"cgwalters-forge/last","fork":false,"archived":false}]);
+            second["answer"]["body"] = json!([{"full_name":"cgwalters-forge/last","fork":false,"archived":false,"private":false}]);
             fixture["requests"] = json!([first, second]);
             let replay = Replay::from_json(&fixture).unwrap();
             let mut value = source_config();

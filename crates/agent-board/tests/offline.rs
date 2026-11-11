@@ -2834,6 +2834,13 @@ fn pass_replay_previews_a_daily_session() {
     // Synthetic dispatch history: evidence of the log contract, not live savings.
     let mut recording: Value =
         serde_json::from_str(include_str!("../../../fixtures/pass/board-2026-10-23.json")).unwrap();
+    recording["requests"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "request": {"get": "https://api.github.com/repos/cgwalters-forge/agent-board"},
+            "answer": {"status": 200, "body": {"has_issues": true}}
+        }));
     // The historical recording predates activity fields on the first anchor
     // page. Supply an explicit, synthetic quiet repository for this replay.
     let mut activity = recording["requests"]

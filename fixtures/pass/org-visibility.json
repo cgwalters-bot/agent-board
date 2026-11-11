@@ -1,0 +1,20 @@
+{
+  "schema": "agent-board/pass-replay/v1",
+  "now": "2026-10-23T15:10:00Z",
+  "requests": [
+    {
+      "request": {"get": "https://api.github.com/orgs/cgwalters-forge/repos?type=public&sort=full_name&per_page=100&page=1"},
+      "answer": {"status": 200, "body": [
+        {"full_name":"cgwalters-forge/agent-board","private":false,"fork":false,"archived":false,"has_issues":true},
+        {"full_name":"cgwalters-forge/.github","private":false,"fork":false,"archived":false,"has_issues":false},
+        {"full_name":"cgwalters-forge/private","private":true,"fork":false,"archived":false,"has_issues":true},
+        {"full_name":"cgwalters-forge/fork","private":false,"fork":true,"archived":false,"has_issues":true},
+        {"full_name":"cgwalters-forge/archived","private":false,"fork":false,"archived":true,"has_issues":true}
+      ]}
+    },
+    {
+      "request": {"get": "https://api.github.com/repos/cgwalters-forge/.github"},
+      "answer": {"status": 200, "body": {"has_issues":false}}
+    }
+  ]
+}
