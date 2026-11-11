@@ -1310,6 +1310,89 @@ fn replay_idle_board_starts_work() {
         "{}",
         report.summary_line()
     );
+    // The candidates not started, screened out or read, by why; the
+    // summary names them most first.
+    let counts = |pairs: &[(&str, usize)]| -> BTreeMap<String, usize> {
+        pairs.iter().map(|(k, n)| ((*k).to_owned(), *n)).collect()
+    };
+    assert_eq!(
+        report.not_ready,
+        counts(&[("dispatched", 2), ("epic-not-live", 22), ("overlap", 1)])
+    );
+    assert!(
+        report
+            .summary_line()
+            .contains(r#", edited 0, not ready {"epic-not-live":22,"dispatched":2,"overlap":1}, planned starts "#),
+        "{}",
+        report.summary_line()
+    );
+}
+
+/// `scan` bounds stage 4's reads on the idle board (agent-board#864):
+/// `candidateRequests` holds tracker#527, whose overlap check reads past
+/// it, as unreadable at that many reads, the candidates after it still
+/// read and started; `candidates` stops the scan after that many held in a
+/// row, two starts before them, the rest waiting with the slots left free.
+#[test]
+fn scan_caps_candidate_reads_and_stops_a_fruitless_run() {
+    let capped = "hold cgwalters-forge/tracker#527: its reads reached 3 requests, the most one candidate may take (scan.candidateRequests); what else it waits on is unread";
+    let stopped = "scan: 3 candidate(s) in a row held or failed and none started, the most a pass reads (scan.candidates); 274 more candidate(s) wait";
+    fn lines<'a>(replaced: &[(usize, &'a str)], upto: usize) -> Vec<&'a str> {
+        let mut lines = STARTED[..upto].to_vec();
+        for (at, line) in replaced {
+            lines[*at] = line;
+        }
+        lines
+    }
+    // The setting, the lines from stage 4's first candidate, the reads
+    // tracker#527 took, and the candidates not started by why.
+    let cases = [
+        (
+            json!({"candidateRequests": 3}),
+            lines(&[(4, capped)], STARTED.len()),
+            3,
+            vec![("dispatched", 2), ("epic-not-live", 22), ("unreadable", 1)],
+        ),
+        (
+            json!({"candidates": 3}),
+            lines(&[(5, stopped)], 6),
+            5,
+            vec![("dispatched", 2), ("epic-not-live", 22), ("overlap", 1)],
+        ),
+        (
+            json!({"candidates": 2}),
+            lines(
+                &[(
+                    4,
+                    "scan: 2 candidate(s) in a row held or failed and none started, the most a pass reads (scan.candidates); 275 more candidate(s) wait",
+                )],
+                5,
+            ),
+            0,
+            vec![("dispatched", 2), ("epic-not-live", 22)],
+        ),
+    ];
+    for (scan, expected, reads, not_ready) in cases {
+        let report = preview(&config(json!({"scan": scan})), &replay());
+        let first = report.lines.iter().position(|l| l == STARTED[0]).unwrap();
+        let after: Vec<&str> = report.lines[first..]
+            .iter()
+            .map(String::as_str)
+            .take_while(|l| !l.starts_with("promote: "))
+            .collect();
+        assert_eq!(after, expected, "scan {scan}");
+        assert_eq!(report.failures, 0, "scan {scan}: {:#?}", report.lines);
+        let counted = report.spent.by_cause.get("cgwalters-forge/tracker#527");
+        assert_eq!(counted.copied().unwrap_or(0), reads, "scan {scan}");
+        let not_ready: BTreeMap<String, usize> = (not_ready.into_iter())
+            .map(|(k, n)| (k.to_owned(), n))
+            .collect();
+        assert_eq!(report.not_ready, not_ready, "scan {scan}");
+        // An unreadable candidate keeps an idle stage 4 from reading as one
+        // with no ready work; a stopped scan starts what it found first.
+        assert!(report.spent.requests < 57, "scan {scan}: {}", report.spent);
+    }
+    assert!(forgejo::check_options(&json!({"scan": {"candidates": 1}})).is_err());
 }
 
 /// The summary names each stage that spent a request, in stage order, and
@@ -1874,6 +1957,52 @@ fn reads_count_to_their_cause() {
     );
     assert_eq!(spent.by_class, counts(&[("issues comments", 5)]));
     assert_eq!(spent.requests, 5);
+}
+
+/// With a cause capped (`scan.candidateRequests`), its reads past the cap
+/// are refused and counted as capped; 304s are refunded, so they do not
+/// bring it nearer; a start's own reads, writes, reads under no cause or
+/// another, a nested epic's included, are never refused.
+#[test]
+fn cause_reads_are_capped() {
+    let bounds = Bounds::new(20, Instant::now() + Duration::from_secs(60));
+    bounds.enter(Stage::Schedule);
+    *bounds.cause_limit.borrow_mut() = Some(("o/r#1".into(), 2));
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    let url = format!("{API_ROOT}repos/o/r/issues/1/comments?per_page=100");
+    let read = || client.get(&url, None).map(|_| ());
+    let revalidate = || client.get(&url, Some(("etag", "x"))).map(|_| ());
+    bounds.caused("o/r#1".into(), || {
+        read().unwrap();
+        revalidate().unwrap();
+        read().unwrap();
+        let refused = read().unwrap_err().to_string();
+        assert_eq!(
+            refused,
+            "the candidate's reads reached 2 requests, the most one may take (scan.candidateRequests)"
+        );
+        assert_eq!(bounds.capped.get(), 1);
+        bounds.caused("epic o/r#9".into(), || read().unwrap());
+        client.send("POST", &url, &json!({})).unwrap();
+        bounds.starting.set(true);
+        read().unwrap();
+        bounds.end_start();
+        assert!(read().is_err());
+    });
+    read().unwrap();
+    bounds.caused("o/r#2".into(), || read().unwrap());
+    *bounds.cause_limit.borrow_mut() = None;
+    bounds.caused("o/r#1".into(), || read().unwrap());
+    let spent = bounds.spent();
+    assert_eq!(spent.by_cause["o/r#1"], 5);
+    assert_eq!(spent.by_cause["epic o/r#9"], 1);
+    assert_eq!(
+        (spent.requests, spent.revalidated, bounds.capped.get()),
+        (8, 1, 2)
+    );
 }
 
 /// `triage` true, or with the scope `all`, triages each candidate without a
@@ -15062,6 +15191,18 @@ fn config_table() {
             "pr pool \"tier-1\" is not a pool name",
         ),
         (json!({"wip": 101}), "wip is not 0 to 100"),
+        (
+            json!({"scan": {"candidateRequests": 0}}),
+            "scan candidateRequests is not 1 to 650",
+        ),
+        (
+            json!({"scan": {"candidates": 1001}}),
+            "scan candidates is not 1 to 1000",
+        ),
+        (
+            json!({"scan": {"candidate": 1}}),
+            "unknown field `candidate`",
+        ),
         (
             json!({"wip": 1, "workRepositories": ["o/r"]}),
             "board is required",
