@@ -34,6 +34,9 @@
 //! a list that goes somewhere public: every query reads each repository's
 //! `isPrivate`, so this costs no request, and a private repository is then
 //! neither listed, searched, nor named in a landing's `closes`.
+//!
+//! [`diff`] is the other `changes`: not a project's window as release notes,
+//! but every followed and midstream repository since its own watermark.
 use crate::github::{ReadBudget, SNAPSHOT_REQUEST_LIMIT, Transport, sync_connection, text};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -885,6 +888,8 @@ impl Changes {
         }
     }
 }
+
+pub mod diff;
 
 #[cfg(test)]
 mod tests;

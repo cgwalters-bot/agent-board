@@ -436,7 +436,8 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     print_report(&report, out)
 }
 
-fn pass_client() -> Result<Client> {
+/// The pass's client, and `changes`'s (docs/pass.md#local-github-credentials).
+pub(crate) fn pass_client() -> Result<Client> {
     Client::from_env_or_else(|| {
         let mut command = std::process::Command::new("gh");
         // This client talks to api.github.com, even when gh's default host

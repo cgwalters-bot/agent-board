@@ -19,7 +19,7 @@ Commands:
 - [`triage`](#agent-board-triage): Apply an operator-reviewed triage verdict list (preview unless --apply)
 - [`check`](#agent-board-check): Check proposals without applying them
 - [`project`](#agent-board-project): Inspect a project's summary and schema
-- [`changes`](#agent-board-changes): What landed, closed, opened or changed hold on the live project since a time, each line a link (read-only); --board-config's operator counts as an author whose new pull requests are listed
+- [`changes`](#agent-board-changes): What changed in the followed and midstream repositories of --config since each one's watermark, read-only: a summary by repository, or --json for the whole diff; --commit moves the watermarks (docs/changes.md). With --since, instead, what landed, closed, opened or changed hold on the live project since a time, each line a link
 - [`item`](#agent-board-item): List or inspect board items
 - [`ask`](#agent-board-ask): Ask the operator a question as an issue, list or resolve asks
 - [`run`](#agent-board-run): Propose run field updates, or write them with --apply
@@ -228,19 +228,24 @@ Options:
 
 ## agent-board changes
 
-What landed, closed, opened or changed hold on the live project since a time, each line a link (read-only); --board-config's operator counts as an author whose new pull requests are listed
+What changed in the followed and midstream repositories of --config since each one's watermark, read-only: a summary by repository, or --json for the whole diff; --commit moves the watermarks (docs/changes.md). With --since, instead, what landed, closed, opened or changed hold on the live project since a time, each line a link
 
 ```text
-agent-board changes [OPTIONS] --since <SINCE>
+agent-board changes [OPTIONS]
 ```
 
 Options:
 
-- `--since <SINCE>`: Start of the window, RFC 3339 (such as 2026-10-23T00:00:00Z)
-- `--until <UNTIL>`: End of the window, RFC 3339; without it, the window runs to now
-- `--format <FORMAT>`: Output format (possible values: `markdown`, `json`) (default: `markdown`)
-- `--public-only`: Leave out issues and pull requests of private repositories, for a list that will be published
-- `--max-chars <N>`: Trim the Markdown to at most N characters as a generated status update is trimmed: the longest sections lose their last lines first, each ending with `+K more`
+- `--config <FILE>`: The pass configuration (docs/pass.md) whose `follow` list and `midstream` owner name the repositories, and whose `operator` has comments flagged; from a trusted checkout, with credentials from GH_TOKEN, GITHUB_TOKEN or gh auth token [default: .github/pass.json]
+- `--state <DIR>`: Where the watermarks and ETags are kept, in changes.json [default: $XDG_CACHE_HOME/agent-board or ~/.cache/agent-board]
+- `--commit`: Move every read repository's watermark to this read's time; without it the next run lists the same changes again
+- `--replay <FILE>`: Read a recorded diff (a replay fixture) at its clock instead of the forge; needs no token, and --state, so that a fixture's watermarks never land in the cache
+- `--record <FILE>`: Read live, and save every read and its answer to FILE as a replay fixture
+- `--since <SINCE>`: Instead, what landed, closed, opened or changed hold on the live project (--owner, --project) since this time, RFC 3339 (such as 2026-10-23T00:00:00Z), each line a link; --board-config's operator counts as an author whose new pull requests are listed
+- `--until <UNTIL>`: End of --since's window, RFC 3339; without it, the window runs to now
+- `--format <FORMAT>`: --since's output format (possible values: `markdown`, `json`) (default: `markdown`)
+- `--public-only`: Leave out of --since's list the issues and pull requests of private repositories, for a list that will be published
+- `--max-chars <N>`: Trim --since's Markdown to at most N characters as a generated status update is trimmed: the longest sections lose their last lines first, each ending with `+K more`
 
 ## agent-board item
 

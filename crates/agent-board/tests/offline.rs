@@ -728,7 +728,12 @@ fn live_project_cli_refusals() {
             ],
             "does not support --json",
         ),
-        (vec!["changes"], "--since"),
+        // Without --since, the repository diff, from the caller's checkout.
+        (vec!["changes"], "read .github/pass.json"),
+        (
+            vec!["changes", "--until", "2026-10-21T00:00:00Z"],
+            "--since",
+        ),
         (
             vec![
                 "changes",
@@ -3975,4 +3980,137 @@ fn pass_local_apply_needs_both_caps() {
         let out = String::from_utf8(output.stdout).unwrap();
         assert_eq!(out.lines().collect::<Vec<_>>(), *stdout, "{args:?}");
     }
+}
+
+#[test]
+fn changes_replay_lists_the_recorded_diff_without_credentials() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let state = std::env::temp_dir().join(format!("agent-board-changes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state).unwrap();
+    // The recording's watermarks: every repository at 14:05 UTC.
+    let replay = |fixture: &str| {
+        let mut command = command();
+        command
+            .args([
+                "changes",
+                "--config",
+                "fixtures/changes/config.json",
+                "--replay",
+            ])
+            .arg(fixture)
+            .arg("--state")
+            .arg(&state)
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env("PATH", "");
+        command
+    };
+    let seed = include_str!("../../../fixtures/changes/state.json");
+    std::fs::write(state.join("changes.json"), seed).unwrap();
+    for args in [
+        vec!["--json", "items"],
+        vec!["--json", "--jq", "["],
+        vec!["--json", "--jq", "unknown_function"],
+        vec!["--json", "--jq", ".repositories | error(\"render failed\")"],
+    ] {
+        replay("fixtures/changes/agentic-job-2026-11-11.json")
+            .arg("--commit")
+            .args(args)
+            .assert()
+            .failure();
+        assert_eq!(
+            std::fs::read_to_string(state.join("changes.json")).unwrap(),
+            seed
+        );
+    }
+    let output = replay("fixtures/changes/agentic-job-2026-11-11.json")
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let items = value["repositories"][0]["items"].as_array().unwrap();
+    for number in [3402, 3411] {
+        let reference = format!("cgwalters-forge/agentic-job#{number}");
+        let item = items.iter().find(|i| i["ref"] == reference).unwrap();
+        assert!(
+            item["changes"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from("closed"))
+        );
+    }
+    let output = replay("fixtures/changes/agentic-job-2026-11-11.json")
+        .arg("--commit")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.starts_with("changes: 43 items in 3 of 24 repositories; 28 requests, 0 revalidated\n"),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 4, "{text}");
+    // After the commit, the second recording lists nothing; --json gives
+    // the diff, selectable by field.
+    let output = replay("fixtures/changes/agentic-job-2026-11-11-again.json")
+        .args(["--json", "schema,repositories"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema"], "agent-board/changes/v1");
+    assert_eq!(value["repositories"].as_array().unwrap().len(), 24);
+    assert!(
+        value["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["items"].as_array().unwrap().is_empty())
+    );
+    for (args, error) in [
+        (
+            vec!["--since", "2026-11-11T00:00:00Z", "--commit"],
+            "cannot be used with",
+        ),
+        (
+            vec!["--owner", "example"],
+            "changes reads its repositories from --config",
+        ),
+        (vec!["--json", "items"], "unknown JSON field: items"),
+    ] {
+        let output = replay("fixtures/changes/agentic-job-2026-11-11-again.json")
+            .args(&args)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert!(err.contains(error), "{args:?}: {err}");
+    }
+    // A fixture's watermarks never land in the cache.
+    let output = command()
+        .args([
+            "changes",
+            "--config",
+            "fixtures/changes/config.json",
+            "--replay",
+            "fixtures/changes/agentic-job-2026-11-11-again.json",
+        ])
+        .current_dir(root)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("--state <DIR>")
+    );
+    std::fs::remove_dir_all(&state).unwrap();
 }
