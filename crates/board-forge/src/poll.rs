@@ -528,6 +528,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "notifications",
     "brokerOutage",
     "operatorAnswers",
+    "operatorReviewFixes",
     "rebaseRounds",
     "pace",
     "lockCollaboratorItems",
@@ -677,6 +678,9 @@ pub struct PollPolicy {
     /// it off and starts a round on them ([`comments`]). Off (the default),
     /// only a person taking the label off starts the rounds again.
     pub operator_answers: bool,
+    /// `operatorReviewFixes`: route an operator's changes-requested review on
+    /// the bot's PR to its bounded fix rounds, not intake triage. Off by default.
+    pub operator_review_fixes: bool,
     /// The pass's existing `assignHolds`: request the operator's review instead
     /// of labelling a stop. Off by default; no standalone poll setting.
     pub assign_holds: bool,
@@ -1043,6 +1047,8 @@ pub struct PrOptions {
     #[serde(default)]
     pub direction_first: bool,
     #[serde(default)]
+    pub operator_review_fixes: bool,
+    #[serde(default)]
     pub owner_branches: bool,
     #[serde(default)]
     pub own_space_only: bool,
@@ -1169,6 +1175,7 @@ impl PrOptions {
             check_reruns,
             unstall,
             direction_first,
+            operator_review_fixes,
             owner_branches,
             own_space_only,
             fold_rounds,
@@ -1184,6 +1191,7 @@ impl PrOptions {
         policy.check_reruns = check_reruns;
         policy.unstall = unstall;
         policy.direction_first = direction_first;
+        policy.operator_review_fixes = operator_review_fixes;
         policy.owner_branches = owner_branches;
         policy.own_space_only = own_space_only;
         policy.fold_rounds = fold_rounds;
@@ -1266,6 +1274,7 @@ impl PollPolicy {
                 .map(|a| a.as_bool().context("operatorAnswers is not a boolean"))
                 .transpose()?
                 .unwrap_or(false),
+            operator_review_fixes: false,
             rebase_rounds: get("rebaseRounds")?
                 .map(|r| {
                     r.as_u64()

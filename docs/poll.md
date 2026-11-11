@@ -882,6 +882,29 @@ superseded by a marker restating the state. The runs count against the three a p
 steps above. Each thread acted on gets a decision line; a preview does not
 advance the cursor.
 
+An intake question can quote an imperative without asking for a code change;
+treating those words as authorization would start an unwanted fix run.
+`operatorReviewFixes: true` (off by default; the pass's
+`pr.operatorReviewFixes`) instead uses the authenticated operator's GitHub
+`CHANGES_REQUESTED` review state. When all new, unhandled direction on the
+bot's own PR consists of nonempty changes-requested reviews, intake starts a
+fix round on that PR in the same pass, without a tracking issue or a
+topic-selected midstream fork. Its decision line logs
+`intent=requested-changes (review state)`. Existing fix bounds, ownership,
+`needs-human` holds, running-round exclusion, two-round limit, per-pass caps
+and comment-ID receipts still apply; `ownSpaceOnly` permits these fixes on
+the bot's own PR outside our space as before. Existing tracking receipts are
+read too, so enabling this cannot replay reviews already triaged.
+A later operator review that no longer requests changes, including a bodyless
+approval, prevents the older review from authorizing a fix.
+
+This is the first slice of agent-board#884: mixed batches, comments, approvals,
+shipping/DCO requests (including “...whatever let's ship. It can always clean
+it up later. You can add my DCO”), and ambiguous prose retain intake triage.
+No classifier, sign-off rewriting or merge override is implemented here.
+Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set
+`pr.operatorReviewFixes` to `true` alongside `notifications: true`.
+
 `notifications` (absent by default, which reads none) reads the bot's GitHub
 notifications, which reach no automation otherwise (agent-board#227):
 `{"reasons": [...], "peers": [{"login": L, "repositories": ["OWNER/REPO"], "kind": "research"}]}`.
