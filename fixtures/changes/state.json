@@ -1,0 +1,78 @@
+{
+  "schema": "agent-board/changes-state/v1",
+  "repositories": {
+    "cgwalters-forge/agentic-job": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/agentic-job-trial": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/ai": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/bcvk": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/bootc": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/bootc-dev-actions": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/bootupd": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/cargo-vendor-filterer": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/cgwalters-devspace-sandbox": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/chisel": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/composefs-rs": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/containers-image-proxy-rs": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/dracut": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/forgejo-ephemeral-runner": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/gh-agentic-workflows": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/gh-aw": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/image-builder": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/infra": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/nickel": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/osbuild": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/ostree": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/praxis": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/rhel-bootc-examples": {
+      "since": "2026-11-11T14:05:00Z"
+    },
+    "cgwalters-forge/rpm-ostree": {
+      "since": "2026-11-11T14:05:00Z"
+    }
+  },
+  "pending": []
+}

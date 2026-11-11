@@ -11,6 +11,19 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- `agent-board changes` without `--since`, the read-only diff of the
+  followed and midstream repositories since each one's watermark, the
+  first step of a change-driven pass (agent-board#894, #895): from a
+  caller checkout with no flags, it reads the configuration's `follow`
+  list plus the `midstream` owner's forks discovered from the
+  organization's listing, one conditional list read per repository and
+  detail only for what changed, and prints a summary of at most 20 lines
+  or `--json`; `--commit` moves the watermarks, kept with the ETags under
+  `~/.cache/agent-board/changes.json`. The `--since` list of the live
+  project is unchanged (docs/changes.md). A bare `--json`, every field,
+  now passes the field check of the commands that select fields, which
+  refused it before.
+
 - Session batch writes guarded by the version they were decided from
   (agent-board#849): every batch action on an issue now carries the
   issue's `updated_at` as the session read it, which the offline check

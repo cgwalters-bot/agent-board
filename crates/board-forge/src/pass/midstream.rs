@@ -104,8 +104,21 @@ impl Midstream {
 
     /// The owner's repositories with the topic, sorted by lower-case name.
     pub(super) fn read(&self, client: &impl Rest) -> Result<Vec<String>> {
+        self.list(client, false, |_, topic| topic)
+    }
+
+    /// The owner's repositories `keep` chooses, given each as the listing
+    /// reads it and whether it has the topic, sorted by lower-case name;
+    /// `public_only` lists only the public ones, whatever the token could read.
+    pub(crate) fn list(
+        &self,
+        client: &impl Rest,
+        public_only: bool,
+        keep: impl Fn(&Value, bool) -> bool,
+    ) -> Result<Vec<String>> {
         let owner = &self.owner;
-        let mut next = Some(format!("{API_ROOT}orgs/{owner}/repos?per_page=100"));
+        let kind = if public_only { "type=public&" } else { "" };
+        let mut next = Some(format!("{API_ROOT}orgs/{owner}/repos?{kind}per_page=100"));
         let mut found = BTreeMap::new();
         for _ in 0..MIDSTREAM_PAGES {
             let Some(url) = next.take() else { break };
@@ -123,7 +136,8 @@ impl Midstream {
                 let topics = repository["topics"]
                     .as_array()
                     .with_context(|| format!("{name} has no topics"))?;
-                if topics.iter().any(|t| t == self.topic.as_str()) {
+                let topic = topics.iter().any(|t| t == self.topic.as_str());
+                if keep(repository, topic) {
                     validate_repository(name)?;
                     ensure!(
                         name.split_once('/')

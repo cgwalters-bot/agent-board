@@ -3,6 +3,7 @@ mod apps;
 mod ask;
 mod broker;
 mod budget;
+mod changes;
 mod ci_health;
 mod cli_docs;
 mod config;
@@ -105,27 +106,8 @@ enum Command {
         #[command(subcommand)]
         command: Project,
     },
-    /// What landed, closed, opened or changed hold on the live project since a time, each line a link (read-only); --board-config's operator counts as an author whose new pull requests are listed.
-    Changes {
-        /// Start of the window, RFC 3339 (such as 2026-10-23T00:00:00Z).
-        #[arg(long)]
-        since: String,
-        /// End of the window, RFC 3339; without it, the window runs to now.
-        #[arg(long)]
-        until: Option<String>,
-        /// Output format.
-        #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
-        format: String,
-        /// Leave out issues and pull requests of private repositories, for a
-        /// list that will be published.
-        #[arg(long)]
-        public_only: bool,
-        /// Trim the Markdown to at most N characters as a generated status
-        /// update is trimmed: the longest sections lose their last lines
-        /// first, each ending with `+K more`.
-        #[arg(long, value_name = "N")]
-        max_chars: Option<usize>,
-    },
+    /// What changed in the followed and midstream repositories of --config since each one's watermark, read-only: a summary by repository, or --json for the whole diff; --commit moves the watermarks (docs/changes.md). With --since, instead, what landed, closed, opened or changed hold on the live project since a time, each line a link.
+    Changes(changes::Changes),
     /// List or inspect board items.
     Item {
         #[command(subcommand)]
@@ -899,36 +881,52 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 dispatch::init(&github(&cli)?, &mut io::stdout().lock())
             }
         }
-        Command::Changes {
-            since,
-            until,
-            format,
-            public_only,
-            max_chars,
-        } => {
+        Command::Changes(args) => {
+            let Some(since) = &args.since else {
+                ensure!(
+                    cli.snapshot.is_none()
+                        && cli.repo.is_none()
+                        && cli.owner.is_none()
+                        && cli.project.is_none()
+                        && cli.board_config.is_none(),
+                    "changes reads its repositories from --config"
+                );
+                validate_json_fields(&cli)?;
+                if let Some(expression) = &cli.jq {
+                    compile_jq(expression)?;
+                }
+                return changes::run(args, |diff| {
+                    if cli.json.is_some() {
+                        render(serde_json::to_value(diff)?, &cli)?;
+                    } else {
+                        write!(io::stdout().lock(), "{}", diff.summary())?;
+                    }
+                    io::stdout().lock().flush().map_err(Into::into)
+                });
+            };
             ensure!(cli.snapshot.is_none(), "changes requires a live project");
             ensure!(
                 cli.json.is_none(),
-                "changes takes --format json, not --json"
+                "changes --since takes --format json, not --json"
             );
             ensure!(
-                format == "markdown" || max_chars.is_none(),
+                args.format == "markdown" || args.max_chars.is_none(),
                 "--max-chars trims Markdown, not --format json"
             );
             let changes = github(&cli)?.changes(
                 board_forge::changes::parse_time(since)?,
-                until
+                args.until
                     .as_deref()
                     .map(board_forge::changes::parse_time)
                     .transpose()?,
                 configured_operator(&cli)?.as_deref(),
-                *public_only,
+                args.public_only,
             )?;
             let mut out = io::stdout().lock();
-            if format == "json" {
+            if args.format == "json" {
                 writeln!(out, "{}", serde_json::to_string_pretty(&changes)?)?;
-            } else if let Some(limit) = max_chars {
-                write!(out, "{}", changes.markdown_within(*limit)?)?;
+            } else if let Some(limit) = args.max_chars {
+                write!(out, "{}", changes.markdown_within(limit)?)?;
             } else {
                 write!(out, "{}", changes.markdown())?;
             }
@@ -1709,12 +1707,14 @@ fn select(value: &Value, fields: &[&str]) -> Result<Value> {
     Ok(Value::Object(selected))
 }
 
-fn render(mut value: Value, cli: &Cli) -> Result<()> {
+fn validate_json_fields(cli: &Cli) -> Result<()> {
     if let Some(fields) = &cli.json {
         let available: &[&str] = if matches!(cli.command, Command::Status(_)) {
             board_forge::org_status::FIELDS
         } else if matches!(cli.command, Command::Overlap(_)) {
             overlap::FIELDS
+        } else if matches!(cli.command, Command::Changes(_)) {
+            board_forge::changes::diff::FIELDS
         } else if matches!(cli.command, Command::Item { .. } | Command::Ask { .. }) {
             &[
                 "identity",
@@ -1748,27 +1748,44 @@ fn render(mut value: Value, cli: &Cli) -> Result<()> {
                 "fields",
             ]
         };
-        for field in fields.split(',') {
-            ensure!(
-                available.contains(&field),
-                "unknown JSON field: {field}; available fields: {}",
-                available.join(",")
-            );
+        // A bare --json is every field.
+        if fields != "*" {
+            for field in fields.split(',') {
+                ensure!(
+                    available.contains(&field),
+                    "unknown JSON field: {field}; available fields: {}",
+                    available.join(",")
+                );
+            }
         }
+    }
+    Ok(())
+}
+
+fn compile_jq(expression: &str) -> Result<jaq_interpret::Filter> {
+    let mut context = jaq_interpret::ParseCtx::new(Vec::new());
+    context.insert_natives(jaq_core::core());
+    context.insert_defs(jaq_std::std());
+    let (parsed, errors) = jaq_parse::parse(expression, jaq_parse::main());
+    ensure!(errors.is_empty(), "invalid --jq expression: {errors:?}");
+    let filter = context.compile(parsed.context("empty --jq expression")?);
+    ensure!(
+        context.errs.is_empty(),
+        "invalid --jq expression: unknown function or invalid binding"
+    );
+    Ok(filter)
+}
+
+fn render(mut value: Value, cli: &Cli) -> Result<()> {
+    validate_json_fields(cli)?;
+    if let Some(fields) = &cli.json
+        && fields != "*"
+    {
         value = select(&value, &fields.split(',').collect::<Vec<_>>())?;
     }
     let mut out = io::stdout().lock();
     if let Some(expression) = &cli.jq {
-        let mut context = jaq_interpret::ParseCtx::new(Vec::new());
-        context.insert_natives(jaq_core::core());
-        context.insert_defs(jaq_std::std());
-        let (parsed, errors) = jaq_parse::parse(expression, jaq_parse::main());
-        ensure!(errors.is_empty(), "invalid --jq expression: {errors:?}");
-        let filter = context.compile(parsed.context("empty --jq expression")?);
-        ensure!(
-            context.errs.is_empty(),
-            "invalid --jq expression: unknown function or invalid binding"
-        );
+        let filter = compile_jq(expression)?;
         let inputs = jaq_interpret::RcIter::new(std::iter::empty());
         for result in filter.run((jaq_interpret::Ctx::new([], &inputs), value.into())) {
             let result = result.map_err(|error| anyhow::anyhow!("jq: {error}"))?;

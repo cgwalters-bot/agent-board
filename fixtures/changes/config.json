@@ -1,0 +1,48 @@
+{
+  "operator": "cgwalters",
+  "bot": "cgwalters-bot",
+  "dispatchRepo": "cgwalters-forge/tracker",
+  "dispatchWorkflow": "dispatch.yml",
+  "follow": [
+    "cgwalters-forge/agentic-job"
+  ],
+  "workRepositories": [
+    "cgwalters-forge/tracker",
+    "cgwalters-forge/agentic-job"
+  ],
+  "board": {
+    "owner": "cgwalters-forge",
+    "project": 1
+  },
+  "epics": {
+    "repository": "cgwalters-forge/tracker",
+    "inWorkRepositories": true
+  },
+  "wip": 8,
+  "triage": {
+    "scope": "epics"
+  },
+  "planPools": [
+    "claude",
+    "openai"
+  ],
+  "pools": {
+    "claude": {},
+    "openai": {}
+  },
+  "midstream": {
+    "owner": "cgwalters-forge",
+    "topic": "bot-midstream"
+  },
+  "usage": {
+    "repository": "cgwalters-forge/bot-ops",
+    "issue": 1,
+    "probe": true
+  },
+  "pr": {
+    "fixPools": [
+      "claude",
+      "openai"
+    ]
+  }
+}
