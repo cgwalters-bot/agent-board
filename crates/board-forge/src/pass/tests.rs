@@ -15287,6 +15287,46 @@ fn body_plans_start_a_p0_or_p1_issue() {
     }
 }
 
+#[test]
+fn living_body_plan_dispatch_uses_logical_time_for_new_and_existing_status() {
+    for existing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let forge = body_plan_forge("P0", &body_plan_block(), "cgwalters-bot", None);
+        if existing {
+            let mut store = living::Store::load(
+                path.to_str().unwrap(),
+                "cgwalters-bot",
+                forge.replay.now - time::Duration::days(1),
+            )
+            .unwrap();
+            let url = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446/comments");
+            let body = json!({"body":"<!-- agent-board-dispatch: 1@2026-01-01T00:00:00Z -->\nAn old dispatch."});
+            let write = store.prepare("POST", &url, &body).unwrap().unwrap();
+            // The fake server deliberately dates comments after the injected
+            // pass clock; a PATCH also omits the POST identity fields.
+            let mut response = forge.write(write.method, &write.url, &write.body).unwrap();
+            store.finish(&write, &mut response).unwrap();
+        }
+        let config = config(json!({"bodyPlans":true,"livingStatus":path}));
+        let report = apply(&forge, &config);
+        assert_eq!(
+            report.failures, 0,
+            "existing={existing}: {:#?}",
+            report.lines
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("start implement cgwalters-forge/tracker#446 plan=body")),
+            "existing={existing}: {:#?}",
+            report.lines
+        );
+        assert_eq!(forge.comments_on("cgwalters-forge/tracker", 446).len(), 1);
+    }
+}
+
 /// An issue body holding the bot's implement plan for tracker#446.
 fn body_plan_block() -> String {
     let plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 446,

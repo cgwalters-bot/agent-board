@@ -46,6 +46,10 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
         "unsupported_capability: reserveScheduling: GitHub stage shares only"
     );
     ensure!(
+        value.get("livingStatus").is_none(),
+        "unsupported_capability: livingStatus: GitHub comments only"
+    );
+    ensure!(
         value.get("topDown").is_none(),
         "unsupported_capability: topDown: GitHub scheduling only"
     );

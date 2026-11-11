@@ -686,6 +686,16 @@ fn epic_records_table() {
     for (name, comments, conclusion, expected) in [
         ("missing", vec![], "success", "warn"),
         (
+            "living status needs ledger, not corrupt",
+            vec![comment(
+                1,
+                format!("{}\nBoard status", crate::pass::LIVING_STATUS_MARKER),
+                old,
+            )],
+            "success",
+            "warn",
+        ),
+        (
             "legacy ignored",
             vec![comment(1, "<!-- coordinator/v1: {} -->\nOld".into(), old)],
             "success",

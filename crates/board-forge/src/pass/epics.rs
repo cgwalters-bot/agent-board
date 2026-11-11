@@ -481,6 +481,14 @@ fn newest_request<'c>(comments: &'c [Comment], writers: &[&str]) -> Option<&'c C
 /// Health facts from the same records stage 3 reads, and unanswered planning
 /// runs, newest first. No board or sub-issue census is needed.
 pub(crate) fn health(comments: &[Comment], operator: &str, bot: &str) -> Result<(Value, Vec<u64>)> {
+    if comments
+        .iter()
+        .any(|c| c.body.starts_with(super::LIVING_STATUS_MARKER) && plan::written_by(c, bot))
+    {
+        // A public prose projection cannot prove apply progress or a failure
+        // streak. Health has no access to the caller's durable pass ledger.
+        return Ok((json!({"ledger_required": true}), vec![]));
+    }
     let writers = [operator, bot];
     let (mut receipts, unread) = epic_apply::receipts(comments, &writers);
     ensure!(unread.is_empty(), "unreadable epic apply receipts");

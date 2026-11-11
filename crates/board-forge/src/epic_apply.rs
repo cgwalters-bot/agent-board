@@ -448,6 +448,10 @@ pub fn receipts(comments: &[Comment], claimers: &[&str]) -> (Vec<Receipt>, Vec<S
     let legacy_marker = format!("<!-- {APPLY_MARKER}: ");
     let (mut out, mut unread) = (Vec::new(), Vec::new());
     for (n, comment) in trusted.iter().enumerate() {
+        if comment.body.starts_with(crate::pass::LIVING_STATUS_MARKER) {
+            unread.push(comment.url.clone());
+            continue;
+        }
         let fenced = has_fence(&comment.body, APPLY_MARKER);
         if !fenced && !comment.body.starts_with(&legacy_marker) {
             continue;
