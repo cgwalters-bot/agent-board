@@ -265,6 +265,52 @@ Caller activation is separate: in `cgwalters-forge/tracker`, file
 `.github/pass.json`, set `mix` to the object above. The caller's `pools.json`
 continues to resolve the variant models; no deployed configuration changes here.
 
+## Living issue status (GitHub)
+
+The concrete risk when replacing dispatch and apply comments is losing their
+replay guards and starting the same work twice. `livingStatus` is an optional
+**durable ledger file path**, off by default. With it, pass-owned job-plan
+comments, dispatch notices and epic apply receipts share one bot-owned status
+comment per issue. Its sections show the current plan's prose, the last dispatch
+and run link, and the last apply's prose. Machine plans, confirmed actions and
+fingerprints stay in the ledger, not a public JSON fence or hidden action list.
+Existing issue bodies, sub-issue links, labels and Project writes are unchanged.
+
+The pass writes the ledger atomically and syncs it before sending each comment
+write. Its existing protocol readers see the saved records, each linked to the
+same public comment. A no-change pass sends no comment write; a new plan or
+dispatch edits that comment. `writes saved by edit: N` counts comment POSTs
+replaced by PATCHes, **not** API requests avoided: edits still consume the existing
+write and request caps, and the normal overhead counts their actual HTTP methods.
+Normal updates add no network reads. Failed public edits remain pending in the
+ledger and are retried within the write/request caps after re-reading the issue's
+bounded comment history to verify ownership; this never replays apply actions.
+Public prose is limited to 2,000 characters per
+section; the ledger is limited to 1,000 records and 4 MiB, and refuses further
+growth rather than evict replay guards.
+
+Use one serialized pass and retain this file across runs, separately from the
+disposable `state` response cache. Back it up; do not remove, roll back or share it
+between callers. State file paths may not be symlinks, including dangling ones;
+canonical destinations must differ. A missing ledger for a visible status comment, a different bot,
+a foreign or unknown editor, and an interrupted first comment POST stop rather
+than reconstructing an empty history. An ambiguous first POST needs a person to
+reconcile its comment id in the ledger. Deleting the public comment does not
+release local claims; subsequent edits fail until reconciled. Standalone dispatch
+and epic apply refuse a living-status issue without its configured pass. Do not
+turn the option off on an issue that has adopted it.
+
+This is the first slice of agent-board#880. It does not migrate old comments,
+change agentic-job run hand-backs, publish findings or triage verdicts into the
+status, or minimize historical comments; those remain follow-ups. Forgejo refuses
+the option. No deployed caller configuration changes here. Caller activation:
+`cgwalters-forge/tracker`, `.github/pass.json`, set `livingStatus` to
+`.state/living-status.json` **only after** its workflow retains that file durably
+and serializes all applying passes.
+
+The supervisor's public epic-health census reports an explicit warning for these
+issues: it cannot infer machine progress from prose without the pass's ledger.
+
 ## What is built
 
 The GitHub pass implements the configuration below and stages 1 to 5, except

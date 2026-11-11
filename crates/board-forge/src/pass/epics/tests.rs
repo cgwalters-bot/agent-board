@@ -13,6 +13,96 @@ const COMMENTS_596: &str = r#""after":null,"name":"tracker","number":596,"#;
 const COMMENTS_890: &str = r#""after":null,"name":"tracker","number":890,"#;
 
 #[test]
+fn living_status_cache_alias_is_refused_before_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let forge = Forge::new(replay());
+    let config = config(
+        json!({"state":dir.path().join("ledger.json"), "livingStatus":dir.path().join("./ledger.json")}),
+    );
+    let result = block(run(
+        &forge,
+        &forge,
+        &config,
+        State::default(),
+        (Mode::Local, Limits::default()),
+        forge.replay.now,
+    ));
+    assert!(result.err().unwrap().to_string().contains("must differ"));
+    assert!(forge.written().is_empty());
+    assert!(!dir.path().join("ledger.json").exists());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("ledger.json", dir.path().join("cache.json")).unwrap();
+        let config = crate::pass::tests::config(
+            json!({"state":dir.path().join("cache.json"), "livingStatus":dir.path().join("ledger.json")}),
+        );
+        let result = block(run(
+            &forge,
+            &forge,
+            &config,
+            State::default(),
+            (Mode::Local, Limits::default()),
+            forge.replay.now,
+        ));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("must not be symlinks")
+        );
+        assert!(forge.written().is_empty());
+        assert!(!dir.path().join("ledger.json").exists());
+    }
+}
+
+#[test]
+fn living_planning_dispatch_edits_the_plan_comment() {
+    use crate::pass::tests::{Forge as PassForge, apply_limited};
+    let dir = tempfile::tempdir().unwrap();
+    let mut forge = PassForge::new(None, false);
+    forge.replay = replay();
+    unfinished(&mut forge.replay);
+    let config = config(json!({"livingStatus": dir.path().join("status.json")}));
+    let limits = Limits {
+        dispatch: Some(1),
+        ..Limits::default()
+    };
+    let report = apply_limited(&forge, &config, limits);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let comments = forge.comments_on("cgwalters-forge/tracker", 596);
+    assert_eq!(comments.len(), 1, "{comments:#?}");
+    assert!(comments[0].contains("### Current plan"), "{comments:#?}");
+    assert!(comments[0].contains("### Last dispatch"), "{comments:#?}");
+    assert!(comments[0].contains("[run]"), "{comments:#?}");
+    assert!(!comments[0].contains("```"), "{comments:#?}");
+    assert!(
+        report.lines.contains(&"writes saved by edit: 1".into()),
+        "{:#?}",
+        report.lines
+    );
+    let run = comments[0]
+        .split("/actions/runs/")
+        .nth(1)
+        .unwrap()
+        .split(')')
+        .next()
+        .unwrap();
+    forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/tracker/actions/runs/{run}")},
+        "answer":{"status":200,"body":{"status":"in_progress","id":run.parse::<u64>().unwrap()}}}));
+    let report = apply_limited(
+        &forge,
+        &config,
+        Limits {
+            dispatch: Some(0),
+            ..Limits::default()
+        },
+    );
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(forge.comments_on("cgwalters-forge/tracker", 596), comments);
+}
+
+#[test]
 fn planning_procedure_comes_from_repository_guidance() {
     use crate::pass::tests::{Forge as PassForge, apply_limited};
 
@@ -975,6 +1065,7 @@ struct Forge {
     comment_reads: RefCell<BTreeMap<u64, usize>>,
     changed_plan: Cell<Option<(u64, usize)>>,
     link_fails: Cell<bool>,
+    receipt_fails: Cell<bool>,
 }
 
 impl Forge {
@@ -990,6 +1081,7 @@ impl Forge {
             comment_reads: RefCell::new(BTreeMap::new()),
             changed_plan: Cell::new(None),
             link_fails: Cell::new(false),
+            receipt_fails: Cell::new(false),
         }
     }
 
@@ -1030,6 +1122,12 @@ impl Rest for Forge {
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         let path = url.trim_start_matches(API_ROOT);
         self.kept(format!("{method} {path}"), body.clone());
+        if self.receipt_fails.get()
+            && method == "PATCH"
+            && text(body, "/body").contains("Applied [this epic plan]")
+        {
+            return Ok((500, json!({"message":"temporary receipt failure"})));
+        }
         let id = self.next();
         if method == "POST" && path.ends_with("/issues") {
             return Ok((201, json!({"number": id})));
@@ -1609,6 +1707,60 @@ fn apply_creates_once_with_final_priorities() {
         "{:#?}",
         report.lines
     );
+}
+
+#[test]
+fn living_apply_keeps_machine_receipt_off_the_issue_and_replays_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("status.json");
+    let settings = json!({"livingStatus": ledger});
+    let mut replay = replay();
+    unfinished(&mut replay);
+    unapplied(&mut replay);
+    let forge = Forge::new(replay);
+    let report = local_with(&forge, 10, settings.clone());
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let comments = forge.added.borrow();
+    let receipts: Vec<_> = comments
+        .iter()
+        .filter(|c| text(c, "/url").contains("/issues/890#"))
+        .collect();
+    assert_eq!(receipts.len(), 1, "{comments:#?}");
+    let body = text(receipts[0], "/body");
+    assert!(body.starts_with(living::MARKER), "{body}");
+    assert!(body.contains("Applied [this epic plan]"), "{body}");
+    assert!(!body.contains("```"), "{body}");
+    assert!(!body.contains("fingerprint"), "{body}");
+    drop(comments);
+    let before = forge.written().len();
+    let report = local_with(&forge, 10, settings);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(forge.written().len(), before, "{:#?}", report.lines);
+}
+
+#[test]
+fn living_failed_receipt_edit_is_reconciled_without_reapplying() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = json!({"livingStatus": dir.path().join("status.json")});
+    let mut replay = replay();
+    unfinished(&mut replay);
+    unapplied(&mut replay);
+    let forge = Forge::new(replay);
+    forge.receipt_fails.set(true);
+    let report = local_with(&forge, 10, settings.clone());
+    assert!(report.failures > 0);
+    let before = forge.written().len();
+    forge.receipt_fails.set(false);
+    let report = local_with(&forge, 1, settings.clone());
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        &forge.written()[before..],
+        &["PATCH repos/cgwalters-forge/tracker/issues/comments/1001"]
+    );
+    assert!(text(&forge.added.borrow()[0], "/body").contains("Applied [this epic plan]"));
+    let before = forge.written().len();
+    let report = local_with(&forge, 1, settings);
+    assert_eq!(forge.written().len(), before, "{:#?}", report.lines);
 }
 
 /// A retry that waits behind `epics.focus` is still asked as a retry, which

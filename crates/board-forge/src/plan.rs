@@ -989,6 +989,15 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     }
     let comments = issue_comments(client, issue)?;
     let (mut plan, from) = newest_plan(&comments, writers)?;
+    ensure!(
+        !comments
+            .iter()
+            .any(|c| c.body.starts_with(crate::pass::LIVING_STATUS_MARKER)
+                && c.author
+                    .as_deref()
+                    .is_some_and(|a| writers.iter().any(|w| w.eq_ignore_ascii_case(a)))),
+        "this issue uses a living status ledger; dispatch through its configured pass"
+    );
     let legacy = target;
     let routing = scheduled
         .routing

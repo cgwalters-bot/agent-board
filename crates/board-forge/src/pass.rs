@@ -731,6 +731,9 @@ pub struct Config {
     pub cost: Option<crate::cost::Publish>,
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
+    /// Opt-in ledger path for one living status comment per issue. Durable,
+    /// serialized storage is required; this is not a disposable response cache.
+    pub living_status: Option<String>,
     /// Off by default: rank epic groups before reading their admission facts.
     #[serde(default)]
     pub top_down: bool,
@@ -2722,6 +2725,7 @@ struct Bounds {
     starting: Cell<bool>,
     /// Writes sent, which [`Kept`] reads are kept no longer than.
     writes: Cell<usize>,
+    living: RefCell<Option<living::Store>>,
     /// The stage under way, which each request is counted to.
     stage: Cell<Stage>,
     by_stage: Cell<ByStage>,
@@ -2776,6 +2780,7 @@ impl Bounds {
             refused: Cell::new(0),
             starting: Cell::new(false),
             writes: Cell::new(0),
+            living: RefCell::new(None),
             stage: Cell::new(Stage::Setup),
             by_stage: Cell::new([0; Stage::ALL.len()]),
             points: Cell::new(0),
@@ -3421,7 +3426,24 @@ impl<C: Rest> Rest for Budget<'_, C> {
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         self.spend(true, &endpoint_class(url))?;
-        let response = self.observe(self.inner.send(method, url, body))?;
+        let prepared = self
+            .bounds
+            .living
+            .borrow_mut()
+            .as_mut()
+            .map(|store| store.prepare(method, url, body))
+            .transpose()?
+            .flatten();
+        let (method, url, body) = prepared
+            .as_ref()
+            .map(|w| (w.method, w.url.as_str(), &w.body))
+            .unwrap_or((method, url, body));
+        let mut response = self.observe(self.inner.send(method, url, body))?;
+        if let Some(write) = &prepared
+            && let Some(store) = self.bounds.living.borrow_mut().as_mut()
+        {
+            store.finish(write, &mut response)?;
+        }
         if (200..300).contains(&response.0) {
             let mut effects = self.bounds.effects.borrow_mut();
             // Publishing the holds is deliberately excluded: accounting must
@@ -3486,7 +3508,8 @@ impl<C: Rest + Transport> Budget<'_, C> {
     /// comment representation, but keep GraphQL's editor evidence intact;
     /// never infer that the author also made an edit.
     fn plan_comments(&self, query: &str, variables: &Value) -> Result<Option<Value>> {
-        if query != plan::COMMENTS_QUERY
+        if self.bounds.living.borrow().is_some()
+            || query != plan::COMMENTS_QUERY
             || !variables["after"].is_null()
             || !self.bounds.cache_enabled.get()
             || self.bounds.starting.get()
@@ -3591,7 +3614,13 @@ impl<C: Rest + Transport> Transport for Budget<'_, C> {
             return Ok(data);
         }
         self.spend(mutation, &graphql_class(query))?;
-        let data = self.graphql_spent(mutation, self.inner.graphql(query, variables))?;
+        let mut data =
+            self.graphql_spent(mutation, self.inner.graphql(query, variables.clone()))?;
+        if query == plan::COMMENTS_QUERY
+            && let Some(store) = self.bounds.living.borrow().as_ref()
+        {
+            store.expand(&variables, &mut data)?;
+        }
         if !mutation {
             self.keep_publication_read(key, KeptRead::GraphQl(data.clone()));
         }
@@ -3877,6 +3906,10 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     (state, mode, limits, now): (State, Mode<'_>, Limits, OffsetDateTime),
     bounds: &Bounds,
 ) -> Result<Report> {
+    if let Some(path) = &config.living_status {
+        living::check_paths(path, config.state.as_deref())?;
+        *bounds.living.borrow_mut() = Some(living::Store::load(path, &config.bot, now)?);
+    }
     bounds.cache_enabled.set(config.state.is_some());
     *bounds.responses.borrow_mut() = state.pass_responses.clone();
     *bounds.publication_pending.borrow_mut() = state.holds_pending.clone();
@@ -3907,6 +3940,11 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     report.summary = caps.summary();
     report.spent = bounds.spent();
     report.effects = bounds.effects.borrow().clone();
+    if let Some(store) = bounds.living.borrow().as_ref() {
+        report
+            .lines
+            .push(format!("writes saved by edit: {}", store.saved));
+    }
     if config.state.is_some() {
         let state = report.state.get_or_insert(previous);
         if state.interval_seconds == 0 {
@@ -4104,6 +4142,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     }
     // Stages 3 and 4's holds, unless either failed outright: they would be
     // partial.
+    scheduler.reconcile_living();
     bounds.enter(Stage::Holds);
     if scheduler.holds_whole {
         scheduler.publish_holds();
@@ -4604,6 +4643,51 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     fn writers(&self) -> [&'a str; 2] {
         [&self.config.operator, &self.config.bot]
+    }
+
+    fn reconcile_living(&mut self) {
+        if !self.apply {
+            return;
+        }
+        let pending = self
+            .client
+            .bounds
+            .living
+            .borrow()
+            .as_ref()
+            .map(living::Store::pending)
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(why) = self.other_holds() {
+            self.line(format!("living status: edits deferred; {why}"));
+            return;
+        }
+        for write in pending {
+            if let Some(why) = self.caps.check(Kind::Write) {
+                self.line(format!("living status: edits deferred; {why}"));
+                break;
+            }
+            let result = (|| -> Result<()> {
+                // Recheck the author/editor before retrying an idempotent PATCH.
+                let issue = living::Store::issue(&write)?;
+                plan::issue_comments(&self.client, &issue)?;
+                self.caps.count(Kind::Write);
+                plan::send(&self.client, write.method, &write.url, &write.body, 0)?;
+                if let Some(store) = self.client.bounds.living.borrow_mut().as_mut() {
+                    store.acknowledge(&write)?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => self.line(format!("living status: reconciled {}", write.url)),
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("living status error: {error:#}"));
+                }
+            }
+        }
     }
 
     fn harness_policy(&self) -> Option<&HarnessPolicy> {
@@ -9097,6 +9181,7 @@ pub mod holds;
 
 pub mod decision;
 pub mod lease;
+mod living;
 pub mod maintain;
 pub mod midstream;
 pub mod mix;
@@ -9107,6 +9192,7 @@ pub mod revisit;
 pub mod sessions;
 pub mod starts;
 mod status;
+pub(crate) use living::MARKER as LIVING_STATUS_MARKER;
 pub mod sweep;
 mod today;
 mod usage;

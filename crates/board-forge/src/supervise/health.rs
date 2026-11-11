@@ -520,6 +520,11 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                 "evidence": evidence,
                 "suggested_action": if bad.is_empty() { "None." } else { action },
             });
+            if id == "epics" && bad.is_empty() && items.iter().any(|i| i["ledger_required"] == true) {
+                check["status"] = "warn".into();
+                check["evidence"] = json!(items.iter().filter(|i| i["ledger_required"] == true).filter_map(|i| i["html_url"].as_str()).collect::<Vec<_>>());
+                check["suggested_action"] = "Epic health is unavailable for living-status issues without the caller's durable pass ledger; inspect the pass report.".into();
+            }
             if [
                 "signatures",
                 "stranded",
