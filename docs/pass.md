@@ -2022,6 +2022,18 @@ Claim reads and reads inside a start bypass conditional caching. A full final
 array page is also read unconditionally: its body can remain unchanged while
 new comments add a successor page.
 
+Issue plan comments use REST to revalidate a complete history shorter than
+100 comments. The cold read also reads GraphQL: REST does not identify the
+last editor, and treating an edited plan as its author's word would let an
+untrusted editor authorize work. Only matching URL, body, author, creation
+and edit times bind that GraphQL evidence to the REST page. A later 304 can
+reuse the evidence; a 200 reads GraphQL again, even if its body looks equal.
+Longer histories still use bounded GraphQL pagination. The evidence travels
+inside the corresponding REST cache entry, so tracker's public-only export
+can retain public issue comments without allowing private usage, timelines
+or unpublished reviews. This is not general GraphQL caching or incremental
+Projects discovery; large boards still require a full project scan.
+
 **The caller must supply trusted state.** Do not restore it from an Actions
 cache writable by unrelated default-branch jobs. Tracker should upload the
 state as a short-lived artifact of the applying `poll.yml` pass and pass its
@@ -2040,8 +2052,10 @@ Priority (P0 first), then epic creation time and identity; within each group,
 children retain Priority/age order. Unparented work follows epics at the same
 Priority. Explicit `epics.focus` still takes precedence.
 
-The board read keeps the fields needed to screen and rank but omits closing
-PR details. Parent authorization and complete closing-PR reads happen only
+The board read keeps the fields needed to screen and rank, including batched
+closing-PR facts. Omitting those facts added one GraphQL read for every held
+candidate reached, exhausting the live pass before ready work. Only overflow
+connections need separate closing-PR reads; parent authorization happens only
 when the walk reaches a child, after slot and pool admission. The walk starts
 ready work immediately and stops at WIP, pool, time or request bounds, rather
 than validating all parents before starting anything. Parent authorization
@@ -2049,9 +2063,9 @@ uses revalidatable REST issue events, at most three pages of 100; an unreadable
 or longer history holds work, never authorizes it. A present `epic` label
 alone still cannot authorize a stranger's children. Existing plan, dependency,
 freshness, lease and write/dispatch checks are unchanged.
-Completed closing-PR reads are retained for revisits and Status. Unvisited
-items retain unknown closing-PR coverage; Status cannot reset those to Todo
-on an assumed absence of activity.
+Closing-PR facts are also available for held-question revisits and Status,
+including candidates the normal start walk never visits. Incomplete coverage
+still cannot reset an issue to Todo on an assumed absence of activity.
 
 Caller activation in `cgwalters-forge/tracker`: set `.github/pass.json`'s
 `topDown` to `true` and `state` to `.state/pass.json`, and pair the state setting

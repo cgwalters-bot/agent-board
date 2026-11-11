@@ -345,11 +345,6 @@ const FACTS: &str = r#"fragment Facts on Issue {
   parent { number state repository { nameWithOwner } labels(first: 50) { nodes { name } totalCount } }
 }"#;
 
-const BOARD_PULLS: &str = r#"  closedByPullRequestsReferences(first: 10, includeClosedPrs: false) {
-    nodes { number state updatedAt repository { nameWithOwner } author { login } } totalCount
-  }
-"#;
-
 /// The open issues of the board with their Priority, Status and Why, a page at a time.
 const BOARD_QUERY: &str = r#"query($owner: String!, $number: Int!, $field: String!, $cursor: String) {
   repositoryOwner(login: $owner) {
@@ -3049,8 +3044,109 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 }
 
-impl<C: Transport> Transport for Budget<'_, C> {
+impl<C: Rest + Transport> Budget<'_, C> {
+    /// REST cannot identify a comment's last editor. Revalidate the public
+    /// comment representation, but keep GraphQL's editor evidence intact;
+    /// never infer that the author also made an edit.
+    fn plan_comments(&self, query: &str, variables: &Value) -> Result<Option<Value>> {
+        if query != plan::COMMENTS_QUERY
+            || !variables["after"].is_null()
+            || !self.bounds.cache_enabled.get()
+            || self.bounds.starting.get()
+            || self.bounds.finishing.get()
+        {
+            return Ok(None);
+        }
+        let owner = variables["owner"].as_str().context("comment owner")?;
+        let name = variables["name"].as_str().context("comment repository")?;
+        let number = variables["number"].as_u64().context("comment issue")?;
+        validate_repository(&format!("{owner}/{name}"))?;
+        let url =
+            format!("{API_ROOT}repos/{owner}/{name}/issues/{number}/comments?per_page=100&page=1");
+        let previous = self.bounds.responses.borrow().get(&url).cloned();
+        let revalidated = self.bounds.revalidated.get();
+        let response = self.get(&url, None)?;
+        ensure!(
+            response.status == 200,
+            "issue comments: HTTP {}",
+            response.status
+        );
+        let short = response.body.as_array().is_some_and(|a| a.len() < 100)
+            && !response
+                .link
+                .as_deref()
+                .is_some_and(|l| l.contains("rel=\"next\""));
+        if !short {
+            return Ok(None);
+        }
+        let evidence = previous.as_ref().filter(|old| {
+            self.bounds.revalidated.get() > revalidated
+                && old["body"] == response.body
+                && old["comment_query"] == fnv(query)
+                && old["comment_evidence"].is_object()
+                && comments_match(&response.body, &old["comment_evidence"])
+        });
+        let data = if let Some(old) = evidence {
+            old["comment_evidence"].clone()
+        } else {
+            self.spend(false)?;
+            self.graphql_spent(false, self.inner.graphql(query, variables.clone()))?
+        };
+        if comments_match(&response.body, &data)
+            && let Some(entry) = self.bounds.next_responses.borrow_mut().get_mut(&url)
+        {
+            let mut enriched = entry.clone();
+            enriched["comment_query"] = fnv(query).into();
+            enriched["comment_evidence"] = data.clone();
+            let added = enriched
+                .to_string()
+                .len()
+                .saturating_sub(entry.to_string().len());
+            let total = self.bounds.response_bytes.get() + added;
+            if enriched.to_string().len() <= RESPONSE_BYTES && total <= CACHE_BYTES {
+                *entry = enriched;
+                self.bounds.response_bytes.set(total);
+            }
+        }
+        Ok(Some(data))
+    }
+}
+
+/// Only complete, identical comment histories bind REST validators to GraphQL
+/// evidence. A changed body, author, edit time, deletion or new comment forces
+/// fresh GraphQL, including its last-editor identity.
+fn comments_match(rest: &Value, data: &Value) -> bool {
+    let connection = &data["repository"]["issue"]["comments"];
+    let (Some(rest), Some(nodes)) = (rest.as_array(), connection["nodes"].as_array()) else {
+        return false;
+    };
+    connection["pageInfo"]["hasNextPage"] == false
+        && rest.len() == nodes.len()
+        && rest.iter().zip(nodes).all(|(r, g)| {
+            [
+                (&r["html_url"], &g["url"]),
+                (&r["body"], &g["body"]),
+                (&r["user"]["login"], &g["author"]["login"]),
+                (&r["created_at"], &g["createdAt"]),
+                (
+                    &r["updated_at"],
+                    if g["lastEditedAt"].is_null() {
+                        &g["createdAt"]
+                    } else {
+                        &g["lastEditedAt"]
+                    },
+                ),
+            ]
+            .into_iter()
+            .all(|(a, b)| a.is_string() && a == b)
+        })
+}
+
+impl<C: Rest + Transport> Transport for Budget<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if let Some(data) = self.plan_comments(query, &variables)? {
+            return Ok(data);
+        }
         let mutation = is_mutation(query);
         self.spend(mutation)?;
         self.graphql_spent(mutation, self.inner.graphql(query, variables))
@@ -3146,7 +3242,7 @@ impl<C: Rest> Rest for Kept<'_, C> {
     }
 }
 
-impl<C: Transport> Transport for Kept<'_, C> {
+impl<C: Rest + Transport> Transport for Kept<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         ensure!(
             !is_mutation(query),
@@ -4486,6 +4582,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.sweep_without_starts(&mut slots, context);
             return Ok(());
         }
+        if config.top_down {
+            self.line(
+                "schedule: top-down epic groups; closing-PR facts batched with the board".into(),
+            );
+        }
         let board = self.board();
         let Ok(mut board) = board else {
             self.board = Some(None);
@@ -5191,10 +5292,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let board = self.config.github_board().context("no GitHub board")?;
         let config = self.config;
         let revisit = config.revisit.is_some() || config.sweep.is_some();
-        let mut query = board_query(revisit, config.assign_holds);
-        if config.top_down {
-            query = query.replace(BOARD_PULLS, "");
-        }
+        let query = board_query(revisit, config.assign_holds);
         let mut cursor = Value::Null;
         let mut options = None;
         let mut items = BTreeMap::new();
@@ -5234,14 +5332,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     Some(_) => continue,
                     None => bail!("a board item could not be read; the board is incomplete"),
                 }
-                let mut content = content.clone();
-                if config.top_down {
-                    // Unread, not an empty set: complete_pulls reads only
-                    // candidates actually reached by the start walk.
-                    content["closedByPullRequestsReferences"] =
-                        json!({"nodes": [], "totalCount": 1});
-                }
-                let mut facts = Facts::from_node(&content)?;
+                let mut facts = Facts::from_node(content)?;
                 facts.priority = node["priority"]["name"].as_str().map(str::to_owned);
                 facts.status = node["status"]["name"].as_str().map(str::to_owned);
                 facts.why = node["why"]["text"].as_str().map(str::to_owned);
