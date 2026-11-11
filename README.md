@@ -28,6 +28,16 @@ and understand its output, then [connect one lane](docs/setup.md#connect-one-lan
 for the live prerequisites only the operator can complete. Leave writes and
 schedules off; the offline rehearsal does not verify a live deployment.
 
+## Run it locally
+
+From a trusted caller checkout, preview with `agent-board pass --config
+.github/pass.json` (include its reviewed `--fix-bounds` files when PR follow-up
+is configured). For GitHub, credentials come from `GH_TOKEN`, then `GITHUB_TOKEN`,
+then your `gh auth login --hostname github.com` login; no token export is needed.
+`DISPATCH_TOKEN` is optional and defaults to the same credential. Preview does
+not write or start runs. Applying still requires the configured bot's identity
+and explicit local caps; see [setup](docs/setup.md#connect-one-lane).
+
 ## License
 
 Apache-2.0 or MIT, at your option.

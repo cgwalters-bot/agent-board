@@ -578,9 +578,16 @@ pub struct Client {
 
 impl Client {
     pub fn from_env() -> Result<Self> {
-        let token = select_token(
+        Self::from_env_or_else(|| Err(AuthenticationRequired.into()))
+    }
+
+    /// Prefer GH_TOKEN, then GITHUB_TOKEN, consulting `fallback` only when
+    /// neither holds a token. Does not change the process environment.
+    pub fn from_env_or_else(fallback: impl FnOnce() -> Result<String>) -> Result<Self> {
+        let token = select_token_or_else(
             std::env::var("GH_TOKEN").ok(),
             std::env::var("GITHUB_TOKEN").ok(),
+            fallback,
         )?;
         Ok(Self::with_token(token))
     }
@@ -1055,6 +1062,15 @@ fn select_token(gh: Option<String>, github: Option<String>) -> Result<String> {
     gh.filter(|s| !s.is_empty())
         .or_else(|| github.filter(|s| !s.is_empty()))
         .ok_or_else(|| AuthenticationRequired.into())
+}
+
+fn select_token_or_else(
+    gh: Option<String>,
+    github: Option<String>,
+    fallback: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    let token = select_token(gh, github).or_else(|_| fallback())?;
+    select_token(Some(token), None)
 }
 
 fn transport_error(error: ureq::Error) -> anyhow::Error {
@@ -2943,10 +2959,25 @@ mod tests {
             (None, None, None),
         ] {
             let result = select_token(gh.map(str::to_owned), github.map(str::to_owned));
+            let mut called = false;
+            let fallback =
+                select_token_or_else(gh.map(str::to_owned), github.map(str::to_owned), || {
+                    called = true;
+                    Ok("local-login".into())
+                });
+            assert_eq!(called, expected.is_none());
+            assert_eq!(fallback.unwrap(), expected.unwrap_or("local-login"));
             match expected {
                 Some(s) => assert_eq!(result.unwrap(), s),
                 None => assert!(result.unwrap_err().is::<AuthenticationRequired>()),
             }
+        }
+        for result in [Ok(String::new()), Err(AuthenticationRequired.into())] {
+            assert!(
+                select_token_or_else(None, None, || result)
+                    .unwrap_err()
+                    .is::<AuthenticationRequired>()
+            );
         }
         for (status, authentication) in [(401, true), (403, false), (429, false), (500, false)] {
             assert_eq!(
