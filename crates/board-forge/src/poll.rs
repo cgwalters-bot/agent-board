@@ -309,7 +309,7 @@ const OWNER_BRANCHES_MAX: usize = 4096;
 // Both writes admit only the head we approved. A queue is required by the base
 // branch's rules, not an auto-merge fallback; GitHub owns revalidation after
 // admission. Auto-merge remains excluded because it can admit a later push.
-const MERGE: &str = "mutation($id: ID!, $head: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, mergeMethod: REBASE, expectedHeadOid: $head}) { clientMutationId } }";
+pub(crate) const MERGE: &str = "mutation($id: ID!, $head: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, mergeMethod: REBASE, expectedHeadOid: $head}) { clientMutationId } }";
 const ENQUEUE: &str = "mutation($id: ID!, $head: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head}) { clientMutationId } }";
 // A head behind a base that requires it up to date, which GitHub refuses to
 // merge (#273), is rebased onto the base instead; the new head is reviewed

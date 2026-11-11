@@ -193,6 +193,7 @@
     "wip": {"verdict": "native", "forgejo": "complete caller run listings"},
     "scan.candidateRequests": {"verdict": "refused", "reason": "GitHub scheduling only: bounds stage 4's per-candidate reads under the GitHub request accounting"},
     "scan.candidates": {"verdict": "refused", "reason": "GitHub scheduling only: stops stage 4's candidate walk, which is only built for GitHub"},
+    "scan.reserve": {"verdict": "refused", "reason": "GitHub stage shares only: sizes what the GitHub stages keep for scheduling from the scan bounds"},
     "triage": {"verdict": "native", "forgejo": "triage plans dispatched as below"},
     "planPools": {"verdict": "same"},
     "triagePools": {"verdict": "same"},

@@ -1742,7 +1742,7 @@ fn stage_shares_keep_requests_for_scheduling() {
     };
     let read = || client.get("https://api.github.com/x", None);
     let kept = |percent| PASS_REQUEST_LIMIT * percent / 100;
-    bounds.enter_keeping(Stage::PullRequests, AFTER_PULL_REQUESTS);
+    bounds.enter_keeping(Stage::PullRequests, bounds.share(AFTER_PULL_REQUESTS));
     assert_eq!(
         client.share_left(),
         Some(PASS_REQUEST_LIMIT - WRITE_RESERVE - kept(AFTER_PULL_REQUESTS))
@@ -1777,7 +1777,7 @@ fn stage_shares_keep_requests_for_scheduling() {
         )
     );
     // Stage 3 has its own share, at least a live epic's consideration.
-    bounds.enter_keeping(Stage::Epics, AFTER_EPICS);
+    bounds.enter_keeping(Stage::Epics, bounds.share(AFTER_EPICS));
     assert_eq!(bounds.share_line(), None);
     assert!(
         bounds.available() >= START_REQUESTS,
@@ -1942,7 +1942,7 @@ fn scheduling_reserve_precedes_all_discovery_stages() {
         (Stage::PullRequests, SCHEDULE_SHARE + EPICS_SHARE),
         (Stage::Epics, SCHEDULE_SHARE),
     ] {
-        bounds.enter_keeping(stage, percent);
+        bounds.enter_keeping(stage, bounds.share(percent));
         while client.get("https://api.github.com/x", None).is_ok() {}
         assert_eq!(
             bounds.left.get(),
@@ -1953,6 +1953,84 @@ fn scheduling_reserve_precedes_all_discovery_stages() {
     bounds.enter(Stage::Schedule);
     assert_eq!(client.share_left(), None);
     assert!(bounds.left.get() > START_RESERVE + START_REQUESTS);
+}
+
+/// With `scan.reserve`, stages 2 and 3 keep what the stages after them are
+/// bounded to need, the scan, a start and their own reads, and under
+/// `reserveScheduling` the candidate reads stage 4 holds back before its
+/// parent discovery, stage 2 keeping stage 3's room too; the fixed shares
+/// hold without it, without both scan bounds, and where the need is larger
+/// (agent-board#878).
+#[test]
+fn sized_reserve_keeps_what_the_scan_needs() {
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+    let fixed = |pulls: usize, epics: usize| (bounds.share(pulls), bounds.share(epics), false);
+    let need =
+        |candidates: usize, requests: usize| candidates * requests + START_RESERVE + LATER_READS;
+    let room = bounds.share(AFTER_PULL_REQUESTS) - bounds.share(AFTER_EPICS);
+    assert_eq!(
+        room,
+        bounds.share(SCHEDULE_SHARE + EPICS_SHARE) - bounds.share(SCHEDULE_SHARE)
+    );
+    let sized = |candidates: usize, requests: usize, discovery: usize| {
+        let need = need(candidates, requests) + discovery;
+        (need + room, need, true)
+    };
+    let scan = |candidates: usize, requests: usize, reserve: bool| json!({"candidates": candidates, "candidateRequests": requests, "reserve": reserve});
+    // The one candidate's requests at which the need is stage 3's share.
+    let at_share = bounds.share(AFTER_EPICS) - START_RESERVE - LATER_READS;
+    for (name, settings, expected) in [
+        (
+            "default",
+            json!({}),
+            fixed(AFTER_PULL_REQUESTS, AFTER_EPICS),
+        ),
+        (
+            "reserve scheduling",
+            json!({"reserveScheduling": true}),
+            fixed(SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE),
+        ),
+        (
+            "scan without reserve",
+            json!({"scan": scan(5, 20, false)}),
+            fixed(AFTER_PULL_REQUESTS, AFTER_EPICS),
+        ),
+        ("sized", json!({"scan": scan(2, 20, true)}), sized(2, 20, 0)),
+        (
+            "sized under reserve scheduling",
+            json!({"reserveScheduling": true, "scan": scan(5, 20, true)}),
+            sized(5, 20, START_REQUESTS),
+        ),
+        (
+            "the smallest scan",
+            json!({"scan": scan(1, 1, true)}),
+            sized(1, 1, 0),
+        ),
+        // Tracker's bounds (tracker#1548): a scan larger than the pass
+        // keeps the fixed share, never more.
+        (
+            "a scan larger than the share",
+            json!({"reserveScheduling": true, "scan": scan(40, 20, true)}),
+            fixed(SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE),
+        ),
+        (
+            "a scan as large as the share",
+            json!({"scan": scan(1, at_share, true)}),
+            fixed(AFTER_PULL_REQUESTS, AFTER_EPICS),
+        ),
+        (
+            "a scan one short of the share",
+            json!({"scan": scan(1, at_share - 1, true)}),
+            sized(1, at_share - 1, 0),
+        ),
+    ] {
+        let (pulls, epics, sized) = kept_shares(&config(settings), &bounds);
+        assert_eq!((pulls, epics, sized), expected, "{name}");
+        assert!(pulls > epics, "{name}");
+    }
+    // That stage 4 still starts work and Status still reads with what a
+    // sized reserve keeps is
+    // [`sized_reserve_merges_every_approved_pull_request_in_one_pass`]'s.
 }
 
 #[test]
@@ -6702,6 +6780,171 @@ fn authored_read_at_its_share_is_deferred() {
     );
     assert_eq!(report.failures, without.failures, "{:#?}", report.lines);
     assert!(report.state.is_some());
+}
+
+/// Thirty approved, green pull requests across ten followed repositories
+/// all merge in one pass within the request limit once `scan.reserve`
+/// sizes what stage 2 keeps from the scan bounds, in place of the default
+/// shares (agent-board#878); under `reserveScheduling`'s fixed share the
+/// stage stops part way, with hundreds of requests kept for stages that do
+/// not use them, and sized under `reserveScheduling` it still stops, as the
+/// need then keeps stage 4's parent-discovery room too. Whatever stage 2
+/// keeps, stage 4 still starts work and Status still reads.
+#[test]
+fn sized_reserve_merges_every_approved_pull_request_in_one_pass() {
+    const REPOSITORIES: u64 = 10;
+    const PULLS: u64 = 30;
+    let repositories: Vec<String> = (1..=REPOSITORIES)
+        .map(|n| format!("cgwalters-forge/work{n}"))
+        .collect();
+    let forge = || {
+        let mut forge = Forge::new(None, false);
+        for (n, repo) in (1..=PULLS).zip(repositories.iter().cycle()) {
+            let head = format!("head{n}");
+            let approval = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
+                "commit": {"oid": head}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
+                "pageInfo": {"hasPreviousPage": false}});
+            let committed = forge.replay.now.format(&Rfc3339).unwrap();
+            let change = json!({"reviews": approval, "headRefOid": head,
+                "headRefName": format!("dispatch/implement/agent-run-{n}"),
+                "series": {"nodes": [{"commit": {"oid": head, "messageHeadline": "Do the thing"}}],
+                    "pageInfo": {"hasNextPage": false}},
+                "commits": {"nodes": [{"commit": {"oid": head, "committedDate": committed,
+                    "message": "Do the thing", "statusCheckRollup": null}}]}});
+            followed(&mut forge.replay, (repo, n), change, json!([]));
+            let variables = json!({"id": format!("PR_{n}"), "head": head});
+            forge.replay.requests.push(json!({
+                "request": graphql_key(poll::MERGE, &variables),
+                "answer": {"data": {"mergePullRequest": {"clientMutationId": null}}},
+            }));
+        }
+        // Each repository lists every one of its pull requests, not
+        // `followed`'s one each.
+        for (r, repo) in repositories.iter().enumerate() {
+            let listed: Vec<Value> = (1..=PULLS)
+                .filter(|n| (n - 1) % REPOSITORIES == r as u64)
+                .map(|n| json!({"number": n, "user": {"login": "cgwalters-bot"}}))
+                .collect();
+            answer(&mut forge.replay, &format!("{repo}/pulls?state=open"))["body"] = json!(listed);
+            forge.replay.requests.push(json!({
+                "request": {"get": format!("{API_ROOT}repos/{repo}")},
+                "answer": {"status": 200, "link": null, "body": {"allow_rebase_merge": true}},
+            }));
+        }
+        forge.replay.requests.push(json!({
+            "request": {"get": format!("{API_ROOT}user")},
+            "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}},
+        }));
+        forge
+    };
+    let merged = |report: &Report| {
+        (report.lines.iter())
+            .filter(|l| l.starts_with("merge cgwalters-forge/work") && l.ends_with(" -> merged"))
+            .count() as u64
+    };
+    let stopped = |report: &Report| {
+        (report.lines.iter())
+            .any(|l| l.starts_with("pull requests: the stage's request share is spent at "))
+    };
+    let kept = |pulls: usize, epics: usize| {
+        format!(
+            "budget: scan.reserve keeps {pulls} requests for the stages after pull requests and {epics} after epics, the scan's need in place of the fixed shares"
+        )
+    };
+    let room = bounds_kept(AFTER_PULL_REQUESTS) - bounds_kept(AFTER_EPICS);
+    for (name, reserve_scheduling, scan, all, sized) in [
+        // The pass of agent-board#878, which spent 386 of the 646 its
+        // reads may take (the limit past the writes' reserve, as every
+        // "has" below).
+        (
+            "the fixed share",
+            true,
+            json!({"candidateRequests": 20, "candidates": 5}),
+            false,
+            None,
+        ),
+        // Its scan, sized: stage 2 has 156 instead of 126, not enough.
+        (
+            "the fixed share and the sized reserve",
+            true,
+            json!({"candidateRequests": 20, "candidates": 5, "reserve": true}),
+            false,
+            Some(5 * 20 + START_RESERVE + START_REQUESTS + LATER_READS),
+        ),
+        // The caller settings' scan under the fixed share: stage 2 has
+        // 196, still not enough.
+        (
+            "the fixed share and the sized reserve at 3 candidates",
+            true,
+            json!({"candidateRequests": 20, "candidates": 3, "reserve": true}),
+            false,
+            Some(3 * 20 + START_RESERVE + START_REQUESTS + LATER_READS),
+        ),
+        // The caller settings: stage 2 has 300 instead of the default
+        // shares' 269.
+        (
+            "the sized reserve",
+            false,
+            json!({"candidateRequests": 20, "candidates": 3, "reserve": true}),
+            true,
+            Some(3 * 20 + START_RESERVE + LATER_READS),
+        ),
+    ] {
+        let settings = json!({"follow": repositories, "pr": {"fixPools": ["claude"]},
+            "reserveScheduling": reserve_scheduling, "scan": scan});
+        let forge = forge();
+        let report = apply_within(&forge, &config(settings), PASS_REQUEST_LIMIT);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let count = merged(&report);
+        assert_eq!(
+            count == PULLS,
+            all,
+            "{name}: {count} merged: {:#?}",
+            report.lines
+        );
+        assert_eq!(stopped(&report), !all, "{name}: {:#?}", report.lines);
+        // Within the limit; where the stage stopped, with much of it unspent.
+        let unspent = if all {
+            WRITE_RESERVE
+        } else {
+            bounds_kept(SCHEDULE_SHARE) / 2
+        };
+        assert!(
+            report.spent.requests <= PASS_REQUEST_LIMIT - unspent,
+            "{name}: {}",
+            report.spent
+        );
+        let line = sized.map(|need| kept(need + room, need));
+        let said = (report.lines.iter()).find(|l| l.starts_with("budget: scan.reserve keeps "));
+        assert_eq!(said, line.as_ref(), "{name}: {:#?}", report.lines);
+        // The stages after it still start work and read Status, and none
+        // of them stops at the budget.
+        assert!(
+            !forge.dispatches().is_empty(),
+            "{name}: {:#?}",
+            report.lines
+        );
+        assert!(
+            !(report.lines.iter()).any(|l| {
+                l.starts_with("budget: candidate discovery stopped")
+                    || l.starts_with("budget: ")
+                        && (l.contains("requests left") || l.contains("keeps its last"))
+                    || l.starts_with("status: the pass's request budget")
+            }),
+            "{name}: {:#?}",
+            report.lines
+        );
+        assert!(
+            (report.lines.iter()).any(|l| l.starts_with("status: ")),
+            "{name}: {:#?}",
+            report.lines
+        );
+    }
+}
+
+/// What a pass at [`PASS_REQUEST_LIMIT`] keeps for `percent` of it.
+fn bounds_kept(percent: usize) -> usize {
+    PASS_REQUEST_LIMIT * percent / 100
 }
 
 /// Wherever a stage's share refuses a read, the stage defers what it left
@@ -15440,6 +15683,14 @@ fn config_table() {
         (
             json!({"scan": {"candidate": 1}}),
             "unknown field `candidate`",
+        ),
+        (
+            json!({"scan": {"candidates": 5, "reserve": true}}),
+            "scan reserve needs both scan candidates and scan candidateRequests",
+        ),
+        (
+            json!({"scan": {"candidateRequests": 20, "reserve": true}}),
+            "scan reserve needs both scan candidates and scan candidateRequests",
         ),
         (json!({"triageReplans": 11}), "triageReplans is not 0 to 10"),
         (
