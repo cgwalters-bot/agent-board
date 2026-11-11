@@ -45,6 +45,10 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
         value.get("reserveScheduling").is_none(),
         "unsupported_capability: reserveScheduling: GitHub stage shares only"
     );
+    ensure!(
+        value.get("topDown").is_none(),
+        "unsupported_capability: topDown: GitHub scheduling only"
+    );
     let contract: Value = serde_json::from_str(CONTRACT).context("Forgejo pass contract")?;
     for (option, entry) in contract["options"]
         .as_object()

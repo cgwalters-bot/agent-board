@@ -221,6 +221,15 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             return (free, 0);
         }
         let writers = self.writers();
+        // Stage 4 completed only candidates it reached, not the whole board.
+        let completed: Vec<_> = candidates
+            .iter()
+            .map(|(rank, facts)| {
+                let mut facts = (*facts).clone();
+                self.restore_pulls(&mut facts);
+                (rank, facts)
+            })
+            .collect();
         // Held for the operator by stage 4 this pass: a plan the pass never
         // starts (its revisit would wait on it), or one it will not act on.
         let operator: BTreeSet<&ItemRef> = (self.report.holds.iter())
@@ -231,7 +240,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             })
             .collect();
         let mut due = Vec::new();
-        for (rank, facts) in candidates {
+        for (rank, facts) in &completed {
             if revisit_hold(facts, &slots.busy, &writers).is_some()
                 || self.outside_epics(facts).is_some()
                 || operator.contains(&facts.issue)
