@@ -7273,7 +7273,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // never to the issue's repository.
         let fix = plan.kind == "fix";
         let dest = ItemRef {
-            repository: plan.repo.clone(),
+            repository: plan.work_repository().into(),
             number: plan.item,
             ..issue.clone()
         };
@@ -7343,14 +7343,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             );
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
-        if !fix && dest != *issue {
-            let target_facts = match self.facts(&dest, board) {
+        let source = ItemRef {
+            repository: plan.repo.clone(),
+            number: plan.item,
+            ..issue.clone()
+        };
+        if !fix && source != *issue {
+            let target_facts = match self.facts(&source, board) {
                 Ok(facts) => facts,
                 // A plan names the issue it implements, never a pull
                 // request, which the issue read finds no issue for
                 // (tracker#318's named composefs-rs#17).
                 Err(error)
-                    if format!("{error:#}").contains(NOT_FOUND) && self.pull_request(&dest) =>
+                    if format!("{error:#}").contains(NOT_FOUND) && self.pull_request(&source) =>
                 {
                     let dest = dest.display();
                     let why = format!(
@@ -7468,7 +7473,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .or_else(|| control.as_ref().and_then(|at| fix_in_flight(at, busy)))
         };
         // A fix plan's pull request has no issue facts to read again.
-        let again = if fix { issue } else { &dest };
+        let again = if fix { issue } else { &source };
         if let Some(step) = self.recheck(slots, (issue, again), target, rule)? {
             return Ok(step);
         }
@@ -7902,6 +7907,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         );
         brief.push_str(&self.verdict_ask(read.0));
         brief.push_str(plan::VALIDATE_PLAN_JSON);
+        if config.midstream.is_some() {
+            brief.push_str(" For work staged here for an issues-off midstream fork, keep repo and item as this tracking issue. Take the work target from its target: staging label or its Target: line and resolve it to the topic-admitted midstream fork, not its upstream. Set target_repo to that fork's OWNER/NAME in the implement plan, and require a draft PR there; do not guess an ambiguous target. Omit target_repo for work in this issue's repository.");
+            if let Some(repositories) = &self.midstreams {
+                brief.push_str(&format!(
+                    " Topic-admitted midstreams this pass: {}.",
+                    repositories.join(", ")
+                ));
+            }
+        }
         if config.intakes(&issue.repository) && read.0.parent.is_none() {
             brief.push_str(" Say on the issue which live epic in a configured work repository fits it best, for the operator to attach it there, or propose a new epic if none fits. Do not invent epic numbers or mutate relationships.");
         }

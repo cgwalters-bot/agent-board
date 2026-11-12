@@ -543,6 +543,9 @@ impl EpicPlan {
                         if let Some(effort) = plan.effort {
                             fields["effort"] = json!(effort.as_str());
                         }
+                        if let Some(target) = &plan.target_repo {
+                            fields["target_repo"] = json!(target);
+                        }
                         // Apply puts the created issue's number in place of NEW-k.
                         match stacks_on {
                             Some(Target::Issue(lower)) => fields["stacks_on"] = lower.number.into(),

@@ -65,6 +65,7 @@ fn forgejo_target_names_and_path_are_not_github_rules() {
 
 fn start() -> Start<'static> {
     Start {
+        issue_repository: None,
         repository: "example/app",
         item: 9,
         kind: "research",

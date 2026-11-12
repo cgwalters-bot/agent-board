@@ -33,7 +33,8 @@ start of a line, holding one JSON object:
 | Field | Required | Meaning |
 |---|---|---|
 | `schema` | yes | `agent-board/job-plan/v1` |
-| `repo` | yes | Target repository, `OWNER/NAME`; the caller's bounds must allow it |
+| `repo` | yes | Repository containing the issue, `OWNER/NAME`; also the work target unless `target_repo` is set |
+| `target_repo` | no | Checkout and draft PR target for an implement plan staged elsewhere, `OWNER/NAME`; omitted keeps existing dispatch. Not supported with stacking or batching |
 | `item` | yes | Positive issue number in `repo`; for `fix`, the pull request whose branch it rewrites |
 | `kind` | yes | `implement`, `triage`, `research`, `fix` or `session`: the profile the run gets; the pass starts `fix` only with [`fixPlans`](pass.md#scheduling) and `session` only with [`sessionPlans`](sessions.md), and then only the operator's own session plan |
 | `runner` | yes | `hosted` (the default planners emit), or a caller-owned profile name: `[a-z0-9][a-z0-9_-]{0,31}`, like `pool`'s syntax and length |
@@ -48,6 +49,31 @@ Every field but `schema` maps onto one input of the caller's dispatch workflow
 Anything else, including `null` for a field, is refused: the caller has no inputs
 for the base branch, budget or allowed outputs yet, so a plan must not appear to
 set them. One plan per comment; a comment with two is refused.
+
+### Issues staged outside the work repository
+
+The concrete threat is checking the tracking repository's bounds while changing
+a different repository, or reading an unrelated issue with the same number in
+the fork. `target_repo` is the one opt-in mechanism: `repo` and `item` still name
+the real issue; the checkout, PR, routing, overlap and work/write admission use
+`target_repo`. No synthetic issue is read in the target. The pass accepts only
+its configured work repositories, and retains its
+own-space write restriction. The caller independently checks the target bounds
+and keeps midstream PRs as drafts; this field grants no authority.
+
+For an issues-off fork, take the target from the staging `target:` label or
+the body's `Target:` line, resolving an upstream name to the admitted midstream
+fork. The pass's midstream triage brief asks the planner to do this and list
+`target_repo` explicitly; an ambiguous label is not a reason to guess. Existing
+plans without the field are not retargeted implicitly. For example, work on
+tracker#1574 for the ostree midstream uses `repo: "cgwalters-forge/tracker"`,
+`item: 1574`, `target_repo: "cgwalters-forge/ostree"`.
+
+GitHub dispatch sends `repo=TARGET`, `issue_repo=SOURCE`, `item=N`; claims and
+receipts remain on the tracking issue. Deploy the receiving workflow's
+[`issue_repo` contract](dispatch.md#staged-issue-caller-contract) before using
+the field. Native Forgejo does not accept this input and refuses it. Fix plans
+on existing fork PRs keep their existing same-repository protocol.
 
 ### Runner profiles (caller integration gated)
 

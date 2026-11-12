@@ -5794,6 +5794,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
         };
         let start = Start {
+            issue_repository: None,
             repository: repo,
             item: number,
             kind: "fix",
