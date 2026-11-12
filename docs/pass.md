@@ -263,6 +263,58 @@ Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set `notifications`
 to `true`, set `midstream: {"owner":"cgwalters-forge","topic":"bot-midstream"}`,
 and keep the existing pass token. No deployed config or token is changed here.
 
+## Followed issue intake
+
+The concrete risks are a busy repository spending the whole pass on enrollment,
+and a stranger's new issue being mistaken for implementation authorization.
+`issueIntake: true` opts GitHub passes into incremental enrollment; it is off by
+default and requires a GitHub board, `state`, `triage` and scheduling. Before
+stage 4's WIP/pool gates, intake lists open issues updated since each followed
+repository's watermark, one GraphQL call per repository, with issue facts and
+project memberships batched. It does not read each issue separately for discovery.
+Only the explicit `follow` list is used, not repositories discovered through PRs.
+
+An absent member is added with Status Todo and the highest matching Priority
+option from its labels (`P0` or `priority/P0`, case-insensitive), otherwise unset.
+Existing members with a Status keep their fields, except that a Done card whose
+issue was reopened since the watermark returns to Todo, keeping its Priority.
+A member with unset Status is repaired as an interrupted enrollment only when
+the bot created it since the watermark, which a failed write retains; a Status
+cleared by hand, or on an older or someone else's card, is left alone. Issues
+are found by their update time, but only those created or reopened since the
+watermark are added: an update to an older issue, or to one whose card someone
+removed, does not enroll it.
+The summary says `intake: N new issue(s) (repo#n, ...)`.
+
+The listing reads at most 100 issues per repository, oldest update first, and
+intake shares at most 15% of the pass request limit, inside its time limit.
+Every mutation consumes `--max-writes`, including failed attempts; admission
+requires room for the add and initial fields together. Oldest watermarks go
+first. First use looks back two days; after that, saved watermarks do not expire.
+Incomplete or refused reads, exhausted shares/caps and failed writes retain the
+repository's watermark. A full page advances only to its final timestamp minus
+one second; a page full at that boundary reports timestamp overflow for a person
+instead of silently skipping issues. Preview writes nothing and advances no
+watermarks. Losing state repeats discovery, not recorded triage dispatches.
+
+In work repositories, enrolled issues opened by the operator or the bot enter
+normal scheduling, even outside the `triage.scope: epics` scope. Issues opened
+by anyone else are enrolled for the operator to see but stay visitors, never
+triaged: a triage runs as the bot, whose plans the writer checks accept.
+Its brief asks it to name the best-fitting live epic for the operator to attach
+the issue to, or to propose one. Epic plans' `attach_sub_issue` stays off: it
+would let any plan the bot posts make some other issue, a stranger's included,
+a candidate child. Existing dispatch records prevent duplicate initial triage,
+and per-item triage stays where repository sessions are configured
+([sessions](sessions.md)). Existing holds, WIP, pool pacing, scan bounds, focus and dispatch
+caps still apply; intake cannot promise a start while those gates hold it.
+Followed repositories outside `workRepositories` can be enrolled, but this does
+not grant permission to start work there.
+
+Caller activation: in `cgwalters-forge/tracker`, `.github/pass.json`, set
+`issueIntake` to `true` after updating the agent-board revision. No deployed
+configuration is changed here.
+
 ## Action-first pull requests (GitHub)
 
 The concrete failure this prevents is spending the PR stage's share on upstream

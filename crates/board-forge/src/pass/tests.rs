@@ -10,6 +10,452 @@ const CONFIG: &str = include_str!("../../../../fixtures/pass/config.json");
 /// appended by hand, finding none ([`merged`] gives tracker#468's one).
 const BOARD: &str = include_str!("../../../../fixtures/pass/board-2026-10-23.json");
 
+/// Move an existing unplanned issue out of the project and into the next
+/// incremental repository listing. Its existing comment fixture is unchanged.
+fn intake_fixture() -> Replay {
+    let mut replay = without_epics(replay());
+    let mut fresh = Value::Null;
+    for entry in &mut replay.requests {
+        if let Some(nodes) = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut)
+        {
+            if let Some(node) = nodes.iter().find(|n| n["content"]["number"] == 459) {
+                fresh = node["content"].clone();
+            }
+            nodes.clear();
+        }
+    }
+    assert!(!fresh.is_null());
+    fresh["id"] = json!("fresh-issue");
+    fresh["parent"] = Value::Null;
+    fresh["labels"] = json!({"nodes":[],"totalCount":0});
+    fresh["createdAt"] = json!(replay.now.format(&Rfc3339).unwrap());
+    fresh["updatedAt"] = fresh["createdAt"].clone();
+    fresh["projectItems"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
+    let variables = json!({"owner":"cgwalters-forge","name":"tracker",
+        "since": (replay.now - time::Duration::days(2)).format(&Rfc3339).unwrap()});
+    replay.requests.push(json!({"request":graphql_key(&intake::query(false), &variables),
+        "answer":{"data":{"repository":{"issues":{"nodes":[fresh],"pageInfo":{"hasNextPage":false}}}}}}));
+    for path in ["events?per_page=100", "pulls?state=open&per_page=100"] {
+        replay.requests.push(
+            json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/{path}")},
+            "answer":{"status":200,"body":[],"link":null}}),
+        );
+    }
+    rest_comment_pages(&mut replay);
+    replay
+}
+
+#[test]
+fn issue_intake_enrolls_a_fresh_unlabelled_issue_and_triages_only_ours() {
+    let cfg = config(json!({"issueIntake":true,"state":"state.json","triage":{},
+        "follow":["cgwalters-forge/tracker"],"workRepositories":["cgwalters-forge/tracker"],"pr":{"fixPools":["claude"]}}));
+    // A visitor's issue is enrolled but never triaged: the triage runs as the
+    // bot, a writer whose implement plan would authorize the stranger's text.
+    for (author, triaged) in [(None, true), (Some("visitor"), false)] {
+        let mut fixture = intake_fixture();
+        if let Some(author) = author {
+            let listing = fixture
+                .requests
+                .iter_mut()
+                .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+                .unwrap();
+            listing["answer"]["data"]["repository"]["issues"]["nodes"][0]["author"]["login"] =
+                json!(author);
+        }
+        let report = preview(&cfg, &fixture);
+        assert_eq!(report.failures, 0, "{author:?}: {:#?}", report.lines);
+        assert!(
+            report
+                .lines
+                .contains(&"intake: 1 new issue(s) (cgwalters-forge/tracker#459)".into()),
+            "{author:?}: {:#?}",
+            report.lines
+        );
+        assert_eq!(
+            report
+                .lines
+                .contains(&"start triage cgwalters-forge/tracker#459 pool=claude".into()),
+            triaged,
+            "{author:?}: {:#?}",
+            report.lines
+        );
+        assert!(
+            report.issue_intake.is_empty(),
+            "preview must not advance watermarks"
+        );
+        assert!(report.spent.requests < PASS_REQUEST_LIMIT);
+    }
+    let off = config(
+        json!({"state":"state.json","follow":["cgwalters-forge/tracker"],
+        "workRepositories":["cgwalters-forge/tracker"],"pr":{"fixPools":["claude"]}}),
+    );
+    let report = preview(&off, &intake_fixture());
+    assert!(!report.lines.iter().any(|l| l.starts_with("intake:")));
+    assert!(!report.lines.iter().any(|l| l.starts_with("start triage")));
+}
+
+#[test]
+fn issue_intake_refuses_unverified_discovery_and_preserves_preview_state() {
+    let cfg = config(json!({"issueIntake":true,"state":"state.json","triage":{},
+        "follow":["cgwalters-forge/tracker"],"workRepositories":["cgwalters-forge/tracker"],"pr":{"fixPools":["claude"]}}));
+    for (name, pointer, value) in [
+        (
+            "foreign repository",
+            "/nodes/0/repository/nameWithOwner",
+            json!("other/repo"),
+        ),
+        ("closed", "/nodes/0/state", json!("CLOSED")),
+        ("truncated labels", "/nodes/0/labels/totalCount", json!(51)),
+        (
+            "truncated membership",
+            "/nodes/0/projectItems/pageInfo/hasNextPage",
+            json!(true),
+        ),
+        (
+            "redacted membership",
+            "/nodes/0/projectItems/nodes",
+            json!([{"id":"member","project":null}]),
+        ),
+        ("missing timestamp", "/nodes/0/updatedAt", Value::Null),
+        ("incomplete page", "/pageInfo/hasNextPage", Value::Null),
+    ] {
+        let mut fixture = intake_fixture();
+        let listing = fixture
+            .requests
+            .iter_mut()
+            .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+            .unwrap();
+        *listing["answer"]["data"]["repository"]["issues"]
+            .pointer_mut(pointer)
+            .unwrap() = value;
+        let report = preview(&cfg, &fixture);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("intake warning:")),
+            "{name}: {:?}",
+            report.lines
+        );
+        assert!(
+            report.lines.contains(&"intake: 0 new issue(s)".into()),
+            "{name}"
+        );
+        assert!(
+            !report.lines.iter().any(|l| l.starts_with("start triage")),
+            "{name}"
+        );
+        assert!(report.issue_intake.is_empty());
+    }
+}
+
+#[test]
+fn issue_intake_state_round_trips_and_rejects_bad_watermarks() {
+    let state = State {
+        interval_seconds: poll::MIN_INTERVAL_SECONDS,
+        issue_intake: BTreeMap::from([("o/r".into(), "2026-11-11T00:00:00Z".into())]),
+        ..State::default()
+    };
+    assert_eq!(
+        State::from_json(&state.to_json()).unwrap().issue_intake,
+        state.issue_intake
+    );
+    for bad in [
+        json!({"o/r":"yesterday"}),
+        json!({"../bad":"2026-11-11T00:00:00Z"}),
+        json!([]),
+    ] {
+        let mut value = state.to_json();
+        value["issue_intake"] = bad;
+        assert!(State::from_json(&value).is_err());
+    }
+}
+
+/// Extend the existing applying forge with checked project-field receipts.
+struct IntakeForge {
+    forge: Forge,
+    enrollment: RefCell<Vec<Value>>,
+    fail_field: bool,
+}
+
+impl Rest for IntakeForge {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        if url == format!("{API_ROOT}user") {
+            return Ok(listed(json!({"login":"cgwalters-bot"})));
+        }
+        self.forge.get(url, validator)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.forge.send(method, url, body)
+    }
+}
+
+impl Broker for IntakeForge {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.forge.usage(url)
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.forge.grant(url)
+    }
+}
+
+impl Transport for IntakeForge {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if query.starts_with(FRESH_QUERY) {
+            let listing = self
+                .forge
+                .replay
+                .requests
+                .iter()
+                .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+                .unwrap();
+            let mut issue = listing["answer"]["data"]["repository"]["issues"]["nodes"][0].clone();
+            issue["projectItems"] = json!({"nodes":[{"project":{"number":1,"owner":{"login":"cgwalters-forge"}},"status":{"name":"Todo"}}],"totalCount":1});
+            return Ok(json!({"repository":{"issue":issue}}));
+        }
+        if query.starts_with("mutation") && query.contains("addProjectV2ItemById") {
+            self.enrollment.borrow_mut().push(variables);
+            return Ok(json!({"addProjectV2ItemById":{"item":{"id":"new-item"}}}));
+        }
+        if query.starts_with("mutation") && query.contains("updateProjectV2ItemFieldValue") {
+            self.enrollment.borrow_mut().push(variables.clone());
+            ensure!(!self.fail_field, "field write refused");
+            return Ok(json!({"updateProjectV2ItemFieldValue":{"projectV2Item":{
+                "id":variables["item"],"fieldValueByName":{"optionId":variables["value"]["singleSelectOptionId"]}
+            }}}));
+        }
+        Transport::graphql(&self.forge, query, variables)
+    }
+}
+
+impl crate::github::GraphQl for IntakeForge {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
+#[test]
+fn issue_intake_apply_counts_writes_and_retains_failed_enrollments() {
+    let cfg = config(json!({"issueIntake":true,"state":"state.json","triage":{},
+        "follow":["cgwalters-forge/tracker"],"workRepositories":["cgwalters-forge/tracker"],"pr":{"fixPools":["claude"]}}));
+    for (max_writes, fail_field, expected_writes) in [
+        (0, false, 0),
+        (1, false, 0),
+        (2, false, 2),
+        (2, true, 2),
+        (100, false, 2),
+    ] {
+        let mut forge = Forge::new(None, false);
+        forge.replay = intake_fixture();
+        let forge = IntakeForge {
+            forge,
+            enrollment: RefCell::default(),
+            fail_field,
+        };
+        let limits = Limits {
+            dispatch: Some(1),
+            writes: Some(max_writes),
+            ..Limits::default()
+        };
+        let report = block(run(
+            &forge,
+            &forge,
+            &cfg,
+            State::default(),
+            (Mode::Local, limits),
+            forge.forge.replay.now,
+        ))
+        .unwrap();
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(
+            forge.enrollment.borrow().len(),
+            expected_writes,
+            "{max_writes}/{fail_field}: {:?}",
+            report.lines
+        );
+        let initial = forge.forge.replay.now - time::Duration::days(2);
+        let watermark = OffsetDateTime::parse(
+            &report.state.unwrap().issue_intake["cgwalters-forge/tracker"],
+            &Rfc3339,
+        )
+        .unwrap();
+        assert_eq!(
+            watermark,
+            if max_writes >= 2 && !fail_field {
+                forge.forge.replay.now - time::Duration::seconds(1)
+            } else {
+                initial
+            }
+        );
+        assert_eq!(
+            forge.forge.dispatches().len(),
+            usize::from(max_writes >= 2 && !fail_field),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn issue_intake_initial_priority_repair_and_reopen() {
+    let cfg = config(json!({"issueIntake":true,"state":"state.json","triage":{},
+        "follow":["cgwalters-forge/tracker"],"workRepositories":["cgwalters-forge/tracker"],"pr":{"fixPools":["claude"]}}));
+    let (fresh, old) = (time::Duration::hours(1), time::Duration::days(30));
+    // (case, issue age, card creator and age, card Status, last reopened, writes)
+    let bot = "cgwalters-bot";
+    let done = || json!({"name":"Done"});
+    for (name, created, card, status, reopened, expected) in [
+        ("new", fresh, None, Value::Null, None, 3),
+        ("old, only updated", old, None, Value::Null, None, 0),
+        ("old, reopened", old, None, Value::Null, Some(fresh), 3),
+        (
+            "interrupted",
+            fresh,
+            Some((bot, fresh)),
+            Value::Null,
+            None,
+            1,
+        ),
+        (
+            "cleared by hand",
+            old,
+            Some((bot, old)),
+            Value::Null,
+            None,
+            0,
+        ),
+        (
+            "another's card",
+            fresh,
+            Some(("operator", fresh)),
+            Value::Null,
+            None,
+            0,
+        ),
+        (
+            "reopened",
+            old,
+            Some(("operator", old)),
+            done(),
+            Some(fresh),
+            1,
+        ),
+        ("done earlier", old, Some((bot, old)), done(), Some(old), 0),
+        (
+            "done, never reopened",
+            fresh,
+            Some((bot, fresh)),
+            done(),
+            None,
+            0,
+        ),
+        (
+            "in progress",
+            fresh,
+            Some((bot, fresh)),
+            json!({"name":"In Progress"}),
+            Some(fresh),
+            0,
+        ),
+    ] {
+        let mut forge = Forge::new(None, false);
+        forge.replay = intake_fixture();
+        let now = forge.replay.now;
+        let at = |age: time::Duration| (now - age).format(&Rfc3339).unwrap();
+        let project = forge
+            .replay
+            .requests
+            .iter()
+            .find_map(|e| {
+                e["answer"]
+                    .pointer("/data/repositoryOwner/projectV2/id")
+                    .and_then(Value::as_str)
+            })
+            .unwrap()
+            .to_owned();
+        let listing = forge
+            .replay
+            .requests
+            .iter_mut()
+            .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+            .unwrap();
+        let issue = &mut listing["answer"]["data"]["repository"]["issues"]["nodes"][0];
+        issue["labels"] = json!({"nodes":[{"name":"P1"},{"name":"priority/p0"}],"totalCount":2});
+        issue["createdAt"] = json!(at(created));
+        if let Some(age) = reopened {
+            issue["timelineItems"] = json!({"nodes":[{"createdAt":at(age)}]});
+        }
+        if let Some((creator, age)) = card {
+            issue["projectItems"]["nodes"] = json!([{"id":"existing-item","createdAt":at(age),
+                "creator":{"login":creator},"project":{"id":project}}]);
+        }
+        let issue = issue.clone();
+        if card.is_some() {
+            for entry in &mut forge.replay.requests {
+                if let Some(nodes) =
+                    entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+                {
+                    *nodes = json!([{"content":issue,"priority":{"name":"P2"},"status":status,"why":null}]);
+                }
+            }
+        }
+        let forge = IntakeForge {
+            forge,
+            enrollment: RefCell::default(),
+            fail_field: false,
+        };
+        let report = block(run(
+            &forge,
+            &forge,
+            &cfg,
+            State::default(),
+            (
+                Mode::Local,
+                Limits {
+                    dispatch: Some(0),
+                    ..Limits::default()
+                },
+            ),
+            forge.forge.replay.now,
+        ))
+        .unwrap();
+        let writes = forge.enrollment.borrow();
+        assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+        assert_eq!(writes.len(), expected, "{name}: {:?}", report.lines);
+        if expected == 1 {
+            assert_eq!(writes[0]["item"], "existing-item", "{name}");
+            assert_eq!(writes[0]["name"], "Status", "{name}");
+        } else if expected == 3 {
+            assert_eq!(writes.len(), 3);
+            assert_eq!(writes[1]["name"], "Priority");
+            let p0 = forge
+                .forge
+                .replay
+                .requests
+                .iter()
+                .filter_map(|e| {
+                    e["answer"]
+                        .pointer("/data/node/fields/nodes")
+                        .and_then(Value::as_array)
+                })
+                .flatten()
+                .find(|f| f["name"] == "Priority")
+                .unwrap()["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["name"] == "P0")
+                .unwrap()["id"]
+                .clone();
+            assert_eq!(writes[1]["value"]["singleSelectOptionId"], p0);
+        }
+    }
+}
+
 /// Same recorded board for both algorithms, with two ready children of
 /// the first P0 epic, a competing P0 orphan, and 400 unrelated parents.
 fn top_down_fixture() -> Replay {
