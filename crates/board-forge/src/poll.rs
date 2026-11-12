@@ -1620,6 +1620,9 @@ pub struct State {
     /// The next own-space repository to screen under `actionFirst`, separate
     /// from the decision cut so false positives cannot stall discovery.
     pub action_first_cursor: Option<String>,
+    /// Unfinished per-repository decisions, retained even when discovery
+    /// screens a disjoint batch on the next pass.
+    pub action_first_positions: BTreeMap<String, u64>,
     /// The candidate `OWNER/REPO#N` the pass's stage 4 scan stopped at
     /// under `scan.candidates` ([`crate::pass::Scan`]): the next pass's
     /// scan resumes after it, so that the stops of a few passes cover the
@@ -1670,6 +1673,7 @@ impl State {
                     "follow_cursor",
                     "share_cursor",
                     "action_first_cursor",
+                    "action_first_positions",
                     "scan_cursor",
                     "holds_pending",
                     "holds_summary_cursor",
@@ -1813,6 +1817,18 @@ impl State {
         };
         let follow_cursor = cursor("follow_cursor")?;
         let action_first_cursor = cursor("action_first_cursor")?;
+        let action_first_positions: BTreeMap<String, u64> = object
+            .get("action_first_positions")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("poll state action_first_positions is not a repository-to-PR map")?
+            .unwrap_or_default();
+        ensure!(
+            action_first_positions.iter().all(|(repo, n)| {
+                validate_repository(repo).is_ok() && repo == &repo.to_ascii_lowercase() && *n > 0
+            }),
+            "poll state action_first_positions contains an invalid repository or PR number"
+        );
         let share_cursor = (object.get("share_cursor"))
             .map(|c| {
                 c.as_str()
@@ -1870,6 +1886,7 @@ impl State {
             follow_cursor,
             share_cursor,
             action_first_cursor,
+            action_first_positions,
             scan_cursor,
             holds_pending,
             holds_summary_cursor,
@@ -1915,6 +1932,9 @@ impl State {
         }
         if let Some(cursor) = &self.action_first_cursor {
             state["action_first_cursor"] = cursor.as_str().into();
+        }
+        if !self.action_first_positions.is_empty() {
+            state["action_first_positions"] = json!(self.action_first_positions);
         }
         if let Some(cursor) = &self.scan_cursor {
             state["scan_cursor"] = cursor.as_str().into();
@@ -8659,7 +8679,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         follow_cursor = if pass.apply.is_some() {
             envelope.next.clone()
         } else {
-            state.follow_cursor
+            state.follow_cursor.clone()
         };
         pass.envelope = Some(envelope);
     }
@@ -8667,16 +8687,13 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     let mut waiting = BTreeSet::new();
     let mut upstream_cursor = None;
     let mut action_first_cursor = None;
+    let mut action_first_positions = BTreeMap::new();
     if config.policy.action_first {
-        (action_first_cursor, upstream_cursor) = pass.action_first(
-            &follow,
-            state.share_cursor.as_deref(),
-            state.action_first_cursor.as_deref(),
-            &missing,
-            &mut outcome,
-        );
+        (action_first_cursor, upstream_cursor, action_first_positions) =
+            pass.action_first(&follow, &state, &missing, &mut outcome);
         if pass.apply.is_none() {
             action_first_cursor = state.action_first_cursor.clone();
+            action_first_positions = state.action_first_positions.clone();
         }
         waiting.extend(outcome.undecided.iter().cloned());
     }
@@ -8813,6 +8830,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         follow_cursor,
         share_cursor,
         action_first_cursor,
+        action_first_positions,
         // The pass's, kept by the pass ([`crate::pass::run`]).
         scan_cursor: None,
         holds_pending: Vec::new(),
@@ -21108,7 +21126,7 @@ mod tests {
         let repo = REPO.to_owned();
         let follow = [&repo].into_iter().collect();
         let mut outcome = Outcome::default();
-        pass.action_first(&follow, None, None, &BTreeSet::new(), &mut outcome);
+        pass.action_first(&follow, &State::default(), &BTreeSet::new(), &mut outcome);
         assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
         assert!(outcome.steps.iter().any(|s| s.number == 470));
         assert!(!outcome.steps.iter().any(|s| s.number == 471));
@@ -21124,6 +21142,8 @@ mod tests {
         fake: &'f Fake,
         left: Cell<usize>,
         screens: RefCell<Vec<String>>,
+        populated: BTreeSet<String>,
+        screen_numbers: BTreeMap<String, BTreeSet<u64>>,
     }
 
     impl<'f> ActionShare<'f> {
@@ -21132,6 +21152,8 @@ mod tests {
                 fake,
                 left: Cell::new(left),
                 screens: RefCell::new(Vec::new()),
+                populated: BTreeSet::from([REPO.to_owned()]),
+                screen_numbers: BTreeMap::new(),
             }
         }
 
@@ -21170,10 +21192,18 @@ mod tests {
                     variables["name"].as_str().unwrap()
                 );
                 self.screens.borrow_mut().push(repo.clone());
-                if repo != REPO {
+                if !self.populated.contains(&repo) {
                     return Ok(json!({"repository": {"pullRequests": {
                         "nodes": [], "pageInfo": {"hasNextPage": false}
                     }}}));
+                }
+                if let Some(numbers) = self.screen_numbers.get(&repo) {
+                    let mut data = self.fake.graphql(query, variables)?;
+                    data["repository"]["pullRequests"]["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|p| numbers.contains(&p["number"].as_u64().unwrap()));
+                    return Ok(data);
                 }
             }
             self.fake.graphql(query, variables)
@@ -21200,10 +21230,12 @@ mod tests {
                 git_ref: None,
             });
             let mut outcome = Outcome::default();
-            let (next, _) = pass.action_first(
+            let (next, _, _) = pass.action_first(
                 &follow,
-                None,
-                cursor.as_deref(),
+                &State {
+                    action_first_cursor: cursor.clone(),
+                    ..State::default()
+                },
                 &BTreeSet::new(),
                 &mut outcome,
             );
@@ -21216,6 +21248,151 @@ mod tests {
             cursor = next;
         }
         assert_eq!(screened, repos.into_iter().collect());
+    }
+
+    #[test]
+    fn action_first_disjoint_discovery_batches_keep_pending_decisions() {
+        let mut fake = github();
+        let approved = fake.pulls[&470].clone();
+        for number in [470, 471] {
+            let mut pull = approved.clone();
+            pull["number"] = json!(number);
+            pull["id"] = json!(format!("PR_{number}"));
+            // Both screen ready, but only the second passes fresh authorization.
+            pull["isCrossRepository"] = json!(number == 471);
+            fake.pulls.insert(number, pull);
+        }
+        let repos: Vec<String> = std::iter::once(REPO.to_owned())
+            .chain((0..15).map(|n| format!("cgwalters-forge/z{n:02}")))
+            .collect();
+        let populated = BTreeSet::from([repos[0].clone(), repos[8].clone()]);
+        let pages = fake.rest.clone();
+        for repo in &populated {
+            for (url, page) in &pages {
+                fake.rest.insert(url.replace(REPO, repo), page.clone());
+            }
+            for number in [470, 471] {
+                fake.page(
+                    &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+                    None,
+                    None,
+                    json!([]),
+                );
+            }
+        }
+        let cfg = config();
+        let follow = repos.iter().collect();
+        let mut state = State {
+            interval_seconds: MIN_INTERVAL_SECONDS,
+            ..State::default()
+        };
+        let mut merged = BTreeSet::new();
+        for round in 0..4 {
+            let mut shared = ActionShare::new(&fake, 40);
+            shared.populated = populated.clone();
+            let mut pass = Pass::new(&shared, &shared, &cfg, now());
+            pass.apply = Some(Apply {
+                dispatcher: &shared,
+                workflow: "dispatch.yml".into(),
+                pools: vec!["claude".into()],
+                git_ref: None,
+            });
+            let mut outcome = Outcome::default();
+            let (next, _, positions) =
+                pass.action_first(&follow, &state, &BTreeSet::new(), &mut outcome);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let screens = shared.screens.borrow();
+            assert_eq!(*screens, repos[(round % 2) * 8..(round % 2 + 1) * 8]);
+            if pass.merged > 0 {
+                assert_eq!(pass.merged, 1);
+                merged.insert(screens[0].clone());
+            }
+            if round == 1 {
+                assert_eq!(positions.len(), 2, "both pending repositories must survive");
+            }
+            state.share_cursor = pass.cut;
+            state.action_first_cursor = next;
+            state.action_first_positions = positions;
+            state = State::from_json(&state.to_json()).unwrap();
+        }
+        assert_eq!(
+            merged, populated,
+            "ready merges starved in disjoint batches"
+        );
+        for invalid in [
+            json!(null),
+            json!([]),
+            json!({"invalid": 471}),
+            json!({REPO: 0}),
+            json!({REPO: "471"}),
+        ] {
+            let mut value = state.to_json();
+            value["action_first_positions"] = invalid;
+            assert!(State::from_json(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn action_first_pending_repository_wraps_after_other_repositories() {
+        let mut fake = github();
+        let approved = fake.pulls[&470].clone();
+        let other = "cgwalters-forge/zzz".to_owned();
+        let repos = [REPO.to_owned(), other.clone()];
+        for number in 470..475 {
+            let mut pull = approved.clone();
+            pull["number"] = json!(number);
+            pull["id"] = json!(format!("PR_{number}"));
+            pull["isCrossRepository"] = json!(number == 474);
+            fake.pulls.insert(number, pull);
+            for repo in &repos {
+                fake.page(
+                    &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+                    None,
+                    None,
+                    json!([]),
+                );
+            }
+        }
+        let pages = fake.rest.clone();
+        for (url, page) in pages {
+            fake.rest.insert(url.replace(REPO, &other), page);
+        }
+        let cfg = config();
+        let follow = repos.iter().collect();
+        let mut state = State {
+            interval_seconds: MIN_INTERVAL_SECONDS,
+            ..State::default()
+        };
+        let mut merged = false;
+        for _ in 0..6 {
+            let mut shared = ActionShare::new(&fake, 34);
+            shared.populated = repos.iter().cloned().collect();
+            shared.screen_numbers = BTreeMap::from([
+                (REPO.to_owned(), (470..474).collect()),
+                (other.clone(), BTreeSet::from([474])),
+            ]);
+            let mut pass = Pass::new(&shared, &shared, &cfg, now());
+            pass.apply = Some(Apply {
+                dispatcher: &shared,
+                workflow: "dispatch.yml".into(),
+                pools: vec!["claude".into()],
+                git_ref: None,
+            });
+            let mut outcome = Outcome::default();
+            let (next, _, positions) =
+                pass.action_first(&follow, &state, &BTreeSet::new(), &mut outcome);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(shared.screens.borrow().len(), 2);
+            if pass.merged > 0 {
+                merged = true;
+                break;
+            }
+            state.share_cursor = pass.cut;
+            state.action_first_cursor = next;
+            state.action_first_positions = positions;
+            state = State::from_json(&state.to_json()).unwrap();
+        }
+        assert!(merged, "one repository monopolized every decision share");
     }
 
     #[test]
@@ -21241,7 +21418,8 @@ mod tests {
             git_ref: None,
         });
         let mut outcome = Outcome::default();
-        let (next, _) = pass.action_first(&follow, None, None, &BTreeSet::new(), &mut outcome);
+        let (next, _, _) =
+            pass.action_first(&follow, &State::default(), &BTreeSet::new(), &mut outcome);
         assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
         assert_eq!(pass.merged, 1, "{:?}", outcome.lines);
         assert_eq!(shared.screens.borrow().len(), 4);
@@ -21290,13 +21468,8 @@ mod tests {
                 git_ref: None,
             });
             let mut outcome = Outcome::default();
-            let (next, _) = pass.action_first(
-                &follow,
-                state.share_cursor.as_deref(),
-                state.action_first_cursor.as_deref(),
-                &BTreeSet::new(),
-                &mut outcome,
-            );
+            let (next, _, positions) =
+                pass.action_first(&follow, &state, &BTreeSet::new(), &mut outcome);
             assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
             screened.extend(shared.screens.borrow().iter().cloned());
             if pass.merged > 0 {
@@ -21305,6 +21478,7 @@ mod tests {
             }
             state.share_cursor = pass.cut;
             state.action_first_cursor = next;
+            state.action_first_positions = positions;
             assert!(state.share_cursor.is_some());
             state = State::from_json(&state.to_json()).unwrap();
         }
