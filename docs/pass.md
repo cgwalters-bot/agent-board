@@ -263,6 +263,66 @@ Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set `notifications`
 to `true`, set `midstream: {"owner":"cgwalters-forge","topic":"bot-midstream"}`,
 and keep the existing pass token. No deployed config or token is changed here.
 
+## Action-first pull requests (GitHub)
+
+The concrete failure this prevents is spending the PR stage's share on upstream
+reads and draft continuations before discovering an approved own-space PR.
+`pr.actionFirst: true` opts into screening admitted own-space repositories
+before taking full PR decisions. It is off by default. Discovery makes one
+GraphQL listing per repository, at most 50 repositories and 100 open PRs each,
+inside the existing request/time budget. A missing, malformed or incomplete
+listing defers that repository, never authorizes an action from partial facts.
+Discovery stops before spending the 32-request decision margin; discovered
+candidates still run, and unlisted repositories resume on a later applying pass.
+The saved `action_first_cursor` rotates discovery independently of the
+`share_cursor` decision cut, so neither deferred listings nor priority
+candidates can reset the other's progress. Preview advances neither cursor.
+
+Approved, non-draft, mergeable candidates run first across those repositories,
+rotating from the saved share cursor within this class. Already queued/auto-merge
+heads, `hold` and `noMerge` are not prioritized. Approval in this cheap screen is only
+an ordering hint: each candidate takes the existing fresh head, review, check,
+hold, operator-approval and admission checks before merging or enqueuing. Then
+the remaining own-space PRs take their normal decisions (fix rounds and
+continuations included), resuming at the saved cursor. The repository envelope,
+dispatch/write caps and the stage's 32-request action margin still apply.
+
+Upstream follow-up comes last and is read-only in this mode, including on the
+bot's own upstream PRs: at most two repository listings (200 PRs), printing
+candidate summaries but taking no rounds, review starts, markers or merges.
+Unread upstream repositories remain undecided. When own-space work finishes,
+the share cursor rotates upstream reads; preview never advances it.
+The summary is `pull requests: merged/enqueued N, fix rounds N, continuations N,
+upstream reads N`. Action counts are taken steps, or would-take steps in preview;
+upstream reads count the bot's PR summaries, not HTTP requests. Review-run WIP
+accounting retains its existing independent census and bounds.
+
+This orders the PR walk, not the earlier intake/search stages. A caller must
+also leave that walk a usable share. In `cgwalters-forge/tracker`, file
+`.github/pass.json`, set `pr.actionFirst` to `true`, `reserveScheduling` to
+`false` and disable `scan.reserve` (the sized scan reserve currently requires
+fixed candidate caps). Leave `scan.candidates` unset: action-first does not
+require a fixed scan cap. These settings leave the normal fixed shares for
+later stages instead of reserving almost the entire pass for a bounded scan.
+No deployed config is changed here.
+
+The original preview on 2026-11-12 against tracker's config (main
+`777e84db3923f08b8bc8dbe36c5004b035a6c0e0`), with `pr.actionFirst: true`,
+`reserveScheduling: false`, `scan.reserve: true`, a three-candidate scan cap and
+no saved state, proposed merges for agent-board#901 and tracker#1553/#1554 before
+the draft walk stopped: `pull requests: merged/enqueued 3, fix rounds 2,
+continuations 3, upstream reads 0`. It reached agentic-job, but could not
+demonstrate a merge there: approved #3420's author was not followed, #3260's
+checkpoint required continuation, and the other approved PRs were drafts.
+The preview exited 1 because this run cannot read the private bot-ops usage
+and holds issue (404); it made no forge writes. With only `pr.actionFirst`
+changed, the original reserve settings stopped before the walk. Offline
+coverage without scan caps merges both approved PRs in repository 25 of 30
+before an eligible draft continuation in one applying pass, with upstream
+traffic and a saved upstream cursor. Repeated applying walks cover discovery
+deferral and persistent priority false positives. Forgejo
+refuses `pr.actionFirst`.
+
 ## Hard-item pool mixing
 
 The concrete risk is a model variant bypassing its shared account's pace.
