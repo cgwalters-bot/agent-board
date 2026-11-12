@@ -538,18 +538,19 @@ impl crate::github::GraphQl for ConditionalFixture {
 
 /// Replay the same server state with synthetic ETags. This measures the
 /// transport opportunity, not GitHub's actual validator availability or costs.
-struct ConditionalRecording {
-    replay: Replay,
+struct ConditionalRecording<T = Replay> {
+    replay: T,
     reads: RefCell<BTreeMap<String, usize>>,
+    traffic: RefCell<Vec<(String, bool)>>,
 }
 
-impl ConditionalRecording {
+impl<T> ConditionalRecording<T> {
     fn count(&self, key: String) {
         *self.reads.borrow_mut().entry(key).or_default() += 1;
     }
 }
 
-impl Rest for ConditionalRecording {
+impl<T: Rest> Rest for ConditionalRecording<T> {
     fn network_requests(&self) -> Option<usize> {
         Some(self.reads.borrow().values().sum())
     }
@@ -560,6 +561,9 @@ impl Rest for ConditionalRecording {
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         self.count(format!("REST {url}"));
+        self.traffic
+            .borrow_mut()
+            .push((format!("GET {url}"), validator.is_some()));
         let mut response = self.replay.get(url, None)?;
         if response.status == 200 {
             let etag = format!("{:x}", Sha256::digest(response.body.to_string()));
@@ -573,18 +577,30 @@ impl Rest for ConditionalRecording {
     }
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.count(format!("{method} {url}"));
+        self.traffic
+            .borrow_mut()
+            .push((format!("{method} {url}"), false));
         self.replay.send(method, url, body)
     }
-}
 
-impl Transport for ConditionalRecording {
-    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        self.count(format!("GraphQL {query}"));
-        self.replay.data(query, variables)
+    fn get_live(&self, url: &str) -> Result<RestResponse> {
+        self.count(format!("LIVE {url}"));
+        self.traffic
+            .borrow_mut()
+            .push((format!("LIVE {url}"), false));
+        self.replay.get_live(url)
     }
 }
 
-impl crate::github::GraphQl for ConditionalRecording {
+impl<T: Transport> Transport for ConditionalRecording<T> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.count(format!("GraphQL {query}"));
+        self.replay.graphql(query, variables)
+    }
+}
+
+impl<T: Transport> crate::github::GraphQl for ConditionalRecording<T> {
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         Transport::graphql(self, query, variables)
     }
@@ -599,7 +615,7 @@ impl Broker for ConditionalFixture {
     }
 }
 
-impl Broker for ConditionalRecording {
+impl<T: Broker> Broker for ConditionalRecording<T> {
     fn usage(&self, url: &str) -> Result<Value> {
         self.replay.usage(url)
     }
@@ -759,6 +775,7 @@ fn response_cache_recorded_steady_state_comparison() {
     let forge = ConditionalRecording {
         replay,
         reads: RefCell::default(),
+        traffic: RefCell::default(),
     };
     let config = config(json!({"state": ".state/poll.json"}));
     let pass = |state| {
@@ -822,6 +839,239 @@ fn response_cache_recorded_steady_state_comparison() {
         lost.spent.revalidated,
         lost.spent.points
     );
+}
+
+fn cached_pass(
+    forge: &ConditionalRecording<Forge>,
+    config: &Config,
+    state: State,
+    apply: bool,
+) -> Report {
+    let own = own();
+    block(run(
+        forge,
+        forge,
+        config,
+        state,
+        (
+            if apply {
+                Mode::Actions(&own)
+            } else {
+                Mode::Preview
+            },
+            Limits::default(),
+        ),
+        forge.replay.replay.now,
+    ))
+    .unwrap()
+}
+
+/// Response loss must not change writes or erase asks. Action receipts live
+/// on the forge, not in the disposable response map, including on a rerun.
+#[test]
+fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
+    let config = config(json!({"state": ".state/poll.json"}));
+    let mut expected = None;
+    for cache in ["cold", "warm", "lost"] {
+        let mut forge = ConditionalRecording {
+            replay: Forge::new(None, false),
+            reads: RefCell::default(),
+            traffic: RefCell::default(),
+        };
+        rest_comment_pages(&mut forge.replay.replay);
+        let mut state = State::default();
+        state
+            .intake_waiting
+            .insert("o/r#1".into(), "2026-10-23T00:00:00Z".into());
+        state.intake_refused.push("o/r#1/issuecomment-2".into());
+        if cache != "cold" {
+            let seed = cached_pass(&forge, &config, state, false);
+            assert_eq!(seed.failures, 0, "{:?}", seed.lines);
+            state = State::from_json(&seed.state.unwrap().to_json()).unwrap();
+            assert!(!state.responses.is_empty());
+            assert!(forge.replay.writes.borrow().is_empty());
+            if cache == "lost" {
+                state.responses.clear();
+            }
+        }
+        forge.reads.borrow_mut().clear();
+        forge.traffic.borrow_mut().clear();
+        let report = cached_pass(&forge, &config, state, true);
+        assert_eq!(report.failures, 0, "{cache}: {:?}", report.lines);
+        assert_eq!(
+            forge.replay.dispatches().len(),
+            6,
+            "{cache}: {:?}",
+            report.lines
+        );
+        assert!(report.spent.requests > 0 && report.spent.points > 0);
+        let traffic = forge.traffic.borrow();
+        let first_write = traffic
+            .iter()
+            .position(|(r, _)| r.starts_with("POST "))
+            .unwrap();
+        assert_eq!(
+            traffic[..first_write]
+                .iter()
+                .any(|(_, conditional)| *conditional),
+            cache == "warm"
+        );
+        let mut read_since_write = BTreeSet::new();
+        for (request, conditional) in &traffic[first_write..] {
+            if let Some(url) = request.strip_prefix("GET ") {
+                assert!(
+                    !conditional || read_since_write.contains(url),
+                    "{cache}: stale validator after write: {request}"
+                );
+                read_since_write.insert(url.to_owned());
+            } else if !request.starts_with("LIVE ") {
+                read_since_write.clear();
+            }
+        }
+        drop(traffic);
+        let writes = forge.replay.writes.borrow().clone();
+        if let Some(expected) = &expected {
+            assert_eq!(&writes, expected, "{cache}");
+        } else {
+            expected = Some(writes.clone());
+        }
+        let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
+        assert_eq!(state.intake_waiting["o/r#1"], "2026-10-23T00:00:00Z");
+        assert_eq!(state.intake_refused, ["o/r#1/issuecomment-2"]);
+        // Simulate loss after real writes too, leaving the action state alone.
+        let mut lost = state;
+        lost.responses.clear();
+        let again = cached_pass(&forge, &config, lost, true);
+        assert_eq!(again.failures, 0, "{cache}: {:?}", again.lines);
+        assert_eq!(
+            *forge.replay.writes.borrow(),
+            writes,
+            "{cache}: replayed a write"
+        );
+        assert_eq!(forge.replay.dispatches().len(), 6);
+        assert!(
+            again.spent.requests > 0,
+            "a new pass must account its own reads"
+        );
+        assert_eq!(
+            again.state.unwrap().intake_refused,
+            ["o/r#1/issuecomment-2"]
+        );
+    }
+}
+
+#[test]
+fn response_cache_applying_rechecks_concurrent_start_holds() {
+    for changed in ["label", "capacity"] {
+        let config = config(json!({"state": ".state/poll.json", "wip": 4}));
+        let mut forge = ConditionalRecording {
+            replay: Forge::new(None, false),
+            reads: RefCell::default(),
+            traffic: RefCell::default(),
+        };
+        rest_comment_pages(&mut forge.replay.replay);
+        let seed = cached_pass(&forge, &config, State::default(), false);
+        let state = State::from_json(&seed.state.unwrap().to_json()).unwrap();
+        assert!(!state.responses.is_empty());
+        forge.replay.late = Some(Box::new(move |request, answer| {
+            if changed == "label" && request.contains(r#""number":459"#) {
+                let labels = &mut answer["repository"]["issue"]["labels"];
+                labels["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name": "needs-human"}));
+                labels["totalCount"] = (labels["totalCount"].as_u64().unwrap() + 1).into();
+            } else if changed == "capacity" && request.contains("status=queued") {
+                answer["total_count"] = 1.into();
+                answer["workflow_runs"] = runs(1).into();
+            }
+        }));
+        forge.reads.borrow_mut().clear();
+        forge.traffic.borrow_mut().clear();
+        let report = cached_pass(&forge, &config, state, true);
+        assert_eq!(report.failures, 0, "{changed}: {:?}", report.lines);
+        let dispatched = forge.replay.dispatches();
+        assert_eq!(dispatched[0], "cgwalters-forge/tracker#446");
+        assert!(
+            !dispatched
+                .iter()
+                .any(|d| d == "cgwalters-forge/tracker#459")
+        );
+        if changed == "capacity" {
+            assert_eq!(dispatched.len(), 1);
+        }
+        assert!(
+            forge
+                .replay
+                .comments_on("cgwalters-forge/tracker", 459)
+                .is_empty()
+        );
+        let reason = if changed == "label" {
+            "hold cgwalters-forge/tracker#459: labelled needs-human"
+        } else {
+            "hold wip: 4 of 4 runs active"
+        };
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(reason)),
+            "{:?}",
+            report.lines
+        );
+        let queued = format!(
+            "GET {API_ROOT}repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?status=queued&per_page=100"
+        );
+        let traffic = forge.traffic.borrow();
+        let reads: Vec<_> = traffic
+            .iter()
+            .filter(|(request, _)| request == &queued)
+            .collect();
+        assert!(reads.len() >= 2);
+        assert!(
+            reads[0].1,
+            "discovery should revalidate the warm representation"
+        );
+        assert!(
+            !reads.last().unwrap().1,
+            "start authorization must read directly"
+        );
+    }
+}
+
+#[test]
+fn response_cache_applying_ambiguous_dispatch_is_not_replayed() {
+    for lost in [false, true] {
+        let config = config(json!({"state": ".state/poll.json"}));
+        let mut forge = ConditionalRecording {
+            replay: Forge::new(Some("/dispatches"), false),
+            reads: RefCell::default(),
+            traffic: RefCell::default(),
+        };
+        rest_comment_pages(&mut forge.replay.replay);
+        only(&mut forge.replay.replay, &["cgwalters-forge/tracker#446"]);
+        let seed = cached_pass(&forge, &config, State::default(), false);
+        let mut state = State::from_json(&seed.state.unwrap().to_json()).unwrap();
+        assert!(!state.responses.is_empty());
+        if lost {
+            state.responses.clear();
+        }
+        let report = cached_pass(&forge, &config, state, true);
+        assert_eq!(report.failures, 1, "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("connection reset during POST") && l.contains("/dispatches"))
+        );
+        assert_eq!(forge.replay.dispatches(), ["cgwalters-forge/tracker#446"]);
+        let mut state = State::from_json(&report.state.unwrap().to_json()).unwrap();
+        // The final mutation lost its reply. No pre-mutation validator survives.
+        assert!(state.responses.is_empty(), "{:?}", state.responses.keys());
+        state.responses.clear();
+        let writes = forge.replay.writes.borrow().clone();
+        let again = cached_pass(&forge, &config, state, true);
+        assert_eq!(again.failures, 0, "{:?}", again.lines);
+        assert_eq!(*forge.replay.writes.borrow(), writes);
+        assert!(again.spent.requests > 0);
+    }
 }
 
 fn at(stamp: &str) -> OffsetDateTime {

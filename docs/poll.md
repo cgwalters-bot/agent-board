@@ -65,6 +65,13 @@ GraphQL points; response data lost: 49 charged, 56 sends, 7 refunded 304s and 43
 points. Decisions and planned starts agree. The lost-cache pass can still obtain
 304s from responses read earlier in that same pass. These are offline transport
 measurements, not hosted GitHub rate readings or evidence of deployed savings.
+Applying replay coverage now compares the exact emitted writes for serialized
+cold, warm and lost-response state, preserves pending intake/refusal records,
+and proves a rerun after response loss does not repeat a dispatch. It also
+injects a new hold label or occupied capacity after the first start, verifies
+the final capacity read bypasses validators, and loses a dispatch reply to
+exercise invalidation and forge-receipt recovery. These are start-path tests,
+not yet applying-pass concurrent-change tests for merge or label-change paths.
 The test prints the hottest exact GraphQL queries and REST URLs; repeated
 dispatch-run status listings are among the REST hot spots. GraphQL dominates
 this fixture. No hot issue-state/labels/assignees/timeline conversion is shipped
