@@ -2103,7 +2103,10 @@ Deleting a local cache must never authorize replay.
 
 To stop an unbounded board scan or runaway dispatch loop, use one fixed pass
 budget: at most 650 forge requests and 15 minutes, including existing subcommand
-work; existing tighter read/action bounds still apply. Report exhaustion and
+work; existing tighter read/action bounds still apply. With `requestShare`
+the request budget is estimated from the token's rate-limit headroom instead of
+the fixed 650 ([the request budget from the rate limit](#the-request-budget-from-the-rate-limit));
+the counts below that are shares of the budget then follow it. Report exhaustion and
 defer unresolved decisions, never interpret truncated data as empty.
 Starting ready work is the pass's main job, so stage 4 keeps what a start may
 take for one: once it has ranked its candidates and until it is done, no read
@@ -2387,6 +2390,53 @@ does: maintain's share, stage 4's hold-back before its parent discovery, and
 deferring the candidates that hold-back leaves unread rather than holding
 them as unreadable; the sized reserve keeps scheduling's requests in its
 place, not those. No tracker settings are changed here.
+
+### The request budget from the rate limit
+
+The concrete failure `requestShare` stops is a pass starved by a fixed
+request count that matches nothing real: the 650 (646 for reads) stopped
+stages at their shares with slots free and ready work waiting, while the
+token's hourly allowance sat unspent, and each hand-tuning of the count or
+the shares moved the bottleneck (agent-board#898). It is off by default and
+GitHub-only; Forgejo reports no rate limit.
+
+`requestShare` (1–90) estimates a request budget from a percentage of the
+token's remaining primary rate-limit allowance. It is not a guarantee of
+retained token headroom. Before any request of
+the pass, it reads `GET /rate_limit`, which GitHub does not count, and takes
+the smaller of the REST core pool's remaining requests and the GraphQL
+pool's remaining points, since the pass counts both as requests in one
+budget. That share, rounded down, is the pass's request limit in place of
+the fixed 650, and the pass says so first (`budget: requestShare keeps the
+pass to 1203 requests, 25% of the 4812 the token has left until
+2026-11-11T13:00:00Z (core; core 4812, graphql 4990); GraphQL share is an
+estimate, not a retained-headroom guarantee`). Everything that is a
+share of the budget follows it: the stages' fixed shares, `reserveScheduling`'s,
+the holds' 15% and the sized reserve's comparison; what is a count stays a
+count: a start's reserve, the writes' reserve, 304 refunds and
+`scan.candidateRequests`. The 15-minute time bound is unchanged, and the
+`--max-*` flags and `scan` still bound what they did. A pass may be larger
+than 650. The combined request ceiling is strict, including the cost stage's
+reads, downloads and writes (which retain their tighter 1,000-request cap).
+GraphQL also stops admitting calls once its observed points reach the share
+of that pool's remaining points. Query costs are known only after execution:
+one multi-point query can overshoot that share. Missing costs use the summary's
+estimates (one point per query, five per mutation), which can undercount.
+Transport retries and concurrent token users can consume additional allowance.
+The 90% maximum therefore targets headroom for other users, not a guaranteed
+tenth left for the standalone poll, supervisor or people's `gh`.
+A token with nothing left gets a limit of 0 and spends nothing, every
+operation refused with `the pass's request budget (0) is spent` until the
+reset the line names; the pass does not wait for it. Where the read fails,
+including a replay that did not record it, the fixed 650 holds and the pass
+says so (`warning: requestShare: the budget was not sized from the token's
+rate limit, so the fixed 650 holds: …`), without a failure. Each pass reads the
+headroom again; the poll's own request budget is not changed.
+
+Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` is to set
+`requestShare` to `25`, targeting more than a sixth of the initial allowance
+after six passes in the ideal one-point-per-call case; the pull request names the
+setting, and no tracker settings are changed here.
 
 ### Candidate admission
 
@@ -4835,7 +4885,8 @@ enabled deployments retain their behavior: omitting an opt-in does not disable
 the pass's ordinary PR follow-up or Status reconciliation when their inputs are
 configured. `--max-dispatch` and `--max-writes` have no default cap; local apply
 requires both explicitly. The fixed 650-request/15-minute budget (two minutes
-to finish work already under way), the 50 default `--max-status-changes` refusal
+to finish work already under way; with `requestShare` the requests are a share
+of the token's rate-limit headroom instead), the 50 default `--max-status-changes` refusal
 threshold and the tighter feature bounds still apply. These limits bound runaway
 scans and writes; they do not grant new authority or replace agentic-job checks.
 
@@ -4893,6 +4944,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `scan.candidateRequests`, `scan.candidates` | GitHub only: the most charged requests considering one stage 4 candidate may take (1–650) before it is held as unreadable, and the most candidates in a row stage 4 reads without starting one (1–1000) before the rest wait for the next pass, which resumes after the last read where `state` keeps it, see [scan bounds](#scan-bounds); each absent (unbounded but by the budget) |
 | `scan.reserve` | GitHub only, needs both scan bounds: stages 2 and 3 keep for the stages after them what those are bounded to need, the scan, a start and their own reads, where that is less than their fixed share, see [sizing the reserve](#sizing-the-reserve-from-the-scan); `false` |
+| `requestShare` | GitHub only: estimate the request budget from 1–90% of the smaller remaining REST/GraphQL pool, read free from `GET /rate_limit` before any request; also stop GraphQL at its observed/estimated point share. Not a retained-headroom guarantee: a query can overshoot and missing costs are estimated. Where the read fails the fixed 650 holds, see [the request budget from the rate limit](#the-request-budget-from-the-rate-limit); absent (the fixed 650) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
