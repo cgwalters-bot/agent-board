@@ -1,175 +1,88 @@
-# Working on agent-board
+Start with [README.md](README.md) for the project and documentation entry points.
 
-**Run `just fmt` then `just check` before every commit you hand back; a change
-that fails `just check` isn't done.**
+Run `just fmt` then `just check` before every commit you hand back; a change
+that fails `just check` isn't done. For a narrow change, start with the affected
+crate's tests, then run all CI checks. Commands, prerequisites and observed
+timings live in the [Justfile](Justfile); see [development checks](docs/setup.md#development-checks)
+for CI and sandbox limits.
 
-agent-board is a Rust CLI for a forge-hosted work board; start with the
-[site's landing page](site/index.md) for its purpose and the
-[setup](docs/setup.md) for its quickstart.
-`agent-board pass --apply` makes its own deterministic writes directly, behind
-preview by default, replay tests and the per-pass caps `--max-dispatch` and
-`--max-writes`; agent
-output goes through agentic-job's independent check and apply
-([architecture](docs/architecture.md#writes)).
-Runs started by the [tracker polling job](https://github.com/cgwalters-forge/tracker#the-pull-request-poll)
-within its fixed bounds (our repositories, at most 2 fix rounds per pull request,
-auto-merge only on review success and green required checks) need no per-run
-approval; do not refuse work for lack of one.
-The [design](docs/design.md) describes the intended coordinator, but is not proof
-that a feature or security boundary has been implemented.
+## Code constraints
 
-## Layout
-
-- `crates/board-core/`: forge-neutral records, validation and pure reconciliation.
-- `crates/board-forge/`: GitHub identity parsing, API transport, paginated snapshots and safe-output lowering.
-- `crates/agent-board/`: CLI, `agent-board` and `gh-agent-board` binaries, live fixture runner and offline CLI tests.
-- `fixtures/`: offline board snapshots shared by unit and CLI tests.
-- `.github/workflows/`: unprivileged PR/push CI.
-- `workflow/`: the review job's task and bounds, and the decision diff script
-  it and implement runs execute.
-- `live/`: protected staging workflow template, run from the staging repository.
-- `docs/`: design, security contracts and implementation limits; distinguish plans from current code.
-- `site/`: the Starlight documentation site, rendering `docs/` in place (no copies) under its own landing page, `site/index.md`; the README only points to it; `just site-test` and `just site-build`, as agentic-job's.
-
-## Build, lint and test
-
-Run from the repository root with Rust supporting edition 2024. There is no
-Makefile or separate test harness. These are the exact commands in
-[CI](.github/workflows/ci.yml), in order; `just check` runs the first three:
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-cargo run --locked -q -p agent-board -- item list --snapshot fixtures/board.json
-cargo run --locked -q -p agent-board -- reconcile plan --snapshot fixtures/board.json --emit
-cargo run --locked -q -p agent-board -- project view --snapshot fixtures/board.json --json project,coverage
-```
-
-A separate CI job, `forgejo`, runs the ignored `forgejo_live` test against a
-Forgejo service container ([Live CI](docs/forges.md#live-ci)); locally it
-needs a fresh container, docker or `CONTAINER=podman`, and the two
-`AGENT_BOARD_TEST_FORGEJO*` variables its module comment names.
-
-A separate CI job, `lint`, runs `just lint`: the shared workflow check over
-`.github/` (not `live/`) from a checkout of cgwalters-forge/actions (see the
-[Justfile](Justfile)). It needs just, cargo and docker or `CONTAINER=podman`,
-and pulls the linter images.
-
-The `site` workflow runs `just site-test`, `just site-build` (Node 22, `npm ci`
-from the lock, no install scripts; 8 s measured) and `just site-check` (lychee;
-the workflow uses its action); on main it then rebuilds with `just site-build-pages`
-for the Pages address and uploads that. Remove `site/node_modules`, `site/dist`
-and `site/.astro` before `just lint`, or zizmor reads the dependencies' workflows.
-
-Measured on a fresh Linux devspace with dependency downloads (2026-10-08):
-format 0.07 s, clippy 15.50 s, tests 20.97 s, CLI commands 7.91/0.07/0.07 s.
-These are observations, not deadlines; CI allows 20 minutes for the job.
-Tests use fixtures and fake transports, require neither root nor a network
-service, and are safe in a credential-free sandbox. Cargo may fetch dependencies.
-For a narrow change, start with the affected crate's tests, then run all CI checks.
-
-The build command in the [live workflow](live/board-test.yml) is also safe locally:
-
-```sh
-cargo build --locked --release -p agent-board
-```
-
-Measured cold release build: 54.30 s. Do not run the live workflow's `test project`
-invocation in a sandbox: it needs GitHub network access and a staging write token,
-and creates/modifies forge objects. No current test requires root. See
-[CLI reference](docs/cli.md) and
-[design implementation limits](docs/design.md#current-implementation-limits).
-
-## Code conventions
-
-Use rustfmt and warning-free clippy, as enforced above. Production code returns
-`anyhow::Result`, propagates errors with `?`, adds `Context` at I/O/decoding
-boundaries, and uses `ensure!`/`bail!` for invalid inputs and unsupported operations.
-There are no panicking `unwrap()`/`expect()` calls outside tests; keep it that way
-(non-panicking `unwrap_or*` defaults are used). Keep diagnostics on stderr and
+Production code returns `anyhow::Result`, propagates errors with `?`, adds
+`Context` at I/O/decoding boundaries, and uses `ensure!`/`bail!` for invalid inputs
+and unsupported operations. No panicking `unwrap()`/`expect()` outside tests
+(non-panicking `unwrap_or*` defaults are fine). Keep diagnostics on stderr and
 machine output on stdout; preserve the tested gh-style exit codes.
 
-Extend the existing table-driven tests for permutations and failure paths rather
+Extend existing table-driven tests for permutations and failure paths rather
 than copying tests. Keep reconciliation deterministic: injected snapshot clock,
 ordered collections, stable action keys and sorted output. Use named constants
-for shared protocol values and resource bounds, as with `SNAPSHOT_SCHEMA`,
-`PLAN_SCHEMA`, `DEFAULT_HOST` and `SNAPSHOT_REQUEST_LIMIT`; do not move forge-specific
-API details into board-core.
+for shared protocol values and resource bounds (`SNAPSHOT_SCHEMA`, `PLAN_SCHEMA`,
+`DEFAULT_HOST`, `SNAPSHOT_REQUEST_LIMIT`); keep forge-specific API details out of
+board-core.
 
 ## Security and scope
 
-Keep it simple: the system should pass a “secure” gut check without extra machinery ([scope decision](https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-6070870618)).
-Watch what gh-aw does; share ideas and code with it and other projects where we can, citing sources ([operator decision](https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-6089335499)).
+Keep it simple: the system should pass a “secure” gut check without extra machinery
+([scope decision](https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-6070870618)).
+Watch what gh-aw does; share ideas and code with it and other projects where we
+can, citing sources ([operator decision](https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-6089335499)).
 
 Explain changes to workflows, permissions, action pins, checkout refs, token
 placement, input bounds and validation in the PR, including their effect on trust.
-PR CI's `rust` job has only `contents: read`, no staging PAT, and disables persisted
-checkout credentials. The staging template has `permissions: {}` and environment
-`Main`; only its `test` job's live invocation receives `GH_TOKEN` from `secrets.PAT`.
-Its build step does not receive that token. Never execute unreviewed code with it.
+Never execute unreviewed code with the staging token; see
+[development checks](docs/setup.md#development-checks) for CI's token separation.
 
-Review `board-core` snapshot/policy validation and reconciliation, `board-forge`
-identity validation, output lowering and GitHub pagination/request bounds, and the
-CLI live runner's scope/cleanup checks when changing their inputs or outputs.
+Review board-core snapshot/policy validation and reconciliation, board-forge
+identity validation, output lowering and GitHub pagination/request bounds, and
+the CLI live runner's scope/cleanup checks when changing their inputs or outputs.
 Unknown fields, missing-versus-null facts, incomplete coverage, issue-versus-PR
 identity, host/repository/project scope and authenticated cleanup are boundaries,
 not convenience checks. Preserve their negative tests.
 
-The pass's direct writes are its own deterministic ones; what an agent produces
-is a proposal until agentic-job's independent check and apply accepts it, and
-that check is **not implemented here** (the CLI's `output check` and `output
-apply` are unsupported). Do not give agents credentials or a direct mutation
-path around it; see [the bounds contract](docs/design.md#3-agentic-job-bounds-and-delegated-operations).
-Sweeping (cleanup of the test projects and scratch issues the CLI creates) is
-deliberately disabled pending authenticated creation receipts; the pass's
-weekly sweep of issues outside the epics ([pass](docs/pass.md#the-weekly-sweep))
-is unrelated.
+The pass's direct writes are its own deterministic ones; agent output remains a
+proposal until agentic-job's independent check and apply accepts it. That check
+is **not implemented here** (`output check` and `output apply` are unsupported).
+Do not give agents credentials or a direct mutation path around it; see
+[architecture](docs/architecture.md#writes) and the
+[bounds contract](docs/design.md#3-agentic-job-bounds-and-delegated-operations).
+Test-project/scratch-issue sweeping is deliberately disabled pending authenticated
+creation receipts, unlike the pass's unrelated [weekly sweep](docs/pass.md#the-weekly-sweep).
+The [design](docs/design.md) is intent, not proof of implementation or a security boundary.
 
 Keep changes task-scoped: no generated artifacts, credential material, live board
 state, unrelated formatting or dependency/lockfile churn. Do not change production
-boards, enable sweeping, or implement deferred mutation paths incidentally. Leave
-homegit and its running controllers untouched; see [design scope](docs/design.md#1-scope-and-durable-model).
+boards, enable sweeping or implement deferred mutation paths incidentally. Leave
+homegit and its running controllers untouched ([design scope](docs/design.md#1-scope-and-durable-model)).
 Do not edit workflow/security configuration unless the task explicitly needs it.
 
-## Planning work in this repository
+Runs started by the [tracker polling job](https://github.com/cgwalters-forge/tracker#the-pull-request-poll)
+within its fixed bounds (our repositories, at most 2 fix rounds per PR, auto-merge
+only on review success and green required checks) need no per-run approval; do not
+refuse work for lack of one.
 
-When planning an agent-board epic, create implement-sized sub-issues for the
-remaining work, each with an implement job plan. Rescope or close sub-issues
-that no longer fit. Include this repository's `AGENTS.md` in child job briefs
-so that implementation runs read its build, review and hand-back instructions.
-These are agent-board's planning norms, not defaults for other repositories.
+## Planning and hand-back
 
-## Hand-back
+When planning an agent-board epic, create implement-sized sub-issues for remaining
+work, each with an implement job plan. Rescope or close sub-issues that no longer
+fit. Include this repository's `AGENTS.md` in child job briefs. These planning
+norms are specific to agent-board.
 
-A feature that ships off (a new option in `POLL_OPTIONS`, `SUPERVISOR_OPTIONS`
-or `AGENT_OPTIONS`) does nothing until the caller's config names it. Its PR, and
-the issue's closing comment, name the caller setting that turns it on, and the
-run opens the caller-side change in tracker or files an issue there for it;
-the supervisor's `unset` check lists the option until then.
+A feature that ships off (a new option in `POLL_OPTIONS`, `SUPERVISOR_OPTIONS` or
+`AGENT_OPTIONS`) does nothing until the caller's config names it. Its PR and the
+issue's closing comment name that setting; open the caller-side change in tracker
+or file an issue there. The supervisor's `unset` check lists the option until then.
 
-One task becomes one pull request with one commit. Recent history uses imperative
-subjects, sometimes with a path prefix (for example `README:`); explain the reason
-for the change in the commit body rather than restating the diff.
-The PR description says what changed, exact commands and exit statuses verified,
-and what was left unverified or deferred. In a disposable worker, leave the tree
-uncommitted and supply the runner's requested report: the runner creates the commit
-and PR, not the worker.
+One task becomes one PR with one commit. Use an imperative subject, optionally
+path-prefixed, and explain why in the commit body rather than restating the diff.
+The PR describes what changed, exact commands and exit statuses verified, and
+anything unverified or deferred. In a disposable worker, leave the tree uncommitted
+and supply the runner's requested report; the runner creates the commit and PR.
 
-A change to the pass, its configuration or its fixtures is not done at `just
-check`: fixtures and review passed a day of fixes that then did little or
-nothing on the live caller (#887). Before handing back, run the changed
-command as a preview against the caller configuration where the run has the
-token, and otherwise replay the recorded live pass, as the README's first
-command does, and the decision diff against the start commit
-([compare two revisions](docs/setup.md#compare-two-revisions)):
-
-```sh
-git worktree add ../base <start commit>
-node workflow/decision-diff.cjs ../base .
-```
-
-Paste its output, at least both summary lines, in the hand-back. A fix for a
-live symptom must show the symptom change there; where the recording does not
-exercise it, or the head reads something the recording lacks and so fails
-replay, say so: a new recording takes the bot's token (`pass --record`).
+A change to the pass, its configuration or fixtures also requires a preview
+against the caller configuration where the run has the token; otherwise replay
+the recorded live pass. Run the decision diff against the start commit and paste
+its output (at least both summary lines) in the hand-back. A live-symptom fix must
+show the symptom change; say when the recording does not exercise it or lacks
+reads needed by the head. See [compare two revisions](docs/setup.md#compare-two-revisions)
+for the recipes and recording requirements.

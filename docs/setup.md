@@ -83,6 +83,36 @@ main-branch attestation for the pinned commit, not the manual release workflow's
 identity. A missing release means publication has not succeeded (or was removed);
 it is not permission to use a different commit or an unverified binary.
 
+## Development checks
+
+Run recipes from the repository root with Rust supporting edition 2024. The
+[Justfile](../Justfile) holds the commands and observed timings, not deadlines;
+there is no Makefile or separate test harness. The [rust CI job](../.github/workflows/ci.yml)
+runs `just check` followed by the commands in `just smoke`, in that order.
+`just fmt` applies rustfmt; `just check` requires formatting and warning-free clippy
+as well as the workspace tests. No current test requires root. The normal suite
+uses fixtures and fake transports and is safe in a credential-free sandbox;
+Cargo may fetch dependencies.
+
+Separate CI jobs run `just lint`'s shared workflow check and the ignored
+`forgejo_live` test (`just test-forgejo` locally; see [Live CI](forges.md#live-ci)).
+Their checkout, container and environment prerequisites are noted beside the
+recipes. The [site](../site/index.md) renders `docs/` in place, without copies,
+under its own landing page; the README points to it. Its workflow runs
+`just site-test`, `just site-build` and `just site-check`, then rebuilds on main
+with `just site-build-pages` and uploads Pages. See the recipes for Node/lychee
+requirements and the dependency-directory cleanup needed before workflow lint.
+
+`just build-release` is the safe local build from the
+[live workflow](../live/board-test.yml). Do not run that workflow's `test project`
+invocation in a sandbox: it needs GitHub network access and a staging write token
+and creates/modifies forge objects. PR CI's `rust` job has only `contents: read`,
+no staging PAT, and disables persisted checkout credentials. The staging template
+has `permissions: {}` and environment `Main`; only its `test` job's live invocation
+receives `GH_TOKEN` from `secrets.PAT`, not its build step. Never execute unreviewed
+code with that token. See the [CLI reference](cli.md) and
+[implementation limits](design.md#current-implementation-limits).
+
 ## Try it offline
 
 The fixtures are in the repository, not the installed package. Clone with
@@ -151,6 +181,16 @@ input that differs is the code:
 ```sh
 node workflow/decision-diff.cjs BASE HEAD [CONFIG [RECORDING]]
 ```
+
+For an implement run, create the base checkout with
+`git worktree add ../base <start commit>`, then run `just replay` and
+`just decision-diff ../base`. Changes to the pass, its configuration or fixtures
+require this comparison before hand-back, in addition to `just check`. Where the
+run has the token, preview the changed command against the caller configuration;
+otherwise use the recorded live pass. Paste at least both summary lines in the
+hand-back. A live-symptom fix must show the symptom change, or explicitly say that
+the recording does not exercise it or lacks the head's required reads. A fresh
+recording requires the bot's token (`pass --record`).
 
 It builds agent-board in both checkouts (`cargo build --locked`), runs the
 rehearsal above with each binary, with `GH_TOKEN`, `GITHUB_TOKEN` and

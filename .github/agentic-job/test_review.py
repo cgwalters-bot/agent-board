@@ -135,7 +135,11 @@ class ReviewContracts(unittest.TestCase):
         # its output in the review. AGENTS.md asks the same of implement runs.
         self.assertIn("`node workflow/decision-diff.cjs . HEAD`", task)
         self.assertIn("`Decision diff` heading", task)
-        self.assertIn("node workflow/decision-diff.cjs ../base .", (ROOT / "AGENTS.md").read_text())
+        agents = (ROOT / "AGENTS.md").read_text()
+        self.assertIn("Run the decision diff against the start commit", agents)
+        self.assertIn("[compare two revisions](docs/setup.md#compare-two-revisions)", agents)
+        self.assertIn("`just decision-diff ../base`", (ROOT / "docs/setup.md").read_text())
+        self.assertIn("decision-diff base:\n    node workflow/decision-diff.cjs {{quote(base)}} .\n", (ROOT / "Justfile").read_text())
 
     def test_decision_diff_of_one_tree_is_empty(self):
         # The same checkout on both sides: both previews run (the build is
