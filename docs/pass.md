@@ -334,6 +334,17 @@ this turn are not repeated by the later walk. This may leave less capacity for
 intake and scheduling; it cannot guarantee all actions when a global bound,
 cap or policy gate holds them.
 
+An approved auto-merge PR behind its base is not left waiting for GitHub to
+refresh it: this turn updates its branch, preferring a rebase where repository
+settings allow it, otherwise using `PUT .../update-branch`. Both requests bind
+the update to the observed head. At most one branch per repository is updated
+per pass, including the later walk; preview reserves the same slot without
+writing. Fresh approval, admission, holds, green checks and write caps still
+apply. A conflicting (`DIRTY`) auto-merge PR enters the existing bounded fix/rebase
+round path rather than being skipped. Clean auto-merge and merge-queued PRs
+remain GitHub's to finish. The summary includes `updated N behind auto-merge PR(s)`
+(would-update steps in preview). This uses `pr.actionFirst`, not a new setting.
+
 The ordinary walk then screens admitted own-space repositories. Discovery makes one
 GraphQL listing per repository, at most 50 repositories and 100 open PRs each,
 inside the existing request/time budget. A missing, malformed or incomplete

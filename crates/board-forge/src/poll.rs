@@ -3961,7 +3961,15 @@ pub fn decide(
     if !pull["mergeQueueEntry"].is_null() {
         return step("skip", QUEUED).followed(None);
     }
-    if !pull["autoMergeRequest"].is_null() {
+    let auto_merge = !pull["autoMergeRequest"].is_null();
+    // Auto-merge does not refresh a branch. Only action-first own-space
+    // maintenance may look past it, on a freshly approved behind/dirty head.
+    let auto_refresh = auto_merge
+        && config.policy.action_first
+        && config.ours(text(pull, "/baseRepository/nameWithOwner"))
+        && matches!(text(pull, "/mergeStateStatus"), BEHIND | "DIRTY")
+        && review_at_head(pull, config, review_run) == Some(Review::Approved);
+    if auto_merge && !auto_refresh {
         return step("skip", AUTO_MERGE).followed(None);
     }
     let partial = truncated(pull);
@@ -4019,7 +4027,7 @@ pub fn decide(
             .iter()
             .map(|(name, _)| format!("{before}{name}{after}")),
     );
-    if pull["mergeable"] == CONFLICTING {
+    if pull["mergeable"] == CONFLICTING || (auto_refresh && pull["mergeStateStatus"] == "DIRTY") {
         failing.push(format!("conflicts with {base}"));
     }
     if placeholder_commits(pull) {
@@ -4339,6 +4347,23 @@ pub fn decide(
             "wait",
             format!("its base {base} is not the default branch {default}; merged only into that"),
         );
+    }
+    if auto_refresh && pull["mergeStateStatus"] == BEHIND {
+        return if no_merge(config, pull) {
+            step(
+                "wait",
+                "pr.noMerge: merging into this base repository is disabled",
+            )
+        } else if harness
+            || (merge_only && config.policy.unstall && pull["isCrossRepository"] == false)
+        {
+            step(
+                "update",
+                "behind auto-merge PR; refresh its branch before auto-merge can proceed",
+            )
+        } else {
+            step("skip", format!("behind {base}, left to its author"))
+        };
     }
     // With `reruns`, a head behind its new base, as a stacked one is once the
     // one below it merged, is rebased onto it ([`UPDATE`]), and the new head's
@@ -5955,12 +5980,33 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         ensure!(!id.is_empty(), "pull request has no id");
         let head = text(pull, "/headRefOid");
         let base = text(pull, "/baseRefName");
-        if !self.updated.insert((repo.to_owned(), base.to_owned())) {
+        if self
+            .updated
+            .iter()
+            .any(|(r, _)| r.eq_ignore_ascii_case(repo))
+        {
             return Ok(format!(
                 "{not}behind {base}; another pull request was brought up to date with it this pass, so this one waits"
             ));
         }
-        self.mutate(UPDATE, json!({"id": id, "head": head}))?;
+        self.updated.insert((repo.to_owned(), base.to_owned()));
+        if !pull["autoMergeRequest"].is_null() {
+            let settings = self.get(&format!("repos/{repo}"))?;
+            if settings["allow_rebase_merge"] == true {
+                self.mutate(UPDATE, json!({"id": id, "head": head}))?;
+            } else {
+                let rest = self.rest;
+                self.send(
+                    rest,
+                    "PUT",
+                    &format!("repos/{repo}/pulls/{}/update-branch", pull["number"]),
+                    json!({"expected_head_sha": head}),
+                    0,
+                )?;
+            }
+        } else {
+            self.mutate(UPDATE, json!({"id": id, "head": head}))?;
+        }
         Ok(format!(
             "brought up to date with {base}; waits for the review of the new head"
         ))
@@ -8130,6 +8176,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             answer.clear();
             decision = step("skip", format!("{LEFT_TO_OPERATOR}{why}"));
         }
+        if decision.action == "update"
+            && self
+                .updated
+                .iter()
+                .any(|(r, _)| r.eq_ignore_ascii_case(repo))
+        {
+            decision = step(
+                "wait",
+                "another pull request was brought up to date in this repository this pass",
+            );
+        }
         // With `ownSpaceOnly`, every step that writes outside our own space,
         // a stop included, is the operator's, and with `fixPlans` every one
         // upstream ([`Config::held_in`]). Its `needs-human` wait is the
@@ -8366,6 +8423,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             });
         if self.apply.is_none() && ran && decision.action == "merge" {
             self.preview_merges += 1;
+        }
+        if self.apply.is_none() && ran && decision.action == "update" {
+            self.updated.insert((repo.to_owned(), base.to_owned()));
         }
         let stepped = (text(&pull, "/author/login") == self.config.bot).then(|| Stepped {
             repository: repo.to_owned(),
@@ -21489,6 +21549,166 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn action_first_behind_auto_merge_updates_one_per_repository_in_order() {
+        for rebase in [false, true] {
+            for apply in [false, true] {
+                let mut fake = github();
+                let mut cfg = config();
+                cfg.policy.action_first = true;
+                fake.page(
+                    &format!("repos/{REPO}"),
+                    None,
+                    None,
+                    json!({"allow_rebase_merge": rebase}),
+                );
+                let original = fake.pulls[&470].clone();
+                let mut items = Vec::new();
+                for number in 470..473 {
+                    let mut p = original.clone();
+                    p["number"] = json!(number);
+                    p["id"] = json!(format!("PR_{number}"));
+                    p["autoMergeRequest"] = json!({"enabledAt": "2026-10-12T00:00:00Z"});
+                    p["mergeStateStatus"] = json!(BEHIND);
+                    fake.pulls.insert(number, p);
+                    fake.page(
+                        &format!("repos/{REPO}/issues/{number}/comments?per_page=100"),
+                        None,
+                        None,
+                        json!([]),
+                    );
+                    items.push(json!({"repository_url": format!("{API_ROOT}repos/{REPO}"), "number": number, "user": {"login": BOT}, "pull_request": {}}));
+                }
+                fake.page(
+                    &action_first::approved_path(&cfg),
+                    None,
+                    None,
+                    json!({"incomplete_results": false, "total_count": 3, "items": items}),
+                );
+                let dispatcher = Fake::default();
+                let follow = [REPO.to_owned()];
+                let mut order = Vec::new();
+                for _ in 0..3 {
+                    fake.writes.borrow_mut().clear();
+                    let caps = caps::Caps::default();
+                    let prior = action_first::run_approved_capped(
+                        &fake,
+                        &fake,
+                        &cfg,
+                        &follow,
+                        if apply { applying(&dispatcher) } else { None },
+                        &caps,
+                        now(),
+                        None,
+                    )
+                    .unwrap();
+                    let outcome = run_capped_after_direction(
+                        &fake,
+                        &fake,
+                        &cfg,
+                        State::default(),
+                        (&[], &follow),
+                        if apply { applying(&dispatcher) } else { None },
+                        Some(&caps),
+                        now(),
+                        Some(prior),
+                    )
+                    .unwrap();
+                    assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                    let updates: Vec<_> = outcome
+                        .steps
+                        .iter()
+                        .filter(|s| s.ran && s.action == "update")
+                        .collect();
+                    assert_eq!(updates.len(), 1, "{:?}", outcome.lines);
+                    let number = updates[0].number;
+                    order.push(number);
+                    assert!(
+                        outcome
+                            .lines
+                            .iter()
+                            .any(|l| l == "updated 1 behind auto-merge PR(s)"),
+                        "{:?}",
+                        outcome.lines
+                    );
+                    let writes = fake.writes.borrow();
+                    if apply {
+                        assert_eq!(writes.len(), 1, "{writes:?}");
+                        if rebase {
+                            assert_eq!(
+                                writes[0],
+                                (
+                                    UPDATE.into(),
+                                    json!({"id": format!("PR_{number}"), "head": HEAD})
+                                )
+                            );
+                        } else {
+                            assert_eq!(
+                                writes[0],
+                                (
+                                    format!(
+                                        "PUT {API_ROOT}repos/{REPO}/pulls/{number}/update-branch"
+                                    ),
+                                    json!({"expected_head_sha": HEAD})
+                                )
+                            );
+                        }
+                    } else {
+                        assert!(writes.is_empty());
+                    }
+                    // The refreshed PR no longer needs an update on the next pass.
+                    fake.pulls.get_mut(&number).unwrap()["mergeStateStatus"] = json!("CLEAN");
+                }
+                assert_eq!(order, [470, 471, 472]);
+            }
+        }
+    }
+
+    #[test]
+    fn action_first_auto_merge_maintenance_preserves_decision_gates() {
+        for (change, enabled, expected) in [
+            (json!({"mergeStateStatus": BEHIND}), false, "skip"),
+            (json!({"mergeStateStatus": "CLEAN"}), true, "skip"),
+            (
+                json!({"mergeStateStatus": "DIRTY", "mergeable": CONFLICTING}),
+                true,
+                "fix",
+            ),
+            (
+                json!({"mergeStateStatus": BEHIND, "reviews": {"nodes": []}}),
+                true,
+                "skip",
+            ),
+            (
+                json!({"mergeStateStatus": BEHIND, "labels": {"nodes": [{"name": LABEL}]}}),
+                true,
+                "skip",
+            ),
+            (
+                json!({"mergeStateStatus": BEHIND, "isDraft": true}),
+                true,
+                "needs-human",
+            ),
+        ] {
+            let mut cfg = config();
+            cfg.policy.action_first = enabled;
+            let mut p = pull("pull-470", change.clone());
+            p["autoMergeRequest"] = json!({"enabledAt": "2026-10-12T00:00:00Z"});
+            let checks = classify_checks(&p, &[]);
+            let run = review_run(&p);
+            let decision = decide(
+                &cfg,
+                &p,
+                &checks,
+                &Marker::default(),
+                (None, run.as_ref()),
+                &Outages::Off,
+                now(),
+            );
+            assert_eq!(decision.action, expected, "{change}: {}", decision.reason);
         }
     }
 
