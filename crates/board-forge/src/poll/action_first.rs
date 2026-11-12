@@ -69,11 +69,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     pub(super) fn action_first(
         &mut self,
         follow: &BTreeSet<&String>,
-        cursor: Option<&str>,
-        discovery_cursor: Option<&str>,
+        state: &State,
         missing: &BTreeSet<String>,
         outcome: &mut Outcome,
-    ) -> (Option<String>, Option<String>) {
+    ) -> (Option<String>, Option<String>, BTreeMap<String, u64>) {
+        let cursor = state.share_cursor.as_deref();
+        let discovery_cursor = state.action_first_cursor.as_deref();
+        let mut positions = state.action_first_positions.clone();
+        positions.retain(|repo, _| follow.iter().any(|r| r.eq_ignore_ascii_case(repo)));
         let mut listed = BTreeMap::new();
         let mut next = None;
         // Discovery must leave a full decision's margin. Resume unlisted
@@ -120,8 +123,29 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         // Both classes rotate from the cut so persistent false positives
         // cannot monopolize the priority share. Neither phase lists again.
+        let mut turns = Vec::new();
+        let mut before = Vec::new();
+        for (repo, turn) in walk(follow, cursor) {
+            if matches!(turn, Turn::Before(_)) {
+                continue;
+            }
+            let key = repo.to_ascii_lowercase();
+            if let Turn::From(n) = turn {
+                positions.entry(key.clone()).or_insert(n);
+            }
+            if let Some(&n) = positions.get(&key) {
+                turns.push((repo, Turn::From(n)));
+                before.push((repo, Turn::Before(n)));
+            } else {
+                turns.push((repo, Turn::All));
+            }
+        }
+        // A repository's earlier PRs come after every other repository,
+        // not immediately after its suffix: otherwise it can monopolize
+        // every decision share even while discovery finds other ready PRs.
+        turns.extend(before);
         for priority in [true, false] {
-            for (repo, turn) in walk(follow, cursor) {
+            for &(repo, turn) in &turns {
                 let Some(open) = listed.get(repo.as_str()) else {
                     continue;
                 };
@@ -130,6 +154,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     outcome.undecided.insert(repo.to_ascii_lowercase());
                     continue;
                 }
+                let key = repo.to_ascii_lowercase();
                 let open = open
                     .iter()
                     .filter(|p| {
@@ -151,6 +176,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 // outstanding asks for its unread PRs, just as on an error.
                 if self.cut.is_some() {
                     outcome.undecided.insert(repo.to_ascii_lowercase());
+                    if let Some((cut_repo, number)) =
+                        self.cut.as_deref().and_then(|c| c.split_once('#'))
+                        && cut_repo == key
+                        && let Ok(number) = number.parse()
+                    {
+                        // Discovery may skip this repository next pass. A cut
+                        // elsewhere must not erase its unfinished decision.
+                        positions.insert(key, number);
+                    }
+                } else if !priority && !matches!(turn, Turn::From(_)) {
+                    positions.remove(&key);
                 }
             }
         }
@@ -216,6 +252,6 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 "pull requests: discovery deferred; next pass starts at {repo}"
             ));
         }
-        (next, upstream_next)
+        (next, upstream_next, positions)
     }
 }
