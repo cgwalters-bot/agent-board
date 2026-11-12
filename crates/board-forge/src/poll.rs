@@ -4444,8 +4444,19 @@ fn describe(repo: &str, event: &Value, config: &Config) -> Option<String> {
 }
 
 /// The result of one pass.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Outcome {
+    pub(crate) approved_read: bool,
+    pub(crate) decided: BTreeSet<(String, u64)>,
+    pub(crate) preview_merges: usize,
+    updated: BTreeSet<(String, String)>,
+    deferred: Vec<Deferred>,
+    review_intake: reviews::Intake,
+    // Transfer the census and its accounting together: re-reading runs cannot
+    // recover slots reserved by claims whose runs are not listed yet.
+    review_runs: BTreeMap<String, Option<Vec<Value>>>,
+    review_unread: Option<String>,
+    pub(crate) approved_cut: Option<String>,
     /// Fenced maintainer report, printed verbatim by the CLI in a dry run.
     pub maintainer_report: Option<String>,
     pub lines: Vec<String>,
@@ -4473,6 +4484,20 @@ pub struct Outcome {
     pub undecided: BTreeSet<String>,
     /// The state to keep for the next pass; its interval is the next gap.
     pub state: State,
+}
+
+impl Outcome {
+    /// Pending reviews have not passed the full census/WIP admission yet.
+    pub(crate) fn hold_deferred_reviews(&mut self) {
+        for review in &self.deferred {
+            if let Some(step) = review.at.1.and_then(|i| self.steps.get_mut(i)) {
+                step.ran = false;
+            }
+            if let Some(line) = self.lines.get_mut(review.at.0) {
+                *line = format!("{}; held: ordinary review census not reached", review.line);
+            }
+        }
+    }
 }
 
 /// A followed pull request that waits on the operator, at the head the
@@ -4803,6 +4828,7 @@ struct Pass<'a, R, G> {
 }
 
 /// A review start or rerun, deferred so that they go in Priority order.
+#[derive(Clone)]
 struct Deferred {
     /// Its board Priority rank ([`PollPolicy::review_ranks`]).
     rank: usize,
@@ -8467,6 +8493,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             .filter_map(|p| p["number"].as_u64())
             .collect();
         for (number, merge_only) in numbers {
+            if outcome
+                .decided
+                .contains(&(repo.to_ascii_lowercase(), number))
+            {
+                continue;
+            }
             if !self.share_allows(repo, Some(number)) {
                 break;
             }
@@ -8484,6 +8516,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             self.rest.under_way(false);
             match read {
                 Ok((line, flying, wait, stepped)) => {
+                    outcome.decided.insert((repo.to_ascii_lowercase(), number));
                     if let Some(p) = self.report_pulls.get_mut(&(repo.to_owned(), number))
                         && let Some(listed) = left.get(&number)
                     {
@@ -8585,7 +8618,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     apply: Option<Apply<'_, R>>,
     caps: Option<&caps::Caps>,
     now: OffsetDateTime,
-    direction: Option<(Outcome, usize)>,
+    mut direction: Option<(Outcome, usize)>,
 ) -> Result<Outcome> {
     let policy = &config.policy;
     ensure!(
@@ -8639,11 +8672,31 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     }
     let mut cursors = Cursors::new(config, &mut state);
     let mut pass = Pass {
+        updated: direction
+            .as_mut()
+            .map(|(o, _)| std::mem::take(&mut o.updated))
+            .unwrap_or_default(),
+        deferred: direction
+            .as_mut()
+            .map(|(o, _)| std::mem::take(&mut o.deferred))
+            .unwrap_or_default(),
+        review_intake: direction
+            .as_mut()
+            .map(|(o, _)| std::mem::take(&mut o.review_intake))
+            .unwrap_or_default(),
+        reviewing: direction.as_ref().map_or(0, |(o, _)| o.reviewing),
+        review_runs: direction
+            .as_mut()
+            .map(|(o, _)| std::mem::take(&mut o.review_runs))
+            .unwrap_or_default(),
+        review_unread: direction.as_mut().and_then(|(o, _)| o.review_unread.take()),
         previous: std::mem::take(&mut state.responses),
         apply,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps,
         dispatched: direction.as_ref().map_or(0, |(o, _)| o.dispatched),
+        merged: direction.as_ref().map_or(0, |(o, _)| o.merged),
+        preview_merges: direction.as_ref().map_or(0, |(o, _)| o.preview_merges),
         remaining: direction
             .as_ref()
             .map_or(POLL_REQUEST_LIMIT, |(_, requests)| {
@@ -8742,6 +8795,15 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         };
         pass.envelope = Some(envelope);
     }
+    if policy.action_first
+        && !outcome.approved_read
+        && let Err(error) = pass.approved(&follow, state.share_cursor.as_deref(), &mut outcome)
+    {
+        outcome.errors += 1;
+        outcome
+            .lines
+            .push(format!("pull requests: approved search error: {error:#}"));
+    }
     // The repositories the pass's share left unwalked, or walked in part.
     let mut waiting = BTreeSet::new();
     let mut upstream_cursor = None;
@@ -8833,9 +8895,29 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         None if pass.apply.is_some() => upstream_cursor,
         None => state.share_cursor.clone(),
     };
+    let share_cursor = if pass.apply.is_some() {
+        outcome.approved_cut.clone().or(share_cursor)
+    } else {
+        share_cursor
+    };
     // Once every repository's review runs are counted toward `wip`. Each
     // start was admitted within the share where the walk queued it, so its
     // reads are under way: the run census past a cut must not strand it.
+    for review in &mut pass.deferred {
+        review.rank = nodes(&review.pull, "/closingIssuesReferences/nodes")
+            .iter()
+            .filter_map(|issue| {
+                let at = text(issue, "/repository/nameWithOwner");
+                let key = format!("{at}#{}", issue["number"].as_u64()?);
+                config
+                    .policy
+                    .review_ranks
+                    .get(&key.to_ascii_lowercase())
+                    .copied()
+            })
+            .min()
+            .unwrap_or(usize::MAX);
+    }
     pass.rest.under_way(true);
     pass.start_reviews(&mut outcome);
     pass.rest.under_way(false);
@@ -8931,9 +9013,11 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
     caps: &caps::Caps,
     now: OffsetDateTime,
     share: usize,
+    prior: Option<(Outcome, usize)>,
 ) -> Result<(Outcome, usize)> {
     let budget = share.min(POLL_REQUEST_LIMIT);
     let mut pass = Pass {
+        dispatched: prior.as_ref().map_or(0, |(o, _)| o.dispatched),
         apply,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps: Some(caps),
@@ -8951,7 +9035,7 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
         );
     }
     let mut cursors = Cursors::new(config, &mut state);
-    let mut outcome = Outcome::default();
+    let (mut outcome, prior_requests) = prior.unwrap_or_default();
     read_direction(
         &mut pass,
         config,
@@ -8969,7 +9053,7 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
     state.intake_refused = pass.intake_refused;
     outcome.dispatched = pass.dispatched;
     outcome.state = state;
-    Ok((outcome, budget - pass.remaining))
+    Ok((outcome, prior_requests + budget - pass.remaining))
 }
 
 impl Cursors {
@@ -21174,6 +21258,263 @@ mod tests {
         ] {
             assert_eq!(share_cursor(cursor), valid, "{cursor}");
         }
+    }
+
+    #[test]
+    fn action_first_approved_handoff_preserves_review_slots() {
+        for receipt in [CLAIM, MARKER, "listed"] {
+            for apply in [false, true] {
+                let mut fake = github();
+                let mut cfg = config();
+                cfg.policy.action_first = true;
+                cfg.policy.review_pools = vec!["claude".into()];
+                cfg.policy.review_wip = Some(ReviewWip {
+                    wip: 1,
+                    active: 0,
+                    held: None,
+                });
+                fake.pulls.get_mut(&470).unwrap()["reviews"]["nodes"] = json!([]);
+                let mut other = fake.pulls[&470].clone();
+                other["number"] = json!(471);
+                other["id"] = json!("pull-471");
+                fake.pulls.insert(471, other);
+                fake.page(
+                    &format!("repos/{REPO}/issues/471/comments?per_page=100"),
+                    None,
+                    None,
+                    json!([]),
+                );
+                let at = "2026-10-12T01:55:00Z";
+                let state = if receipt == CLAIM {
+                    json!({"from": format!("review:{HEAD}")})
+                } else {
+                    json!({"rounds": 0, "review_head": HEAD, "review_at": at})
+                };
+                let comments = if receipt == "listed" {
+                    json!([])
+                } else {
+                    json!([{"id": 98, "user": {"login": BOT}, "created_at": at,
+                        "body": format!("<!-- {receipt}: {state} -->")}])
+                };
+                fake.page(
+                    &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                    None,
+                    None,
+                    comments,
+                );
+                let workflow = review_workflow(&cfg, REPO).unwrap();
+                let since = (now() - time::Duration::days(1)).date();
+                let runs = if receipt == "listed" {
+                    json!([{"id": 77, "path": format!("{WORKFLOWS_DIR}{workflow}"), "event": DISPATCH_EVENT,
+                        "head_sha": HEAD, "head_branch": "main", "display_title": format!("review {REPO}#470 {HEAD} (claude)"),
+                        "status": "in_progress", "repository": {"full_name": REPO}}])
+                } else {
+                    json!([])
+                };
+                fake.page(&format!("repos/{REPO}/actions/workflows/{workflow}/runs?event={DISPATCH_EVENT}&created=%3E%3D{since}&per_page={REVIEW_DISPATCH_READS}"), None, None, json!({"workflow_runs": runs}));
+                fake.page(&action_first::approved_path(&cfg), None, None, json!({"incomplete_results": false, "total_count": 1,
+                    "items": [{"repository_url": format!("{API_ROOT}repos/{REPO}"), "number": 470, "user": {"login": BOT}, "pull_request": {}}]}));
+                let dispatcher = Fake::default();
+                let follow = [REPO.to_owned()];
+                let caps = caps::Caps::default();
+                let applying = || if apply { applying(&dispatcher) } else { None };
+                let prior = action_first::run_approved_capped(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    &follow,
+                    applying(),
+                    &caps,
+                    now(),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(prior.0.errors, 0, "{receipt}: {:?}", prior.0.lines);
+                assert_eq!(prior.0.reviewing, 1, "{receipt}: {:?}", prior.0.lines);
+                let prior = run_direction_capped(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &follow,
+                    applying(),
+                    &caps,
+                    now(),
+                    100,
+                    Some(prior),
+                )
+                .unwrap();
+                // An early exit after intake must also retain the known slot.
+                assert_eq!(prior.0.reviewing, 1, "{receipt}: {:?}", prior.0.lines);
+                let outcome = run_capped_after_direction(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    (&[], &follow),
+                    applying(),
+                    Some(&caps),
+                    now(),
+                    Some(prior),
+                )
+                .unwrap();
+                assert_eq!(outcome.errors, 0, "{receipt}: {:?}", outcome.lines);
+                assert_eq!(outcome.reviewing, 1, "{receipt}: {:?}", outcome.lines);
+                assert_eq!(outcome.dispatched, 0, "{receipt}: {:?}", outcome.lines);
+                assert!(
+                    outcome
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("wip: 1 of 1 runs active")),
+                    "{receipt}: {:?}",
+                    outcome.lines
+                );
+                assert!(!outcome.steps.iter().any(|s| s.action == REVIEW && s.ran));
+                assert!(fake.writes.borrow().is_empty(), "{receipt}");
+            }
+        }
+    }
+
+    #[test]
+    fn action_first_approved_handoff_preserves_updates_and_deferred_reviews() {
+        for review in [false, true] {
+            for apply in [false, true] {
+                let mut fake = github();
+                let mut cfg = config();
+                cfg.policy.action_first = true;
+                if review {
+                    fake.pulls.get_mut(&470).unwrap()["reviews"]["nodes"] = json!([]);
+                    cfg.policy.review_pools = vec!["claude".into()];
+                    let workflow = review_workflow(&cfg, REPO).unwrap();
+                    let since = (now() - time::Duration::days(1)).date();
+                    fake.page(&format!("repos/{REPO}/actions/workflows/{workflow}/runs?event={DISPATCH_EVENT}&created=%3E%3D{since}&per_page={REVIEW_DISPATCH_READS}"), None, None, json!({"workflow_runs": []}));
+                } else {
+                    fake.pulls.get_mut(&470).unwrap()["mergeStateStatus"] = json!(BEHIND);
+                    let mut other = fake.pulls[&470].clone();
+                    other["number"] = json!(469);
+                    other["id"] = json!("pull-469");
+                    fake.pulls.insert(469, other);
+                    fake.page(
+                        &format!("repos/{REPO}/issues/469/comments?per_page=100"),
+                        None,
+                        None,
+                        json!([]),
+                    );
+                }
+                fake.page(&action_first::approved_path(&cfg), None, None, json!({"incomplete_results": false, "total_count": 1,
+                    "items": [{"repository_url": format!("{API_ROOT}repos/{REPO}"), "number": 470, "user": {"login": BOT}, "pull_request": {}}]}));
+                let dispatcher = Fake::default();
+                let follow = [REPO.to_owned()];
+                let caps = caps::Caps::default();
+                let prior = action_first::run_approved_capped(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    &follow,
+                    if apply { applying(&dispatcher) } else { None },
+                    &caps,
+                    now(),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(prior.0.errors, 0, "{:?}", prior.0.lines);
+                if review {
+                    assert_eq!(prior.0.deferred.len(), 1, "{:?}", prior.0.lines);
+                } else if apply {
+                    assert_eq!(prior.0.updated.len(), 1);
+                }
+                let outcome = run_capped_after_direction(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    (&[], &follow),
+                    if apply { applying(&dispatcher) } else { None },
+                    Some(&caps),
+                    now(),
+                    Some(prior),
+                )
+                .unwrap();
+                assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                if review {
+                    assert!(
+                        outcome
+                            .lines
+                            .iter()
+                            .any(|l| l.contains("no run of the review job")
+                                && (!apply || l.contains("started on claude"))),
+                        "{:?}",
+                        outcome.lines
+                    );
+                    assert_eq!(
+                        outcome
+                            .steps
+                            .iter()
+                            .filter(|s| s.action == "review" && s.ran)
+                            .count(),
+                        1
+                    );
+                } else if apply {
+                    assert_eq!(
+                        fake.writes
+                            .borrow()
+                            .iter()
+                            .filter(|(q, _)| q == UPDATE)
+                            .count(),
+                        1,
+                        "{:?}",
+                        outcome.lines
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn action_first_approved_cut_rotates_persistent_false_positives() {
+        let mut fake = github();
+        let approved = fake.pulls[&470].clone();
+        let mut items = Vec::new();
+        for number in 470..475 {
+            let mut pull = approved.clone();
+            pull["number"] = json!(number);
+            pull["id"] = json!(format!("PR_{number}"));
+            pull["isCrossRepository"] = json!(number == 474);
+            fake.pulls.insert(number, pull);
+            fake.page(
+                &format!("repos/{REPO}/issues/{number}/comments?per_page=100"),
+                None,
+                None,
+                json!([]),
+            );
+            items.push(json!({"repository_url": format!("{API_ROOT}repos/{REPO}"), "number": number, "user": {"login": BOT}, "pull_request": {}}));
+        }
+        let cfg = config();
+        fake.page(
+            &action_first::approved_path(&cfg),
+            None,
+            None,
+            json!({"incomplete_results": false, "total_count": items.len(), "items": items}),
+        );
+        let repo = REPO.to_owned();
+        let follow = BTreeSet::from([&repo]);
+        let mut cursor = None;
+        let mut merged = false;
+        for _ in 0..6 {
+            let shared = ActionShare::new(&fake, 35);
+            let mut pass = Pass::new(&shared, &shared, &cfg, now());
+            let mut outcome = Outcome::default();
+            pass.approved(&follow, cursor.as_deref(), &mut outcome)
+                .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            if pass.preview_merges > 0 {
+                merged = true;
+                break;
+            }
+            assert!(outcome.approved_cut.is_some());
+            cursor = outcome.approved_cut;
+        }
+        assert!(merged, "a persistent prefix starved the approved suffix");
     }
 
     #[test]

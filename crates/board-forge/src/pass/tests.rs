@@ -7662,6 +7662,190 @@ fn derived_budget_merges_past_the_legacy_stage_share() {
 }
 
 #[test]
+fn action_first_approved_search_decides_all_seventeen_despite_scheduling_reserve() {
+    let mut forge = Forge::new(None, false);
+    let repositories: Vec<String> = (1..=17)
+        .map(|n| format!("cgwalters-forge/approved{n}"))
+        .collect();
+    let mut items = Vec::new();
+    for (i, repo) in repositories.iter().enumerate() {
+        let number = i + 1;
+        followed(
+            &mut forge.replay,
+            (repo, number as u64),
+            json!({"reviews": {
+            "nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
+                "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
+            "pageInfo": {"hasPreviousPage": false}}}),
+            json!([]),
+        );
+        items.push(
+            json!({"repository_url": format!("{API_ROOT}repos/{repo}"), "number": number,
+            "pull_request": {}, "user": {"login": "cgwalters-bot"}}),
+        );
+        forge.replay.requests.push(json!({"request": graphql_key(poll::MERGE, &json!({"id": format!("PR_{number}"), "head": "abc"})),
+            "answer": {"data": {"mergePullRequest": {"clientMutationId": null}}}}));
+        forge.replay.requests.push(
+            json!({"request": {"get": format!("{API_ROOT}repos/{repo}")},
+            "answer": {"status": 200, "link": null, "body": {"allow_rebase_merge": true}}}),
+        );
+    }
+    let cfg = config(json!({"follow": repositories, "reserveScheduling": true,
+        "pr": {"actionFirst": true, "fixPools": ["claude"]}}));
+    let path = poll::action_first::approved_path(&cfg.poll(None));
+    forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+        "answer": {"status": 200, "link": null, "body": {"incomplete_results": false, "total_count": 17, "items": items}}}));
+    forge
+        .replay
+        .requests
+        .push(json!({"request": {"get": format!("{API_ROOT}user")},
+        "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+    let report = apply(&forge, &cfg);
+    assert_eq!(report.lines.iter().filter(|l| l.starts_with("merge cgwalters-forge/approved") && l.ends_with(" -> merged")).count(), 17, "{:#?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l == "pull requests: approved search found 17, admitted 17")
+    );
+    assert_eq!(
+        report
+            .lines
+            .iter()
+            .filter(|l| l.contains("approved search error"))
+            .count(),
+        0,
+        "{:#?}",
+        report.lines
+    );
+    assert!(report.spent.requests <= PASS_REQUEST_LIMIT);
+    let caps = Caps::new(Limits {
+        writes: Some(0),
+        ..Limits::default()
+    });
+    let (preview, requests) = poll::action_first::run_approved_capped(
+        &forge,
+        &forge,
+        &cfg.poll(None),
+        &repositories,
+        None,
+        &caps,
+        forge.replay.now,
+        None,
+    )
+    .unwrap();
+    assert_eq!(preview.errors, 0, "{:?}", preview.lines);
+    assert_eq!(
+        preview.preview_merges, 0,
+        "the approved turn must respect caps"
+    );
+    assert!(requests <= poll::action_first::APPROVED_REQUESTS);
+}
+
+#[test]
+fn action_first_approved_early_exit_carries_unread_review_requests() {
+    let repo = "cgwalters-forge/agentic-job";
+    let head = "a".repeat(40);
+    let mut forge = Forge::new(None, false);
+    let mut destination = forge.holds_destination(true);
+    destination["needsYou"] = json!(true);
+    followed(
+        &mut forge.replay,
+        (repo, 9),
+        json!({
+            "headRefOid": head,
+            "labels": {"nodes": [{"name": "needs-operator-approval"}], "pageInfo": {"hasNextPage": false}},
+            "reviews": {"nodes": [{"state": "APPROVED", "commit": {"oid": head},
+                "author": {"__typename": "Bot", "login": "github-actions", "databaseId": poll::ACTIONS_BOT_ID},
+                "submittedAt": "2026-10-23T13:00:00Z",
+                "body": format!("VERDICT: APPROVE\n\n<!-- gh-aw-agentic-workflow: review, id: 77, workflow_id: agentic-job, run: https://github.com/{repo}/actions/runs/77 -->")}],
+                "pageInfo": {"hasPreviousPage": false}},
+            "commits": {"nodes": [{"commit": {"oid": head,
+                "committedDate": "2026-10-23T12:00:00Z", "message": "Change", "statusCheckRollup": null}}]}
+        }),
+        json!([]),
+    );
+    inventory_on(&mut forge.replay, repo, 9, "needs-operator-approval");
+    forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/{repo}/actions/runs/77")},
+        "answer": {"status": 200, "link": null, "body": {"id": 77, "path": ".github/workflows/review.yml",
+            "event": "pull_request_target", "head_sha": head, "status": "completed",
+            "run_started_at": "2026-10-23T12:50:00Z", "updated_at": "2026-10-23T13:05:00Z",
+            "repository": {"full_name": repo}}}}));
+    let mut settings = json!({"wip": 0, "follow": [repo], "pr": {"fixPools": ["claude"], "reviewWorkflow": "review.yml"}, "holds": destination});
+    let first = apply(&forge, &config(settings.clone()));
+    assert_eq!(first.failures, 0, "{:?}", first.lines);
+    let (_, prior) = forge.published_holds().unwrap();
+    let previous = holds::parse(&prior).unwrap();
+    let requests = previous["needs_you"]["identities"].as_array().unwrap();
+    assert!(!requests.is_empty(), "{previous}");
+    forge.previous_holds(prior);
+    forge.writes.borrow_mut().clear();
+    settings["pr"]["actionFirst"] = json!(true);
+    settings["authored"] = json!(1);
+    let cfg = config(settings);
+    forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}{}", poll::action_first::approved_path(&cfg.poll(None)))},
+        "answer": {"status": 200, "link": null, "body": {"incomplete_results": false, "total_count": 0, "items": []}}}));
+    // No authored-search answer: its failed read stops the ordinary walk.
+    let second = apply(&forge, &cfg);
+    assert!(
+        second
+            .lines
+            .iter()
+            .any(|l| l.starts_with("follow error: authored pull requests:")),
+        "{:?}",
+        second.lines
+    );
+    let (_, body) = forge.published_holds().unwrap();
+    let snapshot = holds::parse(&body).unwrap();
+    let carried = snapshot["needs_you"]["identities"].as_array().unwrap();
+    for request in requests {
+        assert!(
+            carried.iter().any(|r| r["item"] == request["item"]),
+            "{snapshot}"
+        );
+    }
+    assert_ne!(snapshot["needs_you"]["sources"]["reviews"], "complete");
+}
+
+#[test]
+fn action_first_approved_search_refuses_partial_or_invalid_pages() {
+    let cfg = config(
+        json!({"follow": ["cgwalters-forge/work"], "pr": {"actionFirst": true, "fixPools": ["claude"]}}),
+    );
+    let poll = cfg.poll(None);
+    let path = poll::action_first::approved_path(&poll);
+    for body in [
+        json!({"incomplete_results": true, "total_count": 0, "items": []}),
+        json!({"incomplete_results": false, "total_count": 101, "items": []}),
+        json!({"incomplete_results": false, "total_count": 1, "items": []}),
+        json!({"incomplete_results": false, "total_count": 1, "items": [{"repository_url": "https://example.com/repos/owner/repo", "number": 1, "pull_request": {}}]}),
+        json!({"incomplete_results": false, "total_count": 1, "items": [{"repository_url": format!("{API_ROOT}repos/cgwalters-forge/work"), "number": 1}]}),
+    ] {
+        let mut forge = Forge::new(None, false);
+        forge
+            .replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+            "answer": {"status": 200, "link": null, "body": body}}));
+        let (outcome, requests) = poll::action_first::run_approved_capped(
+            &forge,
+            &forge,
+            &poll,
+            &cfg.follow,
+            None,
+            &Caps::default(),
+            forge.replay.now,
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, 1, "{body}");
+        assert!(outcome.decided.is_empty());
+        assert_eq!(requests, 1);
+        assert!(forge.writes.borrow().is_empty());
+    }
+}
+
+#[test]
 fn action_first_merges_two_approved_prs_in_repository_25_before_drafts_and_upstream() {
     let repositories: Vec<String> = (1..=30)
         .map(|n| {
@@ -7714,6 +7898,8 @@ fn action_first_merges_two_approved_prs_in_repository_25_before_drafts_and_upstr
     let settings = json!({"follow": repositories, "pr": {"fixPools": ["claude"], "actionFirst": true,
         "ownSpaceOnly": true, "mergeAuthors": ["contributor"]}});
     let cfg = config(settings.clone());
+    forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}{}", poll::action_first::approved_path(&cfg.poll(None)))},
+        "answer": {"status": 200, "link": null, "body": {"incomplete_results": false, "total_count": 0, "items": []}}}));
     let state = State {
         share_cursor: Some("aaa/upstream01#1".into()),
         ..State::default()
