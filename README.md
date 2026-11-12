@@ -30,13 +30,15 @@ schedules off; the offline rehearsal does not verify a live deployment.
 
 ## Run it locally
 
-From a trusted caller checkout, preview with `agent-board pass --config
-.github/pass.json` (include its reviewed `--fix-bounds` files when PR follow-up
-is configured). For GitHub, credentials come from `GH_TOKEN`, then `GITHUB_TOKEN`,
+From a trusted caller checkout's root, preview with `agent-board pass`: it reads
+`.github/pass.json`. Put reviewed bounds paths in `fixBounds` (relative to the
+config file) and caps in `maxDispatch`, `maxWrites` and `maxStatusChanges`;
+explicit flags override them. See [local defaults](docs/pass.md#local-configuration-defaults).
+For GitHub, credentials come from `GH_TOKEN`, then `GITHUB_TOKEN`,
 then your `gh auth login --hostname github.com` login; no token export is needed.
 `DISPATCH_TOKEN` is optional and defaults to the same credential. Preview does
 not write or start runs. Applying still requires the configured bot's identity
-and explicit local caps; see [setup](docs/setup.md#connect-one-lane).
+and local caps from config or flags; see [setup](docs/setup.md#connect-one-lane).
 
 ## License
 

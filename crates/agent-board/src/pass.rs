@@ -14,22 +14,22 @@ use tokio::runtime::Runtime;
 pub struct Pass {
     #[command(subcommand)]
     pub command: Option<PassCommand>,
-    /// The pass configuration (docs/pass.md), from a trusted default-branch checkout. Credentials come from GH_TOKEN, GITHUB_TOKEN or gh auth token (in that order), never the file; DISPATCH_TOKEN overrides the token for starts.
-    #[arg(long, value_name = "FILE", required = true)]
+    /// The pass configuration (docs/pass.md), from a trusted default-branch checkout [default: .github/pass.json in the current directory]. Credentials come from GH_TOKEN, GITHUB_TOKEN or gh auth token (in that order), never the file; DISPATCH_TOKEN overrides the token for starts.
+    #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
     /// The caller's agentic-job bounds file for its `fix` kind (such as .github/agentic-job/fix.toml), from the same trusted checkout, never a dispatched head or workflow input: a pull request whose repository is outside its `repos` (unless push_to_pull_request_branch's `own_author` is the pull request's author), or whose head branch is outside its push_to_pull_request_branch `branches`, gets no fix, rebase or continuation round and is left to the operator. Repeatable: a pull request is inside where any one file admits both its repository and its head branch. The policy step stays the boundary.
     #[arg(long, value_name = "FILE")]
     pub fix_bounds: Vec<PathBuf>,
-    /// Take the steps: follow up pull requests, publish the usage snapshot, apply epic plans, start the chosen runs, write board Status and, with holds, publish the hold snapshot as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both --max-dispatch and --max-writes, and is not serialized against the scheduled workflow.
+    /// Take the steps: follow up pull requests, publish the usage snapshot, apply epic plans, start the chosen runs, write board Status and, with holds, publish the hold snapshot as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both dispatch and write caps (config or flags), and is not serialized against the scheduled workflow.
     #[arg(long)]
     pub apply: bool,
-    /// Start at most N agent runs in this pass: pull request fix, rebase and continuation rounds, an epic's planning run, and scheduled starts. The rest are held, each line saying so.
+    /// Start at most N agent runs in this pass: pull request fix, rebase and continuation rounds, an epic's planning run, and scheduled starts. The rest are held, each line saying so. Overrides config maxDispatch.
     #[arg(long, value_name = "N")]
     pub max_dispatch: Option<usize>,
-    /// Take at most N other write steps in this pass: forge writes such as comments, labels, merges, the usage and hold snapshots, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, the usage and hold comments' edits, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together. A pass that made progress publishes its hold snapshot one past a full cap above 0, so its progress is kept.
+    /// Take at most N other write steps in this pass: forge writes such as comments, labels, merges, the usage and hold snapshots, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, the usage and hold comments' edits, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together. A pass that made progress publishes its hold snapshot one past a full cap above 0, so its progress is kept. Overrides config maxWrites.
     #[arg(long, value_name = "N")]
     pub max_writes: Option<usize>,
-    /// Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through.
+    /// Refuse the board Status stage whole when it would change more than N items' Status [default: config maxStatusChanges, otherwise 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through.
     #[arg(long, value_name = "N")]
     pub max_status_changes: Option<usize>,
     /// Preview a recorded pass (a replay fixture) at its clock instead of reading the forge; needs no token. A Forgejo fixture replays only on the instance it was recorded on. On GitHub, with --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage.
@@ -178,14 +178,14 @@ const ACTIONS_VAR: &str = "GITHUB_ACTIONS";
 
 /// How an applying pass is kept from racing the scheduled one: in GitHub
 /// Actions by its run ([`own_run`]); outside, only by its caps, so both must
-/// be given. Checked before any token is read.
+/// be given in config or flags. Checked before any token is read.
 fn apply_mode(limits: Limits) -> Result<Option<PassRun>> {
     if std::env::var(ACTIONS_VAR).as_deref() == Ok("true") {
         return own_run().map(Some);
     }
     if limits.dispatch.is_none() || limits.writes.is_none() {
         bail!(
-            "--apply outside GitHub Actions needs both --max-dispatch and --max-writes: a local pass is not serialized against the scheduled workflow, so its caps bound what it can do"
+            "--apply outside GitHub Actions needs both --max-dispatch and --max-writes (or config maxDispatch and maxWrites): a local pass is not serialized against the scheduled workflow, so its caps bound what it can do"
         );
     }
     Ok(None)
@@ -233,7 +233,7 @@ fn forgejo_apply_mode(
     }
     ensure!(
         limits.dispatch.is_some() && limits.writes.is_some(),
-        "--apply outside Forgejo Actions needs both --max-dispatch and --max-writes"
+        "--apply outside Forgejo Actions needs both --max-dispatch and --max-writes (or config maxDispatch and maxWrites)"
     );
     Ok(None)
 }
@@ -249,15 +249,31 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     if let Some(PassCommand::Next(args)) = &args.command {
         return next(args, out);
     }
-    let path = args.config.as_ref().context("pass needs --config")?;
+    let default_path = PathBuf::from(".github/pass.json");
+    let path = args.config.as_ref().unwrap_or(&default_path);
     let mut config =
         Config::parse_sources(&read(path)?).with_context(|| format!("{}", path.display()))?;
+    let limits = Limits {
+        dispatch: args.max_dispatch.or(config.max_dispatch),
+        writes: args.max_writes.or(config.max_writes),
+        status_changes: args.max_status_changes.or(config.max_status_changes),
+    };
+    let bounds = if args.fix_bounds.is_empty() {
+        let directory = path.parent().context("config has no parent directory")?;
+        config
+            .fix_bounds_files
+            .iter()
+            .map(|file| directory.join(file))
+            .collect::<Vec<_>>()
+    } else {
+        args.fix_bounds.clone()
+    };
     if let Some(board) = config.forgejo_board() {
         // Stop unsupported operations before opening files or looking up any
         // credentials, including the GitHub apply/record/replay paths below.
         for (supplied, option, reason) in [
             (
-                !args.fix_bounds.is_empty(),
+                !bounds.is_empty(),
                 "--fix-bounds",
                 "PR follow-up has no reviewed Forgejo equivalent",
             ),
@@ -273,11 +289,6 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             writeln!(out, "{CONFIG_OK}")?;
             return Ok(());
         }
-        let limits = Limits {
-            dispatch: args.max_dispatch,
-            writes: args.max_writes,
-            status_changes: args.max_status_changes,
-        };
         if let Some(path) = &args.replay {
             // No client, broker or credential variable: only the fixture.
             let value = serde_json::from_str(&read(path)?)
@@ -331,7 +342,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         };
         return print_report(&report, out);
     }
-    config.fix_bounds = FixBoundsSet::read(&args.fix_bounds)?;
+    config.fix_bounds = FixBoundsSet::read(&bounds)?;
     if args.check_config {
         if config.has_repository_sources() {
             let client = pass_client()?.retry_within(
@@ -347,11 +358,6 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         writeln!(out, "{CONFIG_OK}")?;
         return Ok(());
     }
-    let limits = Limits {
-        dispatch: args.max_dispatch,
-        writes: args.max_writes,
-        status_changes: args.max_status_changes,
-    };
     let own = args.apply.then(|| apply_mode(limits)).transpose()?;
     writeln!(
         out,

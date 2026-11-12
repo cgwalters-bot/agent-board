@@ -3023,6 +3023,122 @@ fn pass_replay_previews_without_credentials() {
 }
 
 #[test]
+fn pass_checkout_defaults_match_explicit_flags() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let dir = std::env::temp_dir().join(format!("agent-board-defaults-{}", std::process::id()));
+    let github = dir.join(".github");
+    std::fs::create_dir_all(&github).unwrap();
+    let path = github.join("pass.json");
+    let bounds = github.join("fix.toml");
+    std::fs::write(
+        &bounds,
+        "repos = [\"cgwalters-forge/tracker\"]\n[outputs.push_to_pull_request_branch]\nbranches = [\"dispatch/**\"]\n",
+    )
+    .unwrap();
+    let base: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    let mut config = base.clone();
+    config["fixBounds"] = serde_json::json!(["fix.toml"]);
+    config["maxDispatch"] = 1.into();
+    config["maxWrites"] = 3.into();
+    config["maxStatusChanges"] = 5.into();
+    std::fs::write(&path, config.to_string()).unwrap();
+    let fixture = root.join("fixtures/pass/board-2026-10-23.json");
+    let preview = |cwd: &std::path::Path, extra: &[&str]| {
+        command()
+            .args(["pass", "--replay"])
+            .arg(&fixture)
+            .args(extra)
+            .current_dir(cwd)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env("PATH", "")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let defaults = preview(&dir, &[]);
+    let explicit = preview(
+        root,
+        &[
+            "--config",
+            "fixtures/pass/config.json",
+            "--fix-bounds",
+            bounds.to_str().unwrap(),
+            "--max-dispatch",
+            "1",
+            "--max-writes",
+            "3",
+            "--max-status-changes",
+            "5",
+        ],
+    );
+    assert_eq!(defaults, explicit);
+    // Explicit config paths use the config's directory, not the working directory.
+    assert_eq!(
+        preview(root, &["--config", path.to_str().unwrap()]),
+        defaults
+    );
+    // Each CLI cap, including zero, replaces the config value independently.
+    for flag in ["--max-dispatch", "--max-writes", "--max-status-changes"] {
+        let overridden = preview(&dir, &[flag, "0"]);
+        let mut expected = config.clone();
+        expected[match flag {
+            "--max-dispatch" => "maxDispatch",
+            "--max-writes" => "maxWrites",
+            _ => "maxStatusChanges",
+        }] = 0.into();
+        std::fs::write(&path, expected.to_string()).unwrap();
+        assert_eq!(overridden, preview(&dir, &[]));
+        if flag != "--max-status-changes" {
+            assert_ne!(overridden, defaults, "{flag}");
+        }
+        std::fs::write(&path, config.to_string()).unwrap();
+    }
+    // Every configured bounds file is checked even by --check-config. CLI
+    // bounds replace the whole list, rather than widening it by union.
+    config["fixBounds"] = serde_json::json!(["fix.toml", "missing.toml"]);
+    std::fs::write(&path, config.to_string()).unwrap();
+    let refused = command()
+        .args(["pass", "--check-config"])
+        .current_dir(&dir)
+        .assert()
+        .code(1);
+    assert!(String::from_utf8_lossy(&refused.get_output().stderr).contains("missing.toml"));
+    command()
+        .args(["pass", "--check-config", "--fix-bounds"])
+        .arg(&bounds)
+        .current_dir(&dir)
+        .assert()
+        .success();
+    // Config caps satisfy the existing local apply gate, not the token gate.
+    config["fixBounds"] = serde_json::json!([]);
+    std::fs::write(&path, config.to_string()).unwrap();
+    let refused = command()
+        .args(["pass", "--apply"])
+        .current_dir(&dir)
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env("PATH", "")
+        .assert()
+        .code(4);
+    assert!(String::from_utf8_lossy(&refused.get_output().stderr).contains("gh auth login"));
+    // Discovery never walks upward from an unrelated current directory.
+    let refused = command()
+        .args(["pass", "--check-config"])
+        .current_dir(&github)
+        .assert()
+        .code(1);
+    assert!(
+        String::from_utf8_lossy(&refused.get_output().stderr).contains("read .github/pass.json")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn pass_without_environment_tokens_or_gh_reports_authentication_required() {
     let result = command()
         .args(["pass", "--config", "fixtures/pass/config.json"])

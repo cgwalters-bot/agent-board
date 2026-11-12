@@ -10,6 +10,44 @@ layer. Existing [PR follow-up](poll.md),
 [job-plan](job-plans.md) and [epic-plan](epic-plans.md) protocols remain the
 authority for their operations. The differences below are intentional.
 
+## Local configuration defaults
+
+From the root of a trusted caller checkout, `agent-board pass` reads
+`.github/pass.json` in the current directory. It does not search parent directories
+or inspect workflows. `--config FILE` selects a different file. Preview remains the
+default; discovering a config never enables writes.
+
+The config may set `fixBounds`, `maxDispatch`, `maxWrites` and `maxStatusChanges`:
+
+```json
+{
+  "fixBounds": ["agentic-job/fix.toml", "agentic-job/midstream-fix.toml"],
+  "maxDispatch": 8,
+  "maxWrites": 20,
+  "maxStatusChanges": 50
+}
+```
+
+These are optional fields in the existing pass config, not a complete config.
+Bounds paths are relative to the **config file's directory**, not the current
+directory; absolute paths also work. Every listed file must be readable and valid,
+including with `--check-config`. Explicit `--fix-bounds` flags replace the entire
+configured list and retain their current-directory-relative behavior. Moving a
+config to a temporary directory therefore requires moving its bounds too or passing
+the explicit bounds flags.
+
+Each cap flag overrides its corresponding config field, including a value of zero.
+Omitted dispatch/write caps remain uncapped, and Status keeps its default of 50.
+Local `--apply` requires both dispatch and write caps from either source: these
+existing caps bound a local pass that is not serialized against the hosted one.
+Bounds still only avoid dispatches the policy step would refuse; they do not
+replace that boundary. Use only reviewed config and bounds from a trusted checkout,
+never a dispatched head. No new authorization or credentials are introduced.
+
+This first defaults slice does not change explicit state paths or detailed output.
+Default cache state, short summaries, `--caller`, SQLite/history and interval runs
+remain separate work.
+
 ## Local GitHub credentials
 
 `pass --config FILE` uses the first nonempty token from `GH_TOKEN`, then

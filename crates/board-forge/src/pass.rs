@@ -744,7 +744,15 @@ pub struct Config {
     /// Off unless its `forks` are set: stage 4b, approved fork pull requests
     /// promoted upstream ([`promote`]).
     pub promote: Option<promote::Promote>,
-    /// `--fix-bounds`, never the file's: the poll's [`PollPolicy::fix_bounds`].
+    /// Reviewed bounds files, relative to the configuration file. The CLI's
+    /// `--fix-bounds` list replaces these when supplied.
+    #[serde(default, rename = "fixBounds")]
+    pub fix_bounds_files: Vec<std::path::PathBuf>,
+    /// Default per-pass caps; explicit CLI flags take precedence.
+    pub max_dispatch: Option<usize>,
+    pub max_writes: Option<usize>,
+    pub max_status_changes: Option<usize>,
+    /// Loaded by the CLI from trusted bounds files: the poll's [`PollPolicy::fix_bounds`].
     #[serde(skip)]
     pub fix_bounds: poll::bounds::FixBoundsSet,
 }
