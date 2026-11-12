@@ -272,10 +272,18 @@ direction on the bot's own PRs. Do not enable it in a production caller yet.
 It recognizes plain ship and sign-off patterns in at most five comments of
 4,000 bytes each, including the review in agent-board#884, and logs the chosen
 intent. Questions, negation, quotations, conditions and mixed batches remain
-unclassified. Recognition alone grants no merge or rewrite authority.
+unclassified. The fast path accepts only complete command sentences and the
+explanation from the exact #884 review. Other prose, including prerequisites
+such as “Ship it. First resolve the failing tests.”, stays unclassified rather
+than being discarded as background. Recognition alone grants no merge or
+rewrite authority.
 
 Changes-requested reviews use the existing bounded fix-round path, with the
-same holds, fix bounds and receipts as `pr.operatorReviewFixes`. Plain ship or
+same holds, fix bounds and receipts as `pr.operatorReviewFixes`. The fresh PR
+read must still be open and bot-authored; the fix round is pinned to that head.
+Outstanding change direction survives intervening head updates, unlike approval
+to ship a particular head. A `hold` label retains the request for retry when
+the hold is released. Plain ship or
 DCO requests are retained for retry rather than consumed by tracking triage.
 They currently print `waiting; direct merge/sign-off execution is not
 implemented` and perform no writes. Other direction still goes to triage with

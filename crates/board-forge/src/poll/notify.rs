@@ -2067,6 +2067,9 @@ mod tests {
         for body in [
             "Before you merge it, fix the failing tests",
             "Avoid saying ship it in the release notes",
+            "Ship it. First resolve the failing tests.",
+            "You can add my DCO. After resolving the failures.",
+            "“Ship it”",
         ] {
             let repo = "other/app";
             let fake = intake_github(repo, true, "comment", OPERATOR);
@@ -2107,6 +2110,24 @@ mod tests {
         const SHIP: &str =
             "…whatever let's ship. It can always clean it up later. You can add my DCO";
         for (enabled, author, reviewer, state, body, mixed, fix) in [
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "STALE_HEAD",
+                "Please fix this typo.",
+                false,
+                true,
+            ),
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "MISSING_HEAD",
+                "Please fix this typo.",
+                false,
+                true,
+            ),
             (
                 true,
                 BOT,
@@ -2214,11 +2235,19 @@ mod tests {
                 },
             );
             let mut review = said(5862878257, reviewer, UPDATED, body);
+            if state != "MISSING_HEAD" {
+                review["commit_id"] = if state == "STALE_HEAD" {
+                    "old-head"
+                } else {
+                    "abcdef0123456789"
+                }
+                .into();
+            }
             let superseded = matches!(
                 state,
                 "SUPERSEDED" | "REREQUESTED" | "REREQUESTED_SAME_SECOND"
             );
-            review["state"] = if superseded {
+            review["state"] = if superseded || matches!(state, "STALE_HEAD" | "MISSING_HEAD") {
                 "CHANGES_REQUESTED"
             } else {
                 state
@@ -2244,6 +2273,7 @@ mod tests {
                         "Please fix only the remaining typo.",
                     );
                     request["state"] = "CHANGES_REQUESTED".into();
+                    request["commit_id"] = "abcdef0123456789".into();
                     reviews.push(request);
                     // Eligibility is chronological, not API array order.
                     reviews.reverse();
@@ -2260,6 +2290,7 @@ mod tests {
             fake.page(
                 &format!("repos/{repo}/pulls/2"),
                 json!({
+                "state": "open", "user": {"login": BOT},
                 "head": {"sha": "abcdef0123456789"}, "labels": []}),
             );
             let mut config = search_intake(&fake, repo);
@@ -2302,6 +2333,9 @@ mod tests {
                 assert_eq!(runs[0]["repo"], repo);
                 assert_eq!(runs[0]["item"], "2");
                 assert!(text(&runs[0], "/task").contains(body));
+                // Outstanding change direction survives a rebase; the actual
+                // round is pinned to the fresh head, not the reviewed commit.
+                assert!(text(&runs[0], "/task").contains("abcdef0123456789"));
                 assert!(
                     !fake
                         .writes
@@ -2331,6 +2365,7 @@ mod tests {
                     "Please fix the remaining typo.",
                 );
                 review["state"] = "CHANGES_REQUESTED".into();
+                review["commit_id"] = "abcdef0123456789".into();
                 fake.rest
                     .borrow_mut()
                     .get_mut(&format!(
@@ -2356,6 +2391,9 @@ mod tests {
     fn operator_review_fixes_keep_existing_holds_and_caps() {
         for case in [
             "label",
+            "hold",
+            "closed",
+            "foreign author",
             "rounds",
             "running",
             "dispatch cap",
@@ -2384,6 +2422,7 @@ mod tests {
             );
             let mut review = said(22, OPERATOR, UPDATED, "Please fix the typo.");
             review["state"] = "CHANGES_REQUESTED".into();
+            review["commit_id"] = "abcdef0123456789".into();
             fake.page(
                 &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
                 json!([review]),
@@ -2395,7 +2434,13 @@ mod tests {
             fake.page(
                 &format!("repos/{repo}/pulls/2"),
                 json!({"head": {"sha": "abcdef0123456789"},
-                "labels": if case == "label" { json!([{"name": LABEL}]) } else { json!([]) }}),
+                "state": if case == "closed" { "closed" } else { "open" },
+                "user": {"login": if case == "foreign author" { "someone" } else { BOT }},
+                "labels": match case {
+                    "label" => json!([{"name": LABEL}]),
+                    "hold" => json!([{"name": "HoLd"}]),
+                    _ => json!([]),
+                }}),
             );
             let mut config = search_intake(&fake, repo);
             config.policy.operator_review_fixes = true;
@@ -2434,6 +2479,24 @@ mod tests {
                 "{case}: {:?}",
                 fake.writes.borrow()
             );
+            if case == "hold" {
+                assert!(
+                    !outcome.state.intake_waiting.is_empty(),
+                    "{:?}",
+                    outcome.lines
+                );
+                fake.rest
+                    .borrow_mut()
+                    .get_mut(&format!("{API_ROOT}repos/{repo}/pulls/2"))
+                    .unwrap()["labels"] = json!([]);
+                let released = pass(&fake, &config, outcome.state, true);
+                assert_eq!(released.errors, 0, "{:?}", released.lines);
+                assert_eq!(dispatches(&fake).len(), 1, "{:?}", released.lines);
+                assert_eq!(dispatches(&fake)[0]["kind"], "fix");
+                let again = pass(&fake, &config, released.state, true);
+                assert_eq!(again.errors, 0, "{:?}", again.lines);
+                assert_eq!(dispatches(&fake).len(), 1, "{:?}", again.lines);
+            }
         }
     }
 

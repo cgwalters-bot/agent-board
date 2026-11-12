@@ -209,38 +209,13 @@ pub(super) fn direct_intent(said: &[Said]) -> DirectIntent {
             return DirectIntent::Classify;
         }
         let body = s.body.to_lowercase().replace('’', "'");
-        let words: Vec<_> = body
-            .split(|c: char| !c.is_alphanumeric() && c != '\'')
-            .collect();
-        if body.contains(['?', '`', '"', '>'])
-            || words.iter().any(|w| {
-                matches!(
-                    *w,
-                    "no" | "not"
-                        | "don't"
-                        | "never"
-                        | "if"
-                        | "unless"
-                        | "wait"
-                        | "cannot"
-                        | "can't"
-                        | "won't"
-                        | "could"
-                        | "should"
-                        | "said"
-                        | "says"
-                        | "example"
-                )
-            })
-        {
-            return DirectIntent::Classify;
-        }
         let mut this_ship = false;
         let mut this_signoff = false;
         for sentence in body.split(['.', '!', '\n']) {
             let normalized = sentence
-                .split(|c: char| !c.is_alphanumeric() && c != '\'')
-                .filter(|w| !w.is_empty())
+                .trim()
+                .trim_start_matches('…')
+                .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
             match normalized.as_str() {
@@ -248,16 +223,11 @@ pub(super) fn direct_intent(said: &[Said]) -> DirectIntent {
                     this_ship = true
                 }
                 "add my dco" | "you can add my dco" | "you can sign off" => this_signoff = true,
-                // An action mentioned anywhere other than a complete command
-                // sentence is ambiguous, not permission. Other sentences may
-                // explain the command (as in the operator's exact #884 review).
-                _ if normalized
-                    .split_whitespace()
-                    .any(|w| matches!(w, "ship" | "merge" | "dco" | "sign" | "fix")) =>
-                {
-                    return DirectIntent::Classify;
-                }
-                _ => {}
+                // The exact #884 review includes this explanation. Do not
+                // ignore arbitrary prose: "Ship it. First resolve the failing
+                // tests." is a prerequisite even without a merge/fix keyword.
+                "" | "it can always clean it up later" => {}
+                _ => return DirectIntent::Classify,
             }
         }
         if !this_ship && !this_signoff {
@@ -1779,9 +1749,26 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if hit["state"] != "open" {
             return Ok((true, "left: the pull request is closed".into()));
         }
-        let pull = self.get(&format!("repos/{repo}/pulls/{number}"))?;
+        let pull = self
+            .get_url(
+                &format!("{API_ROOT}repos/{repo}/pulls/{number}"),
+                Value::clone,
+                self.apply.is_some(),
+            )?
+            .0;
         let head = text(&pull, "/head/sha").to_owned();
         ensure!(!head.is_empty(), "the pull request has no head");
+        if review_fix(&self.config.policy, said)
+            && (pull["state"] != "open" || text(&pull, "/user/login") != self.config.bot)
+        {
+            return Ok((
+                true,
+                "left: the pull request is no longer open and bot-authored".into(),
+            ));
+        }
+        if holds(nodes(&pull, "/labels")) {
+            return Ok((false, format!("waiting: labelled {HOLD_LABEL}")));
+        }
         if nodes(&pull, "/labels").iter().any(|l| l["name"] == LABEL) {
             return Ok((true, format!("left to a person: labelled {LABEL}")));
         }
@@ -2494,6 +2481,15 @@ pub(super) mod tests {
             ("What do you think?", Classify),
             ("Before you merge it, fix the failing tests", Classify),
             ("Avoid saying ship it in the release notes", Classify),
+            ("Ship it. First resolve the failing tests.", Classify),
+            ("Ship it. After resolving the failures.", Classify),
+            ("Ship it. Pending legal approval.", Classify),
+            ("You can add my DCO. Once CI passes.", Classify),
+            ("Ship it. Except the deployment changes.", Classify),
+            ("Ship it. Only after my next review.", Classify),
+            ("“Ship it”", Classify),
+            ("‘Add my DCO’", Classify),
+            ("It can always clean it up later.", Classify),
         ] {
             assert_eq!(direct_intent(&[comment(body, false)]), expected, "{body}");
         }
