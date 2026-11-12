@@ -163,7 +163,115 @@ pub(super) struct Said {
 /// Quoted imperative prose cannot authorize a fix; use GitHub review state.
 /// Mixed batches stay in triage rather than guessing which intent wins.
 pub(super) fn review_fix(policy: &PollPolicy, said: &[Said]) -> bool {
-    policy.operator_review_fixes && !said.is_empty() && said.iter().all(|s| s.changes_requested)
+    (policy.operator_review_fixes || policy.operator_intents)
+        && !said.is_empty()
+        && said.iter().all(|s| s.changes_requested)
+}
+
+/// Direction recognition is not action authority. In particular, a ship request
+/// still needs a current approving review and the normal head/check/hold gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DirectIntent {
+    Changes,
+    Ship,
+    Signoff,
+    SignoffAndShip,
+    Classify,
+}
+
+impl DirectIntent {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Changes => "requested-changes",
+            Self::Ship => "ship",
+            Self::Signoff => "signoff",
+            Self::SignoffAndShip => "signoff-and-ship",
+            Self::Classify => "unclassified",
+        }
+    }
+}
+
+/// Only plain, unambiguous direction takes the fast path. Quoted commands,
+/// questions, conditions and mixed batches need a classifier, not substring
+/// matching that could turn "don't merge" into permission to merge.
+pub(super) fn direct_intent(said: &[Said]) -> DirectIntent {
+    const MAX_INTENT_BYTES: usize = 4_000;
+    if said.is_empty() || said.len() > QUOTED {
+        return DirectIntent::Classify;
+    }
+    if said.iter().all(|s| s.changes_requested) {
+        return DirectIntent::Changes;
+    }
+    let mut ship = false;
+    let mut signoff = false;
+    for s in said {
+        if s.changes_requested || s.body.len() > MAX_INTENT_BYTES {
+            return DirectIntent::Classify;
+        }
+        let body = s.body.to_lowercase().replace('’', "'");
+        let words: Vec<_> = body
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .collect();
+        if body.contains(['?', '`', '"', '>'])
+            || words.iter().any(|w| {
+                matches!(
+                    *w,
+                    "no" | "not"
+                        | "don't"
+                        | "never"
+                        | "if"
+                        | "unless"
+                        | "wait"
+                        | "cannot"
+                        | "can't"
+                        | "won't"
+                        | "could"
+                        | "should"
+                        | "said"
+                        | "says"
+                        | "example"
+                )
+            })
+        {
+            return DirectIntent::Classify;
+        }
+        let mut this_ship = false;
+        let mut this_signoff = false;
+        for sentence in body.split(['.', '!', '\n']) {
+            let normalized = sentence
+                .split(|c: char| !c.is_alphanumeric() && c != '\'')
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            match normalized.as_str() {
+                "let's ship" | "whatever let's ship" | "ship it" | "please merge" | "merge it" => {
+                    this_ship = true
+                }
+                "add my dco" | "you can add my dco" | "you can sign off" => this_signoff = true,
+                // An action mentioned anywhere other than a complete command
+                // sentence is ambiguous, not permission. Other sentences may
+                // explain the command (as in the operator's exact #884 review).
+                _ if normalized
+                    .split_whitespace()
+                    .any(|w| matches!(w, "ship" | "merge" | "dco" | "sign" | "fix")) =>
+                {
+                    return DirectIntent::Classify;
+                }
+                _ => {}
+            }
+        }
+        if !this_ship && !this_signoff {
+            return DirectIntent::Classify;
+        }
+        ship |= this_ship;
+        signoff |= this_signoff;
+    }
+    match (ship, signoff) {
+        (true, true) => DirectIntent::SignoffAndShip,
+        (true, false) => DirectIntent::Ship,
+        (false, true) => DirectIntent::Signoff,
+        _ => DirectIntent::Classify,
+    }
 }
 
 /// The comments that a round's marker of the bot's, or a winning triage
@@ -1484,7 +1592,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mine = pull && text(hit, "/user/login") == bot;
         // Read old tracking receipts even for a newly enabled fix route, so
         // enabling it cannot replay a review already handled by triage.
-        let routed = !said.is_empty() && ((directed && mine) || (!mine && !self.config.ours(repo)));
+        let routed = !said.is_empty()
+            && (((directed || self.config.policy.operator_intents) && mine)
+                || (!mine && !self.config.ours(repo)));
         if routed && addressed && !said.iter().any(|s| explicit(&s.body, &bot)) {
             return Ok(None);
         }
@@ -1543,8 +1653,26 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok(None);
         }
         // Tracking claims may have removed earlier prose from a mixed batch.
-        let review_fix = directed && review_fix(&self.config.policy, &said);
+        let review_fix = (directed || self.config.policy.operator_intents)
+            && review_fix(&self.config.policy, &said);
         let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
+        // Keep direct requests pending until their deterministic action path is
+        // implemented. Do not consume them with a read-only tracking triage or
+        // mark them handled: the next pass must still see the request.
+        let intent = (mine && self.config.policy.operator_intents).then(|| direct_intent(&said));
+        if let Some(
+            intent @ (DirectIntent::Ship | DirectIntent::Signoff | DirectIntent::SignoffAndShip),
+        ) = intent
+        {
+            return Ok(Some((
+                false,
+                format!(
+                    "operator comments {}: intent={} (plain patterns): waiting; direct merge/sign-off execution is not implemented",
+                    keys.join(", "),
+                    intent.name()
+                ),
+            )));
+        }
         // A repository the operator did not name in `operatorComments`, where
         // a notification found them: a fix round's brief quotes them in the
         // tracker as a triage's does, so neither copies a private one's.
@@ -1565,7 +1693,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let (done, what) = if let Some(why) = private {
             (true, why)
-        } else if mine && (!directed || review_fix) {
+        } else if mine && ((!directed && !self.config.policy.operator_intents) || review_fix) {
             let (done, what) = self.comment_fix(repo, number, hit, comments, &said)?;
             let what = if review_fix {
                 format!("intent=requested-changes (review state): {what}")
@@ -1575,18 +1703,26 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             (done, what)
         } else if let Some(tracked) = &tracked
             && !directed
+            && intent.is_none()
             && !said.iter().any(|s| explicit(&s.body, &bot))
         {
             self.comment_track(repo, number, pull, comments, &said, tracked)?
         } else {
             let tries = refused.get(&keys[0]).copied().unwrap_or(0);
-            self.comment_triage(
+            let (done, what) = self.comment_triage(
                 repo,
                 number,
                 (pull, None, tracked.as_ref()),
                 (comments, tries),
                 &said,
-            )?
+            )?;
+            let what = match intent {
+                Some(DirectIntent::Classify) => {
+                    format!("intent=unclassified (classifier not implemented): {what}")
+                }
+                _ => what,
+            };
+            (done, what)
         };
         Ok(Some((
             done,
@@ -2324,6 +2460,68 @@ pub(super) mod tests {
 
     pub(in crate::poll) fn now() -> OffsetDateTime {
         OffsetDateTime::parse("2026-10-16T12:00:00Z", &Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn direct_intent_plain_patterns_and_ambiguous_batches() {
+        use DirectIntent::*;
+        let comment = |body: &str, changes_requested| Said {
+            key: "pullrequestreview-5862878257".into(),
+            at: now(),
+            body: body.into(),
+            changes_requested,
+        };
+        for (body, expected) in [
+            (
+                "…whatever let's ship. It can always clean it up later. You can add my DCO",
+                SignoffAndShip,
+            ),
+            ("Let’s ship", Ship),
+            ("Please merge.", Ship),
+            ("Ship it!", Ship),
+            ("Merge it", Ship),
+            ("Add my DCO", Signoff),
+            ("You can sign off", Signoff),
+            ("Do not merge it", Classify),
+            ("Don't ship it", Classify),
+            ("No, please merge nothing", Classify),
+            ("If green, ship it", Classify),
+            ("Should we ship it?", Classify),
+            ("They said let's ship", Classify),
+            ("`ship it`", Classify),
+            ("> Add my DCO", Classify),
+            ("Please merger", Classify),
+            ("What do you think?", Classify),
+            ("Before you merge it, fix the failing tests", Classify),
+            ("Avoid saying ship it in the release notes", Classify),
+        ] {
+            assert_eq!(direct_intent(&[comment(body, false)]), expected, "{body}");
+        }
+        assert_eq!(direct_intent(&[comment("Please fix this", true)]), Changes);
+        let request = [comment("Please fix this", true)];
+        assert!(!review_fix(&PollPolicy::default(), &request));
+        assert!(review_fix(
+            &PollPolicy {
+                operator_intents: true,
+                ..PollPolicy::default()
+            },
+            &request
+        ));
+        assert_eq!(direct_intent(&[]), Classify);
+        assert_eq!(
+            direct_intent(&[comment(&"a".repeat(4_001), false)]),
+            Classify
+        );
+        assert_eq!(
+            direct_intent(&vec![comment("ship it", false); QUOTED + 1]),
+            Classify
+        );
+        for mixed in [
+            vec![comment("ship it", false), comment("wait", false)],
+            vec![comment("ship it", false), comment("fix this", true)],
+        ] {
+            assert_eq!(direct_intent(&mixed), Classify);
+        }
     }
 
     fn config() -> Config {

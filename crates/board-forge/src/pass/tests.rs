@@ -17397,6 +17397,13 @@ fn config_table() {
     assert!(intake.policy.notification_intake.is_some());
     assert!(intake.policy.notifications.is_none());
     assert!(!intake.policy.operator_review_fixes);
+    assert!(!intake.policy.operator_intents);
+    assert!(
+        config(json!({"notifications": true, "pr": {"operatorIntents": true}}))
+            .poll(None)
+            .policy
+            .operator_intents
+    );
     assert!(
         config(json!({"notifications": true, "pr": {"operatorReviewFixes": true}}))
             .poll(None)

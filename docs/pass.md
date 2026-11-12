@@ -263,6 +263,35 @@ Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set `notifications`
 to `true`, set `midstream: {"owner":"cgwalters-forge","topic":"bot-midstream"}`,
 and keep the existing pass token. No deployed config or token is changed here.
 
+### Direct intent routing (unfinished)
+
+The concrete threat is interpreting quoted shipping or DCO text as permission
+to merge or attribute the operator's sign-off. `pr.operatorIntents: true` is
+an off-by-default, **unfinished** routing mechanism for authenticated operator
+direction on the bot's own PRs. Do not enable it in a production caller yet.
+It recognizes plain ship and sign-off patterns in at most five comments of
+4,000 bytes each, including the review in agent-board#884, and logs the chosen
+intent. Questions, negation, quotations, conditions and mixed batches remain
+unclassified. Recognition alone grants no merge or rewrite authority.
+
+Changes-requested reviews use the existing bounded fix-round path, with the
+same holds, fix bounds and receipts as `pr.operatorReviewFixes`. Plain ship or
+DCO requests are retained for retry rather than consumed by tracking triage.
+They currently print `waiting; direct merge/sign-off execution is not
+implemented` and perform no writes. Other direction still goes to triage with
+an explicit `intent=unclassified (classifier not implemented)` diagnostic.
+
+This is routing groundwork, not completion of #884: a bounded small classifier,
+the direct gated merge/enqueue path (including explicit upstream authorization),
+and sign-off rewriting with `promote.signoff` and a head-pinned force push remain
+unimplemented. In particular, no operator approval is carried to a rewritten
+head here. Existing search/history/request bounds and preview behavior are
+unchanged. No new credentials, inference endpoint, workflow permissions or
+agent mutation path are introduced. The eventual caller is
+`cgwalters-forge/tracker`, `.github/pass.json`, key `pr.operatorIntents`, value
+`true`, alongside its existing `notifications: true`; activation must wait for
+the remaining action paths and their replay tests.
+
 ## Action-first pull requests (GitHub)
 
 The concrete failure this prevents is spending the PR stage's share on upstream
