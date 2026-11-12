@@ -1250,12 +1250,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let config = self.config;
         let snapshot = self.snapshot();
-        let pool = choose(
-            snapshot.as_ref(),
-            &config.pools,
-            &config.plan_pools,
-            self.now,
-        );
+        let pool = self.choose_pool(snapshot.as_ref(), &config.plan_pools);
         let Ok(pool) = pool else {
             return 0;
         };
@@ -2652,7 +2647,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             true => self.under_pace(snapshot.as_ref()),
             false => config.plan_pools.clone(),
         };
-        let pool = match choose(snapshot.as_ref(), &config.pools, &names, self.now) {
+        let pool = match self.choose_pool(snapshot.as_ref(), &names) {
             Ok(pool) => pool,
             Err(no) => {
                 let then = format!("no pool for planning: {no}");

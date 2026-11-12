@@ -401,6 +401,31 @@ exited 1 because private bot-ops usage/holds reads returned 404, so live pacing
 and dispatch admission remain unverified. The offline regression merges 17
 approved heads in one applying pass with those scheduling-reserve settings.
 
+## Largest-headroom pool routing
+
+The concrete failure this prevents is repeatedly loading one allowed account
+while another has substantially more pace allowance left. `poolHeadroom: true`
+opts GitHub passes into largest-headroom routing; it is off by default. Existing
+`planPools`, `triagePools` and `pr.fixPools` become allowlists, not preferences.
+Each start chooses the eligible pool with the largest allowed share minus used
+share, breaking ties by pool name. Held, unreadable and nonpositive-headroom
+pools are skipped, even when burst would otherwise admit them. Explicit plan,
+toil, continuation and rerun pools remain restricted to their named account;
+`mix` remains an explicit variant override for matching hard items.
+
+One start reserves **one percentage point** on its account for the rest of this
+pass, including preview starts and mixed variants on their parent account.
+This is an estimate, not measured run cost or extra allowance; the next pass
+reads actual usage again. It prevents a pass from repeatedly choosing by an
+unchanged snapshot. The log explains each start, for example
+`pool: openai (headroom 51%) over claude (12%)`; an explicit pool or mix override
+is labelled as such. No additional network reads, durable state or authorization
+are introduced. Existing request/time, WIP, dispatch and write bounds still
+apply. Forgejo refuses the setting.
+
+Caller activation: in `cgwalters-forge/tracker`, `.github/pass.json`, set
+`poolHeadroom` to `true`. No deployed caller configuration is changed here.
+
 ## Hard-item pool mixing
 
 The concrete risk is a model variant bypassing its shared account's pace.
