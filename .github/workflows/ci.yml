@@ -57,7 +57,7 @@ jobs:
     services:
       forgejo:
         # v17.0.1, the release docs/forges.md checks; bumped by hand.
-        image: codeberg.org/forgejo/forgejo@sha256:fcd19ff4ebc85fb098a67e8e1d0d5a84d07dd6e8a23edcfdfd5b71a6178953be
+        image: data.forgejo.org/forgejo/forgejo@sha256:fcd19ff4ebc85fb098a67e8e1d0d5a84d07dd6e8a23edcfdfd5b71a6178953be
         env:
           FORGEJO__security__INSTALL_LOCK: "true"
           FORGEJO__server__ROOT_URL: http://127.0.0.1:3000/
