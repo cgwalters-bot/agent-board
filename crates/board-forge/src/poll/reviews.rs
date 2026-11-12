@@ -9,7 +9,7 @@ const COMMAND_POLICY: &str = "workflow/review-command.toml";
 pub(super) const INTAKE_PULLS: usize = 10;
 pub(super) const INTAKE_ACTORS: usize = 10;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Intake {
     policies: BTreeMap<String, Option<Policy>>,
     permissions: BTreeMap<String, String>,

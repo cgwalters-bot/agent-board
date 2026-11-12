@@ -267,8 +267,22 @@ and keep the existing pass token. No deployed config or token is changed here.
 
 The concrete failure this prevents is spending the PR stage's share on upstream
 reads and draft continuations before discovering an approved own-space PR.
-`pr.actionFirst: true` opts into screening admitted own-space repositories
-before taking full PR decisions. It is off by default. Discovery makes one
+`pr.actionFirst: true` is off by default. In a pass it first searches approved,
+non-draft, unheld open PRs in the dispatch owner's and bot's space, then takes
+fresh decisions on hits in the trusted followed set. This turn comes before
+operator intake, authored discovery and activity reads, after resolving midstream
+policy. Scheduling reserves cannot defer it: it gets up to 256 requests within
+the global request, time and rate limits, retaining the write reserve and the
+32-request decision margin. One complete search page (at most 100 results) is
+required; incomplete, truncated or malformed results fail explicitly. Search
+does not grant author admission or override `noMerge`, holds, current-head
+approval, check, fix-round, pacing or dispatch/write caps. Conflicting and red
+approved PRs are included, not just mergeable ones. Decisions already taken in
+this turn are not repeated by the later walk. This may leave less capacity for
+intake and scheduling; it cannot guarantee all actions when a global bound,
+cap or policy gate holds them.
+
+The ordinary walk then screens admitted own-space repositories. Discovery makes one
 GraphQL listing per repository, at most 50 repositories and 100 open PRs each,
 inside the existing request/time budget. A missing, malformed or incomplete
 listing defers that repository, never authorizes an action from partial facts.
@@ -297,8 +311,8 @@ upstream reads N`. Action counts are taken steps, or would-take steps in preview
 upstream reads count the bot's PR summaries, not HTTP requests. Review-run WIP
 accounting retains its existing independent census and bounds.
 
-This orders the PR walk, not the earlier intake/search stages. A caller must
-also leave that walk a usable share. In `cgwalters-forge/tracker`, file
+The approved turn does not need the caller to relax scheduling reserves.
+For more capacity for the remaining ordinary walk, in `cgwalters-forge/tracker`, file
 `.github/pass.json`, set `pr.actionFirst` to `true`, `reserveScheduling` to
 `false` and remove the obsolete `scan` object. With `requestShare` enabled,
 stages share the derived budget without fixed stage shares.
@@ -320,6 +334,20 @@ before an eligible draft continuation in one applying pass, with upstream
 traffic and a saved upstream cursor. Repeated applying walks cover discovery
 deferral and persistent priority false positives. Forgejo
 refuses `pr.actionFirst`.
+
+For #903, the unchanged live tracker config still had `reserveScheduling: true`
+and `scan: {candidateRequests: 8, candidates: 30, reserve: true}`. Its preview
+on 2026-11-12 reserved 739 requests after PRs and 500 after epics, explaining
+why the old repository discovery could fall below its 32-request margin before
+reaching an approved head. With the early search, that preview found and admitted
+all **16** then-current matches (not the issue's earlier 17) before intake:
+eight already had auto-merge enabled; actions#220 requested operator review;
+actions#245/#246/#247 lacked a current-head approval; agentic-job#3420 and
+atomic-linux-sandbox#3 were red but outside fix-author admission; tracker#1502
+proposed a rebase and tracker#1543 a fix. No forge writes were made. The preview
+exited 1 because private bot-ops usage/holds reads returned 404, so live pacing
+and dispatch admission remain unverified. The offline regression merges 17
+approved heads in one applying pass with those scheduling-reserve settings.
 
 ## Hard-item pool mixing
 

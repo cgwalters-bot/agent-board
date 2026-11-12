@@ -5144,7 +5144,50 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         poll.policy.no_merge.extend(midstreams);
         let mut direction = None;
         let mut intake_starts = 0;
+        if config.pr.poll.action_first {
+            // Scheduling's reserve must not starve already approved work.
+            // This turn may spend at most 256 requests; global time, rate,
+            // write/dispatch and authorization bounds still apply.
+            bounds.kept.set(
+                bounds
+                    .left
+                    .get()
+                    .saturating_sub(WRITE_RESERVE + poll::action_first::APPROVED_REQUESTS),
+            );
+            let approved = poll::action_first::run_approved_capped(
+                &self.client,
+                &self.client,
+                &poll,
+                &self.follows,
+                self.apply.then(|| poll::Apply {
+                    dispatcher: &self.dispatcher,
+                    workflow: config.dispatch_workflow.clone(),
+                    pools: config.pr.fix_pools.clone(),
+                    git_ref: Some(git_ref.to_owned()),
+                }),
+                self.caps,
+                self.now,
+                state.share_cursor.as_deref(),
+            );
+            bounds.kept.set(later_share);
+            match approved {
+                Ok(prior) => {
+                    intake_starts = prior.0.dispatched;
+                    direction = Some(prior);
+                }
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("approved pull requests error: {error:#}"));
+                }
+            }
+        }
         if config.notifications {
+            bounds.kept.set(
+                bounds
+                    .left
+                    .get()
+                    .saturating_sub(WRITE_RESERVE + OPERATOR_REQUESTS),
+            );
             // Give intake its own bounded turn before authored_named's epic
             // reads and review ranking. Later stages cannot reserve it away.
             // The intake reserves half of what it is given for discovery
@@ -5152,6 +5195,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             // share here, what routing left of it, not the standalone poll's
             // budget, or one long history spends the share before discovery.
             let share = bounds.available().saturating_sub(WRITE_RESERVE);
+            let prior = direction.clone();
             let result = poll::run_direction_capped(
                 &self.client,
                 &self.client,
@@ -5167,22 +5211,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.caps,
                 self.now,
                 share,
+                direction.take(),
             );
             bounds.kept.set(later_share);
             match result {
                 Ok((mut outcome, requests)) => {
                     intake_starts = outcome.dispatched;
                     state = std::mem::take(&mut outcome.state);
-                    self.report.lines.append(&mut outcome.lines);
-                    self.report.failures += outcome.errors;
-                    outcome.errors = 0;
                     self.report.state = Some(state.clone());
                     direction = Some((outcome, requests));
                 }
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("operator comments error: {error:#}"));
-                    return intake_starts;
+                    return self.finish_early_follow(prior, state, intake_starts);
                 }
             }
         }
@@ -5201,16 +5243,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 // As the poll's below: the stages after it keep their share,
                 // and the pull requests wait for the next pass.
                 Err(error) if error.is::<ShareSpent>() => {
-                    self.report.state = Some(state);
+                    self.report.state = Some(state.clone());
                     self.line(format!(
                         "budget: pull requests stopped at its share; authored pull requests wait for the next pass: {error:#}"
                     ));
-                    return intake_starts;
+                    return self.finish_early_follow(direction, state, intake_starts);
                 }
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("follow error: authored pull requests: {error:#}"));
-                    return intake_starts;
+                    return self.finish_early_follow(direction, state, intake_starts);
                 }
             };
             let found = read.len();
@@ -5232,7 +5274,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("follow error: authored turn: {error:#}"));
-                    return intake_starts;
+                    return self.finish_early_follow(direction, state, intake_starts);
                 }
             };
             // As with `repositoriesPerPass`, only a pass that applies moves
@@ -5280,6 +5322,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         });
         let follow = &self.follows;
         let deferred_state = state.clone();
+        let prior = direction.clone();
         match poll::run_capped_after_direction(
             &self.client,
             &self.client,
@@ -5296,52 +5339,80 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 // pass held there is kept.
                 outcome.undecided.extend(waiting);
                 outcome.state.authored_cursor = cursor;
-                if !self.apply {
-                    for step in &outcome.steps {
-                        if step.ran
-                            && matches!(
-                                step.action,
-                                "fix"
-                                    | "rebase"
-                                    | "continue"
-                                    | "answer"
-                                    | "review"
-                                    | "review rerun"
-                                    | "run rerun"
-                                    | "check rerun"
-                            )
-                        {
-                            *self
-                                .report
-                                .planned_starts
-                                .entry(step.action.to_owned())
-                                .or_default() += 1;
-                        }
-                    }
-                }
-                self.report.lines.extend(outcome.lines);
-                self.report.failures += outcome.errors;
-                self.report.state = Some(outcome.state);
-                self.reviewing = outcome.reviewing;
-                self.progressed += outcome.merged;
-                self.followed = Some((outcome.waits, outcome.undecided));
-                self.stepped = outcome.steps;
-                outcome.dispatched
+                self.finish_follow(outcome)
             }
             Err(error) if error.is::<ShareSpent>() => {
-                self.report.state = Some(deferred_state);
+                self.report.state = Some(deferred_state.clone());
                 self.line(
                     "budget: pull requests stopped at its share; discovery waits for the next pass"
                         .into(),
                 );
-                intake_starts
+                self.finish_early_follow(prior, deferred_state, intake_starts)
             }
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("follow error: {error:#}"));
-                intake_starts
+                self.finish_early_follow(prior, deferred_state, intake_starts)
             }
         }
+    }
+
+    /// Retain approved decisions even if a later optional discovery read stops.
+    fn finish_early_follow(
+        &mut self,
+        prior: Option<(poll::Outcome, usize)>,
+        state: State,
+        starts: usize,
+    ) -> usize {
+        if let Some((mut outcome, _)) = prior {
+            outcome
+                .undecided
+                .extend(self.follows.iter().map(|r| r.to_ascii_lowercase()));
+            outcome.state = state;
+            if self.apply
+                && let Some(cursor) = &outcome.approved_cut
+            {
+                outcome.state.share_cursor = Some(cursor.clone());
+            }
+            outcome.hold_deferred_reviews();
+            self.finish_follow(outcome)
+        } else {
+            starts
+        }
+    }
+
+    fn finish_follow(&mut self, outcome: poll::Outcome) -> usize {
+        if !self.apply {
+            for step in &outcome.steps {
+                if step.ran
+                    && matches!(
+                        step.action,
+                        "fix"
+                            | "rebase"
+                            | "continue"
+                            | "answer"
+                            | "review"
+                            | "review rerun"
+                            | "run rerun"
+                            | "check rerun"
+                    )
+                {
+                    *self
+                        .report
+                        .planned_starts
+                        .entry(step.action.to_owned())
+                        .or_default() += 1;
+                }
+            }
+        }
+        self.report.lines.extend(outcome.lines);
+        self.report.failures += outcome.errors;
+        self.report.state = Some(outcome.state);
+        self.reviewing = outcome.reviewing;
+        self.progressed += outcome.merged;
+        self.followed = Some((outcome.waits, outcome.undecided));
+        self.stepped = outcome.steps;
+        outcome.dispatched
     }
 
     fn schedule(&mut self, earlier: usize, git_ref: &str) -> Result<()> {

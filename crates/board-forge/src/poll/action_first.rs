@@ -3,6 +3,134 @@ use super::*;
 
 const UPSTREAM_REPOSITORIES: usize = 2;
 
+/// One search page and fresh decisions, never an unbounded org sweep.
+pub(crate) const APPROVED_REQUESTS: usize = 256;
+
+pub(crate) fn approved_path(config: &Config) -> String {
+    let owner = config.dispatch_repo.split('/').next().unwrap_or_default();
+    let query = format!(
+        "user:{owner} user:{} is:pr is:open review:approved draft:false -label:needs-human archived:false",
+        config.bot
+    );
+    let query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+    format!("search/issues?q={query}&sort=updated&order=asc&per_page=100")
+}
+
+impl<R: Rest, G: Transport> Pass<'_, R, G> {
+    pub(super) fn approved(
+        &mut self,
+        follow: &BTreeSet<&String>,
+        cursor: Option<&str>,
+        outcome: &mut Outcome,
+    ) -> Result<()> {
+        outcome.approved_read = true;
+        let response = self.get(&approved_path(self.config))?;
+        ensure!(
+            response["incomplete_results"] == false
+                && response["total_count"].as_u64().is_some_and(|n| n <= 100),
+            "approved PR search incomplete or exceeds its 100-result bound"
+        );
+        let items = response["items"]
+            .as_array()
+            .context("approved PR search has no items")?;
+        ensure!(
+            response["total_count"].as_u64() == Some(items.len() as u64),
+            "approved PR search is truncated"
+        );
+        let mut listed: BTreeMap<&String, Vec<Value>> = BTreeMap::new();
+        // Validate the whole page before taking any decision. Search is only
+        // discovery: the trusted follow set and fresh pull read authorize work.
+        for item in items {
+            let repo = item["repository_url"]
+                .as_str()
+                .and_then(|s| s.strip_prefix(&format!("{API_ROOT}repos/")))
+                .context("approved PR search has an invalid repository URL")?;
+            validate_repository(repo)?;
+            ensure!(
+                item["pull_request"].is_object() && item["number"].as_u64().is_some_and(|n| n > 0),
+                "approved PR search has an invalid PR identity"
+            );
+            if let Some(&repo) = follow.iter().find(|r| r.eq_ignore_ascii_case(repo))
+                && self.config.ours(repo)
+                && self.envelope.as_ref().is_none_or(|e| e.admits(repo))
+            {
+                listed.entry(repo).or_default().push(item.clone());
+            }
+        }
+        outcome.lines.push(format!(
+            "pull requests: approved search found {}, admitted {}",
+            items.len(),
+            listed.values().map(Vec::len).sum::<usize>()
+        ));
+        for (repo, turn) in walk(follow, cursor) {
+            if let Some(open) = listed.get(repo) {
+                self.follow_open(
+                    repo,
+                    open.iter()
+                        .filter(|p| p["number"].as_u64().is_some_and(|n| turn.takes(n)))
+                        .cloned()
+                        .collect(),
+                    outcome,
+                )?;
+            }
+        }
+        if let Some(at) = &self.cut {
+            outcome.approved_cut = Some(at.clone());
+            outcome.lines.push(format!(
+                "pull requests: approved decisions stopped at {at}; request share spent"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A caller gives approved own-space work a bounded turn before intake,
+/// authored discovery and activity can consume the ordinary stage share.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_approved_capped<R: Rest, G: Transport>(
+    rest: &R,
+    graphql: &G,
+    config: &Config,
+    follow: &[String],
+    apply: Option<Apply<'_, R>>,
+    caps: &caps::Caps,
+    now: OffsetDateTime,
+    cursor: Option<&str>,
+) -> Result<(Outcome, usize)> {
+    let mut pass = Pass {
+        apply,
+        caps: Some(caps),
+        followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
+        remaining: APPROVED_REQUESTS,
+        ..Pass::new(rest, graphql, config, now)
+    };
+    if pass.apply.is_some() {
+        let user = pass.get("user")?;
+        ensure!(
+            text(&user, "/login") == config.bot,
+            "--apply token is not the configured bot"
+        );
+    }
+    let mut outcome = Outcome::default();
+    if let Err(error) = pass.approved(&follow.iter().collect(), cursor, &mut outcome) {
+        outcome.errors += 1;
+        outcome
+            .lines
+            .push(format!("pull requests: approved search error: {error:#}"));
+    }
+    rest.under_way(false);
+    outcome.dispatched = pass.dispatched;
+    outcome.merged = pass.merged;
+    outcome.preview_merges = pass.preview_merges;
+    outcome.updated = pass.updated;
+    outcome.deferred = pass.deferred;
+    outcome.review_intake = pass.review_intake;
+    outcome.reviewing = pass.reviewing;
+    outcome.review_runs = pass.review_runs;
+    outcome.review_unread = pass.review_unread;
+    Ok((outcome, APPROVED_REQUESTS - pass.remaining))
+}
+
 pub(crate) const SCREEN: &str = r#"query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     pullRequests(first: 100, states: OPEN, orderBy: {field: CREATED_AT, direction: ASC}) {
