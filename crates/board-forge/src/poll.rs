@@ -1696,7 +1696,7 @@ impl State {
             .context("invalid pass response cache")?
             .unwrap_or_default();
         ensure!(
-            pass_responses.len() <= 2 * crate::pass::PASS_REQUEST_LIMIT,
+            pass_responses.len() <= crate::pass::STATE_RESPONSES,
             "too many cached pass responses"
         );
         for (url, entry) in &pass_responses {

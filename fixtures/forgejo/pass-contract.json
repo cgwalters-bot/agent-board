@@ -194,6 +194,7 @@
     "scan.candidateRequests": {"verdict": "refused", "reason": "GitHub scheduling only: bounds stage 4's per-candidate reads under the GitHub request accounting"},
     "scan.candidates": {"verdict": "refused", "reason": "GitHub scheduling only: stops stage 4's candidate walk, which is only built for GitHub"},
     "scan.reserve": {"verdict": "refused", "reason": "GitHub stage shares only: sizes what the GitHub stages keep for scheduling from the scan bounds"},
+    "requestShare": {"verdict": "refused", "reason": "GitHub rate limits only: sizes the pass's request budget from the token's rate-limit headroom, which Forgejo does not report"},
     "triage": {"verdict": "native", "forgejo": "triage plans dispatched as below"},
     "planPools": {"verdict": "same"},
     "triagePools": {"verdict": "same"},

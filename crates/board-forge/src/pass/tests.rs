@@ -1473,7 +1473,7 @@ fn replay_idle_board_starts_work() {
     // classes and the causes: each started candidate's reads are its own,
     // the epics' theirs, and the rest the stage's.
     let spent = &report.spent;
-    assert_eq!(spent.by_stage, [0, 0, 0, 0, 16, 37, 3, 0]);
+    assert_eq!(spent.by_stage, [0, 0, 0, 0, 16, 37, 3, 0, 0]);
     assert_eq!(spent.by_stage.iter().sum::<usize>(), spent.requests);
     assert_eq!(spent.by_class.values().sum::<usize>(), spent.requests);
     assert_eq!(spent.by_cause.values().sum::<usize>(), spent.requests);
@@ -1604,37 +1604,37 @@ fn spent_names_each_stage_that_spent() {
     type Counts = BTreeMap<String, usize>;
     let cases: &[(ByStage, bool, Counts, Counts, &str)] = &[
         (
-            [0; 8],
+            [0; Stage::ALL.len()],
             false,
             counts(&[]),
             counts(&[]),
             "requests 0, points 7",
         ),
         (
-            [1, 0, 0, 40, 0, 2, 0, 0],
+            [1, 0, 0, 40, 0, 2, 0, 0, 0],
             true,
             counts(&[]),
             counts(&[]),
             "requests 43 (setup 1, pull requests 40, schedule 2), points ~7",
         ),
         (
-            [0, 1, 2, 3, 4, 5, 6, 7],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8],
             false,
             counts(&[]),
             counts(&[]),
-            "requests 28 (usage 1, maintain 2, pull requests 3, epics 4, schedule 5, status 6, holds 7), points 7",
+            "requests 36 (usage 1, maintain 2, pull requests 3, epics 4, schedule 5, status 6, holds 7, cost 8), points 7",
         ),
         // Most requests first, then by name; the stage's own reads are a
         // cause like a candidate's.
         (
-            [0, 0, 0, 0, 0, 6, 0, 0],
+            [0, 0, 0, 0, 0, 6, 0, 0, 0],
             false,
             counts(&[("issues comments", 2), ("graphql repository.issue", 4)]),
             counts(&[("o/r#2", 2), ("schedule", 2), ("o/r#1", 2)]),
             r#"requests 6 (schedule 6), endpoints {"graphql repository.issue":4,"issues comments":2}, causes {"o/r#1":2,"o/r#2":2,"schedule":2}, points 7"#,
         ),
         (
-            [0, 0, 0, 0, 0, 24, 0, 0],
+            [0, 0, 0, 0, 0, 24, 0, 0, 0],
             false,
             counts(&[("issues", 24)]),
             many.clone(),
@@ -2198,6 +2198,41 @@ fn revalidated_reads_are_free_up_to_their_limit() {
             r#"requests 2 (pull requests 2), 304s {REVALIDATED_LIMIT}, endpoints {{"x":2}}, causes {{"pull requests":2}}, points 0"#
         )
     );
+}
+
+/// A pass sized past the fixed limit keeps for the next pass's conditional
+/// reads no more responses than the state reads back, its first ones, and
+/// still refreshes one it keeps; the state refuses one more.
+#[test]
+fn cached_responses_are_kept_within_what_the_state_reads() {
+    let bounds = Bounds::new(
+        STATE_RESPONSES + 10,
+        Instant::now() + Duration::from_secs(60),
+    );
+    bounds.cache_enabled.set(true);
+    bounds.enter(Stage::PullRequests);
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    let url = |n: usize| format!("{API_ROOT}repos/o/r/issues/{n}");
+    for n in 0..STATE_RESPONSES + 2 {
+        client.get(&url(n), None).unwrap();
+    }
+    client.get(&url(0), None).unwrap();
+    let kept = bounds.next_responses.borrow();
+    assert_eq!(kept.len(), STATE_RESPONSES);
+    assert!(kept.contains_key(&url(0)) && !kept.contains_key(&url(STATE_RESPONSES)));
+    let mut state = State {
+        interval_seconds: poll::MIN_INTERVAL_SECONDS,
+        ..State::default()
+    }
+    .to_json();
+    state["pass_responses"] = json!(*kept);
+    assert!(State::from_json(&state).is_ok());
+    state["pass_responses"][url(STATE_RESPONSES)] = kept[&url(0)].clone();
+    let error = format!("{:#}", State::from_json(&state).unwrap_err());
+    assert!(error.contains("too many cached pass responses"), "{error}");
 }
 
 /// A read counts to the cause under way, a nested one to its own, and the
@@ -15973,6 +16008,9 @@ fn config_table() {
             json!({"scan": {"candidateRequests": 20, "reserve": true}}),
             "scan reserve needs both scan candidates and scan candidateRequests",
         ),
+        (json!({"requestShare": 0}), "requestShare is not 1 to 90"),
+        (json!({"requestShare": 91}), "requestShare is not 1 to 90"),
+        (json!({"requestShare": "50"}), "expected usize"),
         (json!({"triageReplans": 11}), "triageReplans is not 0 to 10"),
         (
             json!({"triageReplans": 1}),
@@ -16981,10 +17019,9 @@ fn budget_refuses_past_its_limit() {
     let url = "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?status=queued&per_page=100";
     assert!(budget.get(url, None).is_ok());
     let error = budget.get(url, None).err().unwrap();
-    assert_eq!(
-        error.to_string(),
-        "the pass's request budget (650) is spent"
-    );
+    // The error names the pass's own limit, derived or fixed.
+    let spent = format!("the pass's request budget ({}) is spent", WRITE_RESERVE + 1);
+    assert_eq!(error.to_string(), spent);
     // Writes spend the reserve reads leave them; the replay then refuses
     // each, but only after the budget let it through.
     for _ in 0..WRITE_RESERVE {
@@ -16992,10 +17029,213 @@ fn budget_refuses_past_its_limit() {
         assert!(error.to_string().starts_with("a replay is read-only"));
     }
     let error = budget.send("PATCH", url, &json!({})).err().unwrap();
-    assert_eq!(
-        error.to_string(),
-        "the pass's request budget (650) is spent"
+    assert_eq!(error.to_string(), spent);
+}
+
+/// With `requestShare`, the pass's request ceiling is sized from the smaller
+/// rate-limit pool's remaining, read free before any request is spent, and
+/// says so; where the read fails, the fixed limit holds and it says that.
+#[test]
+fn request_share_sizes_the_budget_from_the_headroom() {
+    let rate_limit = |core: u64, graphql: u64| {
+        json!({"request": {"get": format!("{API_ROOT}rate_limit")},
+            "answer": {"status": 200, "link": null, "body": {"resources": {
+                "core": {"limit": 5000, "remaining": core, "reset": 1700000000},
+                "graphql": {"limit": 5000, "remaining": graphql, "reset": 1700003600}}}}})
+    };
+    let reset = |pool: &str| {
+        if pool == "core" {
+            "2023-11-14T22:13:20Z"
+        } else {
+            "2023-11-14T23:13:20Z"
+        }
+    };
+    for (name, recorded, share, limit, pool) in [
+        (
+            "the core pool is the smaller",
+            Some((1000, 4000)),
+            25,
+            250,
+            "core",
+        ),
+        (
+            "the graphql pool is the smaller",
+            Some((4000, 1000)),
+            25,
+            250,
+            "graphql",
+        ),
+        ("the pools are even", Some((1000, 1000)), 90, 900, "core"),
+        ("the token has nothing left", Some((0, 4000)), 25, 0, "core"),
+        (
+            "the rate limit cannot be read",
+            None,
+            25,
+            PASS_REQUEST_LIMIT,
+            "",
+        ),
+    ] {
+        let mut replay = replay();
+        if let Some((core, graphql)) = recorded {
+            replay.requests.push(rate_limit(core, graphql));
+        }
+        let config = config(json!({"requestShare": share}));
+        let report = preview_within(&config, &replay, PASS_REQUEST_LIMIT);
+        let said = match recorded {
+            Some((core, graphql)) => format!(
+                "budget: requestShare keeps the pass to {limit} requests, {share}% of the {} the token has left until {} ({pool}; core {core}, graphql {graphql}); GraphQL share is an estimate, not a retained-headroom guarantee",
+                core.min(graphql),
+                reset(pool)
+            ),
+            None => format!(
+                "warning: requestShare: the budget was not sized from the token's rate limit, so the fixed {PASS_REQUEST_LIMIT} holds: the replay did not record {{\"get\":\"{API_ROOT}rate_limit\"}}"
+            ),
+        };
+        assert_eq!(
+            report.lines.first(),
+            Some(&said),
+            "{name}: {:#?}",
+            report.lines
+        );
+        assert!(
+            report.spent.requests <= limit,
+            "{name}: {} within {limit}",
+            report.spent
+        );
+        // A derived limit is the pass's: its shares and its refusals name it.
+        let names_limit = report
+            .lines
+            .iter()
+            .any(|line| line.contains(&format!("the pass's request budget ({limit}) is spent")));
+        assert_eq!(names_limit, limit == 0, "{name}: {:#?}", report.lines);
+        if limit > 0 {
+            assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        }
+    }
+    // A refused read holds the fixed limit as an unrecorded one does.
+    let mut replay = replay();
+    let mut refused = rate_limit(1000, 1000);
+    refused["answer"]["status"] = json!(500);
+    replay.requests.push(refused);
+    let report = preview_within(
+        &config(json!({"requestShare": 25})),
+        &replay,
+        PASS_REQUEST_LIMIT,
     );
+    let first = report.lines.first().unwrap();
+    assert!(
+        first.starts_with("warning: requestShare: ")
+            && first.ends_with("holds: GET rate_limit: GitHub HTTP status 500"),
+        "{first}"
+    );
+    assert!(report.spent.requests <= PASS_REQUEST_LIMIT);
+    // The shares are percentages of the sized limit, so they follow it; a
+    // limit is sized only before a request is spent.
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+    bounds.size(900).unwrap();
+    assert_eq!((bounds.limit.get(), bounds.left.get()), (900, 900));
+    assert_eq!(bounds.share(AFTER_EPICS), 900 * AFTER_EPICS / 100);
+    let (pulls, epics, sized) = kept_shares(&config(json!({})), &bounds);
+    assert_eq!(
+        (pulls, epics, sized),
+        (
+            900 * AFTER_PULL_REQUESTS / 100,
+            900 * AFTER_EPICS / 100,
+            false
+        )
+    );
+    bounds.left.set(899);
+    let error = bounds.size(1000).unwrap_err().to_string();
+    assert_eq!(
+        error,
+        "the pass's budget is sized after a request was spent"
+    );
+    assert_eq!(bounds.limit.get(), 900);
+    // The read is refused as malformed, not misread, where a pool is missing.
+    for (body, missing) in [
+        (
+            json!({"resources": {"core": {"remaining": 1}}}),
+            "graphql.remaining",
+        ),
+        (
+            json!({"resources": {"graphql": {"remaining": 1}}}),
+            "core.remaining",
+        ),
+        (
+            json!({"resources": {"core": {"remaining": 1}, "graphql": {"remaining": 2}}}),
+            "core.reset",
+        ),
+        (
+            json!({"resources": {"core": {"remaining": 2}, "graphql": {"remaining": 1}}}),
+            "graphql.reset",
+        ),
+    ] {
+        let error = Headroom::parse(&body).unwrap_err().to_string();
+        assert_eq!(error, format!("rate_limit has no resources.{missing}"));
+    }
+}
+
+#[test]
+fn request_share_covers_the_due_cost_stage_even_with_no_read_capacity() {
+    for remaining in [0, 5] {
+        let mut replay = replay();
+        replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}rate_limit")},
+            "answer": {"status": 200, "body": {"resources": {
+                "core": {"remaining": remaining, "reset": 1700000000},
+                "graphql": {"remaining": 1000, "reset": 1700000000}}}}}));
+        let config = config(json!({"requestShare": 90, "cost": {"hourUtc": 0}}));
+        let report = preview_within(&config, &replay, PASS_REQUEST_LIMIT);
+        let limit = remaining * 90 / 100;
+        assert!(report.spent.requests <= limit, "{}", report.spent);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.starts_with("cost error:")
+                    && line.contains(&format!("the pass's request budget ({limit}) is spent"))),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+/// Cost is post-execution: one multi-point query can overshoot the estimate,
+/// but neither GraphQL wrapper may admit another after that. REST has its own
+/// remaining request capacity and is not disabled by GraphQL's point stop.
+#[test]
+fn request_share_stops_graphql_after_a_multi_point_query() {
+    for asynchronous in [false, true] {
+        let mut replay = replay();
+        let query = "query { rateLimit { cost } }";
+        replay
+            .requests
+            .push(json!({"request": graphql_key(query, &json!({})),
+            "answer": {"data": {"rateLimit": {"cost": 7}}}}));
+        let bounds = Bounds::new(100, Instant::now() + Duration::from_secs(60));
+        bounds.graphql_limit.set(Some(5));
+        let client = Budget {
+            inner: &replay,
+            bounds: &bounds,
+        };
+        let call = || {
+            if asynchronous {
+                block(crate::github::GraphQl::graphql(&client, query, json!({})))
+            } else {
+                Transport::graphql(&client, query, json!({}))
+            }
+        };
+        assert_eq!(call().unwrap()["rateLimit"]["cost"], 7);
+        assert_eq!(bounds.spent().points, 7);
+        assert!(!bounds.spent().estimated);
+        assert_eq!(
+            call().unwrap_err().to_string(),
+            "the pass's estimated GraphQL point budget (5) is spent"
+        );
+        assert_eq!(bounds.spent().requests, 1);
+        client.spend(false, "issues").unwrap();
+    }
 }
 
 /// Past its time bound a pass admits writes, and the reads of a start under

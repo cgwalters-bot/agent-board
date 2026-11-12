@@ -38,8 +38,13 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Every forge request of one pass, the pull request poll's reads included:
-/// a bound on an unbounded board scan or a runaway dispatch loop.
+/// a bound on an unbounded board scan or a runaway dispatch loop. With
+/// `requestShare` estimates the ceiling from the token's remaining allowance
+/// instead ([`Headroom`]), and this holds only where that cannot be read.
 pub const PASS_REQUEST_LIMIT: usize = 650;
+/// The most `requestShare` may target, leaving nominal headroom for other
+/// users, the poll and supervisor among them (not a point-cost guarantee).
+const REQUEST_SHARE_LIMIT: usize = 90;
 /// How long one pass may take before it defers what is left.
 pub const PASS_SECONDS_LIMIT: u64 = 15 * 60;
 /// How much longer than [`PASS_SECONDS_LIMIT`] what was under way may take
@@ -122,8 +127,14 @@ const LATER_READS: usize = BOARD_PAGES + STATUS_READS + HOLDS_READS;
 
 /// 304s a pass does not charge to its budget: GitHub does not count them
 /// against the rate limit, so a revalidated read that answers from the cache
-/// is free, but only this many, so that they still bound a runaway loop.
+/// is free, but only this many, so that they still bound a runaway loop. A
+/// count, not a share: a pass sized larger by `requestShare` refunds no more.
 const REVALIDATED_LIMIT: usize = PASS_REQUEST_LIMIT;
+/// The most responses a pass keeps for the next pass's conditional reads
+/// ([`poll::State::pass_responses`]), which the state refuses past: what
+/// the fixed limit and its refunds could read. A pass sized larger by
+/// `requestShare` keeps its first reads, so the state it writes is read.
+pub const STATE_RESPONSES: usize = 2 * PASS_REQUEST_LIMIT;
 /// The most causes the summary names, by their requests ([`Spent::by_cause`]):
 /// a candidate or an epic each, the rest counted together.
 const CAUSE_LINES: usize = 10;
@@ -739,6 +750,14 @@ pub struct Config {
     pub top_down: bool,
     /// Off unless set: bounds on stage 4's scan of its candidates ([`Scan`]).
     pub scan: Option<Scan>,
+    /// Off unless set: the percentage, 1 to [`REQUEST_SHARE_LIMIT`], of the
+    /// token's remaining allowance used to estimate this pass's request
+    /// budget, in place of [`PASS_REQUEST_LIMIT`] ([`Headroom`],
+    /// agent-board#898). The failure it stops is a pass starved by a fixed
+    /// count that matches nothing real, while the token's hourly allowance
+    /// sits unspent. This is not a retained-headroom guarantee: GraphQL
+    /// costs are known only after execution, and missing costs are estimated.
+    pub request_share: Option<usize>,
     #[serde(default)]
     pub pr: Pr,
     /// Off unless its `forks` are set: stage 4b, approved fork pull requests
@@ -1438,6 +1457,16 @@ impl Config {
             ensure!(
                 !scan.reserve || (scan.candidates.is_some() && scan.candidate_requests.is_some()),
                 "scan reserve needs both scan candidates and scan candidateRequests"
+            );
+        }
+        if let Some(share) = self.request_share {
+            ensure!(
+                self.forgejo_board().is_none(),
+                "requestShare supports only GitHub"
+            );
+            ensure!(
+                (1..=REQUEST_SHARE_LIMIT).contains(&share),
+                "requestShare is not 1 to {REQUEST_SHARE_LIMIT}"
             );
         }
         if self.work() && self.forgejo_board().is_none() {
@@ -2658,10 +2687,11 @@ enum Stage {
     Schedule,
     Status,
     Holds,
+    Cost,
 }
 
 impl Stage {
-    const ALL: [Stage; 8] = [
+    const ALL: [Stage; 9] = [
         Stage::Setup,
         Stage::Usage,
         Stage::Maintain,
@@ -2670,6 +2700,7 @@ impl Stage {
         Stage::Schedule,
         Stage::Status,
         Stage::Holds,
+        Stage::Cost,
     ];
 
     fn name(self) -> &'static str {
@@ -2682,6 +2713,7 @@ impl Stage {
             Stage::Schedule => "schedule",
             Stage::Status => "status",
             Stage::Holds => "holds",
+            Stage::Cost => "cost",
         }
     }
 }
@@ -2710,7 +2742,9 @@ struct Bounds {
     start_kind: RefCell<String>,
     /// The runs started whose dispatch named them, for the pass view.
     started: RefCell<Vec<view::Run>>,
-    limit: usize,
+    /// The pass's requests: [`PASS_REQUEST_LIMIT`], or its share of the
+    /// token's headroom ([`Self::size`]).
+    limit: Cell<usize>,
     left: Cell<usize>,
     /// No request is admitted after this, but those [`FINISH_SECONDS`] lets
     /// finish.
@@ -2732,6 +2766,9 @@ struct Bounds {
     /// GraphQL points spent, and whether any of them are estimates.
     points: Cell<u64>,
     estimated: Cell<bool>,
+    /// With requestShare, stop GraphQL once its observed/estimated points
+    /// reach this share. The last query can overshoot: cost is post-execution.
+    graphql_limit: Cell<Option<u64>>,
     /// The breaker: why a refusal under a rate limit outlasted its wait,
     /// after which nothing more is sent, and how many requests were not.
     rate_limited: RefCell<Option<String>>,
@@ -2772,7 +2809,7 @@ impl Bounds {
             effects: RefCell::default(),
             start_kind: RefCell::default(),
             started: RefCell::default(),
-            limit,
+            limit: Cell::new(limit),
             left: Cell::new(limit),
             admit_by,
             finishing: Cell::new(false),
@@ -2785,6 +2822,7 @@ impl Bounds {
             by_stage: Cell::new([0; Stage::ALL.len()]),
             points: Cell::new(0),
             estimated: Cell::new(false),
+            graphql_limit: Cell::new(None),
             rate_limited: RefCell::new(None),
             not_sent: Cell::new(0),
             kept: Cell::new(0),
@@ -2798,10 +2836,23 @@ impl Bounds {
         }
     }
 
+    /// Bounds the pass to `limit` requests in place of the limit it was made
+    /// with, before any was spent: a stage's share is a percentage of it
+    /// ([`Self::share`]), so the shares follow.
+    fn size(&self, limit: usize) -> Result<()> {
+        ensure!(
+            self.left.get() == self.limit.get(),
+            "the pass's budget is sized after a request was spent"
+        );
+        self.limit.set(limit);
+        self.left.set(limit);
+        Ok(())
+    }
+
     /// What the pass spent, for its summary line.
     fn spent(&self) -> Spent {
         Spent {
-            requests: self.limit.saturating_sub(self.left.get()),
+            requests: self.limit.get().saturating_sub(self.left.get()),
             by_stage: self.by_stage.get(),
             points: self.points.get(),
             estimated: self.estimated.get(),
@@ -2874,7 +2925,7 @@ impl Bounds {
 
     /// `percent` of the pass's limit, a stage's fixed share ([`kept_shares`]).
     fn share(&self, percent: usize) -> usize {
-        self.limit * percent / 100
+        self.limit.get() * percent / 100
     }
 
     /// Counts the requests from here on to `stage`, whose reads leave
@@ -2900,7 +2951,8 @@ impl Bounds {
     }
 
     fn publication_left(&self) -> usize {
-        (self.limit * HOLDS_SHARE / 100).saturating_sub(self.publication_requests.get())
+        self.share(HOLDS_SHARE)
+            .saturating_sub(self.publication_requests.get())
     }
 
     /// Whether a step decided from what was read, an epic apply, fits in
@@ -3244,7 +3296,8 @@ impl<C> Budget<'_, C> {
         let floor = if write { 0 } else { WRITE_RESERVE };
         ensure!(
             left > floor,
-            "the pass's request budget ({PASS_REQUEST_LIMIT}) is spent"
+            "the pass's request budget ({}) is spent",
+            bounds.limit.get()
         );
         if !write && bounds.reserved() {
             bounds.refused.set(bounds.refused.get() + 1);
@@ -3313,6 +3366,16 @@ impl<C> Budget<'_, C> {
             .points
             .set(bounds.points.get().saturating_add(points));
         self.observe(result)
+    }
+
+    fn spend_graphql(&self, mutation: bool, query: &str) -> Result<()> {
+        if let Some(limit) = self.bounds.graphql_limit.get() {
+            ensure!(
+                self.bounds.points.get() < limit,
+                "the pass's estimated GraphQL point budget ({limit}) is spent"
+            );
+        }
+        self.spend(mutation, &graphql_class(query))
     }
 }
 
@@ -3394,15 +3457,15 @@ impl<C: Rest> Rest for Budget<'_, C> {
         if enabled && response.status == 200 {
             let entry = json!({"body": response.body, "etag": response.etag,
                 "last_modified": response.last_modified, "link": response.link});
-            // Keep only this pass's reads, bounded by its request/304 limits.
+            // Keep only this pass's reads, bounded by bytes and by what the
+            // state reads back ([`STATE_RESPONSES`]).
             let size = entry.to_string().len();
             let total = self.bounds.response_bytes.get() + size;
-            if size <= RESPONSE_BYTES && total <= CACHE_BYTES {
+            let mut kept = self.bounds.next_responses.borrow_mut();
+            let fits = kept.len() < STATE_RESPONSES || kept.contains_key(url);
+            if size <= RESPONSE_BYTES && total <= CACHE_BYTES && fits {
                 self.bounds.response_bytes.set(total);
-                self.bounds
-                    .next_responses
-                    .borrow_mut()
-                    .insert(url.to_owned(), entry);
+                kept.insert(url.to_owned(), entry);
             }
         }
         if response.status == 200 {
@@ -3425,7 +3488,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
-        self.spend(true, &endpoint_class(url))?;
+        self.spend(method != "GET", &endpoint_class(url))?;
         let prepared = self
             .bounds
             .living
@@ -3549,7 +3612,7 @@ impl<C: Rest + Transport> Budget<'_, C> {
         let data = if let Some(old) = evidence {
             old["comment_evidence"].clone()
         } else {
-            self.spend(false, &graphql_class(query))?;
+            self.spend_graphql(false, query)?;
             self.graphql_spent(false, self.inner.graphql(query, variables.clone()))?
         };
         if comments_match(&response.body, &data)
@@ -3613,7 +3676,7 @@ impl<C: Rest + Transport> Transport for Budget<'_, C> {
             self.keep_publication_read(key, KeptRead::GraphQl(data.clone()));
             return Ok(data);
         }
-        self.spend(mutation, &graphql_class(query))?;
+        self.spend_graphql(mutation, query)?;
         let mut data =
             self.graphql_spent(mutation, self.inner.graphql(query, variables.clone()))?;
         if query == plan::COMMENTS_QUERY
@@ -3632,7 +3695,7 @@ impl<C: Rest + Transport> Transport for Budget<'_, C> {
 impl<C: crate::github::GraphQl> crate::github::GraphQl for Budget<'_, C> {
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let mutation = is_mutation(query);
-        self.spend(mutation, &graphql_class(query))?;
+        self.spend_graphql(mutation, query)?;
         let result = self.inner.graphql(query, variables).await;
         self.graphql_spent(mutation, result)
     }
@@ -3917,6 +3980,25 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     let previous = state.clone();
     let caps = Caps::new(limits);
     let mut lines = Vec::new();
+    // The budget first, before any request is spent of it: the read of the
+    // headroom is free, so it goes around the bounds.
+    if let Some(share) = config.request_share {
+        let sized = Headroom::read(client).and_then(|headroom| {
+            let limit = headroom.share(share);
+            bounds.size(limit)?;
+            bounds
+                .graphql_limit
+                .set(Some(headroom.graphql.saturating_mul(share as u64) / 100));
+            Ok(headroom.line(share, limit))
+        });
+        lines.push(match sized {
+            Ok(line) => format!("budget: {line}"),
+            Err(error) => format!(
+                "warning: requestShare: the budget was not sized from the token's rate limit, so the fixed {} holds: {error:#}",
+                bounds.limit.get()
+            ),
+        });
+    }
     let resolved = config.resolve(
         &Budget {
             inner: client,
@@ -4154,11 +4236,16 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if !apply {
         scheduler.observe_decision();
     }
-    // Last, within a request bound of its own and the pass's time bound: the
-    // cost reports, unless a rate limit stopped the pass.
+    // Last, the cost reports. Opted-in sizing covers their requests too;
+    // the default keeps the historical independent cost-stage allowance.
     if bounds.rate_limited.borrow().is_none() {
         let within = (now, apply, bounds.admit_by);
-        cost::stage(unbudgeted, config, within, caps, &mut report);
+        if config.request_share.is_some() {
+            bounds.enter(Stage::Cost);
+            cost::stage(&scheduler.client, config, within, caps, scheduler.report);
+        } else {
+            cost::stage(unbudgeted, config, within, caps, scheduler.report);
+        }
     }
     report
 }
@@ -4184,6 +4271,76 @@ fn kept_shares(config: &Config, bounds: &Bounds) -> (usize, usize, bool) {
     {
         Some(need) if need < epics => (need + (pulls - epics), need, true),
         _ => (pulls, epics, false),
+    }
+}
+
+/// What the token has left of GitHub's primary rate limits until they reset
+/// (`GET /rate_limit`, which GitHub does not count): the REST core pool's
+/// requests and the GraphQL pool's points. A pass counts both as requests
+/// in one budget, so the smaller pool sizes its request ceiling. GraphQL
+/// points also have a separate, post-execution stop; this estimates token
+/// consumption rather than guaranteeing retained headroom.
+#[derive(Debug)]
+struct Headroom {
+    core: u64,
+    graphql: u64,
+    /// When the smaller pool resets, in epoch seconds.
+    reset: i64,
+}
+
+impl Headroom {
+    fn read(client: &impl Rest) -> Result<Self> {
+        let response = client.get(&format!("{API_ROOT}rate_limit"), None)?;
+        ensure!(
+            response.status == 200,
+            "GET rate_limit: GitHub HTTP status {}",
+            response.status
+        );
+        Self::parse(&response.body)
+    }
+
+    fn parse(body: &Value) -> Result<Self> {
+        let count = |pool: &str, field: &str| {
+            body.pointer(&format!("/resources/{pool}/{field}"))
+                .and_then(Value::as_u64)
+                .with_context(|| format!("rate_limit has no resources.{pool}.{field}"))
+        };
+        let (core, graphql) = (count("core", "remaining")?, count("graphql", "remaining")?);
+        let pool = if graphql < core { "graphql" } else { "core" };
+        let reset = i64::try_from(count(pool, "reset")?).context("rate_limit reset")?;
+        Ok(Self {
+            core,
+            graphql,
+            reset,
+        })
+    }
+
+    /// The smaller pool's remaining, and its name.
+    fn remaining(&self) -> (u64, &'static str) {
+        if self.graphql < self.core {
+            (self.graphql, "graphql")
+        } else {
+            (self.core, "core")
+        }
+    }
+
+    /// `percent` of the smaller pool's remaining: the pass's limit.
+    fn share(&self, percent: usize) -> usize {
+        let (remaining, _) = self.remaining();
+        usize::try_from(remaining.saturating_mul(percent as u64) / 100).unwrap_or(usize::MAX)
+    }
+
+    /// The pass's `budget:` line for `limit`, its share of the headroom.
+    fn line(&self, percent: usize, limit: usize) -> String {
+        let (remaining, pool) = self.remaining();
+        let reset = OffsetDateTime::from_unix_timestamp(self.reset)
+            .ok()
+            .and_then(|t| t.format(&Rfc3339).ok())
+            .unwrap_or_else(|| format!("epoch second {}", self.reset));
+        format!(
+            "requestShare keeps the pass to {limit} requests, {percent}% of the {remaining} the token has left until {reset} ({pool}; core {}, graphql {}); GraphQL share is an estimate, not a retained-headroom guarantee",
+            self.core, self.graphql
+        )
     }
 }
 
@@ -9066,7 +9223,9 @@ impl<C: crate::github::GraphQl> crate::github::GraphQl for Recorder<'_, C> {
 }
 
 /// A recorded pass ([`Recorder`]): its answers to the same requests, at
-/// its clock. A request it did not record is an error, as is any write.
+/// its clock. A request it did not record is an error, as is any write: a
+/// recording made without `requestShare` has no `rate_limit` read, so a
+/// replay under it holds the fixed limit, with the warning line first.
 pub struct Replay {
     pub now: OffsetDateTime,
     pub requests: Vec<Value>,

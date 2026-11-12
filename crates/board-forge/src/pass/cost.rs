@@ -4,8 +4,9 @@
 //! `epics.repository`'s [`DATA_BRANCH`] yet is read and published there as
 //! `cost/YYYY-MM-DD.json`, in one commit: yesterday's once a day, and the
 //! whole week on the first run. Its reads and writes have their own request
-//! bound ([`Reader`]), so that a week's backfill takes none of the other
-//! stages' requests, within the pass's time bound; once that bound is spent,
+//! bound ([`Reader`]); with `requestShare` they also spend the pass's remaining
+//! requests, otherwise a backfill takes none of the other stages' requests.
+//! They stay within the pass's time bound; once that bound is spent,
 //! the days read so far are published, and the rest left to the next pass.
 //! One `--max-writes` step; a preview reads only what is published.
 use super::*;
@@ -127,6 +128,44 @@ mod tests {
 
     const AFTER: &str = "2026-10-29T06:30:00Z";
     const LISTING: &str = "GET repos/cgwalters-forge/tracker/contents/cost?ref=data";
+
+    #[test]
+    fn sized_cost_backfill_cannot_bypass_the_pass_budget() {
+        for limit in [0, WRITE_RESERVE, 12, 30, 100] {
+            let forge = Forge::new();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let bounds = Bounds::new(limit, deadline);
+            bounds.enter(Stage::Cost);
+            let client = Budget {
+                inner: &forge,
+                bounds: &bounds,
+            };
+            let mut report = Report::default();
+            stage(
+                &client,
+                &config(json!({"hourUtc": 6})),
+                (at(AFTER), true, deadline),
+                &Caps::new(Limits::default()),
+                &mut report,
+            );
+            let sent = forge.requests().len() + forge.downloads.get();
+            assert!(sent <= bounds.spent().requests, "limit {limit}");
+            assert!(bounds.spent().requests <= limit, "limit {limit}");
+            if limit <= WRITE_RESERVE {
+                assert_eq!(sent, 0);
+                assert!(
+                    report.lines[0].contains("request budget"),
+                    "{:?}",
+                    report.lines
+                );
+            }
+            if limit == 100 {
+                assert_eq!(bounds.spent().requests, 37);
+                assert_eq!(report.failures, 0, "{:?}", report.lines);
+                assert!(report.lines[0].starts_with("cost: published"));
+            }
+        }
+    }
 
     /// The stage's lines, failures and requests sent, `writes` its cap.
     fn stage_on(
