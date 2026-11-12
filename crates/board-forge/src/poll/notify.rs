@@ -2035,6 +2035,24 @@ mod tests {
                 true,
                 BOT,
                 OPERATOR,
+                "REREQUESTED",
+                "Please fix this typo.",
+                false,
+                false,
+            ),
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "REREQUESTED_SAME_SECOND",
+                "Please fix this typo.",
+                false,
+                false,
+            ),
+            (
+                true,
+                BOT,
+                OPERATOR,
                 "COMMENTED",
                 "They said 'please fix this'. What do you think?",
                 false,
@@ -2074,17 +2092,40 @@ mod tests {
                 },
             );
             let mut review = said(5862878257, reviewer, UPDATED, body);
-            review["state"] = if state == "SUPERSEDED" {
+            let superseded = matches!(
+                state,
+                "SUPERSEDED" | "REREQUESTED" | "REREQUESTED_SAME_SECOND"
+            );
+            review["state"] = if superseded {
                 "CHANGES_REQUESTED"
             } else {
                 state
             }
             .into();
             let mut reviews = vec![review];
-            if state == "SUPERSEDED" {
-                let mut approval = said(5862878258, OPERATOR, "2026-10-16T11:30:00Z", "");
+            if superseded {
+                let at = if state == "REREQUESTED_SAME_SECOND" {
+                    UPDATED
+                } else {
+                    "2026-10-16T11:30:00Z"
+                };
+                let mut approval = said(5862878258, OPERATOR, at, "");
                 approval["state"] = "APPROVED".into();
                 reviews.push(approval);
+                if state != "SUPERSEDED" {
+                    // A new request cannot revive the withdrawn one. With no
+                    // receipts, the mixed batch must stay in triage.
+                    let mut request = said(
+                        5862878259,
+                        OPERATOR,
+                        at,
+                        "Please fix only the remaining typo.",
+                    );
+                    request["state"] = "CHANGES_REQUESTED".into();
+                    reviews.push(request);
+                    // Eligibility is chronological, not API array order.
+                    reviews.reverse();
+                }
             }
             fake.page(
                 &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
@@ -2157,7 +2198,10 @@ mod tests {
                 // A new review follows prose already handled on the tracker.
                 // Losing the cursor must not turn it into a mixed batch or
                 // require a midstream fork that this own-PR fix doesn't need.
+                // A bare approval withdraws A, but must not suppress B.
                 config.policy.notification_intake = Some(BTreeMap::new());
+                let mut approval = said(5862878258, OPERATOR, "2026-10-16T11:30:00Z", "");
+                approval["state"] = "APPROVED".into();
                 let mut review = said(
                     5862878259,
                     OPERATOR,
@@ -2173,13 +2217,15 @@ mod tests {
                     .unwrap()
                     .as_array_mut()
                     .unwrap()
-                    .push(review);
+                    .extend([approval, review]);
                 let next = pass(&fake, &config, State::default(), true);
                 assert_eq!(next.errors, 0, "{:?}", next.lines);
                 let runs = dispatches(&fake);
                 assert_eq!(runs.len(), 2, "{:?}", next.lines);
                 assert_eq!(runs[1]["kind"], "fix");
                 assert_eq!(runs[1]["repo"], repo);
+                assert!(text(&runs[1], "/task").contains("Please fix the remaining typo."));
+                assert!(!text(&runs[1], "/task").contains(body));
             }
         }
     }
