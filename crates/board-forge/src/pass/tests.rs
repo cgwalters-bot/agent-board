@@ -263,86 +263,195 @@ fn starts(report: &Report) -> Vec<String> {
         .collect()
 }
 
-/// A scan `scan.candidates` stops resumes after its last read in the next
-/// pass, around to where it stopped, so that the stops of a few passes
-/// cover the board (agent-board#864): on the hold-heavy board, a bound of
-/// 40 reads the first 40 held children cold and stops, the next pass the
-/// other 40, and the third reaches the ready children and starts them,
-/// filling the slots, which moves the cursor to the last it visited. A
-/// cursor naming no candidate scans in order, and a pass whose stage 4
-/// scans nothing keeps it as it was.
+/// A derived-budget stop rotates past the interrupted candidate.
+/// More headroom reaches ready work past 80 held children in one pass.
 #[test]
 fn a_stopped_scan_resumes_after_its_last_read_in_the_next_pass() {
-    let fixture = hold_heavy_fixture();
-    let cfg =
-        config(json!({"topDown":true,"state":"pass-state.json","wip":4,"scan":{"candidates":40}}));
-    let stop = |last: u64| {
-        format!(
-            "scan: 40 candidate(s) read in a row held or failed and none started, the most a pass reads (scan.candidates); 444 more candidate(s) wait; the next pass resumes after cgwalters-forge/tracker#{last}"
-        )
+    let mut fixture = hold_heavy_fixture();
+    let cfg = config(json!({"topDown":true,"state":"pass-state.json","wip":4,"requestShare":50}));
+    let headroom = |remaining: u64| {
+        json!({"request": {"get": format!("{API_ROOT}rate_limit")},
+        "answer": {"status":200,"link":null,"body":{"resources":{
+            "core":{"remaining":remaining,"reset":1700000000},
+            "graphql":{"remaining":remaining,"reset":1700000000}}}}})
     };
-    let resumed = |after: u64| {
-        format!(
-            "schedule: scan resumed after cgwalters-forge/tracker#{after}, where the last pass's scan stopped"
-        )
-    };
+    fixture.0.requests.push(headroom(300));
     let stale = State {
         scan_cursor: Some("cgwalters-forge/tracker#999".into()),
         ..State::default()
     };
     let first = pass_from(&fixture, &cfg, stale);
     assert!(!first.lines.iter().any(|l| l.contains("scan resumed")));
-    assert!(first.lines.contains(&stop(6039)), "{:#?}", first.lines);
-    assert_eq!(
-        first.scan_cursor.as_deref(),
-        Some("cgwalters-forge/tracker#6039")
-    );
     assert!(starts(&first).is_empty());
+    assert!(first.spent.requests <= 150, "{}", first.spent);
+    let cursor = first.scan_cursor.clone().unwrap();
+    let last: u64 = cursor.rsplit('#').next().unwrap().parse().unwrap();
+    assert!((6000..6079).contains(&last), "{cursor}");
+    assert!(
+        first
+            .lines
+            .iter()
+            .any(|line| line.starts_with("budget: ") && line.contains("more candidate(s) wait")),
+        "{:#?}",
+        first.lines
+    );
+    // Keep reads charged, as if changing responses cannot answer 304.
+    // Unchanged low headroom must still reach later ready work.
+    let mut cursor_only = State {
+        scan_cursor: first.scan_cursor.clone(),
+        ..State::default()
+    };
+    let mut reached = false;
+    for _ in 0..10 {
+        let pass = pass_from(&fixture, &cfg, cursor_only);
+        if !starts(&pass).is_empty() {
+            reached = true;
+            break;
+        }
+        assert_ne!(pass.scan_cursor, first.scan_cursor);
+        cursor_only = State {
+            scan_cursor: pass.scan_cursor,
+            ..State::default()
+        };
+    }
+    assert!(reached, "unchanged low headroom starved later ready work");
+    // A pass that never scans keeps the cursor.
+    let full = config(json!({"topDown":true,"state":"pass-state.json","wip":0,"requestShare":50}));
+    let idle = pass_from(&fixture, &full, next_state(&first));
+    assert!(starts(&idle).is_empty());
+    assert_eq!(next_state(&idle).scan_cursor.as_ref(), Some(&cursor));
+    fixture.0.requests.pop();
+    fixture.0.requests.push(headroom(2000));
     let second = pass_from(&fixture, &cfg, next_state(&first));
-    assert!(second.lines.contains(&resumed(6039)), "{:#?}", second.lines);
-    assert!(second.lines.contains(&stop(6079)), "{:#?}", second.lines);
-    assert!(starts(&second).is_empty());
-    let third = pass_from(&fixture, &cfg, next_state(&second));
-    assert!(third.lines.contains(&resumed(6079)), "{:#?}", third.lines);
+    assert!(
+        second.lines.contains(&format!(
+            "schedule: scan resumed after {cursor}, where the last pass's scan stopped"
+        )),
+        "{:#?}",
+        second.lines
+    );
+    assert!(
+        second
+            .lines
+            .iter()
+            .any(|line| line.starts_with(&format!("hold cgwalters-forge/tracker#{}:", last + 1))),
+        "{:#?}",
+        second.lines
+    );
     assert_eq!(
-        starts(&third),
+        starts(&second),
         [
             "start triage cgwalters-forge/tracker#446 pool=claude",
             "start triage cgwalters-forge/tracker#459 pool=claude"
         ]
     );
     assert!(
-        !third.lines.iter().any(|l| l.starts_with("scan: 40")),
+        !second.lines.iter().any(|l| l.starts_with("scan: ")),
         "{:#?}",
-        third.lines
+        second.lines
     );
     assert!(
-        third
+        second
             .lines
             .iter()
             .any(|l| l.starts_with("wip: no slot left")),
         "{:#?}",
-        third.lines
+        second.lines
     );
-    let moved = Some("cgwalters-forge/tracker#459");
-    assert_eq!(third.scan_cursor.as_deref(), moved);
-    assert_eq!(next_state(&third).scan_cursor.as_deref(), moved);
-    // Each pass's reads: the first two 2 a held child, the third the
-    // starts' own.
-    assert!(first.spent.requests >= 80, "{}", first.spent);
-    assert!(second.spent.requests >= 80, "{}", second.spent);
-    assert!(third.spent.requests < 20, "{}", third.spent);
-    // A pass that never scans (its slots all taken) keeps the cursor.
-    let full =
-        config(json!({"topDown":true,"state":"pass-state.json","wip":0,"scan":{"candidates":40}}));
-    let idle = pass_from(&fixture, &full, next_state(&third));
-    assert!(starts(&idle).is_empty());
-    assert_eq!(next_state(&idle).scan_cursor.as_deref(), moved);
+    assert_eq!(second.scan_cursor, None);
+    // A cold pass with sufficient derived headroom walks all 80 holds.
+    let cold = pass_from(&fixture, &cfg, State::default());
+    assert_eq!(starts(&cold), starts(&second));
+    assert!(cold.spent.requests >= 160, "{}", cold.spent);
+}
+
+/// At exact exhaustion, the next candidate was never considered. Keep the
+/// cursor on the held candidate so the ready one leads the next charged walk.
+#[test]
+fn an_unattempted_candidate_does_not_advance_the_scan_cursor() {
+    for focus in [false, true] {
+        let mut fixture = hold_heavy_fixture();
+        for entry in &mut fixture.0.requests {
+            if let Some(nodes) = entry["answer"]
+                .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+                .and_then(Value::as_array_mut)
+            {
+                nodes.retain(|n| matches!(n["content"]["number"].as_u64(), Some(6000 | 446)));
+                for node in nodes {
+                    node["content"]["parent"] = Value::Null;
+                }
+            }
+        }
+        let mut settings =
+            json!({"topDown":true,"state":"pass-state.json","wip":4,"requestShare":50});
+        if focus {
+            focus_read(&mut fixture.0, "OPEN");
+            for child in [
+                "cgwalters-forge/tracker#6000",
+                "cgwalters-forge/tracker#446",
+            ] {
+                child_of(&mut fixture.0, child, ("cgwalters-forge/review", 135));
+            }
+            let mut labelled = fixture
+                .0
+                .requests
+                .iter()
+                .find(|entry| {
+                    entry["request"]["get"] == format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/135/events?per_page=100&page=1")
+                })
+                .unwrap()
+                .clone();
+            labelled["request"]["get"] = format!(
+                "{API_ROOT}repos/cgwalters-forge/review/issues/135/events?per_page=100&page=1"
+            )
+            .into();
+            fixture.0.requests.push(labelled);
+            settings["epics"] = json!({"repository":TRACKER,"inWorkRepositories":true,
+            "focus":"cgwalters-forge/review#135"});
+        }
+        // Eleven reads precede consideration (two more validate a focus); the
+        // held plan takes two more, leaving exactly the start/write reserves.
+        let remaining = 2 * (11 + usize::from(focus) * 2 + 2 + WRITE_RESERVE + START_RESERVE);
+        fixture
+            .0
+            .requests
+            .push(json!({"request":{"get":format!("{API_ROOT}rate_limit")},
+        "answer":{"status":200,"body":{"resources":{
+            "core":{"remaining":remaining,"reset":1700000000},
+            "graphql":{"remaining":remaining,"reset":1700000000}}}}}));
+        let cfg = config(settings);
+        let first = pass_from(&fixture, &cfg, State::default());
+        assert!(starts(&first).is_empty());
+        assert_eq!(
+            first.scan_cursor.as_deref(),
+            Some("cgwalters-forge/tracker#6000")
+        );
+        assert_eq!(first.spent.by_cause["cgwalters-forge/tracker#6000"], 2);
+        assert!(
+            !first
+                .spent
+                .by_cause
+                .contains_key("cgwalters-forge/tracker#446")
+        );
+        // Drop response caches, not the cursor: changing responses cannot refund
+        // reads, and unchanged headroom must still let the ready candidate start.
+        let second = pass_from(
+            &fixture,
+            &cfg,
+            State {
+                scan_cursor: next_state(&first).scan_cursor,
+                ..State::default()
+            },
+        );
+        assert_eq!(
+            starts(&second),
+            ["start triage cgwalters-forge/tracker#446 pool=claude"]
+        );
+    }
 }
 
 /// A scan that reaches its end clears the cursor it resumed from, so the
-/// next pass scans in order again; without `scan.candidates` there is
-/// none to keep.
+/// next pass scans in order again.
 #[test]
 fn a_scan_that_reaches_its_end_clears_the_cursor() {
     let mut replay = top_down_fixture();
@@ -352,10 +461,7 @@ fn a_scan_that_reaches_its_end_clears_the_cursor() {
         scan_cursor: Some("cgwalters-forge/tracker#446".into()),
         ..State::default()
     };
-    // Bounded beyond the board, so that the scan reaches its end.
-    let cfg = config(
-        json!({"topDown":true,"state":"pass-state.json","wip":100,"scan":{"candidates":1000}}),
-    );
+    let cfg = config(json!({"topDown":true,"state":"pass-state.json","wip":100}));
     let report = pass_from(&fixture, &cfg, after_446.clone());
     assert!(
         report.lines.contains(
@@ -380,10 +486,6 @@ fn a_scan_that_reaches_its_end_clears_the_cursor() {
         "{:#?}",
         report.lines
     );
-    assert_eq!(next_state(&report).scan_cursor, None);
-    let unbounded = config(json!({"topDown":true,"state":"pass-state.json","wip":100,"scan":{}}));
-    let report = pass_from(&fixture, &unbounded, after_446);
-    assert!(!report.lines.iter().any(|l| l.contains("scan resumed")));
     assert_eq!(next_state(&report).scan_cursor, None);
 }
 
@@ -2040,79 +2142,6 @@ fn replay_idle_board_starts_work() {
     );
 }
 
-/// `scan` bounds stage 4's reads on the idle board (agent-board#864):
-/// `candidateRequests` holds tracker#527, whose overlap check reads past
-/// it, as unreadable at that many reads, the candidates after it still
-/// read and started; `candidates` stops the scan after that many read and
-/// held in a row, two starts before them, the rest waiting with the slots
-/// left free and the last read kept for the next pass to resume after.
-#[test]
-fn scan_caps_candidate_reads_and_stops_a_fruitless_run() {
-    let capped = "hold cgwalters-forge/tracker#527: its reads reached 3 requests, the most one candidate may take (scan.candidateRequests); what else it waits on is unread";
-    let stopped = "scan: 3 candidate(s) read in a row held or failed and none started, the most a pass reads (scan.candidates); 274 more candidate(s) wait; the next pass resumes after cgwalters-forge/tracker#527";
-    fn lines<'a>(replaced: &[(usize, &'a str)], upto: usize) -> Vec<&'a str> {
-        let mut lines = STARTED[..upto].to_vec();
-        for (at, line) in replaced {
-            lines[*at] = line;
-        }
-        lines
-    }
-    // The setting, the lines from stage 4's first candidate, the reads
-    // tracker#527 took, the candidates not started by why, and the cursor
-    // kept for the next pass.
-    let cases = [
-        (
-            json!({"candidateRequests": 3}),
-            lines(&[(4, capped)], STARTED.len()),
-            3,
-            vec![("dispatched", 2), ("epic-not-live", 22), ("unreadable", 1)],
-            None,
-        ),
-        (
-            json!({"candidates": 3}),
-            lines(&[(5, stopped)], 6),
-            5,
-            vec![("dispatched", 2), ("epic-not-live", 22), ("overlap", 1)],
-            Some("cgwalters-forge/tracker#527"),
-        ),
-        (
-            json!({"candidates": 2}),
-            lines(
-                &[(
-                    4,
-                    "scan: 2 candidate(s) read in a row held or failed and none started, the most a pass reads (scan.candidates); 275 more candidate(s) wait; the next pass resumes after cgwalters-forge/tracker#468",
-                )],
-                5,
-            ),
-            0,
-            vec![("dispatched", 2), ("epic-not-live", 22)],
-            Some("cgwalters-forge/tracker#468"),
-        ),
-    ];
-    for (scan, expected, reads, not_ready, cursor) in cases {
-        let report = preview(&config(json!({"scan": scan})), &replay());
-        assert_eq!(report.scan_cursor.as_deref(), cursor, "scan {scan}");
-        let first = report.lines.iter().position(|l| l == STARTED[0]).unwrap();
-        let after: Vec<&str> = report.lines[first..]
-            .iter()
-            .map(String::as_str)
-            .take_while(|l| !l.starts_with("promote: "))
-            .collect();
-        assert_eq!(after, expected, "scan {scan}");
-        assert_eq!(report.failures, 0, "scan {scan}: {:#?}", report.lines);
-        let counted = report.spent.by_cause.get("cgwalters-forge/tracker#527");
-        assert_eq!(counted.copied().unwrap_or(0), reads, "scan {scan}");
-        let not_ready: BTreeMap<String, usize> = (not_ready.into_iter())
-            .map(|(k, n)| (k.to_owned(), n))
-            .collect();
-        assert_eq!(report.not_ready, not_ready, "scan {scan}");
-        // An unreadable candidate keeps an idle stage 4 from reading as one
-        // with no ready work; a stopped scan starts what it found first.
-        assert!(report.spent.requests < 57, "scan {scan}: {}", report.spent);
-    }
-    assert!(forgejo::check_options(&json!({"scan": {"candidates": 1}})).is_err());
-}
-
 /// The summary names each stage that spent a request, in stage order, and
 /// leaves the rest out; then every endpoint class and the causes that spent
 /// the most, at most [`CAUSE_LINES`] of them and the rest as one count.
@@ -2479,30 +2508,11 @@ fn scheduling_reserve_precedes_all_discovery_stages() {
     assert!(bounds.left.get() > START_RESERVE + START_REQUESTS);
 }
 
-/// With `scan.reserve`, stages 2 and 3 keep what the stages after them are
-/// bounded to need, the scan, a start and their own reads, and under
-/// `reserveScheduling` the candidate reads stage 4 holds back before its
-/// parent discovery, stage 2 keeping stage 3's room too; the fixed shares
-/// hold without it, without both scan bounds, and where the need is larger
-/// (agent-board#878).
+/// Legacy stage shares remain available without requestShare.
 #[test]
-fn sized_reserve_keeps_what_the_scan_needs() {
+fn legacy_stage_shares() {
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
-    let fixed = |pulls: usize, epics: usize| (bounds.share(pulls), bounds.share(epics), false);
-    let need =
-        |candidates: usize, requests: usize| candidates * requests + START_RESERVE + LATER_READS;
-    let room = bounds.share(AFTER_PULL_REQUESTS) - bounds.share(AFTER_EPICS);
-    assert_eq!(
-        room,
-        bounds.share(SCHEDULE_SHARE + EPICS_SHARE) - bounds.share(SCHEDULE_SHARE)
-    );
-    let sized = |candidates: usize, requests: usize, discovery: usize| {
-        let need = need(candidates, requests) + discovery;
-        (need + room, need, true)
-    };
-    let scan = |candidates: usize, requests: usize, reserve: bool| json!({"candidates": candidates, "candidateRequests": requests, "reserve": reserve});
-    // The one candidate's requests at which the need is stage 3's share.
-    let at_share = bounds.share(AFTER_EPICS) - START_RESERVE - LATER_READS;
+    let fixed = |pulls: usize, epics: usize| (bounds.share(pulls), bounds.share(epics));
     for (name, settings, expected) in [
         (
             "default",
@@ -2514,47 +2524,11 @@ fn sized_reserve_keeps_what_the_scan_needs() {
             json!({"reserveScheduling": true}),
             fixed(SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE),
         ),
-        (
-            "scan without reserve",
-            json!({"scan": scan(5, 20, false)}),
-            fixed(AFTER_PULL_REQUESTS, AFTER_EPICS),
-        ),
-        ("sized", json!({"scan": scan(2, 20, true)}), sized(2, 20, 0)),
-        (
-            "sized under reserve scheduling",
-            json!({"reserveScheduling": true, "scan": scan(5, 20, true)}),
-            sized(5, 20, START_REQUESTS),
-        ),
-        (
-            "the smallest scan",
-            json!({"scan": scan(1, 1, true)}),
-            sized(1, 1, 0),
-        ),
-        // Tracker's bounds (tracker#1548): a scan larger than the pass
-        // keeps the fixed share, never more.
-        (
-            "a scan larger than the share",
-            json!({"reserveScheduling": true, "scan": scan(40, 20, true)}),
-            fixed(SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE),
-        ),
-        (
-            "a scan as large as the share",
-            json!({"scan": scan(1, at_share, true)}),
-            fixed(AFTER_PULL_REQUESTS, AFTER_EPICS),
-        ),
-        (
-            "a scan one short of the share",
-            json!({"scan": scan(1, at_share - 1, true)}),
-            sized(1, at_share - 1, 0),
-        ),
     ] {
-        let (pulls, epics, sized) = kept_shares(&config(settings), &bounds);
-        assert_eq!((pulls, epics, sized), expected, "{name}");
+        let (pulls, epics) = kept_shares(&config(settings), &bounds);
+        assert_eq!((pulls, epics), expected, "{name}");
         assert!(pulls > epics, "{name}");
     }
-    // That stage 4 still starts work and Status still reads with what a
-    // sized reserve keeps is
-    // [`sized_reserve_merges_every_approved_pull_request_in_one_pass`]'s.
 }
 
 #[test]
@@ -2790,15 +2764,11 @@ fn reads_count_to_their_cause() {
     assert_eq!(spent.requests, 5);
 }
 
-/// With a cause capped (`scan.candidateRequests`), its reads past the cap
-/// are refused and counted as capped; 304s are refunded, so they do not
-/// bring it nearer; a start's own reads, writes, reads under no cause or
-/// another, a nested epic's included, are never refused.
+/// Candidate reads share the pass budget, with no per-candidate cap.
 #[test]
-fn cause_reads_are_capped() {
+fn cause_reads_share_the_pass_budget() {
     let bounds = Bounds::new(20, Instant::now() + Duration::from_secs(60));
     bounds.enter(Stage::Schedule);
-    *bounds.cause_limit.borrow_mut() = Some(("o/r#1".into(), 2));
     let client = Budget {
         inner: &Revalidating,
         bounds: &bounds,
@@ -2810,30 +2780,21 @@ fn cause_reads_are_capped() {
         read().unwrap();
         revalidate().unwrap();
         read().unwrap();
-        let refused = read().unwrap_err().to_string();
-        assert_eq!(
-            refused,
-            "the candidate's reads reached 2 requests, the most one may take (scan.candidateRequests)"
-        );
-        assert_eq!(bounds.capped.get(), 1);
+        read().unwrap();
         bounds.caused("epic o/r#9".into(), || read().unwrap());
         client.send("POST", &url, &json!({})).unwrap();
         bounds.starting.set(true);
         read().unwrap();
         bounds.end_start();
-        assert!(read().is_err());
+        read().unwrap();
     });
     read().unwrap();
     bounds.caused("o/r#2".into(), || read().unwrap());
-    *bounds.cause_limit.borrow_mut() = None;
     bounds.caused("o/r#1".into(), || read().unwrap());
     let spent = bounds.spent();
-    assert_eq!(spent.by_cause["o/r#1"], 5);
+    assert_eq!(spent.by_cause["o/r#1"], 7);
     assert_eq!(spent.by_cause["epic o/r#9"], 1);
-    assert_eq!(
-        (spent.requests, spent.revalidated, bounds.capped.get()),
-        (8, 1, 2)
-    );
+    assert_eq!((spent.requests, spent.revalidated), (10, 1));
 }
 
 /// `triage` true, or with the scope `all`, triages each candidate without a
@@ -7582,16 +7543,10 @@ fn authored_read_at_its_share_is_deferred() {
     assert!(report.state.is_some());
 }
 
-/// Thirty approved, green pull requests across ten followed repositories
-/// all merge in one pass within the request limit once `scan.reserve`
-/// sizes what stage 2 keeps from the scan bounds, in place of the default
-/// shares (agent-board#878); under `reserveScheduling`'s fixed share the
-/// stage stops part way, with hundreds of requests kept for stages that do
-/// not use them, and sized under `reserveScheduling` it still stops, as the
-/// need then keeps stage 4's parent-discovery room too. Whatever stage 2
-/// keeps, stage 4 still starts work and Status still reads.
+/// Derived headroom removes stage reservations without increasing the total
+/// budget; the PR walk merges all thirty, then scheduling and Status run.
 #[test]
-fn sized_reserve_merges_every_approved_pull_request_in_one_pass() {
+fn derived_budget_merges_past_the_legacy_stage_share() {
     const REPOSITORIES: u64 = 10;
     const PULLS: u64 = 30;
     let repositories: Vec<String> = (1..=REPOSITORIES)
@@ -7646,54 +7601,21 @@ fn sized_reserve_merges_every_approved_pull_request_in_one_pass() {
         (report.lines.iter())
             .any(|l| l.starts_with("pull requests: the stage's request share is spent at "))
     };
-    let kept = |pulls: usize, epics: usize| {
-        format!(
-            "budget: scan.reserve keeps {pulls} requests for the stages after pull requests and {epics} after epics, the scan's need in place of the fixed shares"
-        )
-    };
-    let room = bounds_kept(AFTER_PULL_REQUESTS) - bounds_kept(AFTER_EPICS);
-    for (name, reserve_scheduling, scan, all, sized) in [
-        // The pass of agent-board#878, which spent 386 of the 646 its
-        // reads may take (the limit past the writes' reserve, as every
-        // "has" below).
-        (
-            "the fixed share",
-            true,
-            json!({"candidateRequests": 20, "candidates": 5}),
-            false,
-            None,
-        ),
-        // Its scan, sized: stage 2 has 156 instead of 126, not enough.
-        (
-            "the fixed share and the sized reserve",
-            true,
-            json!({"candidateRequests": 20, "candidates": 5, "reserve": true}),
-            false,
-            Some(5 * 20 + START_RESERVE + START_REQUESTS + LATER_READS),
-        ),
-        // The caller settings' scan under the fixed share: stage 2 has
-        // 196, still not enough.
-        (
-            "the fixed share and the sized reserve at 3 candidates",
-            true,
-            json!({"candidateRequests": 20, "candidates": 3, "reserve": true}),
-            false,
-            Some(3 * 20 + START_RESERVE + START_REQUESTS + LATER_READS),
-        ),
-        // The caller settings: stage 2 has 300 instead of the default
-        // shares' 269.
-        (
-            "the sized reserve",
-            false,
-            json!({"candidateRequests": 20, "candidates": 3, "reserve": true}),
-            true,
-            Some(3 * 20 + START_RESERVE + LATER_READS),
-        ),
-    ] {
+    for (name, share, all) in [("legacy", None, false), ("derived", Some(50), true)] {
         let settings = json!({"follow": repositories, "pr": {"fixPools": ["claude"]},
-            "reserveScheduling": reserve_scheduling, "scan": scan});
-        let forge = forge();
-        let report = apply_within(&forge, &config(settings), PASS_REQUEST_LIMIT);
+            "reserveScheduling": true});
+        let mut cfg = config(settings);
+        cfg.request_share = share;
+        let mut forge = forge();
+        // Keep the same 650 total requests, but no fixed stage reservation.
+        forge
+            .replay
+            .requests
+            .push(json!({"request":{"get":format!("{API_ROOT}rate_limit")},
+            "answer":{"status":200,"link":null,"body":{"resources":{
+                "core":{"remaining":1300,"reset":1700000000},
+                "graphql":{"remaining":1300,"reset":1700000000}}}}}));
+        let report = apply_within(&forge, &cfg, PASS_REQUEST_LIMIT);
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
         let count = merged(&report);
         assert_eq!(
@@ -7714,9 +7636,6 @@ fn sized_reserve_merges_every_approved_pull_request_in_one_pass() {
             "{name}: {}",
             report.spent
         );
-        let line = sized.map(|need| kept(need + room, need));
-        let said = (report.lines.iter()).find(|l| l.starts_with("budget: scan.reserve keeps "));
-        assert_eq!(said, line.as_ref(), "{name}: {:#?}", report.lines);
         // The stages after it still start work and read Status, and none
         // of them stops at the budget.
         assert!(
@@ -16738,23 +16657,20 @@ fn config_table() {
         (json!({"wip": 101}), "wip is not 0 to 100"),
         (
             json!({"scan": {"candidateRequests": 0}}),
-            "scan candidateRequests is not 1 to 650",
+            "unknown field `scan`",
         ),
         (
             json!({"scan": {"candidates": 1001}}),
-            "scan candidates is not 1 to 1000",
+            "unknown field `scan`",
         ),
-        (
-            json!({"scan": {"candidate": 1}}),
-            "unknown field `candidate`",
-        ),
+        (json!({"scan": {"candidate": 1}}), "unknown field `scan`"),
         (
             json!({"scan": {"candidates": 5, "reserve": true}}),
-            "scan reserve needs both scan candidates and scan candidateRequests",
+            "unknown field `scan`",
         ),
         (
             json!({"scan": {"candidateRequests": 20, "reserve": true}}),
-            "scan reserve needs both scan candidates and scan candidateRequests",
+            "unknown field `scan`",
         ),
         (json!({"requestShare": 0}), "requestShare is not 1 to 90"),
         (json!({"requestShare": 91}), "requestShare is not 1 to 90"),
@@ -17890,14 +17806,10 @@ fn request_share_sizes_the_budget_from_the_headroom() {
     bounds.size(900).unwrap();
     assert_eq!((bounds.limit.get(), bounds.left.get()), (900, 900));
     assert_eq!(bounds.share(AFTER_EPICS), 900 * AFTER_EPICS / 100);
-    let (pulls, epics, sized) = kept_shares(&config(json!({})), &bounds);
+    let (pulls, epics) = kept_shares(&config(json!({})), &bounds);
     assert_eq!(
-        (pulls, epics, sized),
-        (
-            900 * AFTER_PULL_REQUESTS / 100,
-            900 * AFTER_EPICS / 100,
-            false
-        )
+        (pulls, epics),
+        (900 * AFTER_PULL_REQUESTS / 100, 900 * AFTER_EPICS / 100)
     );
     bounds.left.set(899);
     let error = bounds.size(1000).unwrap_err().to_string();

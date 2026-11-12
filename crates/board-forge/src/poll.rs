@@ -1651,8 +1651,8 @@ pub struct State {
     /// Unfinished per-repository decisions, retained even when discovery
     /// screens a disjoint batch on the next pass.
     pub action_first_positions: BTreeMap<String, u64>,
-    /// The candidate `OWNER/REPO#N` the pass's stage 4 scan stopped at
-    /// under `scan.candidates` ([`crate::pass::Scan`]): the next pass's
+    /// The last candidate `OWNER/REPO#N` visited before stage 4 stopped
+    /// for budget: the next pass's
     /// scan resumes after it, so that the stops of a few passes cover the
     /// board. None scans in order. Losing it only starts the scan over.
     pub scan_cursor: Option<String>,
