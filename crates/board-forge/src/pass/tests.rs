@@ -7177,6 +7177,224 @@ fn sized_reserve_merges_every_approved_pull_request_in_one_pass() {
     }
 }
 
+#[test]
+fn action_first_merges_two_approved_prs_in_repository_25_before_drafts_and_upstream() {
+    let repositories: Vec<String> = (1..=30)
+        .map(|n| {
+            if n <= 10 {
+                format!("aaa/upstream{n:02}")
+            } else {
+                format!("cgwalters-forge/work{n:02}")
+            }
+        })
+        .collect();
+    let mut forge = Forge::new(None, false);
+    for (i, repo) in repositories.iter().enumerate() {
+        let n = i as u64 + 1;
+        let approved = n == 25;
+        let numbers = if approved { vec![25, 125] } else { vec![n] };
+        let mut nodes = Vec::new();
+        for number in numbers {
+            let review = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
+                "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
+                "pageInfo": {"hasPreviousPage": false}});
+            followed(
+                &mut forge.replay,
+                (repo, number),
+                json!({"isDraft": !approved,
+                "body": if n == 11 { "Closes #8.\n\n```checkpoint\n{\"reason\":\"budget\",\"done\":\"half\",\"left\":\"half\",\"next\":\"the rest\"}\n```" } else { "Closes #8." },
+                "author": {"__typename": "User", "login": if number == 125 { "contributor" } else { "cgwalters-bot" }},
+                "reviews": if approved { review } else { json!({"nodes": [], "pageInfo": {"hasPreviousPage": false}}) }}),
+                json!([]),
+            );
+            nodes.push(json!({"number": number, "isDraft": !approved, "reviewDecision": if approved { "APPROVED" } else { "REVIEW_REQUIRED" },
+                "mergeable": "MERGEABLE", "author": {"login": if number == 125 { "contributor" } else { "cgwalters-bot" }}, "headRefOid": "abc", "labels": {"nodes": []}}));
+            if approved {
+                forge.replay.requests.push(json!({"request": graphql_key(poll::MERGE, &json!({"id": format!("PR_{number}"), "head": "abc"})),
+                    "answer": {"data": {"mergePullRequest": {"clientMutationId": null}}}}));
+            }
+        }
+        let (owner, name) = repo.split_once('/').unwrap();
+        forge.replay.requests.push(json!({"request": graphql_key(poll::action_first::SCREEN, &json!({"owner": owner, "name": name})),
+            "answer": {"data": {"repository": {"pullRequests": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}}}}));
+        forge.replay.requests.push(
+            json!({"request": {"get": format!("{API_ROOT}repos/{repo}")},
+            "answer": {"status": 200, "link": null, "body": {"allow_rebase_merge": true}}}),
+        );
+    }
+    forge
+        .replay
+        .requests
+        .push(json!({"request": {"get": format!("{API_ROOT}user")},
+        "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+    let settings = json!({"follow": repositories, "pr": {"fixPools": ["claude"], "actionFirst": true,
+        "ownSpaceOnly": true, "mergeAuthors": ["contributor"]}});
+    let cfg = config(settings.clone());
+    let state = State {
+        share_cursor: Some("aaa/upstream01#1".into()),
+        ..State::default()
+    };
+    let report = block(run(
+        &forge,
+        &forge,
+        &cfg,
+        state,
+        (Mode::Actions(&own()), Limits::default()),
+        forge.replay.now,
+    ))
+    .unwrap();
+    let merged = report
+        .lines
+        .iter()
+        .filter(|l| l.contains("cgwalters-forge/work25#") && l.ends_with(" -> merged"))
+        .count();
+    assert_eq!(merged, 2, "{:#?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("pull requests: merged/enqueued 2,")),
+        "{:#?}",
+        report.lines
+    );
+    assert!(report.spent.requests <= PASS_REQUEST_LIMIT);
+    let last_merge = report
+        .lines
+        .iter()
+        .rposition(|l| l.contains("cgwalters-forge/work25#") && l.ends_with(" -> merged"))
+        .unwrap();
+    let first_round = report
+        .lines
+        .iter()
+        .position(|l| l.contains(" continue: continuing (round 1):"))
+        .expect("an eligible draft must run a round");
+    assert!(last_merge < first_round, "{:#?}", report.lines);
+    assert!(
+        report.lines[first_round].contains(" -> https://github.com/"),
+        "draft round must dispatch"
+    );
+
+    let mut upstream_settings = settings.clone();
+    upstream_settings["follow"] = json!(repositories[..10]);
+    let upstream_cfg = config(upstream_settings);
+    let mut upstream_forge = Forge::new(None, false);
+    upstream_forge.replay.requests = forge.replay.requests.clone();
+    let upstream_report = apply(&upstream_forge, &upstream_cfg);
+    assert!(
+        upstream_report
+            .lines
+            .iter()
+            .any(|l| l.ends_with("upstream reads 2")),
+        "{:#?}",
+        upstream_report.lines
+    );
+    assert_eq!(
+        upstream_report
+            .state
+            .as_ref()
+            .unwrap()
+            .share_cursor
+            .as_deref(),
+        Some("aaa/upstream03")
+    );
+    assert!(
+        upstream_forge
+            .writes
+            .borrow()
+            .iter()
+            .all(|(_, url, _)| !url.contains("aaa/upstream"))
+    );
+    let next = block(run(
+        &upstream_forge,
+        &upstream_forge,
+        &upstream_cfg,
+        upstream_report.state.unwrap(),
+        (Mode::Actions(&own()), Limits::default()),
+        upstream_forge.replay.now,
+    ))
+    .unwrap();
+    assert_eq!(
+        next.state.as_ref().unwrap().share_cursor.as_deref(),
+        Some("aaa/upstream05")
+    );
+
+    // Discovery approval is not authority. Fresh facts, noMerge and write
+    // admission still veto both candidates without a merge mutation.
+    for case in [
+        "noMerge",
+        "unapproved",
+        "hold",
+        "incomplete",
+        "write cap",
+        "preview",
+    ] {
+        let mut checked = Forge::new(None, false);
+        checked.replay.requests = forge.replay.requests.clone();
+        let mut cfg = config(settings.clone());
+        if case == "noMerge" {
+            cfg.pr.poll.no_merge.push("cgwalters-forge/work25".into());
+        }
+        for entry in &mut checked.replay.requests {
+            let variables = &entry["request"]["variables"];
+            if variables["name"] != "work25" {
+                continue;
+            }
+            let pull = &mut entry["answer"]["data"]["repository"]["pullRequest"];
+            if !pull.is_null() {
+                if case == "unapproved" {
+                    pull["reviews"]["nodes"] = json!([]);
+                }
+                if case == "hold" {
+                    pull["labels"]["nodes"] = json!([{"name": "hold"}]);
+                }
+            }
+            if case == "incomplete" {
+                let pulls = &mut entry["answer"]["data"]["repository"]["pullRequests"];
+                if !pulls.is_null() {
+                    pulls["pageInfo"]["hasNextPage"] = json!(true);
+                }
+            }
+        }
+        let own = own();
+        let mode = if case == "preview" {
+            Mode::Preview
+        } else {
+            Mode::Actions(&own)
+        };
+        let limits = Limits {
+            writes: (case == "write cap").then_some(0),
+            ..Limits::default()
+        };
+        let report = block(run(
+            &checked,
+            &checked,
+            &cfg,
+            State::default(),
+            (mode, limits),
+            checked.replay.now,
+        ))
+        .unwrap();
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.contains("cgwalters-forge/work25#") && l.ends_with(" -> merged")),
+            "{case}: {:#?}",
+            report.lines
+        );
+        if case == "preview" {
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("pull requests: merged/enqueued 2,")),
+                "{:#?}",
+                report.lines
+            );
+        }
+    }
+}
+
 /// What a pass at [`PASS_REQUEST_LIMIT`] keeps for `percent` of it.
 fn bounds_kept(percent: usize) -> usize {
     PASS_REQUEST_LIMIT * percent / 100

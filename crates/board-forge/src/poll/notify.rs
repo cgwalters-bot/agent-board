@@ -3047,6 +3047,7 @@ mod tests {
                 }),
                 dispatched: 0,
                 merged: 0,
+                preview_merges: 0,
                 queues: BTreeMap::new(),
                 updated: Default::default(),
                 outages: None,

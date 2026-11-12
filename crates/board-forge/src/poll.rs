@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry as MapEntry};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub(crate) mod action_first;
 pub mod approval;
 pub mod bounds;
 pub mod comments;
@@ -542,6 +543,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "directionFirst",
     "ownerBranches",
     "ownSpaceOnly",
+    "actionFirst",
     "foldRounds",
     "reviewPools",
     "reviewDispatchRepositories",
@@ -613,6 +615,9 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// Prevent upstream/draft reads from starving ready own-space merges.
+    /// Off by default; discovery and actions retain the poll's request bounds.
+    pub action_first: bool,
     /// Optional issue for the edited maintainer report; absent publishes nothing.
     pub maintainer_report: Option<report::Destination>,
     pub merge_authors: Vec<String>,
@@ -1030,6 +1035,8 @@ pub const OPERATOR_PATHS_LIMIT: usize = 50;
 #[serde(rename_all = "camelCase")]
 pub struct PrOptions {
     #[serde(default)]
+    pub action_first: bool,
+    #[serde(default)]
     pub check_reruns: bool,
     #[serde(default)]
     pub unstall: bool,
@@ -1158,6 +1165,7 @@ impl PrOptions {
     /// Sets these in `policy`.
     pub fn apply(&self, policy: &mut PollPolicy) {
         let Self {
+            action_first,
             check_reruns,
             unstall,
             direction_first,
@@ -1172,6 +1180,7 @@ impl PrOptions {
             operator_paths,
             stale_days,
         } = self.clone();
+        policy.action_first = action_first;
         policy.check_reruns = check_reruns;
         policy.unstall = unstall;
         policy.direction_first = direction_first;
@@ -1304,6 +1313,7 @@ impl PollPolicy {
             owner_branches: false,
             fix_plans: false,
             own_space_only: false,
+            action_first: false,
             fold_rounds: false,
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
@@ -1607,6 +1617,9 @@ pub struct State {
     /// same pull requests are not left out every pass. None walks in order.
     /// Losing it only starts the walk over.
     pub share_cursor: Option<String>,
+    /// The next own-space repository to screen under `actionFirst`, separate
+    /// from the decision cut so false positives cannot stall discovery.
+    pub action_first_cursor: Option<String>,
     /// The candidate `OWNER/REPO#N` the pass's stage 4 scan stopped at
     /// under `scan.candidates` ([`crate::pass::Scan`]): the next pass's
     /// scan resumes after it, so that the stops of a few passes cover the
@@ -1656,6 +1669,7 @@ impl State {
                     "lock_refused",
                     "follow_cursor",
                     "share_cursor",
+                    "action_first_cursor",
                     "scan_cursor",
                     "holds_pending",
                     "holds_summary_cursor",
@@ -1798,6 +1812,7 @@ impl State {
                 .transpose()
         };
         let follow_cursor = cursor("follow_cursor")?;
+        let action_first_cursor = cursor("action_first_cursor")?;
         let share_cursor = (object.get("share_cursor"))
             .map(|c| {
                 c.as_str()
@@ -1854,6 +1869,7 @@ impl State {
             lock_refused,
             follow_cursor,
             share_cursor,
+            action_first_cursor,
             scan_cursor,
             holds_pending,
             holds_summary_cursor,
@@ -1896,6 +1912,9 @@ impl State {
         }
         if let Some(cursor) = &self.share_cursor {
             state["share_cursor"] = cursor.as_str().into();
+        }
+        if let Some(cursor) = &self.action_first_cursor {
+            state["action_first_cursor"] = cursor.as_str().into();
         }
         if let Some(cursor) = &self.scan_cursor {
             state["scan_cursor"] = cursor.as_str().into();
@@ -4652,6 +4671,8 @@ struct Pass<'a, R, G> {
     dispatched: usize,
     /// See [`Outcome::merged`].
     merged: usize,
+    /// Preview merge decisions, including followed non-bot authors.
+    preview_merges: usize,
     /// Each merge queue read, by repository and base branch: whether all its
     /// entries were read, and the entries and their files, with what this pass
     /// added to it after.
@@ -4822,6 +4843,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             apply: None,
             dispatched: 0,
             merged: 0,
+            preview_merges: 0,
             queues: BTreeMap::new(),
             updated: BTreeSet::new(),
             outages: None,
@@ -8216,6 +8238,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     needs_you_reason(&pull, &decision.reason)
                 },
             });
+        if self.apply.is_none() && ran && decision.action == "merge" {
+            self.preview_merges += 1;
+        }
         let stepped = (text(&pull, "/author/login") == self.config.bot).then(|| Stepped {
             repository: repo.to_owned(),
             number,
@@ -8297,6 +8322,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let open: Vec<Value> = (open.into_iter())
             .filter(|p| p["number"].as_u64().is_some_and(|n| turn.takes(n)))
             .collect();
+        self.follow_open(repo, open, outcome)
+    }
+
+    fn follow_open(&mut self, repo: &str, open: Vec<Value>, outcome: &mut Outcome) -> Result<()> {
         if self.config.policy.maintainer_report.is_some() {
             for p in &open {
                 if let Some(number) = p["number"].as_u64() {
@@ -8636,7 +8665,25 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     }
     // The repositories the pass's share left unwalked, or walked in part.
     let mut waiting = BTreeSet::new();
-    for (repo, turn) in walk(&follow, state.share_cursor.as_deref()) {
+    let mut upstream_cursor = None;
+    let mut action_first_cursor = None;
+    if config.policy.action_first {
+        (action_first_cursor, upstream_cursor) = pass.action_first(
+            &follow,
+            state.share_cursor.as_deref(),
+            state.action_first_cursor.as_deref(),
+            &missing,
+            &mut outcome,
+        );
+        if pass.apply.is_none() {
+            action_first_cursor = state.action_first_cursor.clone();
+        }
+        waiting.extend(outcome.undecided.iter().cloned());
+    }
+    for (repo, turn) in walk(&follow, state.share_cursor.as_deref())
+        .into_iter()
+        .filter(|_| !config.policy.action_first)
+    {
         let excluded = pass.envelope.as_ref().is_some_and(|e| !e.admits(repo))
             || missing.contains(&repo.to_ascii_lowercase());
         // A repository's second turn says nothing the first did not.
@@ -8707,7 +8754,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
                 state.share_cursor.clone()
             }
         }
-        None if pass.apply.is_some() => None,
+        None if pass.apply.is_some() => upstream_cursor,
         None => state.share_cursor.clone(),
     };
     // Once every repository's review runs are counted toward `wip`. Each
@@ -8765,6 +8812,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         lock_refused,
         follow_cursor,
         share_cursor,
+        action_first_cursor,
         // The pass's, kept by the pass ([`crate::pass::run`]).
         scan_cursor: None,
         holds_pending: Vec::new(),
@@ -12518,6 +12566,20 @@ mod tests {
 
     impl Transport for Fake {
         fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            if query == action_first::SCREEN {
+                let nodes: Vec<Value> = self
+                    .pulls
+                    .iter()
+                    .map(|(number, pull)| {
+                        let mut pull = pull.clone();
+                        pull["number"] = json!(number);
+                        pull
+                    })
+                    .collect();
+                return Ok(json!({"repository": {"pullRequests": {
+                    "nodes": nodes, "pageInfo": {"hasNextPage": false}
+                }}}));
+            }
             if query.starts_with("mutation") {
                 self.writes
                     .borrow_mut()
@@ -21032,6 +21094,237 @@ mod tests {
         }
     }
 
+    #[test]
+    fn action_first_partial_ordinary_walk_preserves_unread_ask_coverage() {
+        let mut fake = github();
+        let mut first = fake.pulls[&470].clone();
+        first["isDraft"] = json!(true);
+        fake.pulls.clear();
+        fake.pulls.insert(470, first.clone());
+        fake.pulls.insert(471, first);
+        let shared = ActionShare::new(&fake, 34);
+        let cfg = config();
+        let mut pass = Pass::new(&shared, &shared, &cfg, now());
+        let repo = REPO.to_owned();
+        let follow = [&repo].into_iter().collect();
+        let mut outcome = Outcome::default();
+        pass.action_first(&follow, None, None, &BTreeSet::new(), &mut outcome);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(outcome.steps.iter().any(|s| s.number == 470));
+        assert!(!outcome.steps.iter().any(|s| s.number == 471));
+        assert_eq!(pass.cut.as_deref(), Some(format!("{REPO}#471").as_str()));
+        // This feeds needs::Coverage.reviews_complete: published approval
+        // asks for #471 must be carried forward, not treated as resolved.
+        assert!(outcome.undecided.contains(REPO));
+    }
+
+    /// A real request-counted share, beginning at discovery (activity has
+    /// already run). Unlike `Shared`, inspecting the balance spends nothing.
+    struct ActionShare<'f> {
+        fake: &'f Fake,
+        left: Cell<usize>,
+        screens: RefCell<Vec<String>>,
+    }
+
+    impl<'f> ActionShare<'f> {
+        fn new(fake: &'f Fake, left: usize) -> Self {
+            Self {
+                fake,
+                left: Cell::new(left),
+                screens: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn charge(&self) -> Result<()> {
+            if self.left.get() == 0 {
+                return Err(crate::pass::ShareSpent("the share is spent".into()).into());
+            }
+            self.left.set(self.left.get() - 1);
+            Ok(())
+        }
+    }
+
+    impl Rest for ActionShare<'_> {
+        fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+            self.charge()?;
+            self.fake.get(url, validator)
+        }
+
+        fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+            self.charge()?;
+            self.fake.send(method, url, body)
+        }
+
+        fn share_left(&self) -> Option<usize> {
+            Some(self.left.get())
+        }
+    }
+
+    impl Transport for ActionShare<'_> {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            self.charge()?;
+            if query == action_first::SCREEN {
+                let repo = format!(
+                    "{}/{}",
+                    variables["owner"].as_str().unwrap(),
+                    variables["name"].as_str().unwrap()
+                );
+                self.screens.borrow_mut().push(repo.clone());
+                if repo != REPO {
+                    return Ok(json!({"repository": {"pullRequests": {
+                        "nodes": [], "pageInfo": {"hasNextPage": false}
+                    }}}));
+                }
+            }
+            self.fake.graphql(query, variables)
+        }
+    }
+
+    #[test]
+    fn action_first_discovery_keeps_a_decision_margin_and_resumes() {
+        let fake = github();
+        let cfg = config();
+        let repos: Vec<String> = std::iter::once(REPO.to_owned())
+            .chain((0..9).map(|n| format!("cgwalters-forge/z{n}")))
+            .collect();
+        let follow = repos.iter().collect();
+        let mut cursor = None;
+        let mut screened = BTreeSet::new();
+        for _ in 0..2 {
+            let shared = ActionShare::new(&fake, 40);
+            let mut pass = Pass::new(&shared, &shared, &cfg, now());
+            pass.apply = Some(Apply {
+                dispatcher: &shared,
+                workflow: "dispatch.yml".into(),
+                pools: vec!["claude".into()],
+                git_ref: None,
+            });
+            let mut outcome = Outcome::default();
+            let (next, _) = pass.action_first(
+                &follow,
+                None,
+                cursor.as_deref(),
+                &BTreeSet::new(),
+                &mut outcome,
+            );
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(pass.merged, 1, "{:?}", outcome.lines);
+            assert_eq!(shared.screens.borrow().len(), 8);
+            assert!(next.is_some());
+            assert!(pass.cut.is_none());
+            screened.extend(shared.screens.borrow().iter().cloned());
+            cursor = next;
+        }
+        assert_eq!(screened, repos.into_iter().collect());
+    }
+
+    #[test]
+    fn action_first_review_census_preserves_the_decision_margin() {
+        let mut fake = github();
+        let mut cfg = config();
+        cfg.policy.review_pools = vec!["claude".into()];
+        let repos: Vec<String> = std::iter::once(REPO.to_owned())
+            .chain((0..9).map(|n| format!("cgwalters-forge/z{n}")))
+            .collect();
+        for repo in &repos {
+            let workflow = review_workflow(&cfg, repo).unwrap();
+            let since = (now() - time::Duration::days(1)).date();
+            fake.page(&format!("repos/{repo}/actions/workflows/{workflow}/runs?event={DISPATCH_EVENT}&created=%3E%3D{since}&per_page={REVIEW_DISPATCH_READS}"), None, None, json!({"workflow_runs": []}));
+        }
+        let follow = repos.iter().collect();
+        let shared = ActionShare::new(&fake, 40);
+        let mut pass = Pass::new(&shared, &shared, &cfg, now());
+        pass.apply = Some(Apply {
+            dispatcher: &shared,
+            workflow: "dispatch.yml".into(),
+            pools: vec!["claude".into()],
+            git_ref: None,
+        });
+        let mut outcome = Outcome::default();
+        let (next, _) = pass.action_first(&follow, None, None, &BTreeSet::new(), &mut outcome);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert_eq!(pass.merged, 1, "{:?}", outcome.lines);
+        assert_eq!(shared.screens.borrow().len(), 4);
+        assert!(next.is_some());
+        assert!(pass.cut.is_none());
+        // Even repositories deferred by discovery still hold review slots.
+        assert_eq!(pass.review_runs.len(), repos.len());
+    }
+
+    #[test]
+    fn action_first_rotates_persistent_false_positives_before_a_merge() {
+        let mut fake = github();
+        let approved = fake.pulls[&470].clone();
+        for number in 470..474 {
+            let mut pull = approved.clone();
+            pull["number"] = json!(number);
+            pull["id"] = json!(format!("PR_{number}"));
+            // The cheap screen cannot see this fresh authorization failure.
+            pull["isCrossRepository"] = json!(number == 473);
+            fake.pulls.insert(number, pull);
+            fake.page(
+                &format!("repos/{REPO}/issues/{number}/comments?per_page=100"),
+                None,
+                None,
+                json!([]),
+            );
+        }
+        let cfg = config();
+        let repos: Vec<String> = std::iter::once(REPO.to_owned())
+            .chain((0..9).map(|n| format!("cgwalters-forge/z{n}")))
+            .collect();
+        let follow = repos.iter().collect();
+        let mut state = State {
+            interval_seconds: MIN_INTERVAL_SECONDS,
+            ..State::default()
+        };
+        let mut screened = BTreeSet::new();
+        let mut merged = false;
+        for _ in 0..4 {
+            let shared = ActionShare::new(&fake, 40);
+            let mut pass = Pass::new(&shared, &shared, &cfg, now());
+            pass.apply = Some(Apply {
+                dispatcher: &shared,
+                workflow: "dispatch.yml".into(),
+                pools: vec!["claude".into()],
+                git_ref: None,
+            });
+            let mut outcome = Outcome::default();
+            let (next, _) = pass.action_first(
+                &follow,
+                state.share_cursor.as_deref(),
+                state.action_first_cursor.as_deref(),
+                &BTreeSet::new(),
+                &mut outcome,
+            );
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            screened.extend(shared.screens.borrow().iter().cloned());
+            if pass.merged > 0 {
+                merged = true;
+                break;
+            }
+            state.share_cursor = pass.cut;
+            state.action_first_cursor = next;
+            assert!(state.share_cursor.is_some());
+            state = State::from_json(&state.to_json()).unwrap();
+        }
+        assert!(
+            merged,
+            "eligible PR starved behind persistent screen false positives"
+        );
+        assert_eq!(screened, repos.into_iter().collect());
+        for invalid in [
+            json!(null),
+            json!(42),
+            json!("invalid"),
+            json!(format!("{REPO}#470")),
+        ] {
+            let mut value = state.to_json();
+            value["action_first_cursor"] = invalid;
+            assert!(State::from_json(&value).is_err());
+        }
+    }
+
     /// Where the pass's share runs out, the walk stops between pull
     /// requests: the rest wait, undecided rather than failed, and each
     /// applying pass's walk starts from the state the last one returned,
@@ -21228,6 +21521,7 @@ mod tests {
             apply: None,
             dispatched: 0,
             merged: 0,
+            preview_merges: 0,
             queues: BTreeMap::new(),
             updated: BTreeSet::new(),
             outages: None,
