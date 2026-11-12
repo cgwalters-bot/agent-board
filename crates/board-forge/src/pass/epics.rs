@@ -1769,8 +1769,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// The trusted epic-apply configuration: the pass's writers, its work
     /// repositories and the board's Priority options, new sub-issues taking
     /// the last (the lowest).
-    fn apply_config(&self, project: &Project) -> Result<epic_apply::Config> {
-        let config = self.config;
+    fn apply_config(config: &Config, project: &Project) -> Result<epic_apply::Config> {
         let board = config.github_board().context("no GitHub board")?;
         let priorities: serde_json::Map<String, Value> = (project.options.iter())
             .map(|(id, name)| (name.clone(), Value::from(id.clone())))
@@ -1788,6 +1787,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             "priorities": priorities,
             "default_priority": default,
             "label_by_operator": !config.operator.eq_ignore_ascii_case(&config.bot),
+            "attach_sub_issue": config.issue_intake,
         }))
     }
 
@@ -2137,7 +2137,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.epic_held(facts, wait(&why));
             return None;
         }
-        let config = match self.apply_config(project) {
+        let config = match Self::apply_config(self.config, project) {
             Ok(config) => config,
             Err(error) => {
                 self.report.failures += 1;

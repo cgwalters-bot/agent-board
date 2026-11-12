@@ -286,7 +286,8 @@ dispatch branch. Its JSON object has these fields (unknown fields are refused):
 `attach_sub_issue` action is refused. On, a plan writer may link any issue in
 the configured repositories that has no parent to the epic, and every later
 plan may then close or rescope it as any sub-issue: without the opt-in a plan
-reaches only the epic's own sub-issues. `agent-board pass` does not set it.
+reaches only the epic's own sub-issues. `agent-board pass` sets it only with
+`issueIntake` ([followed issue intake](pass.md#followed-issue-intake)).
 
 `close_epic` is optional and off by default. Off, a plan with a `close_epic`
 action is refused and closing an epic stays the operator's alone; on, a plan

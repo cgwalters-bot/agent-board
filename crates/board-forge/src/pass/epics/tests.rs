@@ -13,6 +13,76 @@ const COMMENTS_596: &str = r#""after":null,"name":"tracker","number":596,"#;
 const COMMENTS_890: &str = r#""after":null,"name":"tracker","number":890,"#;
 
 #[test]
+fn issue_intake_placement_uses_the_pass_apply_configuration_and_bounds() {
+    let epic = crate::epic::Epic {
+        issue: crate::epic::IssueRef::parse("cgwalters-forge/tracker#596").unwrap(),
+        id: "I_epic".into(),
+        designated: true,
+        open: true,
+        sub_issues: vec![],
+        closed: vec![],
+    };
+    let project = Project {
+        id: "PVT_board".into(),
+        field: "F_priority".into(),
+        options: vec![("O_p0".into(), "P0".into())],
+    };
+    for enabled in [false, true] {
+        let cfg = config(json!({"issueIntake":enabled,"state":"state.json","triage":{}}));
+        let apply = Scheduler::<Forge>::apply_config(&cfg, &project).unwrap();
+        for target in ["cgwalters-forge/tracker#459", "outsider/repository#1"] {
+            let plan = json!({"schema": EPIC_PLAN_SCHEMA,"epic":epic.issue.to_string(),
+                "actions":[{"type":"attach_sub_issue","issue":target}]});
+            assert_eq!(
+                apply.validate(&plan, &epic).is_ok(),
+                enabled && target.starts_with("cgwalters-forge/")
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_intake_epic_placement_applies_once_through_the_pass() {
+    let mut recording = replay();
+    unfinished(&mut recording);
+    plan_596(
+        &mut recording,
+        EPIC_PLAN_SCHEMA,
+        json!([
+            {"type":"attach_sub_issue","issue":"cgwalters-forge/tracker#459"}
+        ]),
+    );
+    crate::pass::tests::rest_comment_pages(&mut recording);
+    // Stage 4 has no other work in this placement-only lifecycle.
+    for entry in &mut recording.requests {
+        if let Some(nodes) =
+            entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+        {
+            *nodes = json!([]);
+        }
+    }
+    let forge = Forge::new(recording);
+    let settings = json!({"issueIntake":true,"state":"state.json","triage":{},"follow":[]});
+    let first = local_with(&forge, 100, settings.clone());
+    assert_eq!(first.failures, 0, "{:?}", first.lines);
+    assert_eq!(
+        forge
+            .written()
+            .iter()
+            .filter(|w| *w == "graphql addSubIssue")
+            .count(),
+        1,
+        "{:?}",
+        first.lines
+    );
+    let before = forge.written();
+    let second = local_with(&forge, 100, settings);
+    assert_eq!(second.failures, 0, "{:?}", second.lines);
+    assert_eq!(forge.written(), before, "{:?}", second.lines);
+    println!("{}", first.lines.join("\n"));
+}
+
+#[test]
 fn living_status_cache_alias_is_refused_before_mutations() {
     let dir = tempfile::tempdir().unwrap();
     let forge = Forge::new(replay());

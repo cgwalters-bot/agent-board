@@ -43,6 +43,9 @@ pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";
 // already made.
 pub const POLL_REQUEST_LIMIT: usize = 500;
 pub const POLL_REPOSITORY_LIMIT: usize = 50;
+/// Failed issue enrollments a followed repository keeps retry ownership of;
+/// at most one is added a pass, and a complete listing drops closed ones.
+pub const ISSUE_INTAKE_PENDING_LIMIT: usize = 20;
 /// The share left ([`Rest::share_left`]) a pull request's walk needs before
 /// it begins: enough for its reads, a claim's read back and a round's
 /// start, so that the share stops the walk between pull requests rather
@@ -1656,6 +1659,13 @@ pub struct State {
     /// scan resumes after it, so that the stops of a few passes cover the
     /// board. None scans in order. Losing it only starts the scan over.
     pub scan_cursor: Option<String>,
+    /// Repository updated-issue watermarks; discovery only, never authority.
+    pub issue_intake: BTreeMap<String, String>,
+    /// Unfinished enrollments per followed repository, at most
+    /// [`ISSUE_INTAKE_PENDING_LIMIT`] each, so that a later enrollment never
+    /// takes over an earlier one's retry; never infer ownership from a
+    /// manually unset Project Status.
+    pub issue_intake_pending: BTreeMap<String, BTreeSet<u64>>,
     /// Optional holds descendant context left unread at the publication share.
     /// Reporting only; these item names never authorize work.
     pub holds_pending: Vec<String>,
@@ -1715,6 +1725,8 @@ impl State {
                     "action_first_cursor",
                     "action_first_positions",
                     "scan_cursor",
+                    "issue_intake",
+                    "issue_intake_pending",
                     "holds_pending",
                     "holds_summary_cursor",
                     "notify_since",
@@ -1894,6 +1906,39 @@ impl State {
             })
             .transpose()?;
         let authored_cursor = cursor("authored_cursor")?;
+        let issue_intake: BTreeMap<String, String> = object
+            .get("issue_intake")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("poll state issue_intake is not a map")?
+            .unwrap_or_default();
+        ensure!(
+            issue_intake.len() <= POLL_REPOSITORY_LIMIT,
+            "too many issue intake watermarks"
+        );
+        for (repo, at) in &issue_intake {
+            validate_repository(repo).context("issue intake repository")?;
+            OffsetDateTime::parse(at, &Rfc3339).context("issue intake watermark")?;
+        }
+        let issue_intake_pending: BTreeMap<String, BTreeSet<u64>> = object
+            .get("issue_intake_pending")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("poll state issue_intake_pending is not a map")?
+            .unwrap_or_default();
+        ensure!(
+            issue_intake_pending.len() <= POLL_REPOSITORY_LIMIT,
+            "too many pending issue enrollments"
+        );
+        for (repo, numbers) in &issue_intake_pending {
+            validate_repository(repo).context("pending intake repository")?;
+            ensure!(
+                (1..=ISSUE_INTAKE_PENDING_LIMIT).contains(&numbers.len())
+                    && !numbers.contains(&0)
+                    && issue_intake.contains_key(repo),
+                "pending intake needs 1 to {ISSUE_INTAKE_PENDING_LIMIT} issue numbers and a watermark"
+            );
+        }
         let holds_summary_cursor = object
             .get("holds_summary_cursor")
             .map(|c| {
@@ -1940,6 +1985,8 @@ impl State {
             action_first_cursor,
             action_first_positions,
             scan_cursor,
+            issue_intake,
+            issue_intake_pending,
             holds_pending,
             holds_summary_cursor,
             notify_since,
@@ -1993,6 +2040,12 @@ impl State {
         }
         if let Some(cursor) = &self.scan_cursor {
             state["scan_cursor"] = cursor.as_str().into();
+        }
+        if !self.issue_intake.is_empty() {
+            state["issue_intake"] = json!(self.issue_intake);
+        }
+        if !self.issue_intake_pending.is_empty() {
+            state["issue_intake_pending"] = json!(self.issue_intake_pending);
         }
         if !self.holds_pending.is_empty() {
             state["holds_pending"] = json!(self.holds_pending);
@@ -8975,6 +9028,8 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         action_first_positions,
         // The pass's, kept by the pass ([`crate::pass::run`]).
         scan_cursor: None,
+        issue_intake: BTreeMap::new(),
+        issue_intake_pending: BTreeMap::new(),
         holds_pending: Vec::new(),
         holds_summary_cursor: None,
         notify_since,

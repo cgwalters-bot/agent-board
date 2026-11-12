@@ -10,6 +10,614 @@ const CONFIG: &str = include_str!("../../../../fixtures/pass/config.json");
 /// appended by hand, finding none ([`merged`] gives tracker#468's one).
 const BOARD: &str = include_str!("../../../../fixtures/pass/board-2026-10-23.json");
 
+/// Reuse a real unplanned issue's comments, but discover it outside the board.
+fn intake_fixture() -> Replay {
+    let mut replay = without_epics(replay());
+    let mut fresh = Value::Null;
+    for entry in &mut replay.requests {
+        if let Some(nodes) = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut)
+        {
+            if let Some(node) = nodes.iter().find(|n| n["content"]["number"] == 459) {
+                fresh = node["content"].clone();
+            }
+            nodes.clear();
+        }
+    }
+    assert!(!fresh.is_null());
+    fresh["id"] = json!("fresh-issue");
+    fresh["parent"] = Value::Null;
+    fresh["labels"] = json!({"nodes":[],"totalCount":0});
+    fresh["updatedAt"] = json!(replay.now.format(&Rfc3339).unwrap());
+    fresh["reopens"] = json!({"nodes":[]});
+    fresh["projectItems"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
+    let variables = json!({"owner":"cgwalters-forge","name":"tracker",
+        "since": (replay.now - time::Duration::days(2)).format(&Rfc3339).unwrap()});
+    replay.requests.push(json!({"request":graphql_key(&intake::query(false), &variables),
+        "answer":{"data":{"repository":{"issues":{"nodes":[fresh],"pageInfo":{"hasNextPage":false}}}}}}));
+    for path in ["events?per_page=100", "pulls?state=open&per_page=100"] {
+        replay.requests.push(
+            json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/{path}")},
+            "answer":{"status":200,"body":[],"link":null}}),
+        );
+    }
+    rest_comment_pages(&mut replay);
+    replay
+}
+
+fn intake_config() -> Config {
+    config(json!({"issueIntake":true,"state":"state.json","triage":{},
+        "follow":["cgwalters-forge/tracker"],"workRepositories":["cgwalters-forge/tracker"],"pr":{"fixPools":["claude"]}}))
+}
+
+fn intake_issue(replay: &mut Replay) -> &mut Value {
+    &mut replay
+        .requests
+        .iter_mut()
+        .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+        .unwrap()["answer"]["data"]["repository"]["issues"]["nodes"][0]
+}
+
+#[test]
+fn issue_intake_enrolls_any_fresh_issue_and_triages_only_the_operators() {
+    // A visitor's card waits for a person: filing an issue spends no run.
+    for (author, triaged) in [(None, true), (Some("visitor"), false)] {
+        let mut fixture = intake_fixture();
+        if let Some(author) = author {
+            intake_issue(&mut fixture)["author"]["login"] = json!(author);
+        }
+        let report = preview(&intake_config(), &fixture);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert!(
+            report
+                .lines
+                .contains(&"intake: 1 new issue(s) (cgwalters-forge/tracker#459)".into()),
+            "{:#?}",
+            report.lines
+        );
+        assert_eq!(
+            report
+                .lines
+                .contains(&"start triage cgwalters-forge/tracker#459 pool=claude".into()),
+            triaged,
+            "{author:?}: {:#?}",
+            report.lines
+        );
+        assert!(
+            report.issue_intake.is_empty(),
+            "preview must not advance watermarks"
+        );
+    }
+    let mut off = intake_config();
+    off.issue_intake = false;
+    let report = preview(&off, &intake_fixture());
+    assert!(!report.lines.iter().any(|l| l.starts_with("intake:")));
+    assert!(!report.lines.iter().any(|l| l.starts_with("start triage")));
+}
+
+#[test]
+fn issue_intake_refuses_unverified_discovery() {
+    for (name, pointer, value) in [
+        ("pull request", "/__typename", json!("PullRequest")),
+        (
+            "foreign repository",
+            "/repository/nameWithOwner",
+            json!("other/repo"),
+        ),
+        ("closed", "/state", json!("CLOSED")),
+        ("truncated labels", "/labels/totalCount", json!(51)),
+        (
+            "truncated membership",
+            "/projectItems/pageInfo/hasNextPage",
+            json!(true),
+        ),
+        (
+            "redacted membership",
+            "/projectItems/nodes",
+            json!([{"id":"member","project":null}]),
+        ),
+        ("missing timestamp", "/updatedAt", Value::Null),
+    ] {
+        let mut fixture = intake_fixture();
+        *intake_issue(&mut fixture).pointer_mut(pointer).unwrap() = value;
+        let report = preview(&intake_config(), &fixture);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("intake warning:")),
+            "{name}: {:?}",
+            report.lines
+        );
+        assert!(
+            report.lines.contains(&"intake: 0 new issue(s)".into()),
+            "{name}"
+        );
+        assert!(
+            !report.lines.iter().any(|l| l.starts_with("start triage")),
+            "{name}"
+        );
+    }
+}
+
+/// Applying harness: real scheduling, request accounting and dispatch guards,
+/// with checked receipts for the two Project mutation shapes.
+struct IntakeForge {
+    forge: Forge,
+    enrollment: RefCell<Vec<Value>>,
+    fail_field: bool,
+}
+
+impl Rest for IntakeForge {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        if url == format!("{API_ROOT}user") {
+            return Ok(listed(json!({"login":"cgwalters-bot"})));
+        }
+        self.forge.get(url, validator)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.forge.send(method, url, body)
+    }
+}
+
+impl Broker for IntakeForge {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.forge.usage(url)
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.forge.grant(url)
+    }
+}
+
+impl Transport for IntakeForge {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if query.starts_with(FRESH_QUERY) {
+            let listing = self
+                .forge
+                .replay
+                .requests
+                .iter()
+                .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+                .unwrap();
+            let nodes = &listing["answer"]["data"]["repository"]["issues"]["nodes"];
+            let mut issue = (nodes.as_array().unwrap().iter())
+                .find(|n| n["number"] == variables["number"])
+                .unwrap_or(&nodes[0])
+                .clone();
+            issue["projectItems"] = json!({"nodes":[{"project":{"number":1,"owner":{"login":"cgwalters-forge"}},"status":{"name":"Todo"}}],"totalCount":1});
+            return Ok(json!({"repository":{"issue":issue}}));
+        }
+        if query.starts_with("mutation") && query.contains("addProjectV2ItemById") {
+            self.enrollment.borrow_mut().push(variables);
+            return Ok(json!({"addProjectV2ItemById":{"item":{"id":"new-item"}}}));
+        }
+        if query.starts_with("mutation") && query.contains("updateProjectV2ItemFieldValue") {
+            self.enrollment.borrow_mut().push(variables.clone());
+            ensure!(!self.fail_field, "field write refused");
+            return Ok(json!({"updateProjectV2ItemFieldValue":{"projectV2Item":{
+                "id":variables["item"],"fieldValueByName":{"optionId":variables["value"]["singleSelectOptionId"]}
+            }}}));
+        }
+        Transport::graphql(&self.forge, query, variables)
+    }
+}
+
+impl crate::github::GraphQl for IntakeForge {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
+fn intake_apply(forge: &IntakeForge, state: State, max_writes: usize, dispatch: usize) -> Report {
+    intake_apply_with(forge, &intake_config(), state, max_writes, dispatch)
+}
+
+fn intake_apply_with(
+    forge: &IntakeForge,
+    config: &Config,
+    state: State,
+    max_writes: usize,
+    dispatch: usize,
+) -> Report {
+    block(run(
+        forge,
+        forge,
+        config,
+        state,
+        (
+            Mode::Local,
+            Limits {
+                dispatch: Some(dispatch),
+                writes: Some(max_writes),
+                ..Limits::default()
+            },
+        ),
+        forge.forge.replay.now,
+    ))
+    .unwrap()
+}
+
+fn intake_forge() -> IntakeForge {
+    let mut forge = Forge::new(None, false);
+    forge.replay = intake_fixture();
+    IntakeForge {
+        forge,
+        enrollment: RefCell::default(),
+        fail_field: false,
+    }
+}
+
+#[test]
+fn issue_intake_apply_counts_writes_and_retains_failed_enrollments() {
+    for (max_writes, fail_field, expected_writes) in [
+        (0, false, 0),
+        (1, false, 0),
+        (2, false, 2),
+        (2, true, 2),
+        (100, false, 2),
+    ] {
+        let mut forge = intake_forge();
+        forge.fail_field = fail_field;
+        let report = intake_apply(&forge, State::default(), max_writes, 1);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(
+            forge.enrollment.borrow().len(),
+            expected_writes,
+            "{max_writes}/{fail_field}: {:?}",
+            report.lines
+        );
+        let state = report.state.unwrap();
+        let watermark =
+            OffsetDateTime::parse(&state.issue_intake["cgwalters-forge/tracker"], &Rfc3339)
+                .unwrap();
+        assert_eq!(
+            watermark,
+            forge.forge.replay.now
+                - if max_writes >= 2 && !fail_field {
+                    time::Duration::seconds(1)
+                } else {
+                    time::Duration::days(2)
+                }
+        );
+        assert_eq!(
+            state
+                .issue_intake_pending
+                .contains_key("cgwalters-forge/tracker"),
+            fail_field
+        );
+        assert_eq!(
+            forge.forge.dispatches().len(),
+            usize::from(max_writes >= 2 && !fail_field),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+fn intake_member(forge: &mut IntakeForge, status: Value, priority: Value) {
+    let project = forge
+        .forge
+        .replay
+        .requests
+        .iter()
+        .find_map(|e| {
+            e["answer"]
+                .pointer("/data/repositoryOwner/projectV2/id")
+                .and_then(Value::as_str)
+        })
+        .unwrap()
+        .to_owned();
+    let issue = intake_issue(&mut forge.forge.replay);
+    issue["projectItems"]["nodes"] =
+        json!([{"id":"existing-item","project":{"id":project},"status":status}]);
+    let issue = issue.clone();
+    for entry in &mut forge.forge.replay.requests {
+        if let Some(nodes) =
+            entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+        {
+            *nodes = json!([{"content":issue,"priority":priority,"status":status,"why":null}]);
+        }
+    }
+}
+
+#[test]
+fn issue_intake_repairs_only_owned_partial_enrollment_on_next_pass() {
+    let mut forge = intake_forge();
+    forge.fail_field = true;
+    let first = intake_apply(&forge, State::default(), 10, 0);
+    let saved = State::from_json(&first.state.unwrap().to_json()).unwrap();
+    assert_eq!(
+        saved.issue_intake_pending["cgwalters-forge/tracker"],
+        BTreeSet::from([459])
+    );
+    forge.fail_field = false;
+    intake_member(&mut forge, Value::Null, json!({"name":"P2"}));
+    forge.enrollment.borrow_mut().clear();
+    let second = intake_apply(&forge, saved, 10, 0);
+    assert_eq!(forge.enrollment.borrow().len(), 1, "{:?}", second.lines);
+    assert_eq!(forge.enrollment.borrow()[0]["name"], "Status");
+    assert!(second.state.unwrap().issue_intake_pending.is_empty());
+    // The same unset field without retry ownership is a person's decision.
+    forge.enrollment.borrow_mut().clear();
+    let manual = intake_apply(&forge, State::default(), 10, 0);
+    assert!(forge.enrollment.borrow().is_empty(), "{:?}", manual.lines);
+}
+
+fn intake_nodes(forge: &mut IntakeForge) -> &mut Vec<Value> {
+    (forge.forge.replay.requests.iter_mut())
+        .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+        .unwrap()["answer"]["data"]["repository"]["issues"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+}
+
+/// Saved intake state for tracker at the fixture's initial watermark.
+fn intake_state(now: OffsetDateTime, pending: &[u64]) -> State {
+    let repo = "cgwalters-forge/tracker".to_owned();
+    let since = (now - time::Duration::days(2)).format(&Rfc3339).unwrap();
+    State {
+        issue_intake: BTreeMap::from([(repo.clone(), since)]),
+        issue_intake_pending: BTreeMap::from([(repo, pending.iter().copied().collect())]),
+        ..State::default()
+    }
+}
+
+#[test]
+fn issue_intake_keeps_earlier_retry_ownership_across_another_enrollment() {
+    for (fail_field, writes, pending) in [(false, 3, vec![]), (true, 2, vec![458, 459])] {
+        let mut forge = intake_forge();
+        forge.fail_field = fail_field;
+        intake_member(&mut forge, Value::Null, json!({"name":"P2"}));
+        let now = forge.forge.replay.now;
+        let nodes = intake_nodes(&mut forge);
+        let mut other = nodes[0].clone();
+        other["number"] = json!(458);
+        other["id"] = json!("other-issue");
+        other["updatedAt"] = json!((now - time::Duration::hours(1)).format(&Rfc3339).unwrap());
+        other["projectItems"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
+        nodes.insert(0, other);
+        let report = intake_apply(&forge, intake_state(now, &[459]), 10, 0);
+        assert_eq!(
+            forge.enrollment.borrow().len(),
+            writes,
+            "{fail_field}: {:?}",
+            report.lines
+        );
+        let state = report.state.unwrap();
+        let left = state.issue_intake_pending.get("cgwalters-forge/tracker");
+        assert_eq!(
+            left.cloned().unwrap_or_default(),
+            pending.into_iter().collect(),
+            "{fail_field}: {:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn issue_intake_one_repository_failing_keeps_its_state_and_not_the_others() {
+    let forge = intake_forge();
+    let now = forge.forge.replay.now;
+    let mut config = intake_config();
+    config.follow.push("cgwalters-forge/unrecorded".into());
+    let older = (now - time::Duration::days(3)).format(&Rfc3339).unwrap();
+    let mut state = intake_state(now, &[459]);
+    for repo in ["cgwalters-forge/unrecorded", "gone/repo"] {
+        state.issue_intake.insert(repo.into(), older.clone());
+        state
+            .issue_intake_pending
+            .insert(repo.into(), BTreeSet::from([7]));
+    }
+    let report = intake_apply_with(&forge, &config, state, 10, 0);
+    assert!(
+        (report.lines.iter()).any(|l| l.starts_with("intake warning: cgwalters-forge/unrecorded:")),
+        "{:?}",
+        report.lines
+    );
+    assert!(
+        (report.lines).contains(&"intake: 1 new issue(s) (cgwalters-forge/tracker#459)".into()),
+        "{:?}",
+        report.lines
+    );
+    let state = report.state.unwrap();
+    assert_eq!(
+        state.issue_intake,
+        BTreeMap::from([
+            (
+                "cgwalters-forge/tracker".into(),
+                (now - time::Duration::seconds(1)).format(&Rfc3339).unwrap()
+            ),
+            ("cgwalters-forge/unrecorded".into(), older),
+        ])
+    );
+    assert_eq!(
+        state.issue_intake_pending,
+        BTreeMap::from([("cgwalters-forge/unrecorded".into(), BTreeSet::from([7]))])
+    );
+}
+
+#[test]
+fn issue_intake_full_pages_advance_by_timestamp_and_complete_ones_drop_closed_retries() {
+    // "ahead": the second half was updated after the pass began.
+    for (name, more, step, overflow) in [
+        ("full", true, 60, false),
+        ("overflow", true, 0, true),
+        ("complete", false, 60, false),
+        ("ahead", true, 2 * 86400 / 50, false),
+    ] {
+        let mut forge = intake_forge();
+        intake_member(&mut forge, json!({"name":"Todo"}), json!({"name":"P2"}));
+        let now = forge.forge.replay.now;
+        let since = now - time::Duration::days(2);
+        let last = since + time::Duration::seconds(step * intake::PAGE as i64);
+        let template = intake_nodes(&mut forge)[0].clone();
+        *intake_nodes(&mut forge) = (1..=intake::PAGE as i64)
+            .map(|n| {
+                let mut node = template.clone();
+                node["number"] = json!(1000 + n);
+                node["updatedAt"] = json!(
+                    (since + time::Duration::seconds(step * n))
+                        .format(&Rfc3339)
+                        .unwrap()
+                );
+                node
+            })
+            .collect();
+        (forge.forge.replay.requests.iter_mut())
+            .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+            .unwrap()["answer"]["data"]["repository"]["issues"]["pageInfo"]["hasNextPage"] =
+            json!(more);
+        let report = intake_apply(&forge, intake_state(now, &[9999]), 10, 0);
+        assert!(forge.enrollment.borrow().is_empty(), "{name}");
+        assert_eq!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("timestamp overflow")),
+            overflow,
+            "{name}: {:?}",
+            report.lines
+        );
+        let state = report.state.unwrap();
+        let watermark =
+            OffsetDateTime::parse(&state.issue_intake["cgwalters-forge/tracker"], &Rfc3339)
+                .unwrap();
+        let expected = match (more && last <= now, overflow) {
+            (_, true) => since,
+            (true, false) => last - time::Duration::seconds(1),
+            (false, _) => now - time::Duration::seconds(1),
+        };
+        assert_eq!(watermark, expected, "{name}");
+        // A full page may not have reached the pending issue yet.
+        assert_eq!(
+            state.issue_intake_pending.is_empty(),
+            !more,
+            "{name}: {:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn issue_intake_reopen_evidence_preserves_later_manual_done_and_priority() {
+    for (status_at, reopen_at, expected) in [
+        ("2026-10-23T00:00:00Z", Some("2026-10-23T00:01:00Z"), 1),
+        ("2026-10-23T00:02:00Z", Some("2026-10-23T00:01:00Z"), 0),
+        ("2026-10-23T00:00:00Z", None, 0),
+    ] {
+        let mut forge = intake_forge();
+        let issue = intake_issue(&mut forge.forge.replay);
+        issue["reopens"]["nodes"] = match reopen_at {
+            Some(at) => json!([{"createdAt":at}]),
+            None => json!([]),
+        };
+        issue["labels"] = json!({"nodes":[{"name":"P0"}],"totalCount":1});
+        intake_member(
+            &mut forge,
+            json!({"name":"Done","updatedAt":status_at}),
+            json!({"name":"P2"}),
+        );
+        let report = intake_apply(&forge, State::default(), 10, 0);
+        assert_eq!(
+            forge.enrollment.borrow().len(),
+            expected,
+            "{:?}",
+            report.lines
+        );
+        if expected > 0 {
+            assert_eq!(forge.enrollment.borrow()[0]["name"], "Status");
+        }
+    }
+}
+
+#[test]
+fn issue_intake_priority_and_dispatch_are_not_repeated_on_next_pass() {
+    let mut forge = intake_forge();
+    intake_issue(&mut forge.forge.replay)["labels"] =
+        json!({"nodes":[{"name":"P1"},{"name":"priority/p0"}],"totalCount":2});
+    let first = intake_apply(&forge, State::default(), 100, 1);
+    assert_eq!(forge.enrollment.borrow().len(), 3, "{:?}", first.lines);
+    assert_eq!(forge.enrollment.borrow()[1]["name"], "Priority");
+    let p0 = forge
+        .forge
+        .replay
+        .requests
+        .iter()
+        .filter_map(|e| {
+            e["answer"]
+                .pointer("/data/node/fields/nodes")
+                .and_then(Value::as_array)
+        })
+        .flatten()
+        .find(|f| f["name"] == "Priority")
+        .unwrap()["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["name"] == "P0")
+        .unwrap()["id"]
+        .clone();
+    assert_eq!(
+        forge.enrollment.borrow()[1]["value"]["singleSelectOptionId"],
+        p0
+    );
+    assert_eq!(forge.forge.dispatches().len(), 1, "{:?}", first.lines);
+    let comments = forge.forge.comments_on("cgwalters-forge/tracker", 459);
+    assert!(
+        comments.iter().any(|c| c.contains("attach_sub_issue")),
+        "{comments:?}"
+    );
+    let state = first.state.unwrap();
+    let listing = forge
+        .forge
+        .replay
+        .requests
+        .iter_mut()
+        .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+        .unwrap();
+    listing["request"] = graphql_key(
+        &intake::query(false),
+        &json!({"owner":"cgwalters-forge","name":"tracker","since":state.issue_intake["cgwalters-forge/tracker"]}),
+    );
+    intake_member(&mut forge, json!({"name":"Todo"}), json!({"name":"P0"}));
+    forge.enrollment.borrow_mut().clear();
+    let second = intake_apply(&forge, state, 100, 1);
+    assert_eq!(second.failures, 0, "{:?}", second.lines);
+    assert!(forge.enrollment.borrow().is_empty(), "{:?}", second.lines);
+    assert_eq!(forge.forge.dispatches().len(), 1, "{:?}", second.lines);
+}
+
+#[test]
+fn issue_intake_state_round_trips_and_rejects_bad_watermarks_or_ownership() {
+    let state = State {
+        interval_seconds: poll::MIN_INTERVAL_SECONDS,
+        issue_intake: BTreeMap::from([("o/r".into(), "2026-11-11T00:00:00Z".into())]),
+        issue_intake_pending: BTreeMap::from([("o/r".into(), BTreeSet::from([1, 2]))]),
+        ..State::default()
+    };
+    let read = State::from_json(&state.to_json()).unwrap();
+    assert_eq!(read.issue_intake, state.issue_intake);
+    assert_eq!(read.issue_intake_pending, state.issue_intake_pending);
+    let full = (1..=poll::ISSUE_INTAKE_PENDING_LIMIT as u64 + 1).collect::<Vec<_>>();
+    for (field, bad) in [
+        ("issue_intake", json!({"o/r":"yesterday"})),
+        ("issue_intake", json!({"../bad":"2026-11-11T00:00:00Z"})),
+        ("issue_intake", json!([])),
+        ("issue_intake_pending", json!({"o/r":1})),
+        ("issue_intake_pending", json!({"o/r":[0]})),
+        ("issue_intake_pending", json!({"o/r":[]})),
+        ("issue_intake_pending", json!({"o/r":full})),
+        ("issue_intake_pending", json!({"other/repo":[1]})),
+    ] {
+        let mut value = state.to_json();
+        value[field] = bad;
+        assert!(State::from_json(&value).is_err(), "{value}");
+    }
+}
+
 /// Same recorded board for both algorithms, with two ready children of
 /// the first P0 epic, a competing P0 orphan, and 400 unrelated parents.
 fn top_down_fixture() -> Replay {
@@ -127,7 +735,7 @@ struct ConditionalFixture(Replay);
 
 /// The same histories via REST, including timestamps used to bind GraphQL's
 /// editor evidence. No private usage or holds history is copied into these.
-fn rest_comment_pages(replay: &mut Replay) {
+pub(super) fn rest_comment_pages(replay: &mut Replay) {
     let mut pages = Vec::new();
     for entry in &replay.requests {
         if entry["request"]["graphql"] != fnv(plan::COMMENTS_QUERY)

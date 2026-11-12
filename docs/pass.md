@@ -349,6 +349,61 @@ exited 1 because private bot-ops usage/holds reads returned 404, so live pacing
 and dispatch admission remain unverified. The offline regression merges 17
 approved heads in one applying pass with those scheduling-reserve settings.
 
+## Followed issue intake
+
+The concrete risks are a busy repository spending the whole pass on enrollment,
+and a stranger's issue being mistaken for implementation authorization.
+`issueIntake: true` opts GitHub passes into incremental enrollment; it is off by
+default and requires a GitHub board, `state`, `triage` and scheduling. Before
+stage 4's WIP/pool gates, intake lists open issues updated since each explicitly
+followed repository's watermark, one GraphQL call per repository, with facts,
+project memberships and the last native reopen event batched. Discovery makes
+no per-issue reads and does not use repositories discovered through PRs.
+
+An absent member is added with Status Todo and the highest matching Priority
+option from its labels (`P0` or `priority/P0`, case-insensitive), otherwise unset.
+An existing Done card returns to Todo only if its latest native reopen is newer
+than the Done field's update time. Ordinary edits and a later manual Done value
+are not reopens. Existing Priority and Why are preserved. Unset Status is never
+inferred to be intake-owned: after a failed enrollment, state retains that issue
+as pending for repair where a later listing reaches it, besides any earlier ones,
+up to 20 per repository; further enrollments there wait until one is repaired.
+A complete listing that no longer shows a pending issue (it was closed) drops it.
+Losing state (including termination
+before it is saved) loses this retry ownership; an existing unset card then stays
+untouched for a person. Keep state and serialize applying passes as usual.
+The summary says `intake: N new issue(s) (repo#n, ...)`.
+
+The listing reads at most 100 issues per repository, oldest update first, and
+intake shares at most 15% of the pass request limit, inside its time limit.
+Every mutation attempt consumes `--max-writes`; admission requires room for the
+add and initial fields together. Oldest watermarks go first. First use looks
+back two days; saved watermarks do not expire. Incomplete or refused reads,
+exhausted shares/caps and failed writes retain the repository's watermark.
+A full page advances only to its final timestamp minus one second; a page full
+at that boundary reports timestamp overflow rather than silently skipping issues.
+Issues updated after the pass began are left to the next pass.
+Preview writes nothing and advances no state.
+
+In work repositories, followed issues the operator or bot opened enter normal
+triage even outside `triage.scope: epics`. Anyone else's is enrolled but held
+as a visitor's, as below: a triage run's own plan is the bot's, so triaging a
+stranger's issue would let filing it start implementation. Its brief
+asks for placement under the best-fitting live epic with `attach_sub_issue`
+(the protocol's lowering to GitHub's `addSubIssue`) in an epic plan, or a proposed
+epic. The same opt-in enables that action in the pass's epic applier, restricted
+to authenticated plans and configured work repositories. Existing dispatch
+records prevent duplicate initial triage. Configured repository sessions take
+triage instead. Holds, WIP, pacing, scan bounds, focus and dispatch caps still
+apply; intake cannot promise a start while those gates hold it. Enrollment
+outside `workRepositories` grants no permission to start work there.
+
+This extends the mechanism proposed in [#892](https://github.com/cgwalters-forge/agent-board/pull/892),
+adding native reopen evidence and explicit failed-enrollment ownership rather
+than a second discovery path. Caller activation: in `cgwalters-forge/tracker`,
+`.github/pass.json`, set `issueIntake` to `true` after updating agent-board.
+No deployed configuration is changed here.
+
 ## Hard-item pool mixing
 
 The concrete risk is a model variant bypassing its shared account's pace.
