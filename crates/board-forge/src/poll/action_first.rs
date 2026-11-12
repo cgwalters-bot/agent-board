@@ -368,6 +368,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "pull requests: merged/enqueued {}, fix rounds {}, continuations {}, upstream reads {upstream}",
             self.merged + self.preview_merges, count(&["fix", "rebase"]), count(&["continue"])
         ));
+        outcome.lines.push(format!(
+            "updated {} behind auto-merge PR(s)",
+            outcome
+                .steps
+                .iter()
+                .filter(|s| s.ran
+                    && s.action == "update"
+                    && s.reason.starts_with("behind auto-merge PR;"))
+                .count()
+        ));
         for repo in follow {
             self.count_reviews(repo, outcome);
         }
