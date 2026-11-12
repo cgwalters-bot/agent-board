@@ -16500,6 +16500,100 @@ fn unpathed(replay: &mut Replay) {
 /// A plan that names no pool is sent with the one pace chose; the dispatch
 /// record and the run are the plan protocol's.
 #[test]
+fn headroom_reservation_crosses_from_pr_preview_to_scheduling() {
+    let mut replay = replay();
+    only(&mut replay, &["cgwalters-forge/tracker#446"]);
+    let mut settings = json!({"poolHeadroom": true, "wip": 6});
+    followed_draft(&mut replay, &mut settings);
+    settings["pr"]["fixPools"] = json!(["openai", "claude"]);
+    let mut snapshot = usage(&mut replay);
+    let mut entry = snapshot["pools"]["claude"].clone();
+    entry["hold"] = false.into();
+    entry["used_percent"] = 1.into();
+    snapshot["pools"]["claude"] = entry.clone();
+    entry["used_percent"] = 1.5.into();
+    snapshot["pools"]["openai"] = entry;
+    set_usage(&mut replay, &snapshot);
+    let report = preview(&config(settings), &replay);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains("would start continue round 1 pool=claude")),
+        "{:#?}",
+        report.lines
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("start triage cgwalters-forge/tracker#446 pool=openai")),
+        "{:#?}",
+        report.lines
+    );
+}
+
+#[test]
+fn headroom_routes_preview_and_apply_with_either_allowlist_order() {
+    for reversed in [false, true] {
+        for applying in [false, true] {
+            let mut forge = Forge::new(None, false);
+            only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+            implement_plan(&mut forge.replay);
+            unpathed(&mut forge.replay);
+            let mut snapshot = usage(&mut forge.replay);
+            snapshot["pools"]["openai"]["hold"] = false.into();
+            snapshot["pools"]["openai"]["used_percent"] = 1.into();
+            snapshot["pools"]["claude"]["used_percent"] = 40.into();
+            set_usage(&mut forge.replay, &snapshot);
+            let pools = if reversed {
+                json!(["openai", "claude"])
+            } else {
+                json!(["claude", "openai"])
+            };
+            let cfg = config(json!({"wip":3, "poolHeadroom":true, "planPools": pools}));
+            // Entropy would pick claude in one ordering; this mode never draws.
+            let report = crate::pool_choice::with_index(0, || {
+                if applying {
+                    apply(&forge, &cfg)
+                } else {
+                    preview(&cfg, &forge.replay)
+                }
+            });
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            assert!(
+                report.lines.iter().any(|l| l
+                    .starts_with("start implement cgwalters-forge/tracker#446")
+                    && l.contains("pool=openai")),
+                "{:#?}",
+                report.lines
+            );
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("pool: openai (headroom ")
+                        && l.contains(" over claude (")),
+                "{:#?}",
+                report.lines
+            );
+            if applying {
+                let writes = forge.writes.borrow();
+                let (_, _, sent) = writes
+                    .iter()
+                    .find(|(_, url, _)| url.ends_with("/dispatches"))
+                    .unwrap();
+                assert_eq!(sent["inputs"]["pool"], "openai");
+            } else {
+                assert!(forge.writes.borrow().is_empty());
+            }
+        }
+    }
+    assert!(!config(json!({})).pool_headroom);
+}
+
+#[test]
 fn implement_takes_the_paced_pool() {
     for (ticket, expected) in [(0, "claude"), (1, "openai")] {
         let forge = {
@@ -16575,7 +16669,9 @@ fn mixed_start_keeps_model_in_plan_dispatch_and_log() {
             snapshot["pools"]["openai"]["used_percent"] = 1.into();
             set_usage(&mut forge.replay, &snapshot);
         }
-        let cfg = config(json!({"wip":3, "mix": {pool: {"share":1.0,"when":["review:deep"]}}}));
+        let cfg = config(
+            json!({"wip":3, "poolHeadroom":true, "mix": {pool: {"share":1.0,"when":["review:deep"]}}}),
+        );
         let report = crate::pool_choice::with_index(0, || apply(&forge, &cfg));
         assert_eq!(report.failures, 0, "{:#?}", report.lines);
         assert!(

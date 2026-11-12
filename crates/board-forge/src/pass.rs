@@ -617,6 +617,9 @@ pub struct Config {
     pub triage: Option<TriageScope>,
     #[serde(default)]
     pub plan_pools: Vec<String>,
+    /// Off by default: route to the allowed pool with the most pace headroom.
+    #[serde(default)]
+    pub pool_headroom: bool,
     /// None: `planPools`.
     pub triage_pools: Option<Vec<String>>,
     /// Off at 0: else a triage that ended without a plan is followed up by
@@ -1951,6 +1954,8 @@ impl Config {
                 snapshot: snapshot.cloned(),
             }),
             fix_bounds: self.fix_bounds.clone(),
+            preview_fix_pools: self.pool_headroom.then(|| self.pr.fix_pools.clone()),
+            pass_triage_pools: self.pool_headroom.then(|| self.triage_pools().to_vec()),
             fix_plans: self.fix_plans,
             reruns: self.reruns,
             notification_intake: self.notifications.then(BTreeMap::new),
@@ -2700,6 +2705,7 @@ struct Bounds {
     start_kind: RefCell<String>,
     /// The runs started whose dispatch named them, for the pass view.
     started: RefCell<Vec<view::Run>>,
+    routing: RefCell<Option<routing::Routing>>,
     /// The pass's requests: [`PASS_REQUEST_LIMIT`], or its share of the
     /// token's headroom ([`Self::size`]).
     limit: Cell<usize>,
@@ -2763,6 +2769,7 @@ impl Bounds {
             effects: RefCell::default(),
             start_kind: RefCell::default(),
             started: RefCell::default(),
+            routing: RefCell::default(),
             limit: Cell::new(limit),
             left: Cell::new(limit),
             admit_by,
@@ -3331,6 +3338,20 @@ impl<C: Rest> Rest for Budget<'_, C> {
         *self.bounds.start_kind.borrow_mut() = kind.to_owned();
     }
 
+    fn route_pool(&self, rooms: Vec<(String, f64)>) -> Option<Result<String, String>> {
+        self.bounds
+            .routing
+            .borrow_mut()
+            .as_mut()
+            .map(|r| r.choose(rooms))
+    }
+
+    fn preview_pool_start(&self, pool: &str) {
+        if let Some(routing) = self.bounds.routing.borrow_mut().as_mut() {
+            routing.started(pool);
+        }
+    }
+
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         if validator.is_none()
             && let Some(KeptRead::Rest(response)) = self.publication_read(url)
@@ -3467,6 +3488,13 @@ impl<C: Rest> Rest for Budget<'_, C> {
             .as_ref()
             .map(|w| (w.method, w.url.as_str(), &w.body))
             .unwrap_or((method, url, body));
+        if method == "POST"
+            && url.ends_with("/dispatches")
+            && let Some(pool) = body["inputs"]["pool"].as_str()
+        {
+            // Count attempts too: a lost response may still have started a run.
+            self.preview_pool_start(pool);
+        }
         let mut response = self.observe(self.inner.send(method, url, body))?;
         if let Some(write) = &prepared
             && let Some(store) = self.bounds.living.borrow_mut().as_mut()
@@ -3921,6 +3949,9 @@ pub async fn run<C: Rest + Transport + crate::github::GraphQl + Broker>(
     );
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, admit_by);
+    if config.pool_headroom {
+        *bounds.routing.borrow_mut() = Some(routing::Routing::default());
+    }
     run_within(
         client,
         dispatcher,
@@ -4274,6 +4305,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         } else {
             cost::stage(unbudgeted, config, within, caps, scheduler.report);
         }
+    }
+    if let Some(routing) = bounds.routing.borrow_mut().as_mut() {
+        report.lines.append(&mut routing.lines);
     }
     report
 }
@@ -4779,6 +4813,9 @@ struct Scheduler<'a, C> {
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn line(&mut self, line: String) {
+        if let Some(routing) = self.client.bounds.routing.borrow_mut().as_mut() {
+            self.report.lines.append(&mut routing.lines);
+        }
         self.report.lines.push(line);
     }
 
@@ -7415,7 +7452,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // A start the cap holds is judged as a preview judges it, so that it
         // is held by the cap only where it would have started.
         if !self.apply || self.caps.full(Kind::Dispatch) {
-            return Ok(self.capped(&line).unwrap_or(Step::Started(line, holds)));
+            if let Some(step) = self.capped(&line) {
+                return Ok(step);
+            }
+            self.client.preview_pool_start(&pool);
+            return Ok(Step::Started(line, holds));
         }
         // What the dispatch's own check waives is what the pass reports.
         self.ignored.borrow_mut().clear();
@@ -7559,7 +7600,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         );
         let holds = vec![issue.clone(), dest.clone()];
         if !self.apply || self.caps.full(Kind::Dispatch) {
-            return Ok(self.capped(&line).unwrap_or(Step::Started(line, holds)));
+            if let Some(step) = self.capped(&line) {
+                return Ok(step);
+            }
+            self.client.preview_pool_start(&pool);
+            return Ok(Step::Started(line, holds));
         }
         let rule = |facts: &Facts, busy: &BTreeMap<String, String>, writers: &[&str]| {
             hold(facts, busy, writers).or_else(|| self.assignment_hold(facts))
@@ -7578,6 +7623,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             ..self.lease_dispatch(dest, &pool)
         };
         self.dispatcher.start_kind("run rerun");
+        self.client.preview_pool_start(&pool);
         Ok(match dispatcher.send("POST", &path, &json!({})) {
             Ok((status, _)) if (200..300).contains(&status) => Step::Started(line, holds),
             // Refused, so nothing runs: the issue waits as it would have.
@@ -7674,7 +7720,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             })
             .collect();
-        choose(snapshot, &self.config.pools, &accounts, self.now)
+        self.choose_pool(snapshot, &accounts)
             .map(|pool| {
                 names
                     .iter()
@@ -7686,6 +7732,21 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 let probe = names.iter().find(|name| slots.probes.contains_key(*name));
                 probe.cloned().ok_or(why)
             })
+    }
+
+    fn choose_pool(&self, snapshot: Option<&Value>, names: &[String]) -> Result<String, String> {
+        let rooms = names
+            .iter()
+            .filter_map(|name| {
+                let settings = self.config.pool(name)?;
+                room(snapshot, name, settings, self.now)
+                    .ok()
+                    .map(|room| (name.clone(), room))
+            })
+            .collect();
+        self.client
+            .route_pool(rooms)
+            .unwrap_or_else(|| choose(snapshot, &self.config.pools, names, self.now))
     }
 
     /// Takes the pool of a start's `line` off `slots`' probes, saying so,
@@ -8897,6 +8958,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(step);
         }
         if !self.apply {
+            self.client.preview_pool_start(pool);
             return Ok(Step::Started(line, holds));
         }
         if let Some(step) = self.recheck(slots, (issue, issue), target, rule)? {
@@ -9513,6 +9575,7 @@ pub mod needs;
 pub mod next;
 pub mod promote;
 pub mod revisit;
+mod routing;
 pub mod sessions;
 pub mod starts;
 mod status;

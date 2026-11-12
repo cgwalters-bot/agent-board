@@ -1885,6 +1885,25 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok((true, why));
         }
         let Some(apply) = &self.apply else {
+            if self.config.policy.pass_triage_pools.is_some() {
+                if self.dispatched >= POLL_DISPATCH_LIMIT {
+                    return Ok((
+                        false,
+                        format!(
+                            "not started: this pass started {POLL_DISPATCH_LIMIT} runs already"
+                        ),
+                    ));
+                }
+                let pools = self.config.policy.kind_pool_choices(kind);
+                let pool = match self.paced(pools.first().cloned(), &pools) {
+                    Ok(Some(pool)) => pool,
+                    Ok(None) => return Ok((false, "not started: no intake pool".into())),
+                    Err(why) => return Ok((false, format!("not started: {why}"))),
+                };
+                self.dispatched += 1;
+                self.rest.preview_pool_start(&pool);
+                return Ok((true, format!("{kind} pool={pool}")));
+            }
             return Ok((
                 true,
                 match tracks {

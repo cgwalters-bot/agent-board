@@ -692,6 +692,10 @@ pub struct PollPolicy {
     /// `pace`: each run's pool follows the usage snapshot ([`pace`]); none
     /// (the default) leaves the pools as configured.
     pub pace: Option<pace::Pace>,
+    /// Pass-only preview inputs: applying rounds get these from `Apply`.
+    pub preview_fix_pools: Option<Vec<String>>,
+    /// Pass-only intake allowlist, instead of a standalone kind's single pool.
+    pub pass_triage_pools: Option<Vec<String>>,
     /// `lockCollaboratorItems`: the open, unlocked items in the followed
     /// repositories one pass checks, locking those with input only from
     /// collaborators ([`lock`]); none (the default) locks nothing.
@@ -1284,6 +1288,8 @@ impl PollPolicy {
                 .transpose()?
                 .unwrap_or(0),
             pace: pace::Pace::from_json(get("pace")?)?,
+            preview_fix_pools: None,
+            pass_triage_pools: None,
             lock_items: get("lockCollaboratorItems")?
                 .map(|n| {
                     n.as_u64()
@@ -1373,6 +1379,11 @@ impl PollPolicy {
 
     /// The pools a run of `kind` may take: its `kindPools` pool, or its tier's.
     fn kind_pool_choices(&self, kind: &str) -> Vec<String> {
+        if matches!(kind, "triage" | "research")
+            && let Some(pools) = &self.pass_triage_pools
+        {
+            return pools.clone();
+        }
         let pool: Vec<String> = self.kind_pools.get(kind).cloned().into_iter().collect();
         pace::expand(&self.tiers, &pool)
     }
@@ -1463,6 +1474,14 @@ pub trait Rest {
     /// Accounting context for subsequent run dispatches and reruns. This
     /// observes decisions only; it neither authorizes nor counts a start.
     fn start_kind(&self, _kind: &str) {}
+
+    /// Optional pass-wide routing after the caller's eligibility checks.
+    fn route_pool(&self, _rooms: Vec<(String, f64)>) -> Option<Result<String, String>> {
+        None
+    }
+
+    /// Account for a previewed start; applying starts are observed at send.
+    fn preview_pool_start(&self, _pool: &str) {}
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse>;
     /// Bypass every conditional cache, including a pass-wide wrapper. Claims
@@ -5547,8 +5566,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     ) -> Result<String> {
         let continuing = action == "continue";
         let rebasing = action == "rebase";
-        let apply = self.apply.as_ref().context("not applying")?;
-        let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
+        let pools = self
+            .apply
+            .as_ref()
+            .map(|a| &a.pools)
+            .or(self.config.policy.preview_fix_pools.as_ref())
+            .cloned()
+            .context("no fix pools for round")?;
         // After a reset, the counts start again as decide read them.
         let carried = if marker.stopped {
             Marker::default()
@@ -5609,7 +5633,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             single(Some(self.config.policy.diagnostic_pool.clone()).filter(|p| !p.is_empty()))
         } else if refit {
             // The fix pools but the last round's, unless it is the only one.
-            let pools = fix_pools(&apply.pools, self.config);
+            let pools = fix_pools(&pools, self.config);
             let last = marker.pool.as_deref().unwrap_or_default();
             let others: Vec<String> = pools.iter().filter(|p| *p != last).cloned().collect();
             let pools = if others.is_empty() { pools } else { others };
@@ -5622,13 +5646,30 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             } else {
                 pool_round.saturating_sub(1) as usize
             };
-            let pools = fix_pools(&apply.pools, self.config);
+            let pools = fix_pools(&pools, self.config);
             (pools.get(index % pools.len().max(1)).cloned(), pools)
         };
         let pool = match self.paced(pool, &candidates) {
             Ok(pool) => pool,
             Err(why) => return Ok(format!("not started: {why}")),
         };
+        if self.apply.is_none() {
+            if self.dispatched >= POLL_DISPATCH_LIMIT {
+                return Ok(format!(
+                    "not started: this pass started {POLL_DISPATCH_LIMIT} fix runs already"
+                ));
+            }
+            self.dispatched += 1;
+            if let Some(pool) = &pool {
+                self.rest.preview_pool_start(pool);
+            }
+            return Ok(format!(
+                "would start {action} round {round} pool={}",
+                pool.as_deref().unwrap_or("default")
+            ));
+        }
+        let apply = self.apply.as_ref().context("not applying")?;
+        let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
         let raising = raise.is_some() && checkpoint.as_ref().is_some_and(|at| at.reason == "cap");
         let raised = carried.raised || raising;
         let number = pull["number"]
@@ -6757,13 +6798,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             Some(pool) => vec![pool.clone()],
             None => fix_pools(fix, self.config),
         };
-        if let Err(why) = self.paced(pool, &candidates) {
-            return Ok(format!("not re-run: {why}"));
-        }
+        let pool = match self.paced(pool, &candidates) {
+            Ok(pool) => pool,
+            Err(why) => return Ok(format!("not re-run: {why}")),
+        };
         self.writable(&format!("repos/{repo}/"))?;
         self.spend()?;
         self.writes += 1;
         let url = format!("{API_ROOT}repos/{repo}/actions/runs/{id}/rerun-failed-jobs");
+        if let Some(pool) = &pool {
+            self.rest.preview_pool_start(pool);
+        }
         let (status, body) = client.send("POST", &url, &json!({}))?;
         if !(200..300).contains(&status) {
             let message = body["message"].as_str().unwrap_or("message unavailable");
@@ -8344,6 +8389,21 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 &decision,
                 review_run.as_ref(),
             ),
+            (None, None, None)
+                if self.config.policy.preview_fix_pools.is_some()
+                    && matches!(decision.action, "fix" | "continue" | "rebase") =>
+            {
+                self.start_fix(
+                    repo,
+                    &pull,
+                    &checks,
+                    (&marker, &comments),
+                    decision.round.unwrap_or(1),
+                    decision.action,
+                    review_run.as_ref(),
+                )
+                .map(Some)
+            }
             (None, _, _) => Ok(None),
         };
         if let Some((caps, kind)) = caps

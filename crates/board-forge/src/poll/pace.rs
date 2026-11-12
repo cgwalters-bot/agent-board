@@ -621,7 +621,37 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         match self.paces() {
             None => Ok(chosen),
-            Some(paces) => choose(&paces, candidates, chosen.as_deref()).map(Some),
+            Some(paces) => {
+                let rooms = paces
+                    .as_ref()
+                    .ok()
+                    .map(|paces| {
+                        candidates
+                            .iter()
+                            .filter_map(|name| match paces.get(name) {
+                                Some(Mode::Normal { used, ceiling }) => {
+                                    let entry = self
+                                        .config
+                                        .policy
+                                        .pace
+                                        .as_ref()
+                                        .and_then(|p| p.snapshot.as_ref())
+                                        .map(|s| &s["pools"][name]);
+                                    let allowed = entry
+                                        .and_then(|e| e["allowed_percent"].as_f64())
+                                        .unwrap_or(*ceiling);
+                                    Some((name.clone(), allowed - used))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.rest
+                    .route_pool(rooms)
+                    .unwrap_or_else(|| choose(&paces, candidates, chosen.as_deref()))
+                    .map(Some)
+            }
         }
     }
 

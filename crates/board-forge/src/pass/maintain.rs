@@ -751,7 +751,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         // only while it waits on capacity their runs would take, not where
         // this pass cannot admit it anyway (agent-board#803).
         let mut waits = true;
-        match choose(own.as_ref(), &config.pools, &all, self.now) {
+        match self.choose_pool(own.as_ref(), &all) {
             Ok(pool) => {
                 let more = changed.len() - review.len();
                 let plan = json!({
@@ -931,6 +931,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         }
         self.caps.count(Kind::Dispatch);
         if !self.apply {
+            self.client.preview_pool_start(pool);
             *self
                 .report
                 .planned_starts
