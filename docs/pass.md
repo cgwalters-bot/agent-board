@@ -300,10 +300,8 @@ accounting retains its existing independent census and bounds.
 This orders the PR walk, not the earlier intake/search stages. A caller must
 also leave that walk a usable share. In `cgwalters-forge/tracker`, file
 `.github/pass.json`, set `pr.actionFirst` to `true`, `reserveScheduling` to
-`false` and disable `scan.reserve` (the sized scan reserve currently requires
-fixed candidate caps). Leave `scan.candidates` unset: action-first does not
-require a fixed scan cap. These settings leave the normal fixed shares for
-later stages instead of reserving almost the entire pass for a bounded scan.
+`false` and remove the obsolete `scan` object. With `requestShare` enabled,
+stages share the derived budget without fixed stage shares.
 No deployed config is changed here.
 
 The original preview on 2026-11-12 against tracker's config (main
@@ -2190,17 +2188,8 @@ stage 4 also says which candidate came first in its order and what became of
 it, and the first found ready, which only `--max-dispatch` leaves unstarted
 (`schedule: no candidate started; first candidate OWNER/REPO#N: held: …; first
 ready to start: none`): whether its order reached ready work at all, or only
-held items, before its budget or the slots ran out (agent-board#864). With
-`scan` set, stage 4 also stops at its [scan bounds](#scan-bounds): a candidate
-whose reads reach `scan.candidateRequests` is held as unreadable (`hold
-OWNER/REPO#N: its reads reached 20 requests, the most one candidate may take
-(scan.candidateRequests); what else it waits on is unread`), and after
-`scan.candidates` candidates read in a row held or failed with none started
-the rest wait (`scan: 40 candidate(s) read in a row held or failed and none
-started, the most a pass reads (scan.candidates); M more candidate(s) wait;
-the next pass resumes after OWNER/REPO#N`), the free
-slots left for the `idle:` line; it is not the budget stop below, so it plans
-no kept epic. Where every candidate it did read
+held items, before its budget or the slots ran out (agent-board#864).
+There are no separate [scan bounds](#scan-bounds). Where every candidate it did read
 was held, `epics.heldPlanHours` may then plan an epic with what the stop kept
 ([what is built](#what-is-built)). Revisits, daily sessions, the weekly sweep and blocker reads
 that meet the reserve wait too, saying so (`sweep: budget: …`); none holds,
@@ -2245,9 +2234,8 @@ It uses the same discovery-share mechanism: maintain and PR discovery leave
 for scheduling and the later Status/holds stages. Unused requests remain
 available to later stages; neither the total limit nor mutation authority
 changes. The existing finish exceptions above still apply, so this is not a
-hard partition for writes or a guarantee of starts. With `scan.reserve`, both
-shares give way to what the scan bounds say the later stages need, where that
-is less ([sizing the reserve](#sizing-the-reserve-from-the-scan)). A deferred
+hard partition for writes or a guarantee of starts. With `requestShare`, fixed
+stage shares are disabled. A deferred
 maintain read keeps its cached state for the next pass, not a successful
 empty digest.
 Before posting a digest's plan, maintain also requires that the pass has
@@ -2351,105 +2339,30 @@ No tracker settings or workflow are changed here.
 
 ### Scan bounds
 
-The concrete failure `scan` stops is a pass that spends its whole request
-budget reading held candidates and starts nothing, so that its cost scales
-with the open items rather than with its starts: every live pass of a day
-read about 125 candidates for 379 requests, one of them at 37 for the overlap
-check's reads of each open pull request its plan's paths meet, and ended
-with `starts {}` (agent-board#864). It is off by default and GitHub-only,
-and bounds only stage 4's reads of candidates; neither the request limit nor
-what a start may do changes. `topDown` alone turns nothing on: the live
-passes had it and not `scan`, and read every candidate for nothing until
-tracker set `scan` (tracker#1548).
+Stage 4 walks candidates until the pass's request/time budget or available
+starts run out. Held candidates do not consume a separate candidate quota,
+and an expensive candidate uses the same request budget as the rest of the
+walk. The obsolete `scan` object (`candidates`, `candidateRequests` and
+`reserve`) is rejected; remove it from caller configurations.
 
-`scan.candidateRequests` (1–650) is the most charged requests considering
-one candidate may take, counted as the summary's `causes` count them, 304s
-refunded and its parent's liveness reads, the epic's, left out. The read
-that would pass it is refused, and the candidate is held
-as `unreadable` whatever its reads so far decided, with a line that names the
-setting; the candidates after it are read as before. A start's own reads,
-from its recheck on, and writes are never refused, so a candidate found
-ready still has what its start takes. A candidate held so is unread, not
-known held: an idle stage 4 that held one is not taken for a board with no
-ready work.
+With `requestShare` enabled, the request budget is derived from rate-limit
+headroom as below. Without it the legacy pass request limit remains. Pool
+pace, WIP, runner availability and optional `--max-*` overrides still apply.
+No new option, read, write permission or dispatch authority is added.
 
-`scan.candidates` (1–1000) is the most candidates in a row stage 4 reads
-without starting one, failed considerations included; a start, a failed
-start or a start `--max-dispatch` held ends the run. A candidate is read
-when considering it charged a request, 304s refunded: one the board's
-facts screen out (closed, dispatched, its pull request open), or one
-revalidated from the last pass's responses, costs the scan nothing. At the
-bound, the rest wait for the next pass without a hold, as at a budget
-stop, and the pass says so (`scan: 40 candidate(s) read in a row held or
-failed and none started, the most a pass reads (scan.candidates); M more
-candidate(s) wait; the next pass resumes after OWNER/REPO#N`). The free
-slots stay free, so the `idle:` line names the stop and the later stages
-have what the scan did not spend; unlike a budget stop, it does not let
-`epics.heldPlanHours` plan a kept epic, as the rest were not unread for the
-budget.
+When the request/time budget stops the walk, `state.scan_cursor` keeps the last
+visited candidate. The next pass resumes after it, with focus children still
+first and earlier candidates last. An interrupted candidate rotates to the
+end and is retried when the walk wraps: one candidate too expensive for the
+current headroom must not indefinitely block cheaper ready work. A completed
+walk or capacity stop clears the cursor so the
+next pass reconsiders priority order; a pass that visits
+nothing preserves it. A stale cursor starts in order. Without `state`, every
+pass starts in order. The cursor affects ordering only, never admission.
 
-The candidate the stop names is kept in `state` as `scan_cursor`, and the
-next pass's scan resumes after it (`schedule: scan resumed after
-OWNER/REPO#N, where the last pass's scan stopped`), the focus epic's
-children still first, the candidates before the cursor last: the stops of
-a few passes then cover the board instead of reading the same held
-candidates ahead of ready work every pass. Any early end of the scan (the
-bound, the WIP limit, the budget, the pools or the time) keeps the last
-candidate it visited, a scan that reaches its end clears the cursor, and a
-pass that scans nothing (every slot taken, every pool capped) keeps the
-cursor as it was. A cursor naming no candidate scans in order, and without
-`scan.candidates` none is kept. The cursor steers only the order of one
-pass's reads, never what is started. It lives in `state`: without one,
-every pass reads the same candidates up to the bound, so held candidates
-ahead of ready work defer that work until what holds them moves, and
-`scan.candidates` wants `state` set.
-
-Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` sets
-`scan` to `{"candidateRequests": 20, "candidates": 40}` and `state`
-(tracker#1548); no tracker settings are changed here.
-
-#### Sizing the reserve from the scan
-
-The concrete failure `scan.reserve: true` stops is the pull-request stage
-stopping at a fixed share while the requests it kept sit unused, so that
-approved pull requests wait pass after pass: with `reserveScheduling`, the
-stage stopped at 110 requests to keep 520 for the stages after it, which then
-used 254, and the whole pass spent 386 of the 646 its reads may take, the
-limit past the writes' reserve, as every count a stage "has" below is
-(agent-board#878). It is
-off by default, GitHub-only, and needs both scan bounds. With it, stages 2
-and 3 keep for the stages after them what those are bounded to need rather
-than their fixed share: `scan.candidates` times `scan.candidateRequests`, a
-start (its recheck and 104 requests, 109), with `reserveScheduling` the
-candidate reads stage 4 holds back before its parent discovery (104 more),
-and the later stages' own reads (the board's 20 pages at most, a dozen Status
-changes and the holds, 47); the leases a start's recheck reads again are not
-known in advance. Stage 3 keeps that need; stage 2 keeps it and stage 3's own
-room, the fixed shares' difference (130), as before, and the pass says so
-(`budget: scan.reserve keeps 326 requests for the stages after pull requests
-and 196 after epics, the scan's need in place of the fixed shares`). The need
-never raises a share: where it is stage 3's fixed share (247, or 390 with
-`reserveScheduling`) or more, as with tracker's 40 candidates at 20 (800 and
-a start), the fixed shares hold, nothing changes and no line says so. With
-`{"candidateRequests": 20, "candidates": 2, "reserve": true}` and no
-`reserveScheduling`, stage 3 keeps 196 instead of 247 and stage 2 326 instead
-of 377, so stage 2 has 320 (setup, usage and maintain included) instead of
-269; with `reserveScheduling` and 5 candidates, stage 3 keeps 360 instead of
-390 and stage 2 490, so stage 2 has 156 instead of 126. The product bounds
-one scan to a start; the scan after a start has what the earlier stages did
-not spend. Neither the request limit nor what a stage may write changes, and
-the finish exceptions above still apply.
-
-Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` sets
-`scan` to `{"candidateRequests": 20, "candidates": 3, "reserve": true}` and
-`reserveScheduling` to `false`: with `reserveScheduling` the sized reserve
-leaves stage 2 156 at 5 candidates and 196 at 3, which the test of thirty
-approved pull requests shows is not enough, where 3 candidates without it
-leave it 300. Turning `reserveScheduling` off also gives up what else it
-does: maintain's share, stage 4's hold-back before its parent discovery, and
-deferring the candidates that hold-back leaves unread rather than holding
-them as unreadable; the sized reserve keeps scheduling's requests in its
-place, not those. No tracker settings are changed here.
+Caller migration: in `cgwalters-forge/tracker`, `.github/pass.json`, delete
+the `scan` key, retaining the existing `requestShare` and `state` settings.
+No tracker configuration is changed here.
 
 ### The request budget from the rate limit
 
@@ -2470,12 +2383,10 @@ budget. That share, rounded down, is the pass's request limit in place of
 the fixed 650, and the pass says so first (`budget: requestShare keeps the
 pass to 1203 requests, 25% of the 4812 the token has left until
 2026-11-11T13:00:00Z (core; core 4812, graphql 4990); GraphQL share is an
-estimate, not a retained-headroom guarantee`). Everything that is a
-share of the budget follows it: the stages' fixed shares, `reserveScheduling`'s,
-the holds' 15% and the sized reserve's comparison; what is a count stays a
-count: a start's reserve, the writes' reserve, 304 refunds and
-`scan.candidateRequests`. The 15-minute time bound is unchanged, and the
-`--max-*` flags and `scan` still bound what they did. A pass may be larger
+estimate, not a retained-headroom guarantee`). With it, stages share the
+remaining budget without fixed stage shares. A start's reserve, the writes'
+reserve and 304 refunds remain counts. The 15-minute time bound is unchanged,
+and the optional `--max-*` flags remain overrides. A pass may be larger
 than 650. The combined request ceiling is strict, including the cost stage's
 reads, downloads and writes (which retain their tighter 1,000-request cap).
 GraphQL also stops admitting calls once its observed points reach the share
@@ -5002,8 +4913,6 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `epics.close` | Close as completed a due epic whose sub-issues are all closed, rather than ask the operator once, see [what is built](#what-is-built); `false` |
 | `epics.heldPlanHours` | GitHub only: where stage 4 held every candidate it read (the rest unread only for its budget) and a `planPools` pool is under pace, plan one unplanned live epic a pass whose last planning request is at least this many hours (0–168) old, see [what is built](#what-is-built); `0` (off) |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
-| `scan.candidateRequests`, `scan.candidates` | GitHub only: the most charged requests considering one stage 4 candidate may take (1–650) before it is held as unreadable, and the most candidates in a row stage 4 reads without starting one (1–1000) before the rest wait for the next pass, which resumes after the last read where `state` keeps it, see [scan bounds](#scan-bounds); each absent (unbounded but by the budget) |
-| `scan.reserve` | GitHub only, needs both scan bounds: stages 2 and 3 keep for the stages after them what those are bounded to need, the scan, a start and their own reads, where that is less than their fixed share, see [sizing the reserve](#sizing-the-reserve-from-the-scan); `false` |
 | `requestShare` | GitHub only: estimate the request budget from 1–90% of the smaller remaining REST/GraphQL pool, read free from `GET /rate_limit` before any request; also stop GraphQL at its observed/estimated point share. Not a retained-headroom guarantee: a query can overshoot and missing costs are estimated. Where the read fails the fixed 650 holds, see [the request budget from the rate limit](#the-request-budget-from-the-rate-limit); absent (the fixed 650) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |

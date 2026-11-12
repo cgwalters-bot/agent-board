@@ -114,19 +114,6 @@ const SCHEDULE_SHARE: usize = 60;
 
 const EPICS_SHARE: usize = 20;
 
-/// The requests Status is kept for a pass ([`LATER_READS`]): a read and a
-/// write for each of a dozen changes; it read 22 in the pass of
-/// agent-board#878.
-const STATUS_READS: usize = 24;
-
-/// What the stages after the scan read besides its candidates and a start
-/// ([`START_RESERVE`]), which a sized reserve keeps too ([`Scan::reserve`]):
-/// the board's pages, [`BOARD_PAGES`] at most, Status's reads of the items
-/// it changes ([`STATUS_READS`]) and the holds' ([`HOLDS_READS`]). Stage 4's
-/// run, lease and failed-run listings, a page each, ride on a board shorter
-/// than its most pages.
-const LATER_READS: usize = BOARD_PAGES + STATUS_READS + HOLDS_READS;
-
 /// 304s a pass does not charge to its budget: GitHub does not count them
 /// against the rate limit, so a revalidated read that answers from the cache
 /// is free, but only this many, so that they still bound a runaway loop. A
@@ -750,8 +737,6 @@ pub struct Config {
     /// Off by default: rank epic groups before reading their admission facts.
     #[serde(default)]
     pub top_down: bool,
-    /// Off unless set: bounds on stage 4's scan of its candidates ([`Scan`]).
-    pub scan: Option<Scan>,
     /// Off unless set: the percentage, 1 to [`REQUEST_SHARE_LIMIT`], of the
     /// token's remaining allowance used to estimate this pass's request
     /// budget, in place of [`PASS_REQUEST_LIMIT`] ([`Headroom`],
@@ -1195,61 +1180,6 @@ fn broker_url(url: &str) -> bool {
     })
 }
 
-/// `scan`: bounds on stage 4's scan of its candidates, each off unless set
-/// (agent-board#864). The threat they stop is a pass that spends its whole
-/// request budget reading held candidates, one of them at the overlap
-/// check's dozens of reads, and starts nothing: its cost then scales with
-/// the open items, not with the starts.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Scan {
-    /// The most charged requests, writes included, considering one
-    /// candidate may take, 1 to [`PASS_REQUEST_LIMIT`], past which it is
-    /// held as unreadable; its parent's liveness reads and a start's own
-    /// reads are not refused ([`Bounds::cause_capped`]).
-    pub candidate_requests: Option<usize>,
-    /// The most candidates in a row stage 4 reads, charged requests for,
-    /// without starting one, 1 to [`SCAN_CANDIDATES_LIMIT`], after which
-    /// the rest wait for the next pass, which resumes after the last read
-    /// where `state` keeps it ([`Scheduler::start`],
-    /// [`poll::State::scan_cursor`]); without `state`, each pass reads the
-    /// same candidates up to the bound.
-    pub candidates: Option<usize>,
-    /// Off by default: with both bounds set, stages 2 and 3 keep for the
-    /// stages after them what those are bounded to need ([`Self::need`])
-    /// where that is less than their fixed share, instead of the share
-    /// (agent-board#878). The failure it stops is the pull-request stage
-    /// stopping at a fixed share while the requests it kept sit unused, so
-    /// that approved pull requests wait pass after pass.
-    #[serde(default)]
-    pub reserve: bool,
-}
-
-impl Scan {
-    /// What the stages after stage 3 are bounded to need, with `reserve`
-    /// and both bounds set: a scan of `candidates` candidates at
-    /// `candidateRequests` each, a start ([`START_RESERVE`]), with
-    /// `reserve_scheduling` the candidate reads stage 4 holds back before
-    /// its parent discovery too ([`START_REQUESTS`]), and the stages' own
-    /// reads ([`LATER_READS`]); else none, and the fixed shares hold. The
-    /// leases a start's recheck reads again are not known in advance.
-    fn need(&self, reserve_scheduling: bool) -> Option<usize> {
-        if !self.reserve {
-            return None;
-        }
-        let scan = self.candidates?.saturating_mul(self.candidate_requests?);
-        let discovery = if reserve_scheduling {
-            START_REQUESTS
-        } else {
-            0
-        };
-        Some(scan.saturating_add(START_RESERVE + discovery + LATER_READS))
-    }
-}
-
-/// The most `scan.candidates` may be: more than a board has candidates.
-const SCAN_CANDIDATES_LIMIT: usize = 1000;
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Pr {
@@ -1449,26 +1379,6 @@ impl Config {
             );
         }
         ensure!(self.wip <= WIP_LIMIT, "wip is not 0 to {WIP_LIMIT}");
-        if let Some(scan) = &self.scan {
-            ensure!(self.forgejo_board().is_none(), "scan supports only GitHub");
-            for (what, value, limit) in [
-                (
-                    "candidateRequests",
-                    scan.candidate_requests,
-                    PASS_REQUEST_LIMIT,
-                ),
-                ("candidates", scan.candidates, SCAN_CANDIDATES_LIMIT),
-            ] {
-                ensure!(
-                    value.is_none_or(|n| (1..=limit).contains(&n)),
-                    "scan {what} is not 1 to {limit}"
-                );
-            }
-            ensure!(
-                !scan.reserve || (scan.candidates.is_some() && scan.candidate_requests.is_some()),
-                "scan reserve needs both scan candidates and scan candidateRequests"
-            );
-        }
         if let Some(share) = self.request_share {
             ensure!(
                 self.forgejo_board().is_none(),
@@ -2797,11 +2707,6 @@ struct Bounds {
     /// Requests by endpoint class and by cause ([`Spent`]).
     by_class: RefCell<BTreeMap<String, usize>>,
     by_cause: RefCell<BTreeMap<String, usize>>,
-    /// The cause whose charged requests are capped, the candidate under
-    /// consideration, and its cap ([`Scan::candidate_requests`]), or none;
-    /// and how many reads that refused ([`Self::cause_capped`]).
-    cause_limit: RefCell<Option<(String, usize)>>,
-    capped: Cell<usize>,
 }
 
 impl Bounds {
@@ -2843,8 +2748,6 @@ impl Bounds {
             cause: RefCell::new(None),
             by_class: RefCell::default(),
             by_cause: RefCell::default(),
-            cause_limit: RefCell::new(None),
-            capped: Cell::new(0),
         }
     }
 
@@ -2883,20 +2786,6 @@ impl Bounds {
         let out = read();
         *self.cause.borrow_mut() = before;
         out
-    }
-
-    /// The limit a read now would pass ([`Scan::candidate_requests`]): the
-    /// capped cause is under way and has been charged that many requests
-    /// already, 304s refunded. Another cause, an epic's liveness read under
-    /// the candidate included, or a start's own reads are never capped.
-    fn cause_capped(&self) -> Option<usize> {
-        let limit = self.cause_limit.borrow();
-        let (capped, limit) = limit.as_ref()?;
-        if self.starting.get() || self.cause.borrow().as_deref() != Some(capped) {
-            return None;
-        }
-        let spent = self.by_cause.borrow().get(capped).copied().unwrap_or(0);
-        (spent >= *limit).then_some(*limit)
     }
 
     /// Counts a request of `class` to it and to its cause, the stage under
@@ -3326,12 +3215,6 @@ impl<C> Budget<'_, C> {
                 bounds.kept.get()
             ))
             .into());
-        }
-        if !write && let Some(limit) = bounds.cause_capped() {
-            bounds.capped.set(bounds.capped.get() + 1);
-            bail!(
-                "the candidate's reads reached {limit} requests, the most one may take (scan.candidateRequests)"
-            );
         }
         bounds.left.set(left - 1);
         if bounds.stage.get() == Stage::Holds {
@@ -3884,9 +3767,8 @@ pub struct Report {
     /// their hold kind's name, or [`NOT_READY_ERROR`] where their
     /// consideration failed: why nothing was startable (agent-board#864).
     pub not_ready: BTreeMap<String, usize>,
-    /// The last candidate stage 4's scan visited before ending early, under
-    /// [`Scan::candidates`], kept in `state` for the next pass to resume
-    /// after; none where the scan reached its end or has no such bound,
+    /// The last candidate stage 4 visited before a budget stop, kept in
+    /// `state` for the next pass to resume after; none at the walk's end,
     /// and the last pass's where this one scanned nothing.
     pub scan_cursor: Option<String>,
     pub failures: usize,
@@ -4274,12 +4156,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if state.interval_seconds == 0 {
         state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
     }
-    let (after_pulls, after_epics, sized) = kept_shares(config, bounds);
-    if sized {
-        scheduler.line(format!(
-            "budget: scan.reserve keeps {after_pulls} requests for the stages after pull requests and {after_epics} after epics, the scan's need in place of the fixed shares"
-        ));
-    }
+    let (after_pulls, after_epics) = kept_shares(config, bounds);
     bounds.enter_keeping(
         Stage::Maintain,
         if config.reserve_scheduling {
@@ -4362,27 +4239,17 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
 }
 
 /// What stages 2 and 3 keep for the stages after them, in requests: their
-/// fixed shares ([`AFTER_PULL_REQUESTS`] and [`AFTER_EPICS`], or
-/// `reserveScheduling`'s), or with `scan.reserve` what those stages are
-/// bounded to need ([`Scan::need`]) where that is less, stage 3 keeping the
-/// need and stage 2 the need and stage 3's own room, the fixed shares'
-/// difference. The need never raises a share: a scan bound larger than the
-/// pass keeps what the fixed share does. The third is whether the need
-/// sized them.
-fn kept_shares(config: &Config, bounds: &Bounds) -> (usize, usize, bool) {
+/// legacy fixed shares, or no stage shares with `requestShare` enabled.
+fn kept_shares(config: &Config, bounds: &Bounds) -> (usize, usize) {
+    if config.request_share.is_some() {
+        return (0, 0);
+    }
     let (pulls, epics) = if config.reserve_scheduling {
         (SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE)
     } else {
         (AFTER_PULL_REQUESTS, AFTER_EPICS)
     };
-    let (pulls, epics) = (bounds.share(pulls), bounds.share(epics));
-    match config
-        .scan
-        .and_then(|scan| scan.need(config.reserve_scheduling))
-    {
-        Some(need) if need < epics => (need + (pulls - epics), need, true),
-        _ => (pulls, epics, false),
-    }
+    (bounds.share(pulls), bounds.share(epics))
 }
 
 /// What the token has left of GitHub's primary rate limits until they reset
@@ -5752,27 +5619,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // line names them where no candidate started, to say whether the
         // order reached ready work at all (agent-board#864).
         let (mut first, mut ready) = (None, None);
-        // With `scan`, each candidate's reads are capped, and after as many
-        // read (charged a request) in a row that started nothing, the rest
-        // wait: a pass's cost then scales with its starts, not the open
-        // items (agent-board#864). The next pass resumes after the last
-        // candidate this one visited, where `state` keeps it, so the stops
-        // of a few passes cover the board; the focus epic's children still
-        // come first, and the candidates before the cursor last. The cursor
-        // is the last visited wherever the loop ends early, none past its
-        // end, and the last pass's where none was visited
-        // ([`Report::scan_cursor`]).
-        let scan = self.config.scan.unwrap_or_default();
-        let mut fruitless = 0;
+        // Resume after a budget stop, keeping focus children first.
+        // A completed walk clears the cursor; a pass that visits nothing
+        // preserves it. No candidate-count or per-candidate request cap.
         let children = self.focus.children;
-        let resume = scan
-            .candidates
-            .and(self.scan_cursor.take())
-            .and_then(|cursor| {
-                let at = (candidates.iter()).position(|(_, f)| f.issue.display() == cursor)?;
-                Some((cursor, (at + 1).max(children)))
-            });
+        let resume = self.scan_cursor.take().and_then(|cursor| {
+            let at = (candidates.iter()).position(|(_, f)| f.issue.display() == cursor)?;
+            Some((cursor, at + 1))
+        });
         let order: Vec<usize> = match &resume {
+            Some((_, at)) if *at <= children => ((*at..children).chain(0..*at))
+                .chain(children..candidates.len())
+                .collect(),
             Some((_, at)) => ((0..children).chain(*at..candidates.len()))
                 .chain(children..*at)
                 .collect(),
@@ -5784,24 +5642,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             ));
         }
         let mut last: Option<String> = None;
-        let mut ended = true;
+        let mut budget_stopped = false;
         for (visited, n) in order.into_iter().enumerate() {
             let (_, facts) = &candidates[n];
             let left = candidates.len() - visited;
             if free == 0 {
                 self.unconsidered += left;
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
-                ended = false;
-                break;
-            }
-            if scan.candidates.is_some_and(|limit| fruitless >= limit)
-                && let Some(last) = &last
-            {
-                self.unconsidered += left;
-                self.line(format!(
-                    "scan: {fruitless} candidate(s) read in a row held or failed and none started, the most a pass reads (scan.candidates); {left} more candidate(s) wait; the next pass resumes after {last}"
-                ));
-                ended = false;
                 break;
             }
             // The probes taken, no pool is left to start on.
@@ -5811,7 +5658,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.unconsidered += left;
                 let why = format!("{why}; {left} more candidate(s) wait");
                 self.pass_held(HoldKind::Pools, why);
-                ended = false;
                 break;
             }
             if Instant::now() > self.client.bounds.admit_by {
@@ -5820,7 +5666,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.line(format!(
                     "time: the pass ran past {PASS_SECONDS_LIMIT} seconds; {left} candidate(s) deferred"
                 ));
-                ended = false;
+                budget_stopped = true;
                 break;
             }
             let focused = n < children;
@@ -5829,15 +5675,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.focus.spillover = Some(true);
             }
             let issue = facts.issue.display();
-            last = Some(issue.clone());
-            let limit = scan.candidate_requests.map(|n| (issue.clone(), n));
-            *self.client.bounds.cause_limit.borrow_mut() = limit;
-            // Whether considering it charged a request, 304s refunded: only
-            // such a candidate counts towards `scan.candidates`, so a
-            // candidate screened out by the board's facts, or revalidated
-            // from the last pass's responses, costs the scan nothing.
-            let unspent = self.client.bounds.left.get();
             let step = self.caused(issue.clone(), |s| s.within_reserve(|s| {
+                // Only rotate once consideration begins, past the reserve
+                // guard. Interrupted reads rotate too, so an expensive
+                // candidate cannot block later work until headroom grows.
+                last = Some(issue.clone());
                 if s.config.top_down && let Some(parent) = &facts.parent {
                 let held = match s.live(parent) {
                     Ok(true) => None,
@@ -5866,7 +5708,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let earlier = std::mem::replace(&mut self.considered, true);
             // A start under way finishes; the next waits for the time bound.
             self.client.bounds.end_start();
-            let read = usize::from(self.client.bounds.left.get() < unspent);
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
@@ -5877,20 +5718,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     // the candidates were not read rather than not ready.
                     if self.client.bounds.rate_limited.borrow().is_none() {
                         self.not_ready(NOT_READY_ERROR);
-                        fruitless += read;
                     }
                     self.line(format!("fail {issue}: {error:#}"));
                     continue;
                 }
             };
-            fruitless = match &step {
-                Step::Hold(hold) => {
-                    self.not_ready(hold.kind.name());
-                    fruitless + read
-                }
-                Step::Stop(..) => fruitless,
-                Step::Started(..) | Step::Failed(..) | Step::Capped(_) => 0,
-            };
+            if let Step::Hold(hold) = &step {
+                self.not_ready(hold.kind.name());
+            }
             if focused {
                 let focus = &mut self.focus;
                 match &step {
@@ -5952,7 +5787,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         }
                     }
                     free = 0;
-                    ended = false;
+                    budget_stopped = matches!(halt, Halt::Budget | Halt::Time);
                     break;
                 }
                 Step::Capped(line) => {
@@ -5971,8 +5806,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             free -= 1;
             taken += 1;
         }
-        *self.client.bounds.cause_limit.borrow_mut() = None;
-        if scan.candidates.is_none() || ended {
+        if !budget_stopped {
             self.report.scan_cursor = None;
         } else if let Some(last) = last {
             self.report.scan_cursor = Some(last);
@@ -5999,31 +5833,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// What `consider` decides, or stage 4's stop for the budget where the
     /// reserve leaves it nothing to read, or refused one of its reads and it
     /// started nothing: then it decided nothing, like those after it, and
-    /// holds nothing; the stop is a failure only before any candidate. A
-    /// candidate whose reads `scan.candidateRequests` cut short is held as
-    /// unreadable, whatever its reads so far decided: what it waits on is
-    /// unknown, and the rest are read.
+    /// holds nothing; the stop is a failure only before any candidate.
     fn within_reserve(&mut self, consider: impl FnOnce(&mut Self) -> Result<Step>) -> Result<Step> {
         let bounds = self.client.bounds;
         if bounds.reserved() {
             return Ok(Step::Stop(self.reserved(), Halt::Budget));
         }
-        let (refused, capped) = (bounds.refused.get(), bounds.capped.get());
+        let refused = bounds.refused.get();
         match consider(self) {
             step @ Ok(Step::Started(..) | Step::Failed(..) | Step::Capped(..)) => step,
             _ if bounds.refused.get() > refused => {
                 self.ignored.take();
                 Ok(Step::Stop(self.reserved(), Halt::Budget))
-            }
-            _ if bounds.capped.get() > capped => {
-                self.ignored.take();
-                let limit = (bounds.cause_limit.borrow().as_ref()).map_or(0, |(_, n)| *n);
-                Ok(Step::Hold(Hold::new(
-                    HoldKind::Unreadable,
-                    format!(
-                        "its reads reached {limit} requests, the most one candidate may take (scan.candidateRequests); what else it waits on is unread"
-                    ),
-                )))
             }
             step => step,
         }
