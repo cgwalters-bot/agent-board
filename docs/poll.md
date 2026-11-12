@@ -70,8 +70,12 @@ cold, warm and lost-response state, preserves pending intake/refusal records,
 and proves a rerun after response loss does not repeat a dispatch. It also
 injects a new hold label or occupied capacity after the first start, verifies
 the final capacity read bypasses validators, and loses a dispatch reply to
-exercise invalidation and forge-receipt recovery. These are start-path tests,
-not yet applying-pass concurrent-change tests for merge or label-change paths.
+exercise invalidation and forge-receipt recovery. Applying merge and stop-label
+replays cover cold, warm and lost responses too: a hold added between discovery
+and the final live GraphQL recheck prevents both writes. Unheld controls actually
+merge the pinned head or post the stop label, and stop-comment evidence bypasses
+validators. This covers concurrent holds, not every possible concurrent change
+to reviews, checks, head or label ownership.
 The test prints the hottest exact GraphQL queries and REST URLs; repeated
 dispatch-run status listings are among the REST hot spots. GraphQL dominates
 this fixture. No hot issue-state/labels/assignees/timeline conversion is shipped

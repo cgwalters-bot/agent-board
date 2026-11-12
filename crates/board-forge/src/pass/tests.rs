@@ -551,6 +551,14 @@ impl<T> ConditionalRecording<T> {
 }
 
 impl<T: Rest> Rest for ConditionalRecording<T> {
+    fn get_fresh(&self, url: &str) -> Result<RestResponse> {
+        self.count(format!("REST {url}"));
+        self.traffic
+            .borrow_mut()
+            .push((format!("LIVE {url}"), false));
+        self.replay.get_fresh(url)
+    }
+
     fn network_requests(&self) -> Option<usize> {
         Some(self.reads.borrow().values().sum())
     }
@@ -1071,6 +1079,136 @@ fn response_cache_applying_ambiguous_dispatch_is_not_replayed() {
         assert_eq!(again.failures, 0, "{:?}", again.lines);
         assert_eq!(*forge.replay.writes.borrow(), writes);
         assert!(again.spent.requests > 0);
+    }
+}
+
+/// A warm discovery must not authorize a merge or a stop label over a hold
+/// added between the first pull read and the final pre-write read. Include
+/// unheld controls so a skipped stage or an unreadable fixture cannot pass.
+#[test]
+fn response_cache_applying_rechecks_merge_and_label_holds() {
+    const REPO: &str = "cgwalters-forge/agentic-job";
+    for cache in ["cold", "warm", "lost"] {
+        for action in ["merge", "label"] {
+            for held in [false, true] {
+                let name = format!("{cache} {action} held={held}");
+                let config = config(json!({"state": ".state/poll.json", "wip": 0,
+                    "follow": [REPO], "pr": {"fixPools": ["claude"]}}));
+                let mut forge = ConditionalRecording {
+                    replay: Forge::new(None, false),
+                    reads: RefCell::default(),
+                    traffic: RefCell::default(),
+                };
+                let (fields, comments) = if action == "merge" {
+                    (
+                        json!({"reviews": {"nodes": [{"state": "APPROVED",
+                        "author": {"__typename": "User", "login": "cgwalters"},
+                        "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z",
+                        "body": "Approved"}], "pageInfo": {"hasPreviousPage": false}}}),
+                        json!([]),
+                    )
+                } else {
+                    (
+                        json!({"mergeable": "CONFLICTING"}),
+                        json!([{
+                            "id": 7, "user": {"login": "cgwalters-bot"},
+                            "created_at": "2026-10-23T00:00:00Z",
+                            "body": "<!-- tracker-poll: {\"rounds\":2,\"sha\":\"older\"} -->"
+                        }]),
+                    )
+                };
+                followed(&mut forge.replay.replay, (REPO, 9), fields, comments);
+                forge.replay.replay.requests.push(json!({
+                    "request": {"get": format!("{API_ROOT}user")},
+                    "answer": {"status": 200, "body": {"login": "cgwalters-bot"}}
+                }));
+                forge.replay.replay.requests.push(json!({
+                    "request": {"get": format!("{API_ROOT}repos/{REPO}")},
+                    "answer": {"status": 200, "body": {"allow_rebase_merge": true}}
+                }));
+                let mut state = State::default();
+                if cache != "cold" {
+                    let seed = cached_pass(&forge, &config, state, false);
+                    assert_eq!(seed.failures, 0, "{name}: {:?}", seed.lines);
+                    let decision = if action == "merge" {
+                        format!("merge {REPO}#9:")
+                    } else {
+                        format!("{REPO}#9 abc needs-human:")
+                    };
+                    assert!(
+                        seed.lines.iter().any(|l| l.starts_with(&decision)),
+                        "{name}: {:?}",
+                        seed.lines
+                    );
+                    state = State::from_json(&seed.state.unwrap().to_json()).unwrap();
+                    assert!(!state.responses.is_empty());
+                    if cache == "lost" {
+                        state.responses.clear();
+                    }
+                }
+                let pulls = std::rc::Rc::new(Cell::new(0));
+                let reads = pulls.clone();
+                forge.replay.racing = Some(Box::new(move |query, data| {
+                    if query == poll::PULL_QUERY {
+                        reads.set(reads.get() + 1);
+                        if held && reads.get() >= 2 {
+                            data["repository"]["pullRequest"]["labels"] = json!({
+                                "nodes": [{"name": "hold"}], "pageInfo": {"hasNextPage": false}
+                            });
+                        }
+                    }
+                }));
+                forge.reads.borrow_mut().clear();
+                forge.traffic.borrow_mut().clear();
+                let report = cached_pass(&forge, &config, state, true);
+                assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+                assert_eq!(pulls.get(), 2, "{name}: final read must be live GraphQL");
+                let discovery = format!("GET {API_ROOT}repos/{REPO}/pulls?state=open&per_page=100");
+                assert_eq!(
+                    forge
+                        .traffic
+                        .borrow()
+                        .iter()
+                        .find(|(r, _)| r == &discovery)
+                        .map(|(_, conditional)| *conditional),
+                    Some(cache == "warm"),
+                    "{name}: exercise the restored discovery representation"
+                );
+                let writes = forge.replay.writes.borrow();
+                if held {
+                    assert!(writes.is_empty(), "{name}: {writes:?}");
+                    assert!(
+                        report
+                            .lines
+                            .iter()
+                            .any(|l| l.contains("not taken: labelled hold")),
+                        "{name}: {:?}",
+                        report.lines
+                    );
+                } else if action == "merge" {
+                    assert_eq!(writes.len(), 1, "{name}: {writes:?}");
+                    assert!(writes[0].1.contains("mergePullRequest("));
+                    assert_eq!(writes[0].2, json!({"id": "PR_9", "head": "abc"}));
+                } else {
+                    assert!(
+                        writes.iter().any(|(method, url, body)| method == "POST"
+                            && url == &format!("{API_ROOT}repos/{REPO}/issues/9/labels")
+                            && body == &json!({"labels": ["needs-human"]})),
+                        "{name}: {writes:?}"
+                    );
+                    let live_comments =
+                        format!("LIVE {API_ROOT}repos/{REPO}/issues/9/comments?per_page=100");
+                    assert!(
+                        forge
+                            .traffic
+                            .borrow()
+                            .iter()
+                            .any(|(r, conditional)| r == &live_comments && !conditional),
+                        "{name}: stop evidence must bypass validators"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -4604,6 +4742,12 @@ impl Transport for Forge {
             return Ok(data);
         }
         self.failing(&format!("graphql {query}"))?;
+        if query.starts_with("mutation(") && query.contains("mergePullRequest(") {
+            self.writes
+                .borrow_mut()
+                .push(("GraphQL".into(), query.into(), variables));
+            return Ok(json!({"mergePullRequest": {"clientMutationId": null}}));
+        }
         if query.contains(" viewer {") {
             return Ok(json!({"viewer": {"login": self.login}}));
         }
