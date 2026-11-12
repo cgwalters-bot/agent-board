@@ -943,7 +943,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         pull: bool,
         since: OffsetDateTime,
     ) -> Result<Vec<Said>> {
-        let mut newest_review_requests_changes = false;
+        let mut review_superseded_through = None;
         let mut found: Vec<(&str, String, Value)> = comments
             .iter()
             .map(|c| {
@@ -960,19 +960,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 false,
             )?;
             // Review state is direction even without prose: a later bare
-            // approval supersedes an earlier request to change the code.
-            newest_review_requests_changes = reviews
+            // approval supersedes an earlier request to change the code. Keep
+            // that boundary even after another changes-requested review, so a
+            // new request cannot revive withdrawn direction. IDs order reviews
+            // submitted within the same second, independently of API order.
+            review_superseded_through = reviews
                 .iter()
                 .filter(|r| text(r, "/user/login") == self.config.operator)
+                .filter(|r| text(r, "/state") != "CHANGES_REQUESTED")
                 .filter_map(|r| {
                     Some((
                         OffsetDateTime::parse(text(r, "/submitted_at"), &Rfc3339).ok()?,
                         r["id"].as_u64()?,
-                        text(r, "/state"),
                     ))
                 })
-                .max_by_key(|(at, id, _)| (*at, *id))
-                .is_some_and(|(_, _, state)| state == "CHANGES_REQUESTED");
+                .max();
             // An inline comment is posted with its review, so it is dated by
             // the later of creation and submission: one written before the
             // stop in a review submitted after it is part of that answer,
@@ -1013,13 +1015,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .iter()
             .filter(|(_, _, c)| text(c, "/user/login") == self.config.operator)
             .filter_map(|(anchor, at, c)| {
+                let id = c["id"].as_u64()?;
+                let at = OffsetDateTime::parse(at, &Rfc3339).ok()?;
                 Some(Said {
-                    key: format!("{anchor}{}", c["id"].as_u64()?),
-                    at: OffsetDateTime::parse(at, &Rfc3339).ok()?,
+                    key: format!("{anchor}{id}"),
+                    at,
                     body: review_text(text(c, "/body")),
                     changes_requested: *anchor == "pullrequestreview-"
                         && text(c, "/state") == "CHANGES_REQUESTED"
-                        && newest_review_requests_changes,
+                        && review_superseded_through.is_none_or(|boundary| (at, id) > boundary),
                 })
             })
             .filter(|s| s.at >= since && !s.body.is_empty())

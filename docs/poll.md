@@ -896,7 +896,9 @@ and comment-ID receipts still apply; `ownSpaceOnly` permits these fixes on
 the bot's own PR outside our space as before. Existing tracking receipts are
 read too, so enabling this cannot replay reviews already triaged.
 A later operator review that no longer requests changes, including a bodyless
-approval, prevents the older review from authorizing a fix.
+approval, prevents the older review from authorizing a fix, even if a newer
+changes-requested review arrives. Unhandled withdrawn reviews remain triage
+direction, so a mixed batch cannot silently revive the withdrawn request.
 
 This is the first slice of agent-board#884: mixed batches, comments, approvals,
 shipping/DCO requests (including “...whatever let's ship. It can always clean
