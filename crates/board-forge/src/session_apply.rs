@@ -644,6 +644,9 @@ fn plan_comment(plan: &JobPlan, from: &str) -> String {
     if let Some(effort) = plan.effort {
         job["effort"] = effort.as_str().into();
     }
+    if let Some(target) = &plan.target_repo {
+        job["target_repo"] = target.as_str().into();
+    }
     format!("{PLAN_INTRO} {from}\n\n```{PLAN_FENCE}\n{job:#}\n```\n")
 }
 

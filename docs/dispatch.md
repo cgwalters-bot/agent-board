@@ -164,7 +164,8 @@ with a `ref` and these string inputs, which the caller workflow must accept:
 |---|---|
 | `task` | The brief: a plan's `brief`, or the task agent-board writes for a fix or triage round |
 | `repo` | Target repository, `OWNER/NAME`; the caller's bounds must allow it |
-| `item` | Issue or pull request number in `repo` |
+| `item` | Issue or pull request number in `issue_repo` if supplied, otherwise in `repo` |
+| `issue_repo` | Optional source issue repository for a staged implement plan; omitted for existing same-repository dispatch |
 | `kind` | `implement`, `triage`, `research`, `fix` or [`session`](sessions.md): the profile the run gets |
 | `pool` | Inference pool, or empty to leave it to the caller |
 | `effort` | Optional: exactly `heavy`; omitted for the existing default. Carried unchanged even when routing supplies a default pool |
@@ -178,6 +179,26 @@ as hosted is made. Caller workflow failures remain recorded runs, not reasons
 to redispatch. The reviewed tracker resolver is not yet available (tracker#1489);
 live profile support is [gated](job-plans.md#runner-profiles-caller-integration-gated).
 Batched plans add their briefs to `task`.
+
+### Staged issue caller contract
+
+An optional plan `target_repo` sends the work target as `repo` and the source
+as `issue_repo`. Omission sends no new input. The receiving workflow must accept
+`issue_repo` (string, default empty), validate its repository syntax, and use
+`issue_repo || repo` for get-an-issue and source task data. Only unstacked,
+unbatched implement plans support it. Do not treat an issue's labels or body as
+authority to bypass caller bounds.
+
+Keep checkout, safe-output check/apply, PR creation, target bounds and midstream
+rules on `repo`, not the issue repository. A midstream result must be a draft
+PR in that fork, with a fully qualified source issue reference in the body;
+never close an unrelated target issue with the same number. Preserve run titles
+`implement TARGET#N (POOL)` for existing WIP/target routing accounting, even
+though N belongs to the source; do not use that title to fetch a target issue.
+The source identity must be kept for reporting and issue context. Existing fix
+rounds keep using their PR as the item. This repository does not deploy the
+tracker workflow; the caller change and live checkout/draft-PR smoke remain
+deployment prerequisites.
 
 ### Heavy model caller contract
 

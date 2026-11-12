@@ -491,7 +491,8 @@ pub fn from_plan<T: Transport + Rest>(
         .as_ref()
         .map(|route| {
             route.select(&board_forge::dispatch::Start {
-                repository: &plan.repo,
+                repository: plan.work_repository(),
+                issue_repository: plan.target_repo.as_ref().map(|_| plan.repo.as_str()),
                 item: plan.item,
                 kind: &plan.kind,
                 brief: &plan.brief,
@@ -513,7 +514,7 @@ pub fn from_plan<T: Transport + Rest>(
             "routed dispatch does not support batching yet"
         );
         if let Some(route) = &routing {
-            route.check_idle(&client, &target, &plan.repo)?;
+            route.check_idle(&client, &target, plan.work_repository())?;
         }
     }
     let selected = routing
@@ -522,7 +523,7 @@ pub fn from_plan<T: Transport + Rest>(
         .map(|route| &route.target)
         .unwrap_or(&target);
     let dest = ItemRef {
-        repository: plan.repo.clone(),
+        repository: plan.work_repository().into(),
         number: plan.item,
         ..issue.clone()
     };
@@ -556,9 +557,17 @@ pub fn from_plan<T: Transport + Rest>(
         return Ok(());
     }
     let batch = if base.is_some() { 0 } else { args.batch.into() };
+    ensure!(
+        plan.target_repo.is_none() || batch == 0,
+        "target_repo does not support batching"
+    );
     let chosen = batch::select(&client, &issue, &plan, &writers, batch)?;
     if let Some(rule) = collaborators {
-        plan::check_inputs(&client, &issue, &dest, &chosen.extras, rule)?;
+        let source = ItemRef {
+            repository: plan.repo.clone(),
+            ..dest.clone()
+        };
+        plan::check_inputs(&client, &issue, &source, &chosen.extras, rule)?;
     }
     for note in &chosen.notes {
         eprintln!("Not batched: {note}");
@@ -1324,12 +1333,14 @@ mod tests {
                 panic!("preview must not write")
             }
         }
-        for (active, unavailable, stacked, batch, expected) in [
-            (false, false, false, 0, None),
-            (true, false, false, 0, Some("route held")),
-            (false, true, false, 0, Some("route unavailable")),
-            (false, false, true, 0, Some("stacked plans")),
-            (false, false, false, 1, Some("batching")),
+        for (active, unavailable, stacked, batch, staged, expected) in [
+            (false, false, false, 0, false, None),
+            (false, false, false, 0, true, None),
+            (true, false, false, 0, true, Some("route held")),
+            (true, false, false, 0, false, Some("route held")),
+            (false, true, false, 0, false, Some("route unavailable")),
+            (false, false, true, 0, false, Some("stacked plans")),
+            (false, false, false, 1, false, Some("batching")),
         ] {
             let args = FromPlan {
                 issue: "example/tracker#7".into(),
@@ -1358,6 +1369,11 @@ mod tests {
                 block["stacks_on"] = 6.into();
                 block["kind"] = "implement".into();
             }
+            if staged {
+                block["repo"] = "example/tracker".into();
+                block["target_repo"] = "bootc-dev/bootc".into();
+                block["kind"] = "implement".into();
+            }
             let preview = Preview {
                 plan: block,
                 active,
@@ -1384,10 +1400,12 @@ mod tests {
                     request["url"],
                     "https://api.github.com/repos/bootc-dev/cgwalters-devspace-sandbox/actions/workflows/agent.yml/dispatches"
                 );
-                assert_eq!(
-                    request["body"]["inputs"],
-                    json!({"task": "No mutation.", "repo": "bootc-dev/bootc", "item": "8", "kind": "research", "pool": "openai", "cores": "4", "config": "rhel10"})
-                );
+                let mut expected = json!({"task": "No mutation.", "repo": "bootc-dev/bootc", "item": "8", "kind": "research", "pool": "openai", "cores": "4", "config": "rhel10"});
+                if staged {
+                    expected["kind"] = "implement".into();
+                    expected["issue_repo"] = "example/tracker".into();
+                }
+                assert_eq!(request["body"]["inputs"], expected);
                 // Each active status, twice, on both workflows.
                 assert_eq!(preview.reads.get(), 20);
             }

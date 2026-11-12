@@ -315,7 +315,9 @@ pub fn select<T: Transport>(
 }
 
 fn targets(plan: &JobPlan, issue: &ItemRef) -> bool {
-    plan.repo.eq_ignore_ascii_case(&issue.repository) && plan.item == issue.number
+    plan.target_repo.is_none()
+        && plan.repo.eq_ignore_ascii_case(&issue.repository)
+        && plan.item == issue.number
 }
 
 fn section(issue: &ItemRef, plan: &JobPlan) -> String {

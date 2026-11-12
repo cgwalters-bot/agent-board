@@ -778,6 +778,7 @@ impl Checked {
                     run_details: false,
                 };
                 let start = Start {
+                    issue_repository: None,
                     repository: &r.repository,
                     item: r.item,
                     kind: &r.kind,

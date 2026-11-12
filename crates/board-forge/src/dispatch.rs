@@ -16,7 +16,9 @@ pub use forgejo::{Forgejo, Lease as ForgejoLease, Slot as ForgejoSlot};
 pub struct Start<'a> {
     /// Target repository, OWNER/NAME.
     pub repository: &'a str,
-    /// Issue or pull request number in `repository`.
+    /// Source issue repository; absent preserves the existing same-repository request.
+    pub issue_repository: Option<&'a str>,
+    /// Issue or pull request number in `issue_repository`, or `repository` if absent.
     pub item: u64,
     pub kind: &'a str,
     /// The task, sent as the `task` input.
@@ -338,6 +340,9 @@ impl GitHub<'_> {
                 "kind": start.kind,
             },
         });
+        if let Some(repository) = start.issue_repository {
+            body["inputs"]["issue_repo"] = repository.into();
+        }
         if let Some(pool) = start.pool {
             body["inputs"]["pool"] = pool.into();
         }
@@ -360,6 +365,14 @@ impl GitHub<'_> {
             start.runner.is_none_or(crate::plan::valid_pool),
             "runner must be hosted or a profile name matching [a-z0-9][a-z0-9_-]{{0,31}}"
         );
+        if let Some(repository) = start.issue_repository {
+            validate_repository(repository)?;
+            validate_repository(start.repository)?;
+            ensure!(
+                start.kind == "implement" && start.base.is_none(),
+                "separate issue repository needs an unstacked implement run"
+            );
+        }
         let mut body = self.body(start);
         if let Some(route) = route {
             ensure!(route.select(start)?, "target does not match route");
@@ -520,6 +533,7 @@ mod tests {
             ),
         ] {
             let start = Start {
+                issue_repository: None,
                 repository,
                 item: 7,
                 kind,
@@ -855,6 +869,7 @@ mod tests {
             git_ref: "main".into(),
         };
         let start = Start {
+            issue_repository: None,
             repository: "example/app",
             item: 7,
             kind: "fix",
@@ -971,6 +986,7 @@ mod tests {
             git_ref: "main".into(),
         };
         let start = Start {
+            issue_repository: None,
             repository: "example/app",
             item: 7,
             kind: "triage",

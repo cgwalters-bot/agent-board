@@ -338,6 +338,7 @@ impl<T: Transport + board_forge::github::GraphQl> Run<'_, T> {
             target.validate()?;
             let identity = run.identity()?;
             let start = Start {
+                issue_repository: None,
                 repository: &identity.repository,
                 item: identity.number,
                 kind: FAKE_KIND,

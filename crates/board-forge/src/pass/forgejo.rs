@@ -429,7 +429,12 @@ struct Accepted {
 impl Accepted {
     fn start(&self) -> Start<'_> {
         Start {
-            repository: &self.plan.repo,
+            repository: self.plan.work_repository(),
+            issue_repository: self
+                .plan
+                .target_repo
+                .as_ref()
+                .map(|_| self.plan.repo.as_str()),
             item: self.plan.item,
             kind: &self.plan.kind,
             brief: &self.plan.brief,

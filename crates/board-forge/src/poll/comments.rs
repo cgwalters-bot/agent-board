@@ -1240,6 +1240,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             (stop, read),
         )?;
         let start = Start {
+            issue_repository: None,
             repository: repo,
             item: number,
             kind: "fix",
@@ -1788,6 +1789,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let url = format!("https://github.com/{repo}/pull/{number}");
         let brief = fix_brief(repo, number, &head, round, &url, said, &operator);
         let start = Start {
+            issue_repository: None,
             repository: repo,
             item: number,
             kind: "fix",
@@ -2008,6 +2010,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             ),
         };
         let start = Start {
+            issue_repository: None,
             repository: &item_repo,
             item,
             kind,

@@ -59,6 +59,7 @@ pub(crate) const POOL_LIMIT: usize = 32;
 const FIELDS: &[&str] = &[
     "schema",
     "repo",
+    "target_repo",
     "item",
     "kind",
     "runner",
@@ -100,9 +101,11 @@ pub(crate) const PULL_REQUEST_COMMENTS_QUERY: &str = r#"query($owner: String!, $
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobPlan {
-    /// Target repository, OWNER/NAME.
+    /// Repository containing the issue, OWNER/NAME.
     pub repo: String,
-    /// Issue number in the target repository.
+    /// Optional checkout and PR target, separate from the issue repository.
+    pub target_repo: Option<String>,
+    /// Issue number in `repo`.
     pub item: u64,
     pub kind: String,
     pub runner: String,
@@ -167,6 +170,15 @@ impl JobPlan {
             "plan kind {kind:?} is not one of {}",
             PLAN_KINDS.join(", ")
         );
+        let target_repo = match object.get("target_repo") {
+            None => None,
+            Some(_) => {
+                let target = text("target_repo")?;
+                naming.validate_repository(target)?;
+                ensure!(kind == "implement", "plan target_repo needs kind implement");
+                Some(target.to_owned())
+            }
+        };
         let runner = text("runner")?;
         ensure!(
             valid_pool(runner),
@@ -224,8 +236,13 @@ impl JobPlan {
             stacks_on.is_none() || kind == "implement",
             "plan stacks_on needs kind implement"
         );
+        ensure!(
+            target_repo.is_none() || stacks_on.is_none(),
+            "plan target_repo does not support stacking"
+        );
         Ok(Self {
             repo: repo.into(),
+            target_repo,
             item,
             kind: kind.into(),
             runner: runner.into(),
@@ -234,6 +251,10 @@ impl JobPlan {
             brief: brief.into(),
             stacks_on,
         })
+    }
+
+    pub fn work_repository(&self) -> &str {
+        self.target_repo.as_deref().unwrap_or(&self.repo)
     }
 
     /// The plan from a comment body: `None` without a plan fence. The fence
@@ -296,7 +317,8 @@ impl JobPlan {
     /// The job this plan starts; a plan always sends its pool, empty or not.
     fn start<'a>(&'a self, base: Option<&'a str>) -> Start<'a> {
         Start {
-            repository: &self.repo,
+            repository: self.work_repository(),
+            issue_repository: self.target_repo.as_ref().map(|_| self.repo.as_str()),
             item: self.item,
             kind: &self.kind,
             brief: &self.brief,
@@ -1015,7 +1037,7 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             "route does not support stacked plans/base input"
         );
         ensure!(batch == 0, "routed dispatch does not support batching yet");
-        route.check_idle(client, legacy, &plan.repo)?;
+        route.check_idle(client, legacy, plan.work_repository())?;
     }
     let id = plan_id(from)?;
     if let Some(chosen) = scheduled.plan {
@@ -1050,7 +1072,7 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     // The plan may change another repository than the issue it is on: its
     // pull requests and runs are that repository's.
     let dest = ItemRef {
-        repository: plan.repo.clone(),
+        repository: plan.work_repository().into(),
         number: plan.item,
         ..issue.clone()
     };
@@ -1092,10 +1114,18 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
         .unwrap_or_default()
         + &stacked;
     // A batch's other issues would land on the lower slice's branch too.
+    ensure!(
+        plan.target_repo.is_none() || batch == 0,
+        "target_repo does not support batching"
+    );
     let batch = if base.is_some() { 0 } else { batch };
     let chosen = crate::batch::select(client, issue, &plan, writers, batch)?;
     if let Some(rule) = collaborators {
-        check_inputs(client, issue, &dest, &chosen.extras, rule)?;
+        let source = ItemRef {
+            repository: plan.repo.clone(),
+            ..dest.clone()
+        };
+        check_inputs(client, issue, &source, &chosen.extras, rule)?;
     }
     let base = base.as_ref().map(|b| b.branch.as_str());
     let request = |extras: &[&crate::batch::Extra]| {
@@ -1219,7 +1249,7 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             || {
                 if let Some(route) = routing {
                     route
-                        .check_idle(client, legacy, &job.repo)
+                        .check_idle(client, legacy, job.work_repository())
                         .inspect_err(|_| {
                             admission_failed = true;
                         })?;
@@ -1446,6 +1476,13 @@ mod tests {
             ("schema", Value::Null, "schema is not a string"),
             ("repo", json!("ostreedev/ostree/../x"), "invalid repository"),
             ("repo", json!("ostreedev"), "invalid repository"),
+            ("target_repo", Value::Null, "target_repo is not a string"),
+            ("target_repo", json!(""), "invalid repository"),
+            (
+                "target_repo",
+                json!("owner/repo/extra"),
+                "invalid repository",
+            ),
             ("item", json!(0), "positive issue number"),
             ("item", json!(-1), "positive issue number"),
             ("item", json!("3665"), "positive issue number"),
@@ -1508,6 +1545,35 @@ mod tests {
             assert_eq!(error, format!("plan has no {key}"));
         }
         assert!(JobPlan::from_json(&json!([plan()])).is_err());
+    }
+
+    #[test]
+    fn staged_issue_dispatch_separates_source_and_work_repositories() {
+        let mut value = plan();
+        let same = JobPlan::from_json(&value).unwrap();
+        assert!(
+            same.dispatch_request(&target(), None).unwrap()["body"]["inputs"]
+                .get("issue_repo")
+                .is_none()
+        );
+        value["target_repo"] = json!("cgwalters-forge/ostree");
+        let staged = JobPlan::from_json(&value).unwrap();
+        let request = staged.dispatch_request(&target(), None).unwrap();
+        assert_eq!(request["body"]["inputs"]["repo"], "cgwalters-forge/ostree");
+        assert_eq!(request["body"]["inputs"]["issue_repo"], "ostreedev/ostree");
+        assert_eq!(request["body"]["inputs"]["item"], "3665");
+        for kind in ["triage", "research", "fix", SESSION_KIND] {
+            value["kind"] = json!(kind);
+            assert!(JobPlan::from_json(&value).is_err());
+        }
+        value["kind"] = json!("implement");
+        value["stacks_on"] = json!(3664);
+        assert!(
+            JobPlan::from_json(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("stacking")
+        );
     }
 
     #[test]

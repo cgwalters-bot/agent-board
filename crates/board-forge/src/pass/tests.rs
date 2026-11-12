@@ -15769,6 +15769,56 @@ fn stacked_plan_waits_for_the_lower_issues_next_run() {
 }
 
 #[test]
+fn staged_issue_plan_dispatches_to_an_issues_off_fork() {
+    for (target, admitted, own_space) in [
+        ("cgwalters-forge/ostree", true, true),
+        ("cgwalters-forge/ostree", false, true),
+        ("foreign/ostree", true, true),
+    ] {
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        implement_plan(&mut forge.replay);
+        let comments = &mut answer(&mut forge.replay, r#""name":"tracker","number":446"#)["data"]["repository"]
+            ["issue"]["comments"]["nodes"];
+        let comment = comments.as_array_mut().unwrap().last_mut().unwrap();
+        comment["body"] = text(comment, "/body")
+            .replace(
+                "\"item\":446",
+                &format!("\"item\":446,\"target_repo\":\"{target}\""),
+            )
+            .into();
+        forge.replay.requests.push(json!({
+            "request": graphql_key(overlap::TEXT_QUERY, &json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446})),
+            "answer": {"data": {"repository": {"issue": {"title": "Design", "body": "Target: cgwalters-forge/ostree"}}}}
+        }));
+        let mut settings = config(json!({"wip": 3}));
+        if admitted {
+            settings.work_repositories.push(target.into());
+        }
+        settings.pr.poll.own_space_only = own_space;
+        let report = apply(&forge, &settings);
+        assert_eq!(report.failures, 0, "{target}: {:#?}", report.lines);
+        if !admitted || target.starts_with("foreign/") {
+            assert!(forge.dispatches().is_empty(), "{:#?}", report.lines);
+            continue;
+        }
+        let writes = forge.writes.borrow();
+        let (_, _, sent) = writes
+            .iter()
+            .find(|(_, url, _)| url.ends_with("/dispatches"))
+            .unwrap_or_else(|| panic!("{:#?}", report.lines));
+        assert_eq!(sent["inputs"]["repo"], target);
+        assert_eq!(sent["inputs"]["issue_repo"], "cgwalters-forge/tracker");
+        assert_eq!(sent["inputs"]["item"], "446");
+        assert_eq!(forge.comments_on("cgwalters-forge/tracker", 446).len(), 1);
+        drop(writes);
+        let second = apply(&forge, &settings);
+        assert_eq!(second.failures, 0, "{:#?}", second.lines);
+        assert_eq!(forge.dispatches().len(), 1);
+    }
+}
+
+#[test]
 fn heavy_plan_cannot_bypass_the_weekly_budget() {
     for effort in [None, Some("heavy")] {
         let mut replay = replay();
