@@ -86,7 +86,7 @@ fragment F on IssueOrPullRequest{__typename \
 timelineItems(first:100,since:$since,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT,ISSUE_COMMENT,RENAMED_TITLE_EVENT,SUB_ISSUE_ADDED_EVENT,SUB_ISSUE_REMOVED_EVENT,PARENT_ISSUE_ADDED_EVENT,PARENT_ISSUE_REMOVED_EVENT,ADDED_TO_PROJECT_V2_EVENT,REMOVED_FROM_PROJECT_V2_EVENT,PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]){nodes{...TI} pageInfo{hasNextPage}}} \
 ... on PullRequest{number title url state createdAt updatedAt closedAt lastEditedAt merged mergedAt isDraft author{login} \
 commits(last:1){nodes{commit{abbreviatedOid statusCheckRollup{state}}}} \
-timelineItems(first:100,since:$since,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT,ISSUE_COMMENT,RENAMED_TITLE_EVENT,MERGED_EVENT,PULL_REQUEST_REVIEW,PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,READY_FOR_REVIEW_EVENT,CONVERT_TO_DRAFT_EVENT,ADDED_TO_PROJECT_V2_EVENT,REMOVED_FROM_PROJECT_V2_EVENT,PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]){nodes{...TP} pageInfo{hasNextPage}}}} \
+timelineItems(first:100,since:$since,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT,ISSUE_COMMENT,RENAMED_TITLE_EVENT,MERGED_EVENT,PULL_REQUEST_REVIEW,REVIEW_DISMISSED_EVENT,PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,READY_FOR_REVIEW_EVENT,CONVERT_TO_DRAFT_EVENT,ADDED_TO_PROJECT_V2_EVENT,REMOVED_FROM_PROJECT_V2_EVENT,PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]){nodes{...TP} pageInfo{hasNextPage}}}} \
 fragment TI on IssueTimelineItems{__typename \
 ... on ClosedEvent{createdAt actor{login}} ... on ReopenedEvent{createdAt actor{login}} \
 ... on LabeledEvent{createdAt actor{login} label{name}} ... on UnlabeledEvent{createdAt actor{login} label{name}} \
@@ -102,6 +102,7 @@ fragment TP on PullRequestTimelineItems{__typename \
 ... on AddedToProjectV2Event{createdAt} ... on RemovedFromProjectV2Event{createdAt} \
 ... on ProjectV2ItemStatusChangedEvent{createdAt previousStatus status} \
 ... on MergedEvent{createdAt actor{login}} ... on PullRequestReview{submittedAt author{login} state url} \
+... on ReviewDismissedEvent{createdAt actor{login} url previousReviewState review{url author{login}}} \
 ... on PullRequestCommit{commit{abbreviatedOid committedDate}} \
 ... on HeadRefForcePushedEvent{createdAt actor{login} afterCommit{abbreviatedOid}} \
 ... on ReadyForReviewEvent{createdAt} ... on ConvertToDraftEvent{createdAt}}";
@@ -298,6 +299,23 @@ pub struct Review {
     pub operator: bool,
 }
 
+/// A dismissal is an action by its actor, not a new review by the reviewer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ReviewDismissal {
+    pub by: String,
+    pub at: String,
+    pub url: String,
+    pub previous_state: String,
+    /// GitHub can no longer expose the dismissed review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    /// The configured operator dismissed it, regardless of who reviewed it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub operator: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Push {
     pub commit: String,
@@ -357,6 +375,8 @@ pub struct Item {
     pub comments: Vec<Comment>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reviews: Vec<Review>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub review_dismissals: Vec<ReviewDismissal>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pushes: Vec<Push>,
     /// An open pull request's head check state, as GitHub rolls it up.
@@ -752,6 +772,21 @@ pub fn classify(node: &Value, repository: &str, since: &str, operator: &str) -> 
                     url: at("url")?,
                 });
             }
+            "ReviewDismissedEvent" => {
+                let by = login(&event["actor"]);
+                item.changes.insert(Change::Reviewed);
+                item.review_dismissals.push(ReviewDismissal {
+                    operator: by_operator(&by, operator),
+                    by,
+                    at: at("createdAt")?,
+                    url: at("url")?,
+                    previous_state: at("previousReviewState")?,
+                    review_url: event["review"]["url"].as_str().map(str::to_owned),
+                    reviewer: event["review"]["author"]["login"]
+                        .as_str()
+                        .map(str::to_owned),
+                });
+            }
             "PullRequestCommit" => {
                 item.changes.insert(Change::Pushed);
                 item.pushes.push(Push {
@@ -880,7 +915,8 @@ impl Diff {
                     *counts.entry(*change).or_default() += 1;
                 }
                 operator += item.comments.iter().filter(|c| c.operator).count()
-                    + item.reviews.iter().filter(|r| r.operator).count();
+                    + item.reviews.iter().filter(|r| r.operator).count()
+                    + item.review_dismissals.iter().filter(|r| r.operator).count();
             }
             let mut counts: Vec<_> = counts
                 .iter()

@@ -61,12 +61,20 @@ For each issue or pull request updated since the watermark:
 
 - opened, closed, reopened, merged, edited (body or title) and labelled;
 - comments, the configured `operator`'s flagged;
-- reviews;
+- reviews and review dismissals;
 - pushes to a pull request, and the check state of an open pull request's
   head as GitHub rolls it up;
 - sub-issue and parent links;
 - project membership and Status changes;
 - converted to a draft or marked ready for review.
+
+Review dismissals count as `reviewed`, with a separate `review_dismissals`
+list in JSON: the actor, time, event URL and previous review state, plus the
+review URL and reviewer when GitHub still exposes them. The operator flag
+on a dismissal identifies who dismissed it, not who wrote the review. A
+dismissed approval is not a fresh approval; consumers must re-read current
+approval and check state before acting. This adds no writes or pass dispatch
+and uses the existing one-page timeline bound.
 
 A pull request whose head checks were still running is read again on later
 runs until they settle, so that their result is a change too (`checked`),
