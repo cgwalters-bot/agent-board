@@ -632,8 +632,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 0
             }
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("maintain error: {error:#}"));
+                self.report.error("maintain", &error);
                 0
             }
         }
@@ -981,8 +980,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             // Preparation failures and confirmed refusals record nothing.
             // A lost response or server error might still hide a start.
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("{line} failed: {error:#}"));
+                self.report.error(&line, &error);
                 Ok(match maybe_started {
                     true => Start::Posted(Some(id)),
                     false => Start::Deferred,
@@ -1059,8 +1057,11 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 self.settle();
             }
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("maintain error: {said}: {error:#}"));
+                self.report.error_line(
+                    "maintain",
+                    &error,
+                    format!("maintain error: {said}: {error:#}"),
+                );
             }
         }
     }

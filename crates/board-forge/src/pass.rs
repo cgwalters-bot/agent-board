@@ -2967,10 +2967,18 @@ impl Bounds {
         let Some(why) = self.rate_limited.borrow().clone() else {
             return;
         };
-        let before = report.lines.len();
         report.lines.retain(|line| !line.contains(NOT_SENT));
-        let dropped = before - report.lines.len();
+        let before = report.failed_operations.len();
+        report
+            .failed_operations
+            .retain(|line| !line.contains(NOT_SENT));
+        let dropped = before - report.failed_operations.len();
         report.failures = report.failures.saturating_sub(dropped).max(1);
+        if report.failed_operations.is_empty() {
+            report
+                .failed_operations
+                .push(format!("rate-limited: {why}"));
+        }
         report.lines.push(format!(
             "rate-limited: {why}; {} more request(s) not sent, for the next pass",
             self.not_sent.get()
@@ -3167,6 +3175,10 @@ impl std::fmt::Display for BudgetSpent {
 }
 
 impl std::error::Error for BudgetSpent {}
+
+pub(crate) fn budget_spent(error: &anyhow::Error) -> bool {
+    error.is::<BudgetSpent>() || error.is::<ShareSpent>()
+}
 
 /// Every request through it spends one of the pass's budget, but a 304,
 /// which GitHub does not count, up to [`REVALIDATED_LIMIT`]. Reads leave
@@ -3868,6 +3880,8 @@ pub struct Report {
     /// and the last pass's where this one scanned nothing.
     pub scan_cursor: Option<String>,
     pub failures: usize,
+    /// Each counted GitHub operation failure, including its reason.
+    pub failed_operations: Vec<String>,
     pub state: Option<State>,
     pub holds: Vec<Entry>,
     /// The WIP limit and count and the pass's summary, published with
@@ -3881,6 +3895,35 @@ pub struct Report {
 }
 
 impl Report {
+    fn failure(&mut self, reason: String) {
+        self.failures += 1;
+        self.failed_operations.push(reason.clone());
+        self.lines.push(reason);
+    }
+
+    fn error(&mut self, operation: &str, error: &anyhow::Error) {
+        self.error_line(operation, error, format!("{operation} error: {error:#}"));
+    }
+
+    fn error_line(&mut self, operation: &str, error: &anyhow::Error, line: String) {
+        if budget_spent(error) {
+            self.lines.push(format!("{operation} deferred: budget"));
+        } else {
+            self.failure(line);
+        }
+    }
+
+    pub fn failure_summary(&self) -> String {
+        format!(
+            "{} operation(s) of the pass failed{}",
+            self.failures,
+            self.failed_operations
+                .iter()
+                .map(|reason| format!("\n- {reason}"))
+                .collect::<String>()
+        )
+    }
+
     /// The pass's last line: its caps' summary and what it spent, as
     /// `summary: dispatched 1/1, writes 3/5, held 12, requests 80 (epics 30,
     /// schedule 50), endpoints {…}, causes {…}, points ~95, starts {…},
@@ -4177,8 +4220,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         None => match default_branch(&client, &config.dispatch_repo) {
             Ok(branch) => branch,
             Err(error) => {
-                report.failures += 1;
-                report.lines.push(format!("dispatch ref error: {error:#}"));
+                report.error("dispatch ref", &error);
                 return report;
             }
         },
@@ -4239,8 +4281,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
         Err(error) => {
-            scheduler.report.failures += 1;
-            scheduler.line(format!("direction error: {error:#}"));
+            scheduler.report.error("direction", &error);
         }
     }
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
@@ -4248,8 +4289,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds.enter(Stage::Usage);
     scheduler.refresh();
     if let Err(error) = scheduler.reap_overdue(&git_ref) {
-        scheduler.report.failures += 1;
-        scheduler.line(format!("reap error: {error:#}"));
+        scheduler.report.error("reap", &error);
     }
     // The maintain digest, planned while it is due, which the later stages
     // leave its share for.
@@ -4297,8 +4337,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds.enter(Stage::Schedule);
     if let Err(error) = scheduler.schedule(earlier, &git_ref) {
         scheduler.holds_whole = false;
-        scheduler.report.failures += 1;
-        scheduler.line(format!("schedule error: {error:#}"));
+        scheduler.report.error("schedule", &error);
     }
     scheduler.focus_unjudged();
     // Stage 4b: read-only visibility into approved fork PRs, never publication.
@@ -4308,8 +4347,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds.reserve.set(0);
     bounds.enter(Stage::Status);
     if let Err(error) = scheduler.status(&git_ref).await {
-        scheduler.report.failures += 1;
-        scheduler.line(format!("status error: {error:#}"));
+        scheduler.report.error("status", &error);
     }
     for notice in bounds.handoff_notices.borrow().iter() {
         scheduler.line(notice.clone());
@@ -4633,22 +4671,18 @@ struct BudgetStop {
 enum Halt {
     /// Every slot is taken.
     Full,
-    /// Too few requests are left for a start. The rest wait for the next
-    /// pass, as they would for a slot: a failure only when no candidate came
-    /// before, as then the budget let the pass consider nothing.
+    /// Too few requests are left for a start. The rest wait for the next pass.
     Budget,
     /// The time bound passed.
     Time,
 }
 
-impl Halt {
-    /// Whether the stop is a failure, where `earlier` says a candidate was
-    /// considered before it.
-    fn failed(self, earlier: bool) -> bool {
-        match self {
-            Halt::Full => false,
-            Halt::Budget => !earlier,
-            Halt::Time => true,
+impl Step {
+    fn failed(line: &str, holds: Vec<ItemRef>, error: anyhow::Error) -> Self {
+        if budget_spent(&error) {
+            Self::Stop(format!("{line} deferred: budget"), Halt::Budget)
+        } else {
+            Self::Failed(format!("{line} failed: {error:#}"), holds)
         }
     }
 }
@@ -4950,8 +4984,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             match result {
                 Ok(()) => self.line(format!("living status: reconciled {}", write.url)),
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("living status error: {error:#}"));
+                    self.report.error("living status", &error);
                 }
             }
         }
@@ -4998,8 +5031,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Ok(())
             })();
             if let Err(error) = result {
-                self.report.failures += 1;
-                self.line(format!("living status duplicate error: {error:#}"));
+                self.report.error("living status duplicate", &error);
             }
         }
     }
@@ -5165,8 +5197,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     midstreams = read;
                 }
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("follow error: midstream topic {topic}: {error:#}"));
+                    self.report.error_line(
+                        "follow",
+                        &error,
+                        format!("follow error: midstream topic {topic}: {error:#}"),
+                    );
                     return 0;
                 }
             }
@@ -5175,8 +5210,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 midstreams.len()
             ));
             if let Some(repo) = midstreams.iter().find(|repo| never(repo)) {
-                self.report.failures += 1;
-                self.line(format!(
+                self.report.failure(format!(
                     "follow error: midstream {repo} is the direction repository, which the pass never follows"
                 ));
                 return 0;
@@ -5187,8 +5221,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
             if self.follows.len() > POLL_REPOSITORY_LIMIT {
-                self.report.failures += 1;
-                self.line(format!(
+                self.report.failure(format!(
                     "follow error: follow and midstream name more than {POLL_REPOSITORY_LIMIT} repositories"
                 ));
                 return 0;
@@ -5197,8 +5230,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let unfollowed = (config.work_repositories.iter())
                 .find(|w| !self.follows.iter().any(|r| r.eq_ignore_ascii_case(w)));
             if let Some(repo) = unfollowed.filter(|_| config.pr.poll.unstall) {
-                self.report.failures += 1;
-                self.line(format!(
+                self.report.failure(format!(
                     "follow error: pr unstall needs every work repository followed, and {repo} is neither in follow nor has topic {topic}"
                 ));
                 return 0;
@@ -5211,8 +5243,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             promoted.is_some_and(|f| f.keys().any(|k| k.eq_ignore_ascii_case(repo)))
                 && !midstreams.iter().any(|m| m.eq_ignore_ascii_case(repo))
         }) {
-            self.report.failures += 1;
-            self.line(format!(
+            self.report.failure(format!(
                 "follow error: promote fork {repo} is not a topic-selected midstream"
             ));
             return 0;
@@ -5233,8 +5264,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     routes = Some(read);
                 }
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("notifications error: midstream routes: {error:#}"));
+                    self.report.error("notifications midstream routes", &error);
                     return 0;
                 }
             }
@@ -5286,8 +5316,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     direction = Some(prior);
                 }
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("approved pull requests error: {error:#}"));
+                    self.report.error("approved pull requests", &error);
                 }
             }
         }
@@ -5332,8 +5361,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     direction = Some((outcome, requests));
                 }
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("operator comments error: {error:#}"));
+                    self.report.error("operator comments", &error);
                     return self.finish_early_follow(prior, state, intake_starts);
                 }
             }
@@ -5352,7 +5380,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Ok(read) => read,
                 // As the poll's below: the stages after it keep their share,
                 // and the pull requests wait for the next pass.
-                Err(error) if error.is::<ShareSpent>() => {
+                Err(error) if budget_spent(&error) => {
                     self.report.state = Some(state.clone());
                     self.line(format!(
                         "budget: pull requests stopped at its share; authored pull requests wait for the next pass: {error:#}"
@@ -5360,8 +5388,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     return self.finish_early_follow(direction, state, intake_starts);
                 }
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("follow error: authored pull requests: {error:#}"));
+                    self.report.error_line(
+                        "follow",
+                        &error,
+                        format!("follow error: authored pull requests: {error:#}"),
+                    );
                     return self.finish_early_follow(direction, state, intake_starts);
                 }
             };
@@ -5382,8 +5413,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let turn = match authored::turn(&new, &priority, (per_pass, room), rotation) {
                 Ok(turn) => turn,
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("follow error: authored turn: {error:#}"));
+                    self.report.error("follow authored turn", &error);
                     return self.finish_early_follow(direction, state, intake_starts);
                 }
             };
@@ -5452,7 +5482,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 outcome.state.authored_cursor = cursor;
                 self.finish_follow(outcome)
             }
-            Err(error) if error.is::<ShareSpent>() => {
+            Err(error) if budget_spent(&error) => {
                 self.report.state = Some(deferred_state.clone());
                 let starts = self.finish_early_follow(prior, deferred_state, intake_starts);
                 self.line(
@@ -5462,8 +5492,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 starts
             }
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("follow error: {error:#}"));
+                self.report.error("follow", &error);
                 self.finish_early_follow(prior, deferred_state, intake_starts)
             }
         }
@@ -5519,6 +5548,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         self.report.lines.extend(outcome.lines);
         self.report.failures += outcome.errors;
+        self.report
+            .failed_operations
+            .extend(outcome.failed_operations);
         self.report.state = Some(outcome.state);
         self.reviewing = outcome.reviewing;
         self.progressed += outcome.merged;
@@ -5644,8 +5676,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             match self.failed_runs(&target) {
                 Ok(failed) => (self.failed, self.failed_listed) = (failed, true),
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("rerun error: {error:#}; no run is re-run"));
+                    self.report
+                        .error("rerun listing (no run is re-run)", &error);
                 }
             }
         }
@@ -5653,8 +5685,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             match self.find_sweep() {
                 Ok(found) => self.swept = Some(found),
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("sweep error: {error:#}"));
+                    self.report.error("sweep", &error);
                 }
             }
         }
@@ -5850,7 +5881,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 break;
             }
             if Instant::now() > self.client.bounds.admit_by {
-                self.report.failures += 1;
                 self.unconsidered += left;
                 self.line(format!(
                     "time: the pass ran past {PASS_SECONDS_LIMIT} seconds; {left} candidate(s) deferred"
@@ -5894,13 +5924,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             for why in self.ignored.take() {
                 self.held(facts, Hold::new(HoldKind::OverlapIgnored, why));
             }
-            let earlier = std::mem::replace(&mut self.considered, true);
+            self.considered = true;
             // A start under way finishes; the next waits for the time bound.
             self.client.bounds.end_start();
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
-                    self.report.failures += 1;
                     self.unconsidered += 1;
                     // Past a rate limit nothing is sent: those failures are
                     // collapsed into one line ([`Bounds::collapse`]), and
@@ -5908,7 +5937,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     if self.client.bounds.rate_limited.borrow().is_none() {
                         self.not_ready(NOT_READY_ERROR);
                     }
-                    self.line(format!("fail {issue}: {error:#}"));
+                    self.report.error_line(
+                        &format!("consider {issue}"),
+                        &error,
+                        format!("fail {issue}: {error:#}"),
+                    );
                     continue;
                 }
             };
@@ -5944,7 +5977,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     continue;
                 }
                 Step::Stop(why, halt) => {
-                    self.report.failures += usize::from(halt.failed(earlier));
                     self.unconsidered += left;
                     let read = match halt {
                         Halt::Budget if visited > 0 => {
@@ -6061,6 +6093,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // Sent or planned: a failed start may have dispatched.
         self.caps.count(Kind::Dispatch);
         if failed {
+            self.report.failed_operations.push(line.clone());
             self.report.failures += 1;
             self.not_started += 1;
         }
@@ -6321,8 +6354,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         }
                         Ok(false) => self.line(format!("{said}; it moved since, so it stays")),
                         Err(error) => {
-                            self.report.failures += 1;
-                            self.line(format!("lease error: {said}: {error:#}"));
+                            self.report.error(&format!("lease {said}"), &error);
                         }
                     }
                 }
@@ -6359,8 +6391,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let read = match self.usage() {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("usage error: {error:#}"));
+                    self.report.error("usage", &error);
                     None
                 }
             };
@@ -6939,10 +6970,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 HoldKind::NeedsOperator,
                 format!("plan {id}'s fix of {}: {why}", dest.display()),
             ))),
-            Err(error) => Err(Step::Failed(
-                format!("{line} failed: {error:#}"),
-                holds.to_vec(),
-            )),
+            Err(error) => Err(Step::failed(line, holds.to_vec(), error)),
         }
     }
 
@@ -7539,7 +7567,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 match self.post_plan(issue, BODY_PLAN, block) {
                     Ok(posted) => posted,
                     Err(error) => {
-                        return Ok(Step::Failed(format!("{line} failed: {error:#}"), holds));
+                        return Ok(Step::failed(&line, holds, error));
                     }
                 }
             }
@@ -7685,7 +7713,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Err(error) if error.is::<plan::Refused>() => {
                 Step::Hold(Hold::new(HoldKind::Other, error.to_string()))
             }
-            Err(error) => Step::Failed(format!("{line} failed: {error:#}"), holds),
+            Err(error) => Step::failed(&line, holds, error),
         })
     }
 
@@ -7897,7 +7925,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             // Sent or not, the slot stays taken: an ambiguous dispatch is
             // recorded on the issue, and the next pass reads it.
-            Err(error) => Step::Failed(format!("{line} failed: {error:#}"), holds),
+            Err(error) => Step::failed(&line, holds, error),
         }
     }
 
@@ -9056,7 +9084,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             None => self.post_plan(issue, &intro, &plan).map(drop),
         };
         if let Err(error) = posted {
-            return Ok(Step::Failed(format!("{line} failed: {error:#}"), holds));
+            return Ok(Step::failed(&line, holds, error));
         }
         // No overlap check: a triage run changes no files.
         let scheduled = Scheduled {

@@ -113,10 +113,7 @@ pub(crate) fn run_approved_capped<R: Rest, G: Transport>(
     }
     let mut outcome = Outcome::default();
     if let Err(error) = pass.approved(&follow.iter().collect(), cursor, &mut outcome) {
-        outcome.errors += 1;
-        outcome
-            .lines
-            .push(format!("pull requests: approved search error: {error:#}"));
+        outcome.error("pull requests: approved search", &error);
     }
     rest.under_way(false);
     outcome.dispatched = pass.dispatched;
@@ -240,11 +237,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 }
                 Err(error) => {
                     outcome.undecided.insert(repo.to_ascii_lowercase());
-                    if error.is::<crate::pass::ShareSpent>() {
+                    if crate::pass::budget_spent(&error) {
                         next.get_or_insert_with(|| repo.to_ascii_lowercase());
                     } else {
-                        outcome.errors += 1;
-                        outcome.lines.push(format!("{repo} error: {error:#}"));
+                        outcome.error(repo, &error);
                     }
                 }
             }
@@ -293,11 +289,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     .collect();
                 if let Err(error) = self.follow_open(repo, open, outcome) {
                     outcome.undecided.insert(repo.to_ascii_lowercase());
-                    if error.is::<crate::pass::ShareSpent>() {
+                    if crate::pass::budget_spent(&error) {
                         self.stop_at(repo, None);
                     } else {
-                        outcome.errors += 1;
-                        outcome.lines.push(format!("{repo} error: {error:#}"));
+                        outcome.error(repo, &error);
                     }
                 }
                 // A cut between PRs is a successful, partial walk. Keep

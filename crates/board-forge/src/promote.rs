@@ -89,7 +89,7 @@ impl GateFailure {
 type Policies = BTreeMap<String, std::result::Result<policy::Permitted, GateFailure>>;
 
 fn read_failure(error: anyhow::Error) -> anyhow::Error {
-    if error.is::<crate::github::RateLimited>() || error.is::<pass::ShareSpent>() {
+    if error.is::<crate::github::RateLimited>() || pass::budget_spent(&error) {
         return error;
     }
     ReadFailure(format!("{error:#}")).into()

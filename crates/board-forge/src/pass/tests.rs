@@ -1404,7 +1404,7 @@ fn cached_pass(
     apply: bool,
 ) -> Report {
     let own = own();
-    block(run(
+    let report = block(run(
         forge,
         forge,
         config,
@@ -1419,7 +1419,14 @@ fn cached_pass(
         ),
         forge.replay.replay.now,
     ))
-    .unwrap()
+    .unwrap();
+    assert_eq!(
+        report.failures,
+        report.failed_operations.len(),
+        "{:?}",
+        report.lines
+    );
+    report
 }
 
 /// Response loss must not change writes or erase asks. Action receipts live
@@ -2285,7 +2292,7 @@ pub(super) fn preview(config: &Config, replay: &Replay) -> Report {
             .collect();
         replay.requests.extend(extras);
     }
-    block(run(
+    let report = block(run(
         &replay,
         &replay,
         config,
@@ -2293,7 +2300,14 @@ pub(super) fn preview(config: &Config, replay: &Replay) -> Report {
         (Mode::Preview, Limits::default()),
         replay.now,
     ))
-    .unwrap()
+    .unwrap();
+    assert_eq!(
+        report.failures,
+        report.failed_operations.len(),
+        "{:?}",
+        report.lines
+    );
+    report
 }
 
 /// Add bounded synthetic activity to the historical anchor-comment recording.
@@ -2322,7 +2336,58 @@ pub(super) fn preview_within(config: &Config, replay: &Replay, limit: usize) -> 
         replay.now,
     );
     let bounds = Bounds::new(limit, admit_by);
-    block(run_within(replay, replay, config, within, &bounds)).unwrap()
+    let report = block(run_within(replay, replay, config, within, &bounds)).unwrap();
+    assert_eq!(
+        report.failures,
+        report.failed_operations.len(),
+        "{:?}",
+        report.lines
+    );
+    report
+}
+
+#[test]
+fn every_counted_failure_is_named_in_the_summary() {
+    let mut report = Report::default();
+    report.error("schedule", &anyhow::anyhow!("board unreadable"));
+    report.error("status", &anyhow::anyhow!("snapshot incomplete"));
+    for error in [
+        anyhow::Error::new(BudgetSpent("spent".into())),
+        anyhow::Error::new(ShareSpent("spent".into())),
+    ] {
+        report.error("handoff", &error.context("nested read"));
+    }
+    assert_eq!(report.failures, 2);
+    let summary = report.failure_summary();
+    assert_eq!(
+        summary
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .count(),
+        report.failures
+    );
+    assert!(summary.contains("- schedule error: board unreadable"));
+    assert!(summary.contains("- status error: snapshot incomplete"));
+}
+
+#[test]
+fn rate_limit_collapse_counts_operations_not_duplicate_diagnostics() {
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+    *bounds.rate_limited.borrow_mut() = Some("server throttled".into());
+    let mut report = Report::default();
+    report.failure("schedule error: server throttled".into());
+    report.failure("follow error: connection lost".into());
+    report.failure(format!("status error: {NOT_SENT}"));
+    report.lines.push(format!("hold: {NOT_SENT}"));
+    bounds.collapse(&mut report);
+    assert_eq!(report.failures, 2);
+    assert_eq!(report.failures, report.failed_operations.len());
+    assert!(
+        report
+            .failure_summary()
+            .contains("follow error: connection lost")
+    );
+    assert!(!report.failure_summary().contains(NOT_SENT));
 }
 
 /// The recorded answer to the request whose JSON contains `needle`.
@@ -8702,19 +8767,17 @@ fn apply_stops_at_its_time_bound() {
         &Bounds::new(PASS_REQUEST_LIMIT, past),
     ))
     .unwrap();
-    assert_eq!(
-        last_scheduled(&report),
-        "schedule error: the pass's time bound (900 seconds) is spent"
-    );
+    assert_eq!(last_scheduled(&report), "schedule deferred: budget");
     // Nor does stage 3 read the epics.
     assert!(
         report
             .lines
-            .contains(&"epics error: the pass's time bound (900 seconds) is spent".to_owned())
+            .iter()
+            .any(|line| line.starts_with("budget: epics stopped"))
     );
     // Nor does the Status stage read the board.
     assert_eq!(report.lines.last().unwrap(), "status deferred: budget");
-    assert_eq!(report.failures, 2);
+    assert_eq!(report.failures, 0);
     assert!(forge.writes.borrow().is_empty());
 }
 
@@ -15604,7 +15667,7 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
         (
             120,
             "budget: 105 requests left, only what a start may take (109); 9 more candidate(s) wait",
-            1,
+            0,
             0,
             &[
                 "idle: claude is under pace and nothing started; stage 4's budget left 9 candidate(s) unread, first cgwalters-forge/tracker#446",
@@ -15633,7 +15696,7 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             report.lines
         );
         assert_eq!(forge.dispatches().len(), started, "limit {limit}");
-        if failures == 0 {
+        if started > 0 {
             let holds = (report.lines.iter())
                 .filter(|l| l.starts_with("hold cgwalters-forge/"))
                 .count();
@@ -15743,13 +15806,9 @@ fn apply_keeps_a_starts_requests_for_it() {
                     || l.contains("for a start") && !l.starts_with("budget: ")),
             "limit {limit}: {lines:#?}"
         );
-        // Nothing considered is the only failure.
-        let total = report.tally.1.candidates.unwrap_or_default();
-        let wait = format!("; {total} more candidate(s) wait");
-        let none = lines.iter().any(|l| l.ends_with(&wait));
-        assert_eq!(
-            report.failures,
-            usize::from(none),
+        assert_eq!(report.failures, 0, "limit {limit}: {lines:#?}");
+        assert!(
+            report.failed_operations.is_empty(),
             "limit {limit}: {lines:#?}"
         );
         started.insert(forge.dispatches().len());
@@ -22029,22 +22088,17 @@ fn runs_past_the_budget_are_no_capacity() {
         }
     }
     let report = preview(&config(json!({})), &replay);
-    let error = report
-        .lines
-        .iter()
-        .find(|l| l.starts_with("schedule error: in_progress runs: "))
-        .unwrap_or_else(|| panic!("{:#?}", report.lines));
     assert!(
-        error
-            == &format!(
-                "schedule error: in_progress runs: 3 read of {RUN_LIST_LIMIT}; capacity is unknown: the pass's request budget ({PASS_REQUEST_LIMIT}) is spent"
-            ),
-        "{error}"
+        report
+            .lines
+            .contains(&"schedule deferred: budget".to_owned()),
+        "{:?}",
+        report.lines
     );
     assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
     // The Status stage defers without adding another failure.
     assert!(report.lines.contains(&"status deferred: budget".to_owned()));
-    assert_eq!(report.failures, 1, "{:#?}", report.lines);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
 }
 
 /// [`CLOSE_QUERY`] reads the newest event of each kind on its own, so no

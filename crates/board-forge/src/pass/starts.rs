@@ -362,8 +362,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             Ok(guard) => guard,
             // An unread breaker is not permission to start.
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("breaker error: {error:#}; new runs wait"));
+                self.report.error("breaker (new runs wait)", &error);
                 return None;
             }
         };
@@ -510,8 +509,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let open = match self.alarms() {
             Ok(alarms) => alarms.get(kind).cloned(),
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("alarm {kind} error: {error:#}"));
+                self.report.error(&format!("alarm {kind}"), &error);
                 return;
             }
         };
@@ -571,8 +569,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         match sent {
             Ok(_) => self.line(line),
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("{line} failed: {error:#}"));
+                self.report.error(&line, &error);
             }
         }
     }

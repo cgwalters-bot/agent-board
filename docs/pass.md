@@ -1918,6 +1918,10 @@ If the pass's request, GraphQL-point or time budget cannot finish the Status
 reads, it prints `status deferred: budget` without failing the pass or writing
 any Status changes from that partial read. Status is best-effort after scheduling,
 not reserved to run every pass; existing statuses remain until a later pass.
+Promotion handoff reads likewise defer with `promotion handoff deferred: budget`.
+Any partially read promotion conclusions stay unknown, rather than becoming
+evidence that no handoff exists; scheduling and Status keep those sources held
+until a later pass can verify them.
 Invalid promotion handoffs are skipped per PR, reported once
 as `needs-supervisor: promotion handoff OWNER/REPO#N: …; skipped`, and surfaced in
 the supervisor's `needs-supervisor` infrastructure check. Receipt authentication
@@ -2293,7 +2297,10 @@ A pass captures one clock and performs these stages in order:
    within request bounds of its own (see [cost](cost.md#publishing)).
 
 The result names actions, holds, incomplete reads and failures, with a nonzero
-exit for an operational failure. Independent PRs may still be followed when an
+exit for an operational failure. The GitHub pass's final failure diagnostic lists
+each counted failed operation with its reason; request, stage-share and time
+exhaustion defer unresolved work instead of counting as operation failures.
+Independent PRs may still be followed when an
 epic cannot be read. Do not schedule from an incomplete candidate set or missing
 hold facts. Re-read the chosen plan, holds and capacity before each dispatch;
 reserve its slot before sending, including when the response is ambiguous.
@@ -2317,8 +2324,8 @@ for it. A start may spend them, so a candidate found ready has what its start
 takes. Stage 4 stops considering candidates there, as it
 stops for a full WIP, with `budget: N requests left, only what a start may take
 (73); M more candidate(s) wait`, rather than read on into requests no start it
-found could use; the rest wait for the next pass, and the stop is a failure only
-when no candidate was considered. Past a candidate, the line also says how many
+found could use; the rest wait for the next pass without failing it, even when
+no candidate was considered. Past a candidate, the line also says how many
 were considered and the requests they took, starts included (`K candidate(s)
 considered, starts included, for R requests`), to tell them from the stage's own
 reads: the board, run listings and leases (agent-board#789). A stop before

@@ -104,8 +104,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     }
                 }
                 Err(error) => {
-                    outcome.errors += 1;
-                    outcome.lines.push(format!("{repo} lock error: {error:#}"));
+                    outcome.error(&format!("{repo} lock"), &error);
                 }
             }
         }
@@ -159,8 +158,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                                 .push(format!("{key} lock: input only from collaborators"));
                         }
                         Err(error) => {
-                            outcome.errors += 1;
-                            outcome.lines.push(format!("{key} lock error: {error:#}"));
+                            outcome.error(&format!("{key} lock"), &error);
                         }
                     }
                 }

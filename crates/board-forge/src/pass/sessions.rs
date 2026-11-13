@@ -518,8 +518,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 Ok(Some(prepared_session)) => prepared.push(prepared_session),
                 Ok(None) => {}
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("session {repo} error: {error:#}"));
+                    self.report.error(&format!("session {repo}"), &error);
                 }
             }
         }
@@ -577,8 +576,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("session {repo} error: {error:#}"));
+                    self.report.error(&format!("session {repo}"), &error);
                 }
             }
         }
@@ -763,8 +761,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 self.line(format!("session {repo}: {}", hold.reason));
                 None
             }
-            Step::Stop(why, halt) => {
-                self.report.failures += usize::from(halt.failed(true));
+            Step::Stop(why, _) => {
                 self.line(format!("session {repo}: {why}"));
                 None
             }
@@ -944,8 +941,11 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 self.line(format!("apply session {repo} batch={id}: {done}{receipt}"));
             }
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("{line} failed: {error:#}"));
+                self.report.error_line(
+                    "session apply",
+                    &error,
+                    format!("{line} failed: {error:#}"),
+                );
             }
         }
         Ok(())

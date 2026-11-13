@@ -121,7 +121,11 @@ impl<C> Reads<'_, '_, C> {
         if let Err(e) = &result
             && !e.is::<crate::github::NotFound>()
         {
-            *self.failed.borrow_mut() = Some(format!("{e:#}"));
+            if budget_spent(e) {
+                self.exhausted.set(true);
+            } else {
+                *self.failed.borrow_mut() = Some(format!("{e:#}"));
+            }
         }
         result
     }
@@ -155,9 +159,19 @@ impl<C: Rest + Transport> Transport for Reads<'_, '_, C> {
 impl<C: Rest + Transport> Scheduler<'_, C> {
     pub(super) fn promote(&mut self) {
         let (lines, failures) = view(&self.client, self.config, self.now);
-        self.report.failures += failures;
+        debug_assert_eq!(
+            failures,
+            lines
+                .iter()
+                .filter(|line| line.starts_with("promote error:"))
+                .count()
+        );
         for line in lines {
-            self.line(line);
+            if line.starts_with("promote error:") {
+                self.report.failure(line);
+            } else {
+                self.line(line);
+            }
         }
     }
 }

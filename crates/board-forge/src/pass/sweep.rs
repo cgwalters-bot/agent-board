@@ -427,8 +427,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
             Ok(_) => (free, 0),
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("sweep error: {error:#}"));
+                self.report.error("sweep", &error);
                 (free, 0)
             }
         }
@@ -450,16 +449,14 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             Ok(Some(found)) if found.open => found,
             Ok(_) => return,
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("sweep error: {error:#}"));
+                self.report.error("sweep", &error);
                 return;
             }
         };
         let board = match self.board() {
             Ok(board) => board,
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("sweep error: {error:#}"));
+                self.report.error("sweep", &error);
                 return;
             }
         };
@@ -793,8 +790,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 self.line(format!("sweep {url}: {}", hold.reason));
                 None
             }
-            Step::Stop(why, halt) => {
-                self.report.failures += usize::from(halt.failed(true));
+            Step::Stop(why, _) => {
                 self.line(format!("sweep {url}: {why}"));
                 None
             }
@@ -941,7 +937,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             match attached {
                 Ok(_) => done.push(format!("- Attached {name} to {}", epic.display())),
                 Err(error) => {
-                    self.report.failures += 1;
+                    self.report.error(
+                        &format!("sweep attach {name} to {}", epic.display()),
+                        &error,
+                    );
                     left.push(format!(
                         "- {name}: belongs to {}, but attaching it failed: {error:#}",
                         epic.display()
@@ -1053,8 +1052,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         match sent {
             Ok(()) => self.line(line),
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("{line} failed: {error:#}"));
+                self.report.error(&line, &error);
             }
         }
     }

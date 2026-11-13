@@ -4526,6 +4526,7 @@ pub struct Outcome {
     pub maintainer_report: Option<String>,
     pub lines: Vec<String>,
     pub errors: usize,
+    pub failed_operations: Vec<String>,
     pub activity: usize,
     pub in_flight: usize,
     /// The runs this pass started, which a caller counts against its capacity.
@@ -4552,6 +4553,24 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    fn failure(&mut self, reason: String) {
+        self.errors += 1;
+        self.failed_operations.push(reason.clone());
+        self.lines.push(reason);
+    }
+
+    fn error(&mut self, operation: &str, error: &anyhow::Error) {
+        self.error_line(operation, error, format!("{operation} error: {error:#}"));
+    }
+
+    fn error_line(&mut self, operation: &str, error: &anyhow::Error, line: String) {
+        if crate::pass::budget_spent(error) {
+            self.lines.push(format!("{operation} deferred: budget"));
+        } else {
+            self.failure(line);
+        }
+    }
+
     /// Pending reviews have not passed the full census/WIP admission yet.
     pub(crate) fn hold_deferred_reviews(&mut self) {
         for review in &self.deferred {
@@ -5074,10 +5093,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let read = self.review_runs(repo);
         self.rest.under_way(false);
         if let Err(error) = read {
-            outcome.errors += 1;
-            outcome
-                .lines
-                .push(format!("{repo} error: the review job's runs: {error:#}"));
+            outcome.error(&format!("{repo} review job's runs"), &error);
             self.review_unread
                 .get_or_insert(format!("the review job's runs in {repo} could not be read"));
         }
@@ -6621,10 +6637,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     }
                 }
                 Err(error) => {
-                    outcome.errors += 1;
+                    outcome.error(&format!("{}#{}", review.repo, review.number), &error);
                     outcome.undecided.insert(review.repo.to_ascii_lowercase());
-                    outcome.lines[line] =
-                        format!("{}#{} error: {error:#}", review.repo, review.number);
+                    outcome.lines[line] = if crate::pass::budget_spent(&error) {
+                        format!("{}#{} deferred: budget", review.repo, review.number)
+                    } else {
+                        format!("{}#{} error: {error:#}", review.repo, review.number)
+                    };
                     failed.extend(stepped);
                 }
             }
@@ -8676,16 +8695,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     outcome.waits.extend(wait);
                     outcome.steps.extend(stepped);
                 }
-                Err(error) if error.is::<crate::pass::ShareSpent>() => {
+                Err(error) if crate::pass::budget_spent(&error) => {
                     self.stop_at(repo, Some(number));
                     break;
                 }
                 Err(error) => {
-                    outcome.errors += 1;
                     outcome.undecided.insert(repo.to_ascii_lowercase());
-                    outcome
-                        .lines
-                        .push(format!("{repo}#{number} error: {error:#}"));
+                    outcome.error(&format!("{repo}#{number}"), &error);
                 }
             }
         }
@@ -8901,11 +8917,10 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
                 missing.insert(repo.to_ascii_lowercase());
             }
             Err(error) => {
-                if error.is::<crate::pass::ShareSpent>() {
+                if crate::pass::budget_spent(&error) {
                     deferred.push((repo, error));
                 } else {
-                    outcome.errors += 1;
-                    outcome.lines.push(format!("{repo} error: {error:#}"));
+                    outcome.error(repo, &error);
                 }
                 // Keep the page this pass could not replace, or the next one
                 // would report all of it again.
@@ -8952,10 +8967,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         && !outcome.approved_read
         && let Err(error) = pass.approved(&follow, state.share_cursor.as_deref(), &mut outcome)
     {
-        outcome.errors += 1;
-        outcome
-            .lines
-            .push(format!("pull requests: approved search error: {error:#}"));
+        outcome.error("pull requests: approved search", &error);
     }
     // The repositories the pass's share left unwalked, or walked in part.
     let mut waiting = BTreeSet::new();
@@ -9005,7 +9017,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         }
         let result = pass.follow_turn(repo, turn, &mut outcome);
         if let Err(error) = &result
-            && error.is::<crate::pass::ShareSpent>()
+            && crate::pass::budget_spent(error)
         {
             pass.stop_at(repo, None);
         }
@@ -9016,7 +9028,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         }
         match result {
             Ok(()) => {}
-            Err(error) if error.is::<crate::pass::ShareSpent>() => {}
+            Err(error) if crate::pass::budget_spent(&error) => {}
             // Only its list of pull requests passes a 404 up: each pull
             // request's own errors stay its own.
             Err(error) if error.is::<crate::github::NotFound>() => {
@@ -9024,9 +9036,8 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
                 outcome.lines.push(not_found(repo));
             }
             Err(error) => {
-                outcome.errors += 1;
                 outcome.undecided.insert(repo.to_ascii_lowercase());
-                outcome.lines.push(format!("{repo} error: {error:#}"));
+                outcome.error(repo, &error);
             }
         }
     }
@@ -9267,7 +9278,7 @@ fn read_direction<R: Rest, G: Transport>(
             // fail the pass's own steps along with it. Where the search is
             // also `operatorComments`', which a caller turned on as a step,
             // its failure stays an error.
-            Err(error) if error.is::<crate::pass::ShareSpent>() => {
+            Err(error) if crate::pass::budget_spent(&error) => {
                 outcome
                     .lines
                     .push(format!("operator comments deferred: {error:#}"));
@@ -9278,10 +9289,7 @@ fn read_direction<R: Rest, G: Transport>(
                 ));
             }
             Err(error) => {
-                outcome.errors += 1;
-                outcome
-                    .lines
-                    .push(format!("operator comments error: {error:#}"));
+                outcome.error("operator comments", &error);
             }
         }
         pass.intaking = false;
@@ -9299,16 +9307,13 @@ fn read_direction<R: Rest, G: Transport>(
                 cursors.notify_before = before;
             }
             Ok(_) => {}
-            Err(error) if error.is::<crate::pass::ShareSpent>() => {
+            Err(error) if crate::pass::budget_spent(&error) => {
                 outcome
                     .lines
                     .push(format!("notifications deferred: {error:#}"));
             }
             Err(error) => {
-                outcome.errors += 1;
-                outcome
-                    .lines
-                    .push(format!("notifications error: {error:#}"));
+                outcome.error("notifications", &error);
             }
         }
         pass.intaking = false;
