@@ -612,7 +612,22 @@ mod tests {
             "visitor duplicate",
             "partial merge",
             "linkage kind",
+            "invalid fork state",
+            "fork number",
+            "head repository",
+            "published branch",
+            "head network",
+            "merge timestamp",
+            "null linkage",
+            "multiple sources",
+            "metadata read",
         ];
+        let (mut mixed, mixed_config) = crate::promote::tests::handoff_scenario();
+        let good = crate::pass::tests::facts(REPO, 31, "2026-10-23T00:00:00Z");
+        let good_key = key(&good.issue);
+        let mut mixed_items = BTreeMap::from([(good_key.clone(), good)]);
+        let mut bad_keys = Vec::new();
+        let mut expected_notices = Vec::new();
         for case in cases {
             let (mut replay, config) = crate::promote::tests::handoff_scenario();
             for entry in &mut replay.requests {
@@ -636,14 +651,29 @@ mod tests {
                             body.as_object_mut().unwrap().remove("merged");
                         }
                         "missing read" => entry["answer"]["status"] = json!(403),
+                        "merge timestamp" => {
+                            body["state"] = json!("closed");
+                            body["merged"] = json!(true);
+                            body["merged_at"] = json!("not a timestamp");
+                        }
                         _ => {}
                     }
                 } else if path.ends_with("/pulls/34") {
                     match case {
                         "fork head" => body["head"]["sha"] = json!("a".repeat(40)),
                         "missing linkage" => body["body"] = json!("link removed"),
+                        "null linkage" => body["body"] = Value::Null,
+                        "multiple sources" => {
+                            body["body"] = json!(format!("Closes {REPO}#31\nCloses {REPO}#32"))
+                        }
+                        "fork number" => body["number"] = json!(999),
+                        "head repository" => body["head"]["repo"]["full_name"] = Value::Null,
+                        "head network" => {
+                            body["head"]["repo"]["full_name"] = json!("cgwalters-bot/unrelated")
+                        }
                         "partial merge" => body["body"] = json!(format!("Part of {REPO}#31")),
-                        "no record open" => body["state"] = json!("open"),
+                        "no record open" | "conflicting fork" => body["state"] = json!("open"),
+                        "invalid fork state" => body["state"] = json!("unknown"),
                         _ => {}
                     }
                 } else if path.contains("/timeline?") {
@@ -674,7 +704,8 @@ mod tests {
                             let receipt = body[0].clone();
                             body.as_array_mut().unwrap().push(receipt);
                         }
-                        "no record" | "no record open" => *body = json!([]),
+                        "no record" | "no record open" | "invalid fork state"
+                        | "conflicting fork" => *body = json!([]),
                         "legacy prose" => {
                             body[0]["body"] = json!(
                                 "Published approved head as upstream.\n\n<!-- agent-board-promote-status -->"
@@ -692,6 +723,18 @@ mod tests {
                                     .unwrap()
                                     .replace("promoted/v1", "promoted/v2")
                             )
+                        }
+                        "published branch" => {
+                            let text = body[0]["body"].as_str().unwrap();
+                            let record =
+                                crate::plan::fenced_json_as(text, "agent-board-promoted", "test")
+                                    .unwrap()
+                                    .unwrap();
+                            // Preserve the record's canonical field order.
+                            body[0]["body"] = json!(text.replace(
+                                &format!("\"published_branch\": {}", record["published_branch"]),
+                                "\"published_branch\": \"../bad\"",
+                            ));
                         }
                         "source issue" => {
                             body[0]["body"] = json!(
@@ -723,6 +766,14 @@ mod tests {
                 } else if path.ends_with(&format!("repos/{REPO}")) && case == "network" {
                     body["parent"]["full_name"] = json!("other/repo");
                     body["source"]["full_name"] = json!("other/repo");
+                } else if path.ends_with("repos/cgwalters-bot/composefs-rs")
+                    && case == "head network"
+                {
+                    body["full_name"] = json!("cgwalters-bot/unrelated");
+                    body["parent"]["full_name"] = json!("other/repo");
+                    body["source"]["full_name"] = json!("other/repo");
+                    entry["request"]["get"] =
+                        json!("https://api.github.com/repos/cgwalters-bot/unrelated");
                 }
                 if entry["request"]["variables"]["number"] == 34 {
                     let nodes = &mut entry["answer"]["data"]["repository"]["pullRequest"]["comments"]
@@ -752,6 +803,27 @@ mod tests {
                     }
                 }
             }
+            if case == "metadata read" {
+                replay
+                    .requests
+                    .retain(|e| e["request"]["variables"]["number"] != 34);
+            }
+            if case == "conflicting fork" {
+                let mut fork = replay
+                    .requests
+                    .iter()
+                    .find(|e| {
+                        e["request"]["get"]
+                            .as_str()
+                            .is_some_and(|p| p.ends_with("/pulls/34"))
+                    })
+                    .unwrap()["answer"]["body"]
+                    .clone();
+                fork["state"] = json!("open");
+                fork["number"] = json!(35);
+                replay.requests.push(json!({"request":{"get":format!("https://api.github.com/repos/{REPO}/pulls/35")},"answer":{"status":200,"link":null,"body":fork}}));
+                replay.requests.push(json!({"request":{"get":format!("https://api.github.com/repos/{REPO}/issues/35/comments?per_page=100&page=1")},"answer":{"status":200,"link":null,"body":[]}}));
+            }
             let facts = crate::pass::tests::facts(REPO, 31, "2026-10-23T00:00:00Z");
             let at = key(&facts.issue);
             let mut read = BoardRead {
@@ -759,16 +831,6 @@ mod tests {
                 items: BTreeMap::from([(at.clone(), facts)]),
             };
             let result = crate::promote::handoff::enrich(&replay, &config, &mut read.items);
-            if case == "missing linkage" {
-                assert_eq!(
-                    result.unwrap(),
-                    [format!(
-                        "needs-supervisor: promotion handoff {REPO}#34: handoff needs one deterministic source issue; skipped"
-                    )]
-                );
-                assert_eq!(read.items[&at].promotion, Some(Promotion::Unknown));
-                continue;
-            }
             let valid = matches!(
                 case,
                 "open"
@@ -780,8 +842,67 @@ mod tests {
                     | "no record"
                     | "partial merge"
             );
-            assert_eq!(result.is_ok(), valid, "{case}: {result:?}");
+            let fatal = matches!(
+                case,
+                "network" | "missing read" | "pagination" | "metadata read"
+            );
+            assert_eq!(result.is_err(), fatal, "{case}: {result:?}");
             if !valid {
+                if !fatal {
+                    let notices = result.unwrap();
+                    assert!(!notices.is_empty(), "{case}");
+                    assert_eq!(
+                        read.items[&at].promotion,
+                        Some(Promotion::Unknown),
+                        "{case}"
+                    );
+                    // Put every local refusal beside a good publication in one
+                    // board. Move only item identities, leaving shared metadata.
+                    let offset = (bad_keys.len() as u64 + 1) * 100;
+                    fn relocate(value: &mut Value, offset: u64) {
+                        match value {
+                            Value::Number(n) if matches!(n.as_u64(), Some(31 | 34 | 35 | 70)) => {
+                                *value = json!(n.as_u64().unwrap() + offset);
+                            }
+                            Value::String(s) => {
+                                for n in [31, 34, 35, 70] {
+                                    for (before, after) in [
+                                        (format!("/{n}"), format!("/{}", n + offset)),
+                                        (format!("#{n}"), format!("#{}", n + offset)),
+                                        (format!(": {n},"), format!(": {},", n + offset)),
+                                    ] {
+                                        *s = s.replace(&before, &after);
+                                    }
+                                }
+                            }
+                            Value::Array(rows) => rows.iter_mut().for_each(|v| relocate(v, offset)),
+                            Value::Object(fields) => {
+                                fields.values_mut().for_each(|v| relocate(v, offset))
+                            }
+                            _ => {}
+                        }
+                    }
+                    for mut entry in replay.requests {
+                        relocate(&mut entry, offset);
+                        if !mixed
+                            .requests
+                            .iter()
+                            .any(|e| e["request"] == entry["request"])
+                        {
+                            mixed.requests.push(entry);
+                        }
+                    }
+                    for notice in notices {
+                        let mut notice = json!(notice);
+                        relocate(&mut notice, offset);
+                        expected_notices.push(notice.as_str().unwrap().to_owned());
+                    }
+                    let facts =
+                        crate::pass::tests::facts(REPO, 31 + offset, "2026-10-23T00:00:00Z");
+                    let at = key(&facts.issue);
+                    mixed_items.insert(at.clone(), facts);
+                    bad_keys.push(at);
+                }
                 continue;
             }
             let facts = &read.items[&at];
@@ -846,6 +967,17 @@ mod tests {
                 derive(&status).unwrap().to,
                 if case == "merge" { Done } else { NeedsHuman }
             );
+        }
+        let notices =
+            crate::promote::handoff::enrich(&mixed, &mixed_config, &mut mixed_items).unwrap();
+        expected_notices.sort();
+        assert_eq!(notices, expected_notices);
+        assert!(matches!(
+            mixed_items[&good_key].promotion,
+            Some(Promotion::Open(_))
+        ));
+        for at in bad_keys {
+            assert_eq!(mixed_items[&at].promotion, Some(Promotion::Unknown), "{at}");
         }
     }
 
@@ -1068,7 +1200,7 @@ mod tests {
                 "{:?}",
                 report.lines
             );
-            if matches!(case, "unread" | "closed-unmerged") || case.starts_with("retarget") {
+            if case == "unread" {
                 assert!(report.failures > 0, "{:?}", report.lines);
                 if case.starts_with("retarget") {
                     assert!(
@@ -1088,7 +1220,10 @@ mod tests {
                     "{:?}",
                     report.lines
                 );
-            } else if case == "removed source" {
+            } else if matches!(case, "removed source" | "closed-unmerged")
+                || case.starts_with("retarget")
+            {
+                assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
                 assert!(
                     report
                         .holds

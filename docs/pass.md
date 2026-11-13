@@ -1918,12 +1918,14 @@ If the pass's request, GraphQL-point or time budget cannot finish the Status
 reads, it prints `status deferred: budget` without failing the pass or writing
 any Status changes from that partial read. Status is best-effort after scheduling,
 not reserved to run every pass; existing statuses remain until a later pass.
-Promotion handoffs with no unique source issue are skipped per PR, reported once
+Invalid promotion handoffs are skipped per PR, reported once
 as `needs-supervisor: promotion handoff OWNER/REPO#N: …; skipped`, and surfaced in
-the supervisor's `needs-supervisor` check. Receipt authentication and identity
-failures still refuse the board read rather than trusting unverified evidence.
-Issues named by an ambiguous candidate's timeline or surviving receipt stay
+the supervisor's `needs-supervisor` infrastructure check. Receipt authentication
+and identity failures never authorize a promotion. Multiple active fork PRs
+claiming one source attach no verified promotion and report each conflicting PR.
+Issues named by a refused candidate's timeline, source or surviving receipt stay
 unread for promotion: no replacement run starts and their Status is kept.
+Failed API requests and incomplete source timelines still refuse the board read.
 
 The replay gate below is partly met: there is one recorded board, from 23
 October, with a synthetic usage snapshot and an empty whole-board read, and
@@ -2243,8 +2245,9 @@ A pass captures one clock and performs these stages in order:
      including when the fork is closed: open upstream work holds scheduling and
      derives In Progress; only a matching closing merge derives Done. A merged
      `Part of` slice leaves the source unfinished. An abandoned closed attempt
-     without a publication marker is ignored; unreadable or invalid first-party
-     publication evidence fails the board read safely. The scan and start
+     without a publication marker is ignored; invalid first-party publication
+     evidence holds only the affected sources for supervisor inspection. Failed
+     API reads still fail the board read safely. The scan and start
      rechecks share existing pagination/request/time bounds; no new caller
      option is added. Capped recoverable fork closure remains separate
      acceptance work after replay proof. A
