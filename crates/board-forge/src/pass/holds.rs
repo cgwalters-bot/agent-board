@@ -1946,7 +1946,15 @@ pub struct Reading<'a> {
 /// or reason stands.
 pub fn summary(body: &str) -> Summary {
     let field = |labels: &[&str]| {
+        let mut fenced = false;
         body.lines()
+            .filter(|line| {
+                if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+                    fenced = !fenced;
+                    return false;
+                }
+                !fenced
+            })
             .map(|l| l.trim().strip_prefix("- ").unwrap_or(l.trim()))
             .find_map(|l| {
                 let (label, rest) = l.split_once(':')?;
@@ -1959,7 +1967,12 @@ pub fn summary(body: &str) -> Summary {
             .and_then(|rest| one_line(rest, MAX_ASK))
     };
     Summary {
-        question: field(&["Decision needed", "Question for the operator"]),
+        question: field(&[
+            "Decision needed",
+            "Question for the operator",
+            "Question",
+            "Q",
+        ]),
         recommendation: field(&["Recommendation", "Recommended"]),
         revision: None,
     }

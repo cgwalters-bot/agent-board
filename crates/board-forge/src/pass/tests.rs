@@ -13368,6 +13368,60 @@ fn apply_revisits_a_sample_with_spare_capacity() {
     }
 }
 
+/// Recently active questionless holds may be repaired, but only opt-in and
+/// through the same bounded revisit admission and cooldown as old issues.
+#[test]
+fn revisit_repairs_questionless_holds_once() {
+    for (enabled, body, expected) in [
+        (false, "", false),
+        (true, "", true),
+        (true, "Question: Approve the budget?", false),
+        (true, "Question: No concrete decision", true),
+    ] {
+        let mut forge = Forge::new(None, false);
+        silent(&mut forge.replay, &[], &["cgwalters-forge/tracker#468"]);
+        if !body.is_empty() {
+            let mut node = comment_node(999, "cgwalters-bot", body);
+            node["url"] =
+                "https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-999".into();
+            node["createdAt"] = forge.replay.now.format(&Rfc3339).unwrap().into();
+            forge
+                .added
+                .borrow_mut()
+                .entry(("cgwalters-forge/tracker".into(), 468))
+                .or_default()
+                .push(node);
+        }
+        let settings = config(json!({"wip": 12, "revisit": {
+            "perPass": 1, "afterDays": 14, "heldAfterDays": 3, "repairQuestions": enabled
+        }}));
+        let first = apply(&forge, &settings);
+        assert_eq!(first.failures, 0, "{:#?}", first.lines);
+        assert_eq!(
+            first.tally.1.revisited,
+            Some(Some(usize::from(expected))),
+            "{:#?}",
+            first.lines
+        );
+        if expected {
+            let posted = forge.comments_on("cgwalters-forge/tracker", 468);
+            assert!(
+                posted
+                    .iter()
+                    .any(|c| c.contains("do not invent a question or remove the hold yourself"))
+            );
+            let second = apply(&forge, &settings);
+            assert_eq!(second.failures, 0, "{:#?}", second.lines);
+            assert_eq!(
+                second.tally.1.revisited,
+                Some(Some(0)),
+                "{:#?}",
+                second.lines
+            );
+        }
+    }
+}
+
 /// Focus first: tracker#446, a child of the live P0 epic tracker#528,
 /// weighs 5⁴ × 4 (P0 of three options) × 1, and agentic-job#188, outside
 /// any epic, 1 × 4 × 4, though both are P0 and #188 has been silent four

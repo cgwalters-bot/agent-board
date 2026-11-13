@@ -1153,10 +1153,13 @@ with the most urgent Priority, waiting since the earlier.
 null. For a hold, they are the newest summary comment on its issue (a
 `blocking` hold's pull request) that the bot wrote and last edited, read
 as data: the rest of its first
-`Decision needed:` or `Question for the operator:` line, and
+`Decision needed:`, `Question for the operator:`, `Question:` or `Q:` line, and
 `Recommendation:` or `Recommended:` line. Labels are case-insensitive, may
 be plain or bold (the colon inside or outside the bold), and may be list
-items. An unlabelled bold opening sentence does not count. Such a line left
+items. Lines inside fenced code blocks and unlabelled opening sentences do
+not count. A newer authenticated triage verdict supersedes older summaries
+even when it asks nothing: done/obsolete prose is not made into a question
+and does not itself release a hold. Such a line left
 empty is absent, and the ask falls back to the
 board Why's question (a Why starting `Q:`), else the hold's reason. The
 summaries of every listed held issue are read, and `summaries`
@@ -3476,6 +3479,33 @@ happens only where the caller's bounds for its triage runs allow one; the
 pass itself closes nothing for it but on a verdict with `triageClose`. With
 `triageFollowUpDays` the brief also asks for a verdict, and the revisit's
 plan is then followed up as any triage plan is.
+
+### Repairing questionless holds
+
+The concrete failure this addresses is a needs-you card that says only
+`labelled needs-human`, or repeats a question superseded by a newer verdict.
+On GitHub, `revisit.repairQuestions: true` also admits recently active
+person-held candidates to the existing revisit draw (default false). After
+reading their complete bounded comment thread, the pass uses the same
+authenticated summary parser as needs-you, then the board's `Q:` question.
+If that contains a question mark, a recent issue is left alone; otherwise
+it can receive repair triage. This is a heuristic, not proof of a real decision.
+
+Repair uses the same maximum 15 draws, `perPass` cap (1–5), spare WIP slots,
+pool selection, request/time/write limits, pending-plan check, revisit
+cooldown (`heldAfterDays`, else `afterDays`) and unchanged-input deduplication.
+Missing update times, future update times and unreadable threads cannot
+admit a repair. No hold is cleared by this path. The brief asks for a
+`Decision needed:` line with the decision and options, or evidence proposing
+release through existing policy, never an invented question. The posted
+revisit plan and dispatch record are the pending repair's provenance.
+
+The option does not expand stage 4's candidate or epic scope, inspect held
+pull requests outside it, or guarantee every placeholder gets a run in one
+pass. Existing needs-you quality diagnostics remain until a question is
+recovered or the hold is released. Forgejo rejects this option; its existing
+age-based revisits are unchanged. Deployment and a later live health report
+are required to prove queue-wide improvement.
 
 ## The weekly sweep
 

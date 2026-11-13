@@ -455,7 +455,13 @@ pub(super) fn bot_summary(comments: &[Comment], bot: &str) -> Option<Summary> {
     (comments.iter())
         .filter(|c| is(c.author.as_deref(), &bot) && !foreign_edit(c, &bot))
         .map(|c| (c, holds::summary(&c.body)))
-        .filter(|(_, s)| s.question.is_some() || s.recommendation.is_some())
+        // A newer verdict with no ask supersedes an older question. It is
+        // display evidence only, never authority to release the hold.
+        .filter(|(c, s)| {
+            s.question.is_some()
+                || s.recommendation.is_some()
+                || plan::triage_verdict(&c.body).is_some()
+        })
         .max_by_key(|(c, _)| (c.changed, comment_id(&c.url)))
         .map(|(_, s)| s)
 }
@@ -763,6 +769,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
 /// comment, deletion or edit to any candidate must invalidate the cache.
 fn revision(comments: &[Comment], bot: &str) -> String {
     let mut hash = Sha256::new();
+    // Invalidate summaries parsed before explicit questions/verdict supersession.
+    hash.update("needs-you-summary/v2");
     hash.update(bot.to_ascii_lowercase());
     for c in comments {
         hash.update(format!(
@@ -1276,6 +1284,47 @@ mod tests {
         let said = bot_summary(&comments, BOT).unwrap();
         assert_eq!(said.question.as_deref(), Some("New?"));
         assert_eq!(bot_summary(&comments[2..], BOT), None);
+    }
+
+    #[test]
+    fn explicit_questions_and_newer_verdicts() {
+        let verdict = |value: &str| format!("```schedule-triage\n{{\"verdict\":\"{value}\"}}\n```");
+        let cases = [
+            ("Question: Approve the budget?", Some("Approve the budget?")),
+            ("- **Q:** Change the bounds?", Some("Change the bounds?")),
+            ("```text\nQuestion: Quoted?\n```", None),
+            ("Should we ship?", None),
+        ];
+        for (body, expected) in cases {
+            let said = bot_summary(&[comment(1, (BOT, None), 0, body)], BOT);
+            assert_eq!(said.and_then(|s| s.question).as_deref(), expected, "{body}");
+        }
+        for value in ["done", "obsolete", "partly", "needs-operator"] {
+            let comments = [
+                comment(1, (BOT, None), 0, "Decision needed: Old?"),
+                comment(2, (BOT, None), 1, &verdict(value)),
+            ];
+            assert_eq!(
+                bot_summary(&comments, BOT).unwrap().question,
+                None,
+                "{value}"
+            );
+        }
+        let body = format!("Question: Raise the budget?\n{}", verdict("needs-operator"));
+        for (author, editor, expected) in [
+            (BOT, None, "Raise the budget?"),
+            ("visitor", None, "Old?"),
+            (BOT, Some("visitor"), "Old?"),
+        ] {
+            let comments = [
+                comment(1, (BOT, None), 0, "Decision needed: Old?"),
+                comment(2, (author, editor), 1, &body),
+            ];
+            assert_eq!(
+                bot_summary(&comments, BOT).unwrap().question.as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     /// The shared consumer fixture is what the producer publishes for its
