@@ -14023,6 +14023,82 @@ fn apply_revisits_a_sample_with_spare_capacity() {
     }
 }
 
+/// Recently active questionless holds may be repaired, but only opt-in and
+/// through the same bounded revisit admission and cooldown as old issues.
+/// The repair's answer is what the needs-you summary read then publishes.
+#[test]
+fn revisit_repairs_questionless_holds_once() {
+    let post = |forge: &Forge, id: u64, body: &str, at: OffsetDateTime| {
+        let mut node = comment_node(id, "cgwalters-bot", body);
+        node["url"] =
+            format!("https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-{id}")
+                .into();
+        node["createdAt"] = at.format(&Rfc3339).unwrap().into();
+        forge
+            .added
+            .borrow_mut()
+            .entry(("cgwalters-forge/tracker".into(), 468))
+            .or_default()
+            .push(node);
+    };
+    for (enabled, body, expected) in [
+        (false, "", false),
+        (true, "", true),
+        (true, "Question: Approve the budget?", false),
+        (true, "Question: No concrete decision", true),
+    ] {
+        let mut forge = Forge::new(None, false);
+        silent(&mut forge.replay, &[], &["cgwalters-forge/tracker#468"]);
+        if !body.is_empty() {
+            post(&forge, 999, body, forge.replay.now);
+        }
+        let settings = config(json!({"wip": 12, "revisit": {
+            "perPass": 1, "afterDays": 14, "heldAfterDays": 3, "repairQuestions": enabled
+        }}));
+        let first = apply(&forge, &settings);
+        assert_eq!(first.failures, 0, "{:#?}", first.lines);
+        assert_eq!(
+            first.tally.1.revisited,
+            Some(Some(usize::from(expected))),
+            "{:#?}",
+            first.lines
+        );
+        if expected {
+            let posted = forge.comments_on("cgwalters-forge/tracker", 468);
+            assert!(
+                posted
+                    .iter()
+                    .any(|c| c.contains("do not invent a question or remove the hold yourself"))
+            );
+            let second = apply(&forge, &settings);
+            assert_eq!(second.failures, 0, "{:#?}", second.lines);
+            assert_eq!(
+                second.tally.1.revisited,
+                Some(Some(0)),
+                "{:#?}",
+                second.lines
+            );
+            let answer = format!(
+                "Found.\n\n**Decision needed:** Raise the budget? Options: raise, keep.\n\n\
+                 ```{TRIAGE_FENCE}\n{{\"verdict\": \"needs-operator\"}}\n```\n"
+            );
+            post(
+                &forge,
+                1000,
+                &answer,
+                forge.replay.now + time::Duration::hours(1),
+            );
+            let issue = needs::on_github("cgwalters-forge/tracker", 468);
+            let comments = plan::issue_comments(&forge, &issue).unwrap();
+            let said = needs::bot_summary(&comments, "cgwalters-bot").unwrap();
+            assert_eq!(
+                said.question.as_deref(),
+                Some("Raise the budget? Options: raise, keep.")
+            );
+        }
+    }
+}
+
 /// Focus first: tracker#446, a child of the live P0 epic tracker#528,
 /// weighs 5⁴ × 4 (P0 of three options) × 1, and agentic-job#188, outside
 /// any epic, 1 × 4 × 4, though both are P0 and #188 has been silent four
