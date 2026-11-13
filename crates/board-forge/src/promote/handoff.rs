@@ -85,6 +85,31 @@ pub(crate) fn enrich(
     config: &Config,
     items: &mut BTreeMap<String, Facts>,
 ) -> Result<Vec<String>> {
+    match enrich_within(client, config, items) {
+        Err(error) if crate::pass::budget_spent(&error) => {
+            // Discard even earlier repositories' conclusions: an interrupted
+            // read must not turn an unverified handoff into an absent one.
+            if let Some(settings) = &config.promote {
+                for facts in items.values_mut().filter(|facts| {
+                    settings
+                        .forks
+                        .keys()
+                        .any(|repo| repo.eq_ignore_ascii_case(&facts.issue.repository))
+                }) {
+                    facts.promotion = Some(Promotion::Unknown);
+                }
+            }
+            Ok(vec!["promotion handoff deferred: budget".into()])
+        }
+        result => result,
+    }
+}
+
+fn enrich_within(
+    client: &(impl Rest + Transport),
+    config: &Config,
+    items: &mut BTreeMap<String, Facts>,
+) -> Result<Vec<String>> {
     let mut skipped = Vec::new();
     let mut unknown = BTreeSet::new();
     let Some(settings) = config.promote.as_ref().filter(|_| enabled(config)) else {
@@ -137,7 +162,9 @@ pub(crate) fn enrich(
             match enrich_pull(client, config, repo, target, n, items, &mut affected) {
                 Ok(Some((at, promotion))) => claims.entry(at).or_default().push((n, promotion)),
                 Ok(None) => {}
-                Err(error) if error.is::<ReadFailure>() => return Err(error),
+                Err(error) if error.is::<ReadFailure>() || crate::pass::budget_spent(&error) => {
+                    return Err(error);
+                }
                 Err(error) => {
                     unknown.extend(affected);
                     skipped.push(notice(repo, n, &format!("{error:#}")));

@@ -270,8 +270,7 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
         self.line(summary);
         let bound = self.caps.status_changes();
         if changes.len() > bound {
-            self.report.failures += 1;
-            self.line(format!(
+            self.report.failure(format!(
                 "status: refused, {} changes are more than --max-status-changes {bound}; nothing is written. Check them, then pass a higher cap once",
                 changes.len()
             ));
@@ -288,7 +287,6 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
             if self.apply
                 && (bounds.left.get() < WRITE_RESERVE + 2 || Instant::now() > bounds.admit_by)
             {
-                self.report.failures += 1;
                 self.line(format!(
                     "status: the pass's request budget or time is spent; {} change(s) wait for the next pass",
                     changes.len() - n
@@ -303,8 +301,7 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
             let write = match write {
                 Ok(write) => write,
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("{said} failed: {error:#}"));
+                    self.report.error(&said, &error);
                     continue;
                 }
             };
@@ -324,8 +321,7 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
                     item.identity.display()
                 )),
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("{said} failed: {error:#}"));
+                    self.report.error(&said, &error);
                 }
             }
         }
@@ -335,8 +331,7 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
     /// `read`'s value, or none where it failed, which is reported as `what`.
     fn unread<T>(&mut self, read: Result<T>, what: &str) -> Option<T> {
         read.map_err(|error| {
-            self.report.failures += 1;
-            self.line(format!("status error: {what}: {error:#}"));
+            self.report.error(&format!("status {what}"), &error);
         })
         .ok()
     }
@@ -579,6 +574,35 @@ mod tests {
 
     /// Scenario edits of public promote/Status recordings, not live evidence.
     /// The existing hold and Status paths consume the same verified facts.
+    #[test]
+    fn promotion_handoff_budget_defers_with_unknown_facts() {
+        const REPO: &str = "cgwalters-forge/composefs-rs";
+        let (replay, config) = crate::promote::tests::handoff_scenario();
+        // Stop at every boundary: metadata, timeline, PR, receipt authentication,
+        // and upstream reads must all retain the typed budget stop.
+        for limit in 0..9 {
+            let bounds = Bounds::new(limit, Instant::now() + Duration::from_secs(60));
+            let client = Budget {
+                inner: &replay,
+                bounds: &bounds,
+            };
+            let facts = crate::pass::tests::facts(REPO, 31, "2026-10-23T00:00:00Z");
+            let at = key(&facts.issue);
+            let mut items = BTreeMap::from([(at.clone(), facts)]);
+            let notices = crate::promote::handoff::enrich(&client, &config, &mut items).unwrap();
+            assert_eq!(
+                notices,
+                ["promotion handoff deferred: budget"],
+                "limit {limit}"
+            );
+            assert_eq!(
+                items[&at].promotion,
+                Some(Promotion::Unknown),
+                "limit {limit}"
+            );
+        }
+    }
+
     #[test]
     fn promotion_handoff_recorded_scenarios() {
         const REPO: &str = "cgwalters-forge/composefs-rs";
@@ -1191,6 +1215,40 @@ mod tests {
             let mut config = crate::pass::tests::config(json!({"wip":8,"workRepositories":[REPO]}));
             config.promote = promotion_config.promote.take();
             let report = crate::pass::tests::preview(&config, &replay);
+            assert_eq!(
+                report.failures,
+                report.failed_operations.len(),
+                "{case}: {:?}",
+                report.lines
+            );
+            if case == "open" {
+                let mut deferred = 0;
+                for limit in 0..=report.spent.requests {
+                    let bounded = crate::pass::tests::preview_within(&config, &replay, limit);
+                    assert_eq!(bounded.failures, 0, "limit {limit}: {:?}", bounded.lines);
+                    assert!(
+                        !bounded.lines.iter().any(|line| line.contains("error:")),
+                        "limit {limit}: {:?}",
+                        bounded.lines
+                    );
+                    if bounded
+                        .lines
+                        .iter()
+                        .any(|line| line == "promotion handoff deferred: budget")
+                    {
+                        deferred += 1;
+                        assert!(
+                            !bounded
+                                .lines
+                                .iter()
+                                .any(|line| line.starts_with(&format!("status {REPO}#31:"))),
+                            "limit {limit}: {:?}",
+                            bounded.lines
+                        );
+                    }
+                }
+                assert!(deferred > 0);
+            }
             assert_eq!(report.tally.1.started, 0, "{:?}", report.lines);
             assert!(
                 !report
@@ -1527,7 +1585,8 @@ mod tests {
             ]
         );
         assert_eq!(board.writes.borrow().len(), 2);
-        assert_eq!(report.failures, 1);
+        assert_eq!(report.failures, 0);
+        assert!(report.failed_operations.is_empty());
     }
 
     #[test]

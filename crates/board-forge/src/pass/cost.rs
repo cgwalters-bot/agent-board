@@ -32,8 +32,7 @@ pub(super) fn stage<C: Rest>(
     };
     let repository = epics.repository.as_str();
     let fail = |report: &mut Report, line: String| {
-        report.failures += 1;
-        report.lines.push(line);
+        report.failure(line);
     };
     let cache = publish.cache.as_deref().map(std::path::Path::new);
     if let Some(cache) = cache.filter(|dir| !dir.is_dir()) {

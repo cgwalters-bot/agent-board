@@ -572,10 +572,11 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         // With a grant, pacing never falls back to the published snapshot,
         // which may be paced otherwise: the grant decides, or holds.
         if let (Err(error), Some((budget, grant))) = (&read, &grant) {
-            self.report.failures += 1;
-            self.line(format!(
-                "usage error: reading the broker: {error:#}; pacing reads the grant"
-            ));
+            self.report.error_line(
+                "usage reading the broker",
+                error,
+                format!("usage error: reading the broker: {error:#}; pacing reads the grant"),
+            );
             read = bare(&config.pools, self.now).and_then(|mut snapshot| {
                 grants(&mut snapshot, grant.as_ref(), budget, self.now)?;
                 Ok((BTreeMap::new(), snapshot))
@@ -591,10 +592,11 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 snapshot
             }
             Err(error) if grant.is_some() => {
-                self.report.failures += 1;
-                self.line(format!(
-                    "usage error: reading the broker: {error:#}; pacing reads the published snapshot"
-                ));
+                self.report.error_line(
+                    "usage reading the broker",
+                    &error,
+                    format!("usage error: reading the broker: {error:#}; pacing reads the published snapshot"),
+                );
                 return;
             }
             Err(error) => {
@@ -608,9 +610,15 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                     Ok(_) => self.line(format!("usage warning: {said}")),
                     Err(why) => {
                         if self.report.failures == failures {
-                            self.report.failures += 1;
+                            if !budget_spent(&error) {
+                                self.report
+                                    .failure(format!("usage error: {said}, but {why}"));
+                            } else {
+                                self.line("usage deferred: budget".into());
+                            }
+                        } else {
+                            self.line(format!("usage error: {said}, but {why}"));
                         }
-                        self.line(format!("usage error: {said}, but {why}"));
                     }
                 }
                 return;
@@ -637,8 +645,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         match published {
             Ok(url) => self.line(format!("usage: published {url}")),
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("usage error: {said}: {error:#}"));
+                self.report
+                    .error_line("usage", &error, format!("usage error: {said}: {error:#}"));
             }
         }
     }
@@ -650,10 +658,11 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         match read {
             Ok(grant) => Some(grant),
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!(
-                    "usage error: reading the grant: {error:#}; every pool holds"
-                ));
+                self.report.error_line(
+                    "usage reading the grant",
+                    &error,
+                    format!("usage error: reading the grant: {error:#}; every pool holds"),
+                );
                 None
             }
         }
@@ -851,8 +860,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 return;
             }
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("holds error: {said}: {error:#}"));
+                self.report
+                    .error_line("holds", &error, format!("holds error: {said}: {error:#}"));
                 return;
             }
         };
@@ -881,8 +890,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         match published {
             Ok(url) => self.line(format!("holds: published {url}{view}{past_cap}")),
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("holds error: {said}: {error:#}"));
+                self.report
+                    .error_line("holds", &error, format!("holds error: {said}: {error:#}"));
             }
         }
     }

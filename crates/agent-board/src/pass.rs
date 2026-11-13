@@ -497,11 +497,7 @@ fn print_report(report: &Report, out: &mut impl Write) -> Result<()> {
         writeln!(out, "{line}")?;
     }
     writeln!(out, "{}", report.summary_line())?;
-    ensure!(
-        report.failures == 0,
-        "{} operation(s) of the pass failed",
-        report.failures
-    );
+    ensure!(report.failures == 0, "{}", report.failure_summary());
     Ok(())
 }
 

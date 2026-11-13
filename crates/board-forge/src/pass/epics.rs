@@ -1101,7 +1101,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Ok(()) => {}
             // The census met the stage's share: the epics wait for the next
             // pass, with the holds left unpublished as partial.
-            Err(error) if error.is::<ShareSpent>() => {
+            Err(error) if budget_spent(&error) => {
                 self.holds_whole = false;
                 self.waited.clear();
                 self.held_epic = None;
@@ -1113,8 +1113,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.holds_whole = false;
                 self.waited.clear();
                 self.held_epic = None;
-                self.report.failures += 1;
-                self.line(format!("epics error: {error:#}"));
+                self.report.error("epics", &error);
             }
         }
         let starts = turn.starts;
@@ -1462,8 +1461,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(focus) = self.config.focus() {
             if let Some(why) = self.focus_refused(&focus, repository, &live) {
                 self.holds_whole = false;
-                self.report.failures += 1;
-                self.line(format!(
+                self.report.failure(format!(
                     "focus error: epics.focus: {why}; no epic is planned or applied and no new run starts until pass.json names a live epic or drops the setting"
                 ));
                 return Ok(());
@@ -1510,7 +1508,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 ))
             }
             Err(error) => {
-                self.report.failures += 1;
+                self.report.error("epics runs in flight", &error);
                 self.line(format!(
                     "hold epics: the runs in flight could not be listed, so none is planned: {error:#}"
                 ));
@@ -1521,7 +1519,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let bounds = self.client.bounds;
             if bounds.left.get() < START_REQUESTS || Instant::now() > bounds.admit_by {
                 self.holds_whole = false;
-                self.report.failures += 1;
                 self.line(format!(
                     "epics: the pass's request or time budget is low; {} live epic(s) deferred",
                     live.len() - n
@@ -1798,8 +1795,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let comments = match plan::issue_comments(&self.client, &facts.issue) {
             Ok(comments) => comments,
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("fail epic {name}: {error:#}"));
+                self.report.error_line(
+                    &format!("epic {name}"),
+                    &error,
+                    format!("fail epic {name}: {error:#}"),
+                );
                 return;
             }
         };
@@ -2017,7 +2017,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                             .then(|| (done, format!("its run {run} {how}"))),
                         Ok(None) => None,
                         Err(error) => {
-                            self.report.failures += 1;
+                            self.report.error(
+                                &format!("epic {} planning run {run}", facts.issue.display()),
+                                &error,
+                            );
                             let why =
                                 format!("its planning run {run} could not be read: {error:#}");
                             self.epic_held(facts, Hold::new(HoldKind::Unreadable, why));
@@ -2135,8 +2138,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let config = match self.apply_config(project) {
             Ok(config) => config,
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("fail epic {name}: {error:#}"));
+                self.report.error_line(
+                    &format!("epic {name}"),
+                    &error,
+                    format!("fail epic {name}: {error:#}"),
+                );
                 return None;
             }
         };
@@ -2169,8 +2175,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 });
             }
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("fail epic {name}: plan {id}: {error:#}"));
+                self.report.error(&format!("epic {name} plan {id}"), &error);
                 return None;
             }
         };
@@ -2196,7 +2201,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // Apply reads the comments three times, each as many pages as now.
         let needed = APPLY_REQUESTS + 3 * pages + ACTION_REQUESTS * planned.actions + WRITE_RESERVE;
         if !bounds.fits(needed) {
-            self.report.failures += 1;
             let why = format!(
                 "the pass has {} requests left, fewer than its apply may take ({needed}), or ran out of time",
                 bounds.left.get()
@@ -2242,8 +2246,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Err(error) => {
                 // What it wrote is on its receipt; count it all against the cap.
                 self.caps.count_many(Kind::Write, planned.writes);
-                self.report.failures += 1;
-                self.line(format!("{line} failed: {error:#}"));
+                self.report.error(&line, &error);
             }
         }
         None
@@ -2279,8 +2282,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         match epic_apply::record_recovery(&self.client, &facts.census, receipt, url, self.now) {
             Ok(()) => self.line(format!("{line}; recorded on {}", receipt.url)),
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("{line}; recording it failed: {error:#}"));
+                self.report.error(&format!("{line}; recording it"), &error);
             }
         }
     }
@@ -2330,7 +2332,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Ok(true) => self.epic_held(facts, hold(why)),
             Ok(false) => self.epic_held(facts, hold(format!("{why}; {OFF_BOARD}"))),
             Err(error) => {
-                self.report.failures += 1;
+                self.report
+                    .error(&format!("epic {} {why}", facts.issue.display()), &error);
                 self.epic_held(facts, hold(format!("{why} failed: {error:#}")));
             }
         }
@@ -2368,7 +2371,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             );
             // Gone already is released too.
             if let Err(error) = plan::send(&self.client, "DELETE", &url, &Value::Null, 404) {
-                self.report.failures += 1;
+                self.report.error(&line, &error);
                 self.epic_held(facts, hold(format!("{line} failed: {error:#}")));
                 return false;
             }
@@ -2427,7 +2430,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let changed = match self.changed_since(facts) {
                 Ok(changed) => changed.map(|why| (HoldKind::Other, why)),
                 Err(error) => {
-                    self.report.failures += 1;
+                    self.report
+                        .error(&format!("epic {} recheck", facts.issue.display()), &error);
                     let why = format!("it could not be read again: {error:#}");
                     Some((HoldKind::Unreadable, why))
                 }
@@ -2492,7 +2496,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Ok(true) => report(self, line),
             Ok(false) => report(self, format!("{line}; {OFF_BOARD}")),
             Err(error) => {
-                self.report.failures += 1;
+                self.report.error(&line, &error);
                 report(self, format!("{line} failed: {error:#}"));
             }
         }
@@ -2680,13 +2684,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let step = match step {
             Ok(step) => step,
             Err(error) => {
-                self.report.failures += 1;
-                self.line(format!("fail epic {name}: {error:#}"));
+                self.report.error_line(
+                    &format!("epic {name}"),
+                    &error,
+                    format!("fail epic {name}: {error:#}"),
+                );
                 return;
             }
         };
-        if let Step::Failed(..) = step {
+        if let Step::Failed(line, _) = &step {
             self.report.failures += 1;
+            self.report.failed_operations.push(line.clone());
             self.not_started += 1;
         }
         if !self.apply && matches!(step, Step::Started(..)) {
@@ -2698,9 +2706,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         match step {
             Step::Hold(hold) => self.epic_held(facts, hold),
-            Step::Stop(why, halt) => {
-                // Stage 4's candidates come after: none was considered.
-                self.report.failures += usize::from(halt.failed(false));
+            Step::Stop(why, _) => {
                 self.line(why);
             }
             Step::Capped(line) => {

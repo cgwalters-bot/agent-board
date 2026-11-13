@@ -301,7 +301,6 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 break;
             }
             if Instant::now() > self.client.bounds.admit_by {
-                self.report.failures += 1;
                 self.line(format!(
                     "time: the pass ran past {PASS_SECONDS_LIMIT} seconds; revisits deferred"
                 ));
@@ -311,12 +310,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             self.client.bounds.end_start();
             match step {
                 Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("fail revisit {issue}: {error:#}"));
+                    self.report.error(&format!("revisit {issue}"), &error);
                 }
                 Ok(Step::Hold(hold)) => self.line(format!("revisit {issue}: {}", hold.reason)),
                 Ok(Step::Stop(why, halt)) => {
-                    self.report.failures += usize::from(halt.failed(true));
                     // As stage 4's starts: a recheck that finds every slot
                     // taken holds new runs.
                     match why.strip_prefix(WIP_HOLD) {

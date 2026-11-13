@@ -407,10 +407,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 // read is still done with, and the next pass goes on before
                 // it rather than reading the same pages again.
                 Err(error) if !read.is_empty() => {
-                    outcome.errors += 1;
-                    outcome
-                        .lines
-                        .push(format!("notifications error: {error:#}"));
+                    outcome.error("notifications", &error);
                     url = Some(page);
                     cut = true;
                     break;
@@ -460,10 +457,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         done
                     }
                     Err(error) => {
-                        outcome.errors += 1;
-                        outcome
-                            .lines
-                            .push(format!("{repo}#{number} notification error: {error:#}"));
+                        outcome.error(&format!("{repo}#{number} notification"), &error);
                         false
                     }
                 };
@@ -486,10 +480,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     // The budget, most likely: it and the rest stay unread,
                     // and the cursor stays before them, to be read again.
                     Err(error) => {
-                        outcome.errors += 1;
-                        outcome.lines.push(format!(
-                            "{at} notification error: not marked read: {error:#}"
-                        ));
+                        outcome.error_line(
+                            &format!("{at} notification not marked read"),
+                            &error,
+                            format!("{at} notification error: not marked read: {error:#}"),
+                        );
                         for (_, listed, _) in std::iter::once((id, listed, at)).chain(pending) {
                             let at = updated(&listed);
                             open = Some(open.map_or(at, |o| o.min(at)));
@@ -515,8 +510,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let next_before = match (url.is_some(), oldest) {
             (true, Some(_)) if stuck(oldest) => {
                 if !cut {
-                    outcome.errors += 1;
-                    outcome.lines.push(format!(
+                    outcome.failure(format!(
                         "notifications error: over {} unread threads were updated in the second before {}, and older ones are not reached",
                         BUCKET_PAGES * THREADS_PAGE,
                         stamp(before.unwrap_or(since))?
@@ -3451,10 +3445,19 @@ mod tests {
             let next = pass
                 .notifications(&settings, &BTreeSet::new(), (None, None), &mut outcome)
                 .unwrap();
-            assert_eq!(outcome.errors, 1, "{case}: {:?}", outcome.lines);
+            assert_eq!(
+                outcome.errors,
+                usize::from(case != "budget"),
+                "{case}: {:?}",
+                outcome.lines
+            );
             let failed = format!("{OTHER}#2 notification error: not marked read: ");
             assert!(
-                outcome.lines[0].starts_with(&failed),
+                if case == "budget" {
+                    outcome.lines[0].ends_with("deferred: budget")
+                } else {
+                    outcome.lines[0].starts_with(&failed)
+                },
                 "{case}: {:?}",
                 outcome.lines
             );

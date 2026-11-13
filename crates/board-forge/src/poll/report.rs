@@ -163,10 +163,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 continue;
             }
             let entries = self.merge_queue(repo).unwrap_or_else(|error| {
-                outcome.errors += 1;
-                outcome.lines.push(format!(
-                    "maintainer report: {repo} merge queue error: {error:#}"
-                ));
+                outcome.error(&format!("maintainer report: {repo} merge queue"), &error);
                 Value::Null
             });
             queues.insert(*repo, entries);
@@ -187,10 +184,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             self.publish_report(at, &body, &mut outcome.lines)
         })();
         if let Err(error) = result {
-            outcome.errors += 1;
-            outcome
-                .lines
-                .push(format!("maintainer report error: {error:#}"));
+            outcome.error("maintainer report", &error);
         }
     }
 

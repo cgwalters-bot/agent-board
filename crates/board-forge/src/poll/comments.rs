@@ -823,10 +823,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                                 done
                             }
                             Err(error) => {
-                                outcome.errors += 1;
-                                outcome.lines.push(format!(
-                                    "{repo}#{number} operator comments error: {error:#}"
-                                ));
+                                outcome
+                                    .error(&format!("{repo}#{number} operator comments"), &error);
                                 false
                             }
                         }
@@ -919,8 +917,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 (true, _) => anchor,
                 (false, Some(at)) if at > cursor - lag => at + lag,
                 _ => {
-                    outcome.errors += 1;
-                    outcome.lines.push(format!(
+                    outcome.failure(format!(
                         "operator comments: unresolved search overflow at {}; hidden hits may remain; discovery cursor retained, human intervention required",
                         stamp(cursor - lag)?
                     ));
