@@ -26,6 +26,7 @@ pub mod approval;
 pub mod bounds;
 pub mod comments;
 mod dependencies;
+pub mod direction;
 pub mod drafts;
 pub mod lock;
 pub mod notify;
@@ -1659,6 +1660,9 @@ pub struct State {
     /// tried again, however often the thread is found. Losing it costs one
     /// more refused write a comment.
     pub intake_refused: Vec<String>,
+    /// Receipts of admitted operator direction, for the holds snapshot
+    /// ([`direction`]); they report and never admit work.
+    pub operator_direction: direction::Direction,
     /// `lockCollaboratorItems` ([`lock`]): the open, unlocked items whose
     /// input check refused them, `OWNER/REPO#N` to the `updated_at` it read,
     /// which go to the back of the next pass's queue until they change.
@@ -1740,6 +1744,7 @@ impl State {
                     "intake_page",
                     "intake_waiting",
                     "intake_refused",
+                    "operator_direction",
                     "lock_refused",
                     "follow_cursor",
                     "share_cursor",
@@ -1854,6 +1859,13 @@ impl State {
             Some(refused) => serde_json::from_value(refused.clone())
                 .context("poll state intake_refused is not a list of strings")?,
         };
+        let operator_direction: direction::Direction = match object.get("operator_direction") {
+            None => direction::Direction::default(),
+            Some(value) => {
+                serde_json::from_value(value.clone()).context("poll state operator_direction")?
+            }
+        };
+        operator_direction.validate()?;
         ensure!(
             intake_refused.len() <= comments::INTAKE_REFUSED_LIMIT,
             "poll state intake_refused holds over {} comments",
@@ -1980,6 +1992,7 @@ impl State {
             intake_page,
             intake_waiting,
             intake_refused,
+            operator_direction,
             lock_refused,
             follow_cursor,
             share_cursor,
@@ -2022,6 +2035,9 @@ impl State {
         }
         if !self.intake_refused.is_empty() {
             state["intake_refused"] = json!(self.intake_refused);
+        }
+        if self.operator_direction != direction::Direction::default() {
+            state["operator_direction"] = json!(self.operator_direction);
         }
         if !self.lock_refused.is_empty() {
             state["lock_refused"] = json!(self.lock_refused);
@@ -4892,6 +4908,7 @@ struct Pass<'a, R, G> {
     intaking: bool,
     /// [`State::intake_refused`], as this pass goes on.
     intake_refused: Vec<String>,
+    operator_direction: direction::Direction,
     /// The anchors of the thread at hand whose direction is settled without
     /// a run (answered by hand, refused for good): kept out of its claims.
     intake_skip: BTreeSet<String>,
@@ -5049,6 +5066,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             caps: None,
             intaking: false,
             intake_refused: Vec::new(),
+            operator_direction: direction::Direction::default(),
             intake_skip: BTreeSet::new(),
             writes: 0,
             review_runs: BTreeMap::new(),
@@ -8925,6 +8943,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         );
     }
     let direction_read = direction.is_some();
+    pass.operator_direction = std::mem::take(&mut state.operator_direction);
     let mut outcome = direction.map(|(outcome, _)| outcome).unwrap_or_default();
     // Only an applying pass writes, so only it records refusals.
     if config.policy.notification_intake.is_some() {
@@ -9171,6 +9190,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         intake_page,
         intake_waiting,
         intake_refused: pass.intake_refused,
+        operator_direction: pass.operator_direction,
         lock_refused,
         follow_cursor,
         share_cursor,
@@ -9226,6 +9246,7 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps: Some(caps),
         intake_refused: std::mem::take(&mut state.intake_refused),
+        operator_direction: std::mem::take(&mut state.operator_direction),
         remaining: budget,
         ..Pass::new(rest, graphql, config, now)
     };
@@ -9255,6 +9276,7 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
     state.notify_since = cursors.notify_since;
     state.notify_before = cursors.notify_before;
     state.intake_refused = pass.intake_refused;
+    state.operator_direction = pass.operator_direction;
     outcome.dispatched = pass.dispatched;
     outcome.state = state;
     Ok((outcome, prior_requests + budget - pass.remaining))
@@ -9292,6 +9314,9 @@ fn read_direction<R: Rest, G: Transport>(
     cursors: &mut Cursors,
     outcome: &mut Outcome,
 ) {
+    if config.policy.notification_intake.is_some() && pass.apply.is_some() {
+        pass.operator_direction.passes = pass.operator_direction.passes.saturating_add(1);
+    }
     if !config.policy.operator_comments.is_empty()
         || (config.policy.notification_intake.is_some() && config.policy.notifications.is_none())
     {
@@ -22510,6 +22535,7 @@ mod tests {
             intaking: false,
             intake_refused: Vec::new(),
             intake_skip: BTreeSet::new(),
+            operator_direction: direction::Direction::default(),
             writes: 0,
             review_runs: BTreeMap::new(),
             review_intake: reviews::Intake::default(),

@@ -60,7 +60,7 @@ pub const INTAKE_WAITING_LIMIT: usize = THREADS_PAGE;
 /// ([`State::intake_refused`]); past it the oldest is forgotten.
 pub const INTAKE_REFUSED_LIMIT: usize = 100;
 /// The anchors that name the operator's comments ([`Said::key`]).
-const ANCHORS: &[&str] = &["issuecomment-", "discussion_r", "pullrequestreview-"];
+pub(super) const ANCHORS: &[&str] = &["issuecomment-", "discussion_r", "pullrequestreview-"];
 /// How old a comment may be and still start a run: the first pass, or one
 /// after the state was lost, does not act on what the operator said long ago.
 pub(super) const LOOKBACK_SECONDS: i64 = 2 * 24 * 60 * 60;
@@ -4347,6 +4347,7 @@ pub(super) mod tests {
                 caps: None,
                 intaking: false,
                 intake_refused: Vec::new(),
+                operator_direction: direction::Direction::default(),
                 intake_skip: BTreeSet::new(),
                 writes: 0,
                 review_runs: BTreeMap::new(),

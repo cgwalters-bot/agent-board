@@ -499,6 +499,7 @@ mod tests {
             caps: None,
             intaking: false,
             intake_refused: Vec::new(),
+            operator_direction: direction::Direction::default(),
             intake_skip: BTreeSet::new(),
             writes: 0,
             review_runs: BTreeMap::new(),
