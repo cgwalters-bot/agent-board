@@ -13,6 +13,7 @@ pub(super) fn snapshot(
     steps: &[poll::Stepped],
     plans: &BTreeMap<String, String>,
     holds: &[Published],
+    upstreams: &crate::upstream::Observations,
 ) -> Value {
     let follow = follow
         .iter()
@@ -71,6 +72,20 @@ pub(super) fn snapshot(
                     row["plan_kind"] = kind.clone();
                 }
                 items.insert(item, row);
+            }
+        }
+        for (item, observation) in upstreams {
+            if item
+                .rsplit_once('#')
+                .is_some_and(|(r, _)| r.eq_ignore_ascii_case(&repository))
+            {
+                let row = items
+                    .entry(item.clone())
+                    .or_insert_with(|| json!({"kind":"observed", "operator":false}));
+                row["upstream"] = match observation {
+                    Ok(state) => state.json(),
+                    Err(error) => json!({"error":error}),
+                };
             }
         }
         let mut counts = BTreeMap::<String, usize>::new();
@@ -143,12 +158,23 @@ mod tests {
             releases: 1,
         };
         let followed = (vec![], BTreeSet::from(["o/other".into()]));
+        let upstreams = BTreeMap::from([(
+            "o/other#9".into(),
+            Ok(crate::upstream::State {
+                item: "elsewhere/project#12".into(),
+                state: "open".into(),
+                reason: None,
+                closed_at: None,
+                closed_by: None,
+            }),
+        )]);
         let work = snapshot(
             (&["o/r".into(), "o/other".into()], &["o/work".into()]),
             Some(&followed),
             &steps,
             &plans,
             &[hold("o/other#9"), hold("o/work#2")],
+            &upstreams,
         );
         assert_eq!(
             work["repositories"]["o/r"]["counts"],
@@ -169,6 +195,11 @@ mod tests {
         assert_eq!(other["items"][1]["item"], "o/other#9");
         assert_eq!(other["items"][1]["kind"], "held");
         assert_eq!(other["items"][1]["plan_kind"], "triage");
+        assert_eq!(
+            other["items"][1]["upstream"]["item"],
+            "elsewhere/project#12"
+        );
+        assert_eq!(other["items"][1]["upstream"]["state"], "open");
         let held = &work["repositories"]["o/work"]["items"][0];
         assert!(held.get("plan_kind").is_none(), "{held}");
         let mut document = holds::snapshot(&[], "2026-11-05T12:00:00Z".into(), Default::default());
@@ -180,7 +211,14 @@ mod tests {
         let many = (1..=MAX_ITEMS + 5)
             .map(|n| step(n as u64, "fix", poll::WaitReason::Person))
             .collect::<Vec<_>>();
-        let work = snapshot((&["o/r".into()], &[]), None, &many, &BTreeMap::new(), &[]);
+        let work = snapshot(
+            (&["o/r".into()], &[]),
+            None,
+            &many,
+            &BTreeMap::new(),
+            &[],
+            &BTreeMap::new(),
+        );
         assert_eq!(work["repositories"]["o/r"]["count"], MAX_ITEMS + 5);
         assert_eq!(work["repositories"]["o/r"]["omitted"], 5);
         assert_eq!(

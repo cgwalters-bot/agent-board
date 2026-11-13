@@ -3565,6 +3565,10 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
     )
     .unwrap();
     replay.requests.extend(policy.requests);
+    // Hypothetical source issue with no upstream association; the old public
+    // recording predates this source-body read.
+    replay.requests.push(serde_json::json!({"request":{"get":"https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/31"},
+        "answer":{"status":200,"body":{"number":31,"repository_url":"https://api.github.com/repos/cgwalters-forge/composefs-rs","body":"A fork issue."}}}));
     for e in &mut replay.requests {
         let url = e["request"]["get"].as_str().unwrap_or_default().to_owned();
         if url.contains("pulls?state=open") {

@@ -1506,6 +1506,16 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0]["repo"], "upstream/midstream");
         assert_eq!(inputs[0]["kind"], "triage");
+        let writes = fake.writes.borrow();
+        let created = writes
+            .iter()
+            .find(|(path, _)| path == &format!("POST {API_ROOT}repos/upstream/midstream/issues"))
+            .unwrap();
+        assert_eq!(
+            crate::upstream::parse(text(&created.1, "/body")).unwrap(),
+            Some(2)
+        );
+        drop(writes);
         assert!(text(&inputs[0], "/task").contains("let's get a draft of the fix"));
         assert_eq!(replies(&fake).len(), 1);
         assert!(
@@ -1544,6 +1554,30 @@ mod tests {
         assert_eq!(notified.errors, 0, "{:?}", notified.lines);
         assert_eq!(dispatches(&fake).len(), 1);
         assert_eq!(replies(&fake).len(), 1);
+    }
+
+    #[test]
+    fn upstream_association_excludes_prs_and_fallback_trackers() {
+        for (pull, fallback) in [(true, false), (false, true)] {
+            let fake = intake_github(OTHER, pull, "mention", OPERATOR);
+            let mut config = search_intake(&fake, OTHER);
+            if fallback {
+                config.policy.notification_intake =
+                    Some(BTreeMap::from([(OTHER.into(), DISPATCH.into())]));
+            }
+            let report = pass(&fake, &config, State::default(), true);
+            assert_eq!(report.errors, 0, "{:?}", report.lines);
+            let writes = fake.writes.borrow();
+            let issues = writes
+                .iter()
+                .filter(|(path, _)| path.starts_with("POST ") && path.ends_with("/issues"))
+                .collect::<Vec<_>>();
+            assert_eq!(issues.len(), 1);
+            assert_eq!(
+                crate::upstream::parse(text(&issues[0].1, "/body")).unwrap(),
+                None
+            );
+        }
     }
 
     #[test]

@@ -148,6 +148,7 @@ fn assess(
     if matches!(gate, Gates::Promoted(_)) {
         return Ok((gate, Ok("")));
     }
+    authorized_promotion_body(client, config, repo, pull, &target.upstream, command)?;
     let policy = policies
         .entry(target.upstream.to_ascii_lowercase())
         .or_insert_with(|| {
@@ -200,6 +201,8 @@ const RECORDED_FIELDS: &[&str] = &[
     "actor",
     "title",
     "body",
+    "repository_url",
+    "pull_request",
     "merged_at",
     "ahead_by",
     "behind_by",
@@ -650,27 +653,8 @@ fn stack_gate(
     upstream: &str,
     base: &str,
 ) -> Result<String> {
-    let text = pull["body"]
-        .as_str()
-        .context("cannot tie fork PR to issue: missing body")?;
-    let issues: Vec<_> = referenced_numbers(text)
-        .into_iter()
-        .filter(|n| crate::stack::closes(text, repo, *n) || crate::stack::part_of(text, repo, *n))
-        .collect();
-    hold!(
-        issues.len() == 1,
-        "cannot tie fork PR to one issue deterministically{}",
-        if text.trim().is_empty() {
-            ": empty body"
-        } else {
-            ""
-        }
-    );
-    let issue = crate::parse_github_item(
-        &format!("{repo}#{}", issues[0]),
-        None,
-        crate::github::DEFAULT_HOST,
-    )?;
+    let issue = source_issue(repo, pull)?;
+    promotion_body(client, repo, pull, upstream)?;
     let comments = crate::plan::issue_comments_with_edit_evidence(client, &issue)?;
     let writers = [&*config.operator, &*config.bot];
     if crate::plan::no_plan(&comments, &writers) {
@@ -757,6 +741,119 @@ fn stack_gate(
         "stack parent {repo}#{n}: closed unmerged; rebase by hand"
     ))
     .into())
+}
+
+fn source_issue(repo: &str, pull: &Value) -> Result<board_core::ItemRef> {
+    let text = pull["body"]
+        .as_str()
+        .context("cannot tie fork PR to issue: missing body")?;
+    let issues: Vec<_> = referenced_numbers(text)
+        .into_iter()
+        .filter(|n| crate::stack::closes(text, repo, *n) || crate::stack::part_of(text, repo, *n))
+        .collect();
+    hold!(
+        issues.len() == 1,
+        "cannot tie fork PR to one issue deterministically{}",
+        if text.trim().is_empty() {
+            ": empty body"
+        } else {
+            ""
+        }
+    );
+    crate::parse_github_item(
+        &format!("{repo}#{}", issues[0]),
+        None,
+        crate::github::DEFAULT_HOST,
+    )
+}
+
+/// Only this mechanically derived closing line supplements the approved text.
+/// A qualified body link cannot redirect publication or close another repo's issue.
+fn promotion_body(client: &impl Rest, repo: &str, pull: &Value, upstream: &str) -> Result<String> {
+    let source = source_issue(repo, pull)?;
+    let target = crate::upstream::target(client, &source)
+        .map_err(|e| Held(format!("upstream link held: {e:#}")))?;
+    let mut body = pull["body"]
+        .as_str()
+        .context("missing pull body")?
+        .to_owned();
+    if let Some(target) = target {
+        hold!(
+            target.repository.eq_ignore_ascii_case(upstream),
+            "upstream link held: fork parent {} differs from configured target {upstream}",
+            target.repository
+        );
+        crate::upstream::issue(client, &target.repository, target.number)
+            .map_err(|e| Held(format!("upstream link held: {e:#}")))?;
+        body.push_str(&format!("\n\nFixes {}", target.display()));
+    }
+    Ok(body)
+}
+
+const SOURCE_TEXT_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){number url body createdAt author{login} lastEditedAt editor{login}}}}";
+
+/// A closing reference is publication text, so mutable issue prose alone is
+/// not authority. Require a trusted author/last editor and a change strictly
+/// before the selected operator command, including on repeated publication.
+fn authorized_promotion_body(
+    client: &(impl Rest + Transport),
+    config: &Config,
+    repo: &str,
+    pull: &Value,
+    upstream: &str,
+    command: &Command,
+) -> Result<String> {
+    let body = promotion_body(client, repo, pull, upstream)?;
+    if body == pull["body"] {
+        return Ok(body);
+    }
+    let source = source_issue(repo, pull)?;
+    let (owner, name) = repo.split_once('/').context("invalid source repository")?;
+    let data = client
+        .graphql(
+            SOURCE_TEXT_QUERY,
+            serde_json::json!({"owner":owner,"name":name,"number":source.number}),
+        )
+        .context("upstream link text evidence unreadable")?;
+    let issue = &data["repository"]["issue"];
+    hold!(
+        issue["number"] == source.number
+            && issue["url"] == format!("https://github.com/{repo}/issues/{}", source.number),
+        "upstream link source text identity mismatch"
+    );
+    let number = crate::upstream::parse(issue["body"].as_str().context("missing source text")?)?
+        .context("upstream link changed during publication")?;
+    hold!(
+        body == format!(
+            "{}\n\nFixes {upstream}#{number}",
+            pull["body"].as_str().context("missing pull body")?
+        ),
+        "upstream link changed during publication"
+    );
+    let edited = issue
+        .get("lastEditedAt")
+        .context("missing source edit metadata")?;
+    let (actor, changed) = if edited.is_null() {
+        hold!(
+            issue.get("editor") == Some(&Value::Null),
+            "ambiguous source editor"
+        );
+        (&issue["author"], at(&issue["createdAt"])?)
+    } else {
+        (&issue["editor"], at(edited)?)
+    };
+    hold!(
+        actor["login"]
+            .as_str()
+            .is_some_and(|login| login.eq_ignore_ascii_case(&config.operator)
+                || login.eq_ignore_ascii_case(&config.bot)),
+        "upstream link source author/editor is not trusted"
+    );
+    hold!(
+        changed < command.created,
+        "upstream link source changed after command; fresh command required"
+    );
+    Ok(body)
 }
 
 fn dco_gate(

@@ -556,6 +556,25 @@ Stage 4b reports approved promotion candidates and their first held gate using
 the standalone [`agent-board promote`](cli.md#agent-board-promote) evaluator.
 It never publishes, even in an applying pass. The shared `promote.forks` setting
 enables these reads; absent or empty means `promote: off` with no reads.
+
+For open issues in admitted `midstream` or `promote.forks` repositories,
+the pass reads an optional whole `Upstream: #N` body line when scheduling
+considers the candidate, not eagerly for every board item. No new
+option is needed; without those fork settings this path is off. Intake adds the
+line when staging an upstream issue in its matching fork, not for PR threads or
+an issues-off fallback tracker. Triage briefs ask for the same representation.
+The repository is derived from GitHub's verified fork parent, never duplicated
+in the line. Source, parent and upstream-issue reads share the existing pass
+request/time budget; no upstream writes are added. Malformed/ambiguous links,
+missing parent evidence and failed reads hold that candidate as unreadable.
+The dispatchable-work item view records the observed upstream item, state,
+reason, closing actor/time, or the named read error, within its existing item cap.
+An upstream issue closed as completed by someone other than the bot asks for
+triage again, unless an accepted plan already postdates that completion.
+Invalid or untrusted plan evidence retains the normal hold/repair policy. This
+does not close the fork issue automatically, bypass active-work holds or enable
+triage where it is off. No association leaves existing scheduling unchanged.
+
 The [maintain](#maintain) digest is dispatched only where its repository is
 public; elsewhere it is planned and recorded but not dispatched.
 

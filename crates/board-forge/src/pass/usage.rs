@@ -983,6 +983,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 &self.stepped,
                 &self.report.accepted_plans.borrow(),
                 &snapshot.holds,
+                &self.report.upstreams.borrow(),
             ));
         }
         if self.config.holds.as_ref().is_some_and(|h| h.pass_view) {
