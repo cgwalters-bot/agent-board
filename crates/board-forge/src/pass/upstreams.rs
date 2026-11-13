@@ -138,7 +138,8 @@ mod tests {
             for (path, body) in [
                 (
                     format!("repos/{FORK}"),
-                    json!({"full_name":FORK,"fork":true,"parent":{"full_name":"other-org/project"}}),
+                    json!({"full_name":FORK,"fork":true,"topics":["bot-midstream"],
+                        "custom_properties":{"origin":"fork"},"parent":{"full_name":"other-org/project"}}),
                 ),
                 (
                     format!("repos/{FORK}/issues/468/timeline?per_page=100&page=1"),

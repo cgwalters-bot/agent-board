@@ -554,8 +554,10 @@ unless `pr.ownSpaceOnly` keeps every write out of them but those on the bot's
 own pull requests ([the poll](poll.md)).
 Stage 4b reports approved promotion candidates and their first held gate using
 the standalone [`agent-board promote`](cli.md#agent-board-promote) evaluator.
-It never publishes, even in an applying pass. The shared `promote.forks` setting
-enables these reads; absent or empty means `promote: off` with no reads.
+It never publishes, even in an applying pass. Shared `promote` settings with
+`midstream` discovery or legacy `promote.forks` hints enable these reads.
+Publication requires both `origin=fork` and `bot-midstream` metadata and the
+actual GitHub fork parent; the legacy map cannot authorize a destination.
 
 For open issues in admitted `midstream` or `promote.forks` repositories,
 the pass reads an optional whole `Upstream: #N` body line when scheduling
@@ -5237,7 +5239,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.directionFirst` | Run the intake's search (a standalone poll's `operatorComments` and `notifications`) before the followed repositories' reads, so that they cannot spend stage 2's share first, at the walk's expense, see [the intake](#github-operator-direction-intake); `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
-| `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, shared by standalone `promote` and the read-only pass view; destination comes from here, never a PR body; a fork is named once ignoring case, is not its own upstream, and may also be in `follow` only under the midstream owner with topic membership verified in stage 2; `base` non-empty; absent or `{}` means off with no forge reads |
+| `promote.forks` | Legacy map of fork repository to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, readable for one release for pinned callers. Every entry needs `origin=fork`, `bot-midstream` and GitHub fork status; upstream must equal GitHub's parent, base overrides its default branch. Without entries, `midstream` discovery supplies candidates from metadata. A non-fork attempt or conflicting parent is a hard error. Publication remains off by default through `promote.publish`. |
 | `promote.publish` | Default `false`: allow standalone `promote --apply --max-writes N` to publish one upstream draft or update one same-head PR after fresh gates and operator current-head approval; three writes reserved; no pushes, ready changes or fork closure; the pass always remains read-only for promotion |
 | `promote.onApproval` | Default `false`: standalone `promote` also evaluates draft fork PRs and, on a draft without a `/promote` command, takes the operator's latest deciding review approving the current head, submitted after its push, as the trigger (never `--human-text`); publication still needs `promote.publish` |
 | `promote.signoff.name`, `promote.signoff.email` | Reserved operator sign-off identity; both non-empty; required with `promote.forks`, no default; no sign-off is performed in the preview |

@@ -80,6 +80,10 @@ fn timeline(replay: &mut Replay, events: Value) {
 
 fn scenario() -> Replay {
     let mut replay = Replay::from_json(&serde_json::from_str(FIXTURE).unwrap()).unwrap();
+    // Promotion metadata is a scenario fact, not part of the older recording.
+    let metadata = body(&mut replay, &format!("repos/{REPO}"));
+    metadata["topics"] = json!(["bot-midstream"]);
+    metadata["custom_properties"] = json!({"origin":"fork"});
     // Keep one observed bot-fork PR; readiness and command are scenario edits.
     let selected = body(&mut replay, "pulls?state=open")
         .as_array()
@@ -1774,6 +1778,25 @@ fn publication() -> (PublishingForge, Config) {
     (forge, config)
 }
 
+#[test]
+fn metadata_only_preview_and_publication_use_the_parent_default() {
+    let (mut forge, mut config) = publication();
+    config.promote.as_mut().unwrap().forks.clear();
+    config.midstream = Some(pass::midstream::Midstream {
+        owner: "cgwalters-forge".into(),
+        topic: "bot-midstream".into(),
+    });
+    let metadata = body(&mut forge.replay, &format!("repos/{REPO}"));
+    metadata["parent"]["default_branch"] = json!("main");
+    let metadata = metadata.clone();
+    forge.replay.requests.push(json!({"request":{"get":format!("{API}orgs/cgwalters-forge/repos?type=public&per_page=100")},
+        "answer":{"status":200,"link":null,"body":[metadata]}}));
+    assert!(preview(&forge, &config, forge.replay.now).unwrap()[0].starts_with("would promote"));
+    assert!(forge.writes.borrow().is_empty());
+    assert!(apply(&forge, &config, forge.replay.now, 3).unwrap()[0].starts_with("promoted"));
+    assert_eq!(forge.writes.borrow()[1].2["base"], "main");
+}
+
 /// A second hypothetical PR on another branch, derived from exactly the
 /// same scenario reads, as the next candidate after #34.
 fn with_second(forge: &mut PublishingForge) {
@@ -3051,10 +3074,118 @@ fn incomplete_or_unreadable_is_never_empty_success() {
             entry["answer"]["body"]["source"]["full_name"] = json!("other/repo");
         }
     }
-    assert_eq!(
-        run(replay, &config).0.unwrap(),
-        [hold("fork-network mismatch"), REMAINING.into()]
+    assert!(
+        format!("{:#}", run(replay, &config).0.unwrap_err()).contains("disagrees with fork parent")
     );
+}
+
+#[test]
+fn promotion_targets_require_metadata_and_the_actual_parent() {
+    for (fork, origin, topics, parent, legacy, expected) in [
+        (
+            true,
+            "fork",
+            json!(["bot-midstream"]),
+            "upstream/project",
+            false,
+            "selected",
+        ),
+        (
+            true,
+            "owned",
+            json!(["bot-midstream"]),
+            "upstream/project",
+            false,
+            "skip",
+        ),
+        (true, "fork", json!([]), "upstream/project", true, "skip"),
+        (
+            true,
+            "fork",
+            json!(["bot-midstream"]),
+            "upstream/project",
+            true,
+            "selected",
+        ),
+        (true, "owned", json!([]), "other/project", true, "disagrees"),
+        (
+            false,
+            "fork",
+            json!(["bot-midstream"]),
+            "upstream/project",
+            false,
+            "GitHub fork",
+        ),
+        (
+            false,
+            "owned",
+            json!([]),
+            "upstream/project",
+            true,
+            "GitHub fork",
+        ),
+        (
+            true,
+            "fork",
+            json!(["bot-midstream"]),
+            "other/project",
+            true,
+            "disagrees",
+        ),
+    ] {
+        let metadata = json!({"full_name":"team/project", "fork":fork,
+            "custom_properties":{"origin":origin}, "topics":topics,
+            "parent":{"full_name":parent,"default_branch":"trunk"}});
+        let hint = pass::promote::Fork {
+            upstream: "upstream/project".into(),
+            base: "release".into(),
+        };
+        let result = target(&metadata, "team/project", legacy.then_some(&hint));
+        match expected {
+            "selected" => {
+                let target = result.unwrap().unwrap();
+                assert_eq!(target.upstream, parent);
+                assert_eq!(target.base, if legacy { "release" } else { "trunk" });
+            }
+            "skip" => assert!(result.unwrap().is_none()),
+            error => assert!(format!("{:#}", result.unwrap_err()).contains(error)),
+        }
+    }
+}
+
+#[test]
+fn metadata_discovery_does_not_need_static_fork_entries() {
+    for (origin, topic, fork, expected) in [
+        ("fork", true, true, "selected"),
+        ("owned", true, true, "skip"),
+        ("fork", false, true, "skip"),
+        ("fork", true, false, "error"),
+    ] {
+        let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+        value["promote"]["forks"] = json!({});
+        value["midstream"] = json!({"owner":"cgwalters-forge","topic":"bot-midstream"});
+        value["pr"] = json!({"fixPools":["claude"]});
+        let config = Config::parse(&value.to_string()).unwrap();
+        assert!(enabled(&config));
+        let mut replay = scenario();
+        let metadata = json!({"full_name":REPO,"fork":fork,
+            "custom_properties":{"origin":origin},
+            "topics":if topic {json!(["bot-midstream"])} else {json!([])},
+            "parent":{"full_name":"composefs/composefs-rs","default_branch":"trunk"}});
+        *body(&mut replay, &format!("repos/{REPO}")) = metadata.clone();
+        replay.requests.push(json!({"request":{"get":format!("{API}orgs/cgwalters-forge/repos?type=public&per_page=100")},
+            "answer":{"status":200,"link":null,"body":[metadata]}}));
+        let result = targets(&replay, &config);
+        match expected {
+            "selected" => {
+                let found = result.unwrap();
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[REPO].base, "trunk");
+            }
+            "skip" => assert!(result.unwrap().is_empty()),
+            _ => assert!(format!("{:#}", result.unwrap_err()).contains("GitHub fork")),
+        }
+    }
 }
 
 #[test]

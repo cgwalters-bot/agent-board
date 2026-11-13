@@ -3210,6 +3210,10 @@ fn organization_sources_preserve_promotion_replay_and_reconcile_config_loading()
         .as_array_mut()
         .unwrap()
         .extend(org["requests"].as_array().unwrap().iter().cloned());
+    // Scenario metadata absent from the historical recording.
+    replay["requests"][0]["answer"]["body"]["topics"] = serde_json::json!(["bot-midstream"]);
+    replay["requests"][0]["answer"]["body"]["custom_properties"] =
+        serde_json::json!({"origin":"fork"});
     std::fs::write(&path, config.to_string()).unwrap();
     std::fs::write(&replay_path, replay.to_string()).unwrap();
     let output = command()
@@ -3428,6 +3432,15 @@ fn pass_replay_with_promote_discovery_is_read_only() {
         "request":{"graphql":"ac69d4026a5e9797","variables":{"owner":"cgwalters-forge","name":"bootc"}},
         "answer":{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}
     }));
+    recording["requests"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "request":{"get":"https://api.github.com/repos/cgwalters-forge/bootc"},
+            "answer":{"status":200,"body":{"full_name":"cgwalters-forge/bootc","fork":true,
+                "topics":["bot-midstream"],"custom_properties":{"origin":"fork"},
+                "parent":{"full_name":"bootc-dev/bootc","default_branch":"main"}}}
+        }));
     let recording_path = dir.join("replay.json");
     std::fs::write(&recording_path, recording.to_string()).unwrap();
     let replay = |config: &Value, name: &str| {
@@ -3454,8 +3467,8 @@ fn pass_replay_with_promote_discovery_is_read_only() {
     let output = replay(&with, "with").success().get_output().clone();
     let without = String::from_utf8(without.stdout).unwrap();
     assert!(without.contains("\npromote: off\n"), "{without}");
-    // One extra discovery read, no candidates or promotion writes. The summary
-    // accounts for the extra request and GraphQL point; other decisions match.
+    // Metadata and candidate discovery reads, no promotion writes. The summary
+    // accounts for those extra requests; other decisions match.
     let decisions = |s: &str| {
         s.lines()
             .filter(|l| !l.starts_with("summary:") && *l != "promote: off")
@@ -3571,6 +3584,10 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
         "answer":{"status":200,"body":{"number":31,"repository_url":"https://api.github.com/repos/cgwalters-forge/composefs-rs","body":"A fork issue."}}}));
     for e in &mut replay.requests {
         let url = e["request"]["get"].as_str().unwrap_or_default().to_owned();
+        if url == "https://api.github.com/repos/cgwalters-forge/composefs-rs" {
+            e["answer"]["body"]["topics"] = serde_json::json!(["bot-midstream"]);
+            e["answer"]["body"]["custom_properties"] = serde_json::json!({"origin":"fork"});
+        }
         if url.contains("pulls?state=open") {
             let mut p = e["answer"]["body"]
                 .as_array()
@@ -3761,30 +3778,17 @@ fn promote_offline_preview_and_cli_refusals() {
         .env_remove("GITHUB_TOKEN")
         .env_remove("DISPATCH_TOKEN")
         .assert()
-        .success()
+        .failure()
         .get_output()
         .clone();
-    let recorded: Value = serde_json::from_str(include_str!(
-        "../../../fixtures/promote/public-2026-11-04.json"
-    ))
-    .unwrap();
-    let mut pulls = recorded["requests"][1]["answer"]["body"]
-        .as_array()
-        .unwrap()
-        .clone();
-    pulls.sort_by_key(|p| p["number"].as_u64());
-    let mut expected = String::new();
-    for pull in pulls {
-        expected.push_str(&format!(
-            "hold promote cgwalters-forge/composefs-rs#{} head={} command=unverified: draft\n",
-            pull["number"],
-            pull["head"]["sha"].as_str().unwrap()
-        ));
-    }
-    expected.push_str(board_forge::promote::REMAINING);
-    expected.push('\n');
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
-    assert!(output.stderr.is_empty());
+    // Old recordings cannot prove the newly required metadata; do not invent
+    // public facts in them or silently treat missing evidence as permission.
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("missing repository topics")
+    );
     for (extra, code, reason) in [
         (vec!["--apply"], 1, "--max-writes"),
         (

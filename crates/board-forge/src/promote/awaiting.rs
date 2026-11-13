@@ -129,14 +129,15 @@ impl<'a> Awaiting<'a> {
         number: u64,
         now: OffsetDateTime,
     ) -> Result<String> {
-        let target = self
+        let legacy = self
             .config
             .promote
             .as_ref()
             .context("promote configuration")?
             .forks
-            .get(repo)
-            .context("unknown promotion fork")?;
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(repo))
+            .map(|(_, target)| target);
         let pull = get(client, &format!("repos/{repo}/pulls/{number}"))?;
         ensure!(pull["number"] == number, "promotion pull identity mismatch");
         for path in [
@@ -156,7 +157,8 @@ impl<'a> Awaiting<'a> {
         }
         ensure!(pull["draft"].is_boolean(), "missing promotion draft flag");
         let metadata = get(client, &format!("repos/{repo}"))?;
-        repository(&metadata, repo)?;
+        let target = super::target(&metadata, repo, legacy)?
+            .context("repository lacks midstream metadata")?;
         let command = evaluate(
             client,
             self.config,
@@ -173,7 +175,7 @@ impl<'a> Awaiting<'a> {
             self.config,
             repo,
             &pull,
-            target,
+            &target,
             &command,
             &mut self.policies,
         )?;

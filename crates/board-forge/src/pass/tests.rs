@@ -20677,7 +20677,10 @@ fn promotion_view_is_read_only_and_budgeted() {
                 inner: &replay,
                 bounds: &expired,
             };
-            assert_eq!(promote::view(&budget, &cfg, replay.now), (vec!["promote: discovery incomplete (budget); fork cgwalters-forge/composefs-rs not evaluated".into()], 0));
+            assert_eq!(
+                promote::view(&budget, &cfg, replay.now),
+                (vec!["promote: discovery incomplete (budget)".into()], 0)
+            );
             continue;
         }
         let budget = Budget {
@@ -20690,12 +20693,17 @@ fn promotion_view_is_read_only_and_budgeted() {
         match case {
             "silent" => {
                 assert!(lines.is_empty());
-                assert_eq!(bounds.spent().requests, 1);
+                assert_eq!(bounds.spent().requests, 2);
             }
             "canceled command" | "stale permission" => {
                 assert!(lines.is_empty(), "{case}: {lines:?}")
             }
-            "budget" => assert_eq!(lines, ["promote: 1 candidate(s) not evaluated (budget)"]),
+            "budget" => assert_eq!(
+                lines,
+                [
+                    "promote: discovery incomplete (budget); fork cgwalters-forge/composefs-rs not evaluated"
+                ]
+            ),
             "read error" | "unreadable compare" | "missing behind" | "malformed detail" => assert!(
                 lines[0].starts_with("promote error: cgwalters-forge/composefs-rs#34:"),
                 "{lines:?}"
@@ -20761,6 +20769,20 @@ fn promotion_policy_absence_is_a_hold_for_live_and_replay_clients() {
             "DCO sign-off rewrite required"
         }));
     }
+}
+
+#[test]
+fn metadata_promotion_cannot_evade_midstream_no_merge_with_another_topic() {
+    let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+    value["follow"] = json!(["cgwalters-forge/staged"]);
+    value["midstream"] = json!({"owner":"cgwalters-forge", "topic":"other-topic"});
+    value["pr"] = json!({"fixPools":["claude"]});
+    value["promote"] = json!({"forks":{},"signoff":{"name":"Operator","email":"operator@example.invalid"},
+        "policyRepository":"cgwalters-forge/tracker"});
+    // Reject before stage 2 can treat the explicitly followed fork as ordinary
+    // mergeable work; metadata-only admission uses the literal bot-midstream.
+    let error = Config::parse(&value.to_string()).unwrap_err();
+    assert!(format!("{error:#}").contains("preserve no-merge protection"));
 }
 
 #[test]
@@ -20923,6 +20945,8 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                 settings["follow"] = json!([REPO]);
                 settings["promote"] = json!({"forks": {REPO: {"upstream":"example/upstream", "base":"main"}},
                     "signoff":{"name":"Op", "email":"op@example.invalid"}, "policyRepository":"cgwalters-forge/tracker"});
+                forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}orgs/cgwalters-forge/repos?type=public&per_page=100")},
+                    "answer":{"status":200,"link":null,"body":[]}}));
                 // Scenario edits: this legacy no-merge fixture has no
                 // publication handoffs; the bounded Status scan reads that
                 // absence and the configured network explicitly.
@@ -21013,6 +21037,8 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                         .as_str()
                         .is_some_and(|url| url.contains("orgs/cgwalters-forge/repos"))
                 });
+                forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}orgs/cgwalters-forge/repos?type=public&per_page=100")},
+                    "answer":{"status":200,"link":null,"body":[]}}));
                 forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}orgs/cgwalters-forge/repos?type=public&sort=full_name&per_page=100&page=1")},
                     "answer":{"status":200,"body":if source == "metadata-private" {json!([])} else {json!([{"full_name":REPO,"fork":true,"archived":false,"private":false,
                         "custom_properties":{"origin":"fork"},"topics":["bot-midstream"]}])}}}));
