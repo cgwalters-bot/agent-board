@@ -2,6 +2,7 @@
   "now": "2026-10-15T12:00:00Z",
   "signatures": [{"signature":"example", "count":2}],
   "pass-errors": [{"signature":"example", "count":3}],
+  "needs-supervisor": [{"cause":"needs-supervisor", "reason":"promotion handoff example/project#12: handoff needs one deterministic source issue; skipped"}],
   "stranded": [{"signature":"example", "count":2}],
   "main": [{"signature":"example", "count":1}],
   "needs-you": [{"signature":"example", "count":2}],

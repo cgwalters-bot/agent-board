@@ -190,7 +190,17 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
             return Ok(());
         };
         let github = self.github(board);
-        let snapshot = github.snapshot().await.context("reading the whole board")?;
+        // A snapshot is all-or-nothing. Its size is only known while reading;
+        // if admission stops mid-read, discard it before deriving or writing
+        // anything. Forge/decoding errors remain errors, not budget deferrals.
+        let snapshot = match github.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.is::<BudgetSpent>() => {
+                self.line("status deferred: budget".into());
+                return Ok(());
+            }
+            Err(error) => return Err(error.context("reading the whole board")),
+        };
         // What scheduling read is reused, and what it failed to read, which
         // it reported, is not read again; what it did not reach is read here.
         let runs = "the runs in flight could not be listed";
@@ -198,6 +208,13 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
             Some(busy) => busy,
             None => {
                 let listed = self.runs(&config.target(git_ref));
+                if listed
+                    .as_ref()
+                    .is_err_and(|error| error.is::<BudgetSpent>())
+                {
+                    self.line("status deferred: budget".into());
+                    return Ok(());
+                }
                 self.unread(listed.map(|(_, busy)| busy), runs)
             }
         };
@@ -209,6 +226,10 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
             Some(read) => read,
             None => {
                 let read = self.board();
+                if read.as_ref().is_err_and(|error| error.is::<BudgetSpent>()) {
+                    self.line("status deferred: budget".into());
+                    return Ok(());
+                }
                 self.unread(read, pulls)
             }
         };
@@ -398,6 +419,9 @@ fn item_facts(
     ItemFacts {
         status: item.status.clone(),
         complete: item.fields_complete
+            && !open_issues
+                .and_then(|read| read.items.get(&at))
+                .is_some_and(|facts| facts.promotion == Some(Promotion::Unknown))
             && matches!(item.content_kind.as_str(), "issue" | "pull_request"),
         pull_request,
         moving: pull_request && ours.moving(item.author.as_deref(), updated(item)),
@@ -735,6 +759,16 @@ mod tests {
                 items: BTreeMap::from([(at.clone(), facts)]),
             };
             let result = crate::promote::handoff::enrich(&replay, &config, &mut read.items);
+            if case == "missing linkage" {
+                assert_eq!(
+                    result.unwrap(),
+                    [format!(
+                        "needs-supervisor: promotion handoff {REPO}#34: handoff needs one deterministic source issue; skipped"
+                    )]
+                );
+                assert_eq!(read.items[&at].promotion, Some(Promotion::Unknown));
+                continue;
+            }
             let valid = matches!(
                 case,
                 "open"
@@ -815,6 +849,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ambiguous_handoffs_do_not_hide_a_good_neighbor() {
+        const REPO: &str = "cgwalters-forge/composefs-rs";
+        let (mut replay, config) = crate::promote::tests::handoff_scenario();
+        let template = replay
+            .requests
+            .iter()
+            .find(|entry| {
+                entry["request"]["get"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with("/pulls/34"))
+            })
+            .unwrap()["answer"]["body"]
+            .clone();
+        replay.requests.push(json!({"request":{"get":format!("https://api.github.com/repos/{REPO}/issues/30/timeline?per_page=100&page=1")},"answer":{"status":200,"link":null,"body":[]}}));
+        for (n, body) in [
+            (32, json!("No source")),
+            (33, json!(format!("Closes {REPO}#30\nCloses {REPO}#29"))),
+            (35, Value::Null),
+        ] {
+            let mut pull = template.clone();
+            pull["number"] = json!(n);
+            pull["state"] = json!("open");
+            pull["body"] = json!(body);
+            replay.requests.push(json!({"request":{"get":format!("https://api.github.com/repos/{REPO}/pulls/{n}")},"answer":{"status":200,"link":null,"body":pull}}));
+            replay.requests.push(json!({"request":{"get":format!("https://api.github.com/repos/{REPO}/issues/{n}/comments?per_page=100&page=1")},"answer":{"status":200,"link":null,"body":[]}}));
+            for entry in &mut replay.requests {
+                if entry["request"]["get"]
+                    .as_str()
+                    .is_some_and(|p| p.contains("/issues/30/timeline?"))
+                {
+                    entry["answer"]["body"].as_array_mut().unwrap().push(json!({"event":"cross-referenced","source":{"issue":{"html_url":format!("https://github.com/{REPO}/pull/{n}"),"pull_request":{}}}}));
+                }
+            }
+        }
+        let facts = crate::pass::tests::facts(REPO, 31, "2026-10-23T00:00:00Z");
+        let at = key(&facts.issue);
+        let mut items = BTreeMap::from([(at.clone(), facts)]);
+        let unknown = crate::pass::tests::facts(REPO, 30, "2026-10-23T00:00:00Z");
+        let unknown_key = key(&unknown.issue);
+        items.insert(unknown_key.clone(), unknown);
+        let notices = crate::promote::handoff::enrich(&replay, &config, &mut items).unwrap();
+        assert_eq!(
+            notices,
+            [
+                (32, "handoff needs one deterministic source issue"),
+                (33, "handoff needs one deterministic source issue"),
+                (35, "missing source linkage")
+            ]
+            .map(|(n, why)| format!(
+                "needs-supervisor: promotion handoff {REPO}#{n}: {why}; skipped"
+            ))
+        );
+        assert!(matches!(items[&at].promotion, Some(Promotion::Open(_))));
+        assert_eq!(items[&unknown_key].promotion, Some(Promotion::Unknown));
+    }
+
     /// Scenario edits: source issue substituted into the recorded board, a
     /// closed fork and an open upstream. Replay rejects every attempted write.
     #[test]
@@ -871,6 +962,7 @@ mod tests {
             "unread",
             "retarget off-board",
             "retarget closed",
+            "removed source",
         ] {
             let mut replay = replay();
             let mut added = crate::pass::tests::replay();
@@ -941,6 +1033,13 @@ mod tests {
                 {
                     entry["answer"]["body"]["body"] = json!(format!("Part of {REPO}#32"));
                 }
+                if case == "removed source"
+                    && entry["request"]["get"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with("/pulls/34"))
+                {
+                    entry["answer"]["body"]["body"] = Value::Null;
+                }
                 if entry["request"]["get"]
                     .as_str()
                     .is_some_and(|p| p.ends_with("/pulls/70"))
@@ -986,6 +1085,40 @@ mod tests {
                         .lines
                         .iter()
                         .any(|l| l.starts_with(&format!("status {REPO}#31:"))),
+                    "{:?}",
+                    report.lines
+                );
+            } else if case == "removed source" {
+                assert!(
+                    report
+                        .holds
+                        .iter()
+                        .any(|h| h.hold.kind == HoldKind::Unreadable
+                            && h.line().contains("promotion handoff needs supervisor")),
+                    "{:?}",
+                    report.lines
+                );
+                assert!(
+                    !report
+                        .lines
+                        .iter()
+                        .any(|l| l.starts_with(&format!("status {REPO}#31:")))
+                );
+                assert_eq!(
+                    report
+                        .lines
+                        .iter()
+                        .filter(|l| l.starts_with(&format!(
+                            "needs-supervisor: promotion handoff {REPO}#34:"
+                        )))
+                        .count(),
+                    1
+                );
+                assert!(
+                    !report
+                        .lines
+                        .iter()
+                        .any(|l| l.starts_with("schedule error:")),
                     "{:?}",
                     report.lines
                 );
@@ -1260,6 +1393,41 @@ mod tests {
         );
         assert_eq!(board.writes.borrow().len(), 2);
         assert_eq!(report.failures, 1);
+    }
+
+    #[test]
+    fn status_read_defers_without_writes_at_each_budget_boundary() {
+        // Cover refusal before the first request and partway through the
+        // snapshot; there must be no derivation from a partial board.
+        for limit in WRITE_RESERVE..17 + WRITE_RESERVE {
+            let board = Board {
+                replay: replay(),
+                since: BTreeMap::new(),
+                writes: RefCell::new(vec![]),
+            };
+            let bounds = Bounds::new(limit, Instant::now() + Duration::from_secs(60));
+            let report = block(run_within(
+                &board,
+                &board,
+                &config(),
+                (
+                    State::default(),
+                    Mode::Local,
+                    Limits::default(),
+                    board.replay.now,
+                ),
+                &bounds,
+            ))
+            .unwrap();
+            assert_eq!(
+                stage(&report),
+                ["status deferred: budget"],
+                "limit {limit}: {:?}",
+                report.lines
+            );
+            assert!(board.writes.borrow().is_empty(), "limit {limit}");
+            assert!(!report.lines.iter().any(|l| l.starts_with("status error:")));
+        }
     }
 
     /// The recorded Status option's id.

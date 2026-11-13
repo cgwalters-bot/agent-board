@@ -1914,6 +1914,17 @@ unless given) refuse the stage whole: it writes none, prints each as
 pass over a board that drifted is looked at first and then let through
 once with a higher number.
 
+If the pass's request, GraphQL-point or time budget cannot finish the Status
+reads, it prints `status deferred: budget` without failing the pass or writing
+any Status changes from that partial read. Status is best-effort after scheduling,
+not reserved to run every pass; existing statuses remain until a later pass.
+Promotion handoffs with no unique source issue are skipped per PR, reported once
+as `needs-supervisor: promotion handoff OWNER/REPO#N: …; skipped`, and surfaced in
+the supervisor's `needs-supervisor` check. Receipt authentication and identity
+failures still refuse the board read rather than trusting unverified evidence.
+Issues named by an ambiguous candidate's timeline or surviving receipt stay
+unread for promotion: no replacement run starts and their Status is kept.
+
 The replay gate below is partly met: there is one recorded board, from 23
 October, with a synthetic usage snapshot and an empty whole-board read, and
 stage 3's reads of the epics tracker#596, #766 and #890 that evening appended
