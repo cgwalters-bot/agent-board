@@ -8713,13 +8713,8 @@ fn apply_stops_at_its_time_bound() {
             .contains(&"epics error: the pass's time bound (900 seconds) is spent".to_owned())
     );
     // Nor does the Status stage read the board.
-    let last = report.lines.last().unwrap();
-    assert!(
-        last.starts_with("status error: reading the whole board: ")
-            && last.ends_with("the pass's time bound (900 seconds) is spent"),
-        "{last}"
-    );
-    assert_eq!(report.failures, 3);
+    assert_eq!(report.lines.last().unwrap(), "status deferred: budget");
+    assert_eq!(report.failures, 2);
     assert!(forge.writes.borrow().is_empty());
 }
 
@@ -22047,8 +22042,9 @@ fn runs_past_the_budget_are_no_capacity() {
         "{error}"
     );
     assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
-    // The Status stage finds the budget spent too.
-    assert_eq!(report.failures, 2, "{:#?}", report.lines);
+    // The Status stage defers without adding another failure.
+    assert!(report.lines.contains(&"status deferred: budget".to_owned()));
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
 }
 
 /// [`CLOSE_QUERY`] reads the newest event of each kind on its own, so no

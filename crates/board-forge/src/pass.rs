@@ -2195,6 +2195,8 @@ pub struct ClosingPull {
 pub enum Promotion {
     Open(ClosingPull),
     Merged,
+    /// A timeline candidate's source is ambiguous; do not infer capacity.
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2463,6 +2465,12 @@ const PR_OPEN: [&str; 2] = ["pull request ", " is open"];
 /// operator's approval of its pull request, as the poll's merge gate does;
 /// labels not all read say nothing.
 fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> Option<Hold> {
+    if facts.promotion == Some(Promotion::Unknown) {
+        return Some(Hold::new(
+            HoldKind::Unreadable,
+            "promotion handoff needs supervisor",
+        ));
+    }
     // Revisits and triage follow-ups use this shared rule too, rather than
     // hold(); a verified delivery must not acquire another planning run.
     if facts.promotion == Some(Promotion::Merged) {
@@ -2686,6 +2694,8 @@ type ByStage = [usize; Stage::ALL.len()];
 /// What a pass may still spend, in requests and in time, both stages
 /// together, and what it spent.
 struct Bounds {
+    /// Per-item handoff notices, deduplicated across board reads and rechecks.
+    handoff_notices: RefCell<BTreeSet<String>>,
     /// Successful pass-local reads, reused only by the reporting stage, never
     /// by a start or merge recheck. Unlike decision reads, writes do not evict
     /// these observations: publication reports what the pass saw.
@@ -2755,6 +2765,7 @@ struct Bounds {
 impl Bounds {
     fn new(limit: usize, admit_by: Instant) -> Self {
         Self {
+            handoff_notices: RefCell::default(),
             publication_reads: RefCell::default(),
             publication_bytes: Cell::new(0),
             publication_runs: RefCell::default(),
@@ -3145,6 +3156,18 @@ impl std::fmt::Display for ShareSpent {
 
 impl std::error::Error for ShareSpent {}
 
+/// Admission stopped by the pass's request, time or GraphQL point budget.
+#[derive(Debug)]
+struct BudgetSpent(String);
+
+impl std::fmt::Display for BudgetSpent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BudgetSpent {}
+
 /// Every request through it spends one of the pass's budget, but a 304,
 /// which GitHub does not count, up to [`REVALIDATED_LIMIT`]. Reads leave
 /// the stages after the one under way what it keeps for them
@@ -3226,10 +3249,12 @@ impl<C> Budget<'_, C> {
         let now = Instant::now();
         let late = now > bounds.admit_by;
         let finishing = write || bounds.finishing.get();
-        ensure!(
-            !late || (finishing && now <= bounds.admit_by + Duration::from_secs(FINISH_SECONDS)),
-            "the pass's time bound ({PASS_SECONDS_LIMIT} seconds) is spent"
-        );
+        if late && !(finishing && now <= bounds.admit_by + Duration::from_secs(FINISH_SECONDS)) {
+            return Err(BudgetSpent(format!(
+                "the pass's time bound ({PASS_SECONDS_LIMIT} seconds) is spent"
+            ))
+            .into());
+        }
         let left = bounds.left.get();
         if bounds.stage.get() == Stage::Holds {
             let reserve = if write { 0 } else { WRITE_RESERVE };
@@ -3248,11 +3273,13 @@ impl<C> Budget<'_, C> {
             .into());
         }
         let floor = if write { 0 } else { WRITE_RESERVE };
-        ensure!(
-            left > floor,
-            "the pass's request budget ({}) is spent",
-            bounds.limit.get()
-        );
+        if left <= floor {
+            return Err(BudgetSpent(format!(
+                "the pass's request budget ({}) is spent",
+                bounds.limit.get()
+            ))
+            .into());
+        }
         if !write && bounds.reserved() {
             bounds.refused.set(bounds.refused.get() + 1);
             bail!(
@@ -3311,11 +3338,13 @@ impl<C> Budget<'_, C> {
     }
 
     fn spend_graphql(&self, mutation: bool, query: &str) -> Result<()> {
-        if let Some(limit) = self.bounds.graphql_limit.get() {
-            ensure!(
-                self.bounds.points.get() < limit,
+        if let Some(limit) = self.bounds.graphql_limit.get()
+            && self.bounds.points.get() >= limit
+        {
+            return Err(BudgetSpent(format!(
                 "the pass's estimated GraphQL point budget ({limit}) is spent"
-            );
+            ))
+            .into());
         }
         self.spend(mutation, &graphql_class(query))
     }
@@ -4281,6 +4310,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if let Err(error) = scheduler.status(&git_ref).await {
         scheduler.report.failures += 1;
         scheduler.line(format!("status error: {error:#}"));
+    }
+    for notice in bounds.handoff_notices.borrow().iter() {
+        scheduler.line(notice.clone());
     }
     // Stages 3 and 4's holds, unless either failed outright: they would be
     // partial.
@@ -6425,7 +6457,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             match connection["pageInfo"]["hasNextPage"].as_bool() {
                 Some(false) => {
-                    crate::promote::handoff::enrich(&self.client, config, &mut items)
+                    self.enrich_handoffs(&mut items)
                         .context("reading promotion handoff")?;
                     return Ok(BoardRead {
                         options: options.unwrap_or_default(),
@@ -6694,10 +6726,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn handoff(&self, facts: Facts) -> Result<Facts> {
         let at = key(&facts.issue);
         let mut items = BTreeMap::from([(at.clone(), facts)]);
-        crate::promote::handoff::enrich(&self.client, self.config, &mut items)
+        self.enrich_handoffs(&mut items)
             .context("rechecking promotion handoff")?;
         let facts = items.remove(&at).context("missing rechecked issue")?;
         Ok(facts)
+    }
+
+    fn enrich_handoffs(&self, items: &mut BTreeMap<String, Facts>) -> Result<()> {
+        let notices = crate::promote::handoff::enrich(&self.client, self.config, items)?;
+        self.client
+            .bounds
+            .handoff_notices
+            .borrow_mut()
+            .extend(notices);
+        Ok(())
     }
 
     /// Whether `item` reads as a pull request; not where it reads as

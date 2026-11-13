@@ -78,15 +78,18 @@ pub(super) fn success(
 }
 
 /// Enrich the existing per-pass facts. No new store, client or mutation path.
-/// A failure refuses the board read as a whole: scheduling cannot mistake an
-/// incomplete handoff scan for capacity, nor Status release an affected issue.
+/// Ambiguous source prose skips only that PR, with a diagnostic for the
+/// supervisor. Receipt authentication and live identity failures still refuse
+/// the read: unverified publication evidence is never authority.
 pub(crate) fn enrich(
     client: &(impl Rest + Transport),
     config: &Config,
     items: &mut BTreeMap<String, Facts>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut skipped = Vec::new();
+    let mut unknown = BTreeSet::new();
     let Some(settings) = config.promote.as_ref().filter(|_| enabled(config)) else {
-        return Ok(());
+        return Ok(skipped);
     };
     for (repo, target) in &settings.forks {
         if !items
@@ -104,7 +107,7 @@ pub(crate) fn enrich(
         // Source timelines retain historical cross-references after fork
         // closure or body edits. Bound relevant evidence, not the fork's entire
         // PR history; an incomplete source timeline still fails closed.
-        let mut candidates = BTreeSet::new();
+        let mut candidates: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
         for facts in items
             .values()
             .filter(|f| f.open && f.issue.repository.eq_ignore_ascii_case(repo))
@@ -122,13 +125,16 @@ pub(crate) fn enrich(
                     .context("missing handoff cross-reference URL")?;
                 let at = crate::parse_github_item(url, None, crate::github::DEFAULT_HOST)?;
                 if at.repository.eq_ignore_ascii_case(repo) {
-                    candidates.insert(at.number);
+                    candidates
+                        .entry(at.number)
+                        .or_default()
+                        .insert(crate::pass::key(&facts.issue));
                 }
             }
         }
         let mut seen = BTreeSet::new();
         let mut sources = BTreeSet::new();
-        for n in candidates {
+        for (n, linked) in candidates {
             let pull = get(client, &format!("repos/{repo}/pulls/{n}"))?;
             ensure!(pull["number"] == n, "handoff fork number mismatch");
             if !pull["user"]["login"]
@@ -137,9 +143,9 @@ pub(crate) fn enrich(
             {
                 continue;
             }
-            let body = pull["body"]
-                .as_str()
-                .context("handoff fork body unreadable")?;
+            // GitHub represents an absent description as null. It is no
+            // source linkage, not a failure to read the board.
+            let body = pull["body"].as_str().unwrap_or_default();
             let n = pull["number"]
                 .as_u64()
                 .filter(|n| *n > 0)
@@ -156,18 +162,9 @@ pub(crate) fn enrich(
                             .is_some_and(|b| b.contains(STATUS) || b.contains(FENCE))
                 })
                 .collect();
-            // A removed/ambiguous body link must not hide a surviving receipt.
-            // Comment content selects additional verification, never authority.
-            let relevant = !receipts.is_empty()
-                || items.values().any(|f| {
-                    f.open
-                        && f.issue.repository.eq_ignore_ascii_case(repo)
-                        && (crate::stack::closes(body, repo, f.issue.number)
-                            || crate::stack::part_of(body, repo, f.issue.number))
-                });
-            if !relevant {
-                continue;
-            }
+            // Timeline candidates remain relevant even after a body edit
+            // removes its links. Receipt content selects verification, never
+            // authority.
             ensure!(receipts.len() <= 1, "duplicate handoff records");
             // Authenticate and decode a surviving receipt before looking up
             // the live body's source. Retargeting that body off-board must
@@ -181,7 +178,27 @@ pub(crate) fn enrich(
             if record.is_none() && pull["state"] == "closed" {
                 continue;
             }
-            let issue = source(repo, &pull)?;
+            let issue = match source(repo, &pull) {
+                Ok(issue) => issue,
+                Err(error) => {
+                    // Missing prose cannot erase a surviving publication or
+                    // turn a historical cross-reference into spare capacity.
+                    // These facts authorize only a hold, never completion.
+                    unknown.extend(linked);
+                    if let Some(record) = &record {
+                        let at = crate::parse_github_item(
+                            &format!("{}#{}", record.source_repository, record.source_issue),
+                            None,
+                            crate::github::DEFAULT_HOST,
+                        )?;
+                        unknown.insert(crate::pass::key(&at));
+                    }
+                    skipped.push(format!(
+                        "needs-supervisor: promotion handoff {repo}#{n}: {error:#}; skipped"
+                    ));
+                    continue;
+                }
+            };
             if let Some(record) = &record {
                 ensure!(
                     record.schema == SCHEMA
@@ -295,7 +312,12 @@ pub(crate) fn enrich(
             }
         }
     }
-    Ok(())
+    for at in unknown {
+        if let Some(facts) = items.get_mut(&at) {
+            facts.promotion = Some(Promotion::Unknown);
+        }
+    }
+    Ok(skipped)
 }
 
 fn at_time(value: &Value, field: &str) -> Result<OffsetDateTime> {

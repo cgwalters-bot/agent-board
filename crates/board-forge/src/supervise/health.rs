@@ -38,6 +38,10 @@ pub const CHECKS: &[(&str, &str)] = &[
         "File one owning-repository bug per recurring pass error and request a fix.",
     ),
     (
+        "needs-supervisor",
+        "Inspect the per-item handoffs skipped by the newest pass; repair their source links before retrying promotion.",
+    ),
+    (
         "runs",
         "Inspect the timeout and cancel only after checking the run.",
     ),
@@ -124,7 +128,7 @@ pub const CHECKS: &[(&str, &str)] = &[
 ];
 
 /// The checks whose settings may be left out, reported "Not configured.".
-const OPTIONAL_CHECKS: &[&str] = &["release", "idle", "stuck", "capacity"];
+const OPTIONAL_CHECKS: &[&str] = &["release", "idle", "stuck", "capacity", "needs-supervisor"];
 /// A run still listed as unfinished after this long is left out of the runs
 /// check: GitHub has refused both cancel and force-cancel on such runs, so
 /// nothing can clear them and they would keep the check red for ever.
@@ -474,7 +478,7 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                 "unset" => items.iter().collect(),
                 "pass-errors" => items.iter().filter(|i| i["count"].as_u64().is_some_and(|n| n >= limits.poll_failures as u64)).collect(),
                 "signatures" | "stranded" | "main" | "needs-you" | "queue-aged" | "reviews"
-                | "apply-failures" | "stalls" => {
+                | "apply-failures" | "stalls" | "needs-supervisor" => {
                     items.iter().filter(|i| i["problem"] != false).collect()
                 }
                 _ => vec![],
@@ -533,6 +537,7 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             if [
                 "signatures",
                 "pass-errors",
+                "needs-supervisor",
                 "stranded",
                 "main",
                 "needs-you",
@@ -1900,6 +1905,19 @@ pub fn collect(
     });
     capture("pass-errors", &|o| {
         c.pass_error_signatures(got(o, "poll").as_deref())
+    });
+    capture("needs-supervisor", &|o| {
+        let passes = c.passes(got(o, "poll").as_ref())?;
+        let notices: Vec<Value> = passes.first().and_then(|p| p["lines"].as_array())
+            .into_iter().flatten().filter_map(Value::as_str)
+            .filter(|line| line.starts_with("needs-supervisor: promotion handoff "))
+            .map(|line| json!({"cause":"needs-supervisor", "reason":line, "html_url":passes[0]["html_url"]}))
+            .collect();
+        ensure!(
+            notices.len() <= s.limits.max_items,
+            "handoff notices truncated"
+        );
+        Ok(notices)
     });
     capture("runs", &|_| {
         let mut all = vec![];

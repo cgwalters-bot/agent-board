@@ -985,6 +985,7 @@ fn collector_reads_scheduler_logs_records_runs_annotations_and_pull_requests() {
             "2026-10-15T11:50:32.1Z example/project#5 (epic example/project#1) skip: plan https://github.com/example/project/issues/5#issuecomment-1 was dispatched already, https://github.com/example/project/issues/5#issuecomment-2".to_owned(),
             format!("2026-10-15T11:50:41.4Z \x1b[0m{}", if idle { "idle: 7 slot(s) free and nothing started; skipped: plan was dispatched already 1" } else { "1 dispatched" }),
             "2026-10-15T11:51:20.7Z example/project#1 idle: minimum planning interval has not elapsed".to_owned(),
+            "2026-10-15T11:51:21.7Z needs-supervisor: promotion handoff example/project#12: handoff needs one deterministic source issue; skipped".to_owned(),
         ]
         .join("\n")
     };
@@ -1140,6 +1141,12 @@ fn collector_reads_scheduler_logs_records_runs_annotations_and_pull_requests() {
         ]
     );
     let url = |id: u64| format!("https://github.com/example/control/actions/runs/{id}");
+    assert_eq!(checks["needs-supervisor"]["status"], "fail");
+    assert_eq!(checks["needs-supervisor"]["evidence"], json!([url(31)]));
+    assert_eq!(
+        checks["needs-supervisor"]["signatures"][0]["cause"],
+        "needs-supervisor"
+    );
     assert_eq!(checks["idle"]["status"], "fail");
     assert_eq!(checks["idle"]["evidence"], json!([url(31), url(32)]));
     assert_eq!(checks["stuck"]["status"], "fail");
