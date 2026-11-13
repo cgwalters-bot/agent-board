@@ -2927,6 +2927,19 @@ mod tests {
                         text(input, "/task").contains("post nothing to the pull request"),
                         "{case}: {input}"
                     );
+                    let task = text(input, "/task");
+                    assert!(
+                        task.contains("link any fork issue from your report"),
+                        "{case}: {input}"
+                    );
+                    assert!(
+                        task.contains("post its implement plan there"),
+                        "{case}: {input}"
+                    );
+                    assert!(
+                        !task.contains("The result stays on that issue"),
+                        "{case}: {input}"
+                    );
                     // Claims and dispatch records belong to the tracking issue.
                     // Only the existing bounded acknowledgement may touch source.
                     for (path, body) in fake.writes.borrow().iter() {

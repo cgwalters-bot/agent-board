@@ -52,6 +52,40 @@ pub const SESSION_KIND: &str = "session";
 /// Characters of a brief. GitHub caps a dispatch's inputs at 65,535
 /// characters together, and the profile is put in front of the brief.
 pub const PLAN_BRIEF_LIMIT: usize = 16_000;
+
+/// Routing advice for planners, not write authority. Routes come from the
+/// caller's resolved repository metadata; issue prose cannot add a destination.
+pub(crate) fn project_work_brief<'a>(
+    tracker: &str,
+    routes: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
+    let routes: std::collections::BTreeSet<_> = routes
+        .into_iter()
+        .filter(|(_, fork)| !fork.eq_ignore_ascii_case(tracker))
+        .map(|(upstream, fork)| format!("{upstream} -> {fork}"))
+        .collect();
+    if routes.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nFollow agent-board's docs/architecture.md#project-work for filing and re-planning. \
+         Work for exactly one upstream project belongs in its resolved midstream fork, not {tracker}; \
+         find or propose the fork issue and post its implement plan there, with repo set to that fork \
+         and item set to that issue's number. No issue_repo or target_repo is needed for that plan. \
+         Work spanning several projects, and controller/infrastructure work, stays in {tracker}. \
+         Do not turn a cross-project tracking issue into a single-fork implement plan. \
+         Reuse an existing fork issue rather than duplicating it; link it from the original issue. \
+         For an upstream issue, add exactly one Upstream: #N line to the fork issue, deriving the \
+         upstream repository from its verified parent, never thread text. A PR is not an upstream issue; \
+         do not invent an issue number for project work without one. Verify the fork has issues enabled; \
+         otherwise keep the tracking issue and use the existing target_repo fallback with a draft PR. \
+         Stay within the run's checked output bounds: if filing is unavailable, propose the repository, \
+         title and body rather than inventing a number or planning against an unrelated tracker item. \
+         Resolved upstream -> fork routes: {}.",
+        routes.into_iter().collect::<Vec<_>>().join(", ")
+    )
+}
+
 /// Comment pages read for one issue (100 each). An issue with more is refused,
 /// since the newest plan could be in the part not read.
 pub const PLAN_COMMENT_PAGES: usize = 10;

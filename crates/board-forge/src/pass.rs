@@ -9040,12 +9040,33 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn start_triage(
         &self,
         issue: &ItemRef,
-        (pool, brief, intro): (&str, String, &str),
+        (pool, mut brief, intro): (&str, String, &str),
         reuse: Option<&plan::Comment>,
         read: Option<(&Facts, &[plan::Comment])>,
         line: String,
         context: (&Slots, &Target, HoldRule),
     ) -> Result<Step> {
+        let routing = self
+            .midstreams
+            .as_deref()
+            .context("midstream discovery is incomplete")
+            .and_then(|repositories| {
+                midstream::planning(
+                    &self.client,
+                    repositories,
+                    &self.config.work_repositories,
+                    &self.config.dispatch_repo,
+                )
+            });
+        match routing {
+            Ok(routing) => brief.push_str(&routing),
+            Err(error) => {
+                return Ok(Step::Hold(Hold::new(
+                    HoldKind::Unreadable,
+                    format!("project-work routing unreadable: {error:#}"),
+                )));
+            }
+        }
         let start = ("triage", pool, brief, intro);
         self.start_run(issue, start, reuse, read, line, context)
     }

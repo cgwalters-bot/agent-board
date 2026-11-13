@@ -11001,6 +11001,65 @@ fn plan_brief(body: &str) -> String {
 }
 
 #[test]
+fn triage_routes_project_work_using_resolved_forks() {
+    for (name, forks, expected) in [
+        ("off", vec![], vec![]),
+        (
+            "one fork",
+            vec![("cgwalters-forge/app", "source/app")],
+            vec!["source/app -> cgwalters-forge/app"],
+        ),
+        (
+            "several forks",
+            vec![
+                ("cgwalters-forge/app", "source/app"),
+                ("cgwalters-forge/other", "source/other"),
+            ],
+            vec![
+                "source/app -> cgwalters-forge/app",
+                "source/other -> cgwalters-forge/other",
+            ],
+        ),
+        (
+            "infrastructure",
+            vec![("cgwalters-forge/tracker", "source/tracker")],
+            vec![],
+        ),
+    ] {
+        // No promotion configuration is involved: the verified parent is the
+        // route even when an explicit promotion override would name another.
+        let mut recorded = replay();
+        let repositories: Vec<String> = forks.iter().map(|(fork, _)| (*fork).into()).collect();
+        for (fork, upstream) in forks {
+            recorded.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{fork}")},
+                "answer":{"status":200,"body":{"full_name":fork,"fork":true,"parent":{"full_name":upstream}}}}));
+        }
+        let brief = midstream::planning(
+            &recorded,
+            &repositories,
+            &repositories,
+            "cgwalters-forge/tracker",
+        )
+        .unwrap();
+        assert_eq!(
+            brief.contains("#project-work"),
+            !expected.is_empty(),
+            "{name}: {brief}"
+        );
+        for route in &expected {
+            assert!(brief.contains(route), "{name}: {brief}");
+        }
+        if !expected.is_empty() {
+            assert!(brief.contains("Work spanning several projects, and controller/infrastructure work, stays in cgwalters-forge/tracker"), "{name}: {brief}");
+            assert!(
+                brief.contains("post its implement plan there, with repo set to that fork"),
+                "{name}: {brief}"
+            );
+        }
+    }
+}
+
+#[test]
 fn operator_ask_policy_keeps_its_domains_and_defaults_to_no_delegation() {
     let example = tracker_operator_ask();
     let mut cases = vec![("absent", None, None, true)];
@@ -21398,6 +21457,28 @@ fn notification_routes_require_verified_unambiguous_fork_parents() {
             let routes = routes.unwrap();
             assert_eq!(routes.staging["upstream/project"], staging);
             assert_eq!(routes.forks["upstream/project"], "o/fork");
+        }
+        let advice = midstream::planning(
+            &recorded,
+            &["o/fork".into()],
+            &["o/fork".into()],
+            "o/tracker",
+        );
+        assert_eq!(advice.is_ok(), valid, "{status} {body}: {advice:?}");
+        if valid {
+            let advice = advice.unwrap();
+            assert_eq!(
+                advice.contains("upstream/project -> o/fork"),
+                body["fork"] == true
+            );
+            if body["has_issues"] == false {
+                assert!(advice.contains("existing target_repo fallback"));
+            }
+            assert!(
+                midstream::planning(&recorded, &["o/fork".into()], &[], "o/tracker")
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
     let mut recorded = replay();
