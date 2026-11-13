@@ -4242,6 +4242,24 @@ fn replay_scenarios() {
             0,
         ),
         (
+            "pull requests pace by banked resets from the fresh reading",
+            Box::new(|r, c| {
+                r.now += time::Duration::minutes(45);
+                with_broker(r, c, json!({"body": usage::tests::broker()}));
+                c["pools"] = json!({"claude": {"target": 0.95, "burst": 95},
+                    "openai": {"target": 0.95, "burst": 3,
+                        "resets": [{"expires": "2026-10-24T00:00:00Z"}]}});
+                followed_draft(r, c);
+            }),
+            vec![
+                "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1)",
+                "pools: openai speed 41.4x: 1 banked resets, first expires 2026-10-24T00:00:00Z",
+                "pools: claude normal 18% used of 145% allowed, openai normal 3% used of 99% allowed",
+            ],
+            6,
+            0,
+        ),
+        (
             "a speed override reaches dispatch from a real non-held broker reading",
             Box::new(|r, c| {
                 with_broker(r, c, json!({"body": usage::tests::broker()}));
@@ -18734,6 +18752,7 @@ fn room_table() {
     let settings = PoolSettings {
         target: 0.95,
         burst: 0.0,
+        resets: vec![],
     };
     // A week's window half gone: pace allows 47.5 points.
     let entry = json!({"observed_at": "2026-10-23T11:00:00Z", "used_percent": 40.0, "window_minutes": 10080,
@@ -18822,6 +18841,7 @@ fn room_table() {
             PoolSettings {
                 target: 1.0,
                 burst: 0.0,
+                resets: vec![],
             },
         ),
     ]);

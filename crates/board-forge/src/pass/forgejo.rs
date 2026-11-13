@@ -1999,7 +1999,9 @@ fn refresh<B: Broker>(
     report
         .lines
         .push(format!("usage: {}", usage::pools(&snapshot).join("; ")));
-    Ok(Some(config.pace.apply(snapshot, now)))
+    let snapshot = resets::apply(config, snapshot, now);
+    report.lines.extend(resets::lines(config, &snapshot, now));
+    Ok(Some(snapshot))
 }
 
 #[cfg(test)]

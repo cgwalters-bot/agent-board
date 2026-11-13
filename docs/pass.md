@@ -735,6 +735,44 @@ decision, `hold` and a `reason` (null unless held), and a paced one its
 holds, so the review app shows that rather than its own. A recording keeps the
 broker's answer under no address.
 
+#### Banked reset pacing (draft)
+
+`pools.<pool>.resets` is absent by default. Each entry names an RFC 3339
+`expires`; optional `useAt` names when the operator plans to press it, before
+expiry. For example, to spend the current week before Sunday starts in UTC:
+
+```json
+{"pools":{"openai":{"target":0.95,"burst":50,"resets":[
+  {"expires":"2026-11-30T20:15:00Z","useAt":"2026-11-15T00:00:00Z"},
+  {"expires":"2026-12-01T22:45:00Z"},
+  {"expires":"2026-12-12T22:41:00Z"}
+]}}}
+```
+
+For each future expiry, in order, pacing divides the current window's remaining
+capacity, plus one full window per natural reset strictly before that expiry,
+plus the banked resets through that entry, by the time remaining. The largest
+rate relative to one window per window length wins, never below 1. A future
+`useAt` adds a deadline for the capacity *preceding* that reset; it does not
+count the reset's own capacity before the operator presses it. Expired entries
+and past planned-use deadlines do not contribute a rate. There are at most 32
+entries per pool; duplicate expiry instants and invalid dates are refused.
+
+This uses the same multiplied allowance as `pace.speed`, for the pass and its
+pull request follow-up alike, but never holds a pool the configured pace leaves
+open, by burst say. A live explicit override still wins. Provider exhaustion (including a short window), unknown
+holds, missing usage and broker grants remain binding. The `pools:` line prints
+the factor, count and earliest expiry, or says the speed is unavailable. A dollar
+budget currently holding work is reported without publishing its amount. No
+configured WIP, dispatch or request cap is raised.
+
+This is an incomplete slice of #940, not ready for caller activation. #781's
+checkbox-resolution mechanism is not implemented yet. Reset asks, recording used
+resets, once-only wasted-reset logging, predictive budget warnings and throughput
+cap evidence remain to be integrated. In particular, do not leave a consumed reset
+in an activated config without used-reset accounting: this slice would count it
+as capacity until expiry. It never presses a provider reset automatically.
+
 The broker learns a pool's windows only from the responses to requests made
 through it, so after a restart a held pool would never get a reading. With
 `usage.probe`, a pool with no reading whose count of requests in the broker's
