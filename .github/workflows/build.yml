@@ -4,9 +4,9 @@ on:
   workflow_call:
     inputs:
       release:
-        description: Tag recorded in the manifest
+        description: Optional tag recorded in the manifest
         type: string
-        default: TAG
+        default: ''
 permissions:
   contents: read
 env:
@@ -32,7 +32,7 @@ jobs:
             "dist/$name-$TARGET" --version
           done
           (cd dist && sha256sum agent-board-* gh-agent-board-*) > dist/SHA256SUMS
-      # An attested manifest binds the commit and tag to both binary digests.
+      # An attested manifest binds the commit and optional tag to both digests.
       - name: Manifest
         env:
           RELEASE: ${{ inputs.release }}

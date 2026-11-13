@@ -148,64 +148,64 @@ the CLI creates, Forgejo writes and dispatch, and GitLab.
 ## Install and build today
 
 Source installation remains available to developers ([setup](setup.md#install)).
-Tracker's normal `just build-agent-board` now downloads and verifies the
+Tracker's existing `just build-agent-board` downloads and verifies the
 `build-<AGENT_BOARD_REV>` prerelease; it no longer compiles or falls back to source.
 [Tracker#956 / #1164](https://github.com/cgwalters-forge/tracker/pull/1164),
 [`469ac2c`](https://github.com/cgwalters-forge/tracker/commit/469ac2c5a312b6a890b531ec851a56d1ab4238df),
 migrated the shared installer and bump selection. Its receipt reports a real
 5.573-second verified install and version smoke check, not scheduled recurrence.
-Current tracker pins `7ecc57cec045ce1be7798a92fd00a0168513327c` and requires
-published, verified assets before proposing a bump. [Tracker#1167](https://github.com/cgwalters-forge/tracker/issues/1167)
+That installer requires published, verified release assets before proposing a
+bump and must migrate to the artifact contract below. [Tracker#1167](https://github.com/cgwalters-forge/tracker/issues/1167)
 remains open: provision the binary in the actual session agent (not only its profile
 job), add real signed negative-verification cases and nonempty token-isolation
-sentinels, and correct the inherited bump-token documentation. Do not reopen the
-producer or claim that the closed migration issue proves those follow-ups.
+sentinels, and correct the inherited bump-token documentation. The artifact
+producer change does not establish those follow-ups.
 
 CI's `rust` job runs
 `just check` and the CLI against the fixture on every pull request and on
-main. CI also builds the static release target and publishes
-[commit prereleases](#commit-prereleases) for green main pushes.
+main. CI also builds the static release target and uploads
+[main CI artifacts](#main-ci-artifacts) for green main pushes.
 [Setup](setup.md#download-and-verify-a-release) documents versioned release
-verification and [commit verification](setup.md#download-and-verify-a-commit-prerelease).
+verification and [CI artifact verification](setup.md#download-and-verify-a-main-ci-artifact).
 
-## Commit prereleases
+## Main CI artifacts
 
-[Issue #614](https://github.com/cgwalters-forge/agent-board/issues/614)'s producer
-merged in [#615](https://github.com/cgwalters-forge/agent-board/pull/615),
-[`6b2d361`](https://github.com/cgwalters-forge/agent-board/commit/6b2d36182b4e53cf5b9c74771e87b86c5ad65939).
-For example, the observed source snapshot has a
-[published commit prerelease](https://github.com/cgwalters-forge/agent-board/releases/tag/build-c343eae54bf4ddb8bc60e870c5509040b043f45a)
-with the five assets below. This is artifact delivery, not v1 or live stage evidence.
+[CI](../.github/workflows/ci.yml) uploads `agent-board-main` after its `ci`
+sentinel succeeds on a push to main: specs, Rust, workflow lint, static build and
+Forgejo must all pass. A separate OIDC job checks binary checksums, attests
+`release.json`, verifies the provenance without a token and uploads both static
+binaries, `SHA256SUMS`, `release.json` and `provenance.jsonl` together. The manifest
+keeps schema `agent-board.release.v1` with an empty `tag` for CI builds. Versioned
+manual releases still record their tag.
 
-[CI](../.github/workflows/ci.yml) publishes `build-<full 40-character commit>`
-after its `ci` sentinel succeeds on a push to main: specs, Rust, workflow lint,
-static build and Forgejo must all pass. PR and merge-group runs never publish.
-Each main commit has its own concurrency group so a newer push does not cancel
-an older green commit's publication. No extra build or version bump is needed;
-`release.yml` remains the manual path for versioned releases.
+The intermediate `agent-board` artifact exists on PR/merge-group runs too; it
+is **not** the consumer bundle. Only main pushes can upload `agent-board-main`.
+The OIDC job never checks out or executes project code or a built binary. CI no
+longer has `contents: write` and creates no tags or releases. Each main SHA keeps
+its own concurrency group so subsequent pushes do not cancel its upload.
 
-CI passes the commit tag to [build.yml](../.github/workflows/build.yml), then a
-separate job attests its `release.json` manifest and verifies the bundle without
-a token. Only the publishing job has `contents: write`; neither it nor the OIDC
-job checks out or executes project code. It creates the tag explicitly at the
-tested SHA and publishes the two static binaries, `SHA256SUMS`, `release.json`
-and `provenance.jsonl` as a prerelease with `--latest=false`. This avoids giving
-PR code publishing credentials or mistaking a moving main ref for the tested
-commit. The [caller verification recipe](setup.md#download-and-verify-a-commit-prerelease)
-binds the manifest to CI on main and an independently pinned commit before
-checking the binary digests; checksums alone do not establish authenticity.
+Consumers select the latest successful main push run of `ci.yml`, capture its
+run ID and head SHA, and download `agent-board-main` from that exact run. They
+verify CI's main-branch attestation against that SHA, check manifest identity and
+checksums, and log the selected SHA before executing. This stops substitution of
+PR, other-workflow or different-commit bytes; checksums alone cannot do that.
+See the [download recipe](setup.md#download-and-verify-a-main-ci-artifact), including
+the optional manual `AGENT_BOARD_REV` rollback pin. No new runtime security option
+or automatic pin PR is needed.
 
-Existing tags/releases are never overwritten: rerunning publication fails if
-the tag already exists. If a failure leaves a tag or draft, a maintainer must
-inspect it and remove the incomplete release/tag before rerunning. Restrict
-`build-*` tag creation with a ruleset to limit who can impersonate this naming
-scheme; caller attestation verification remains necessary.
+Artifact retention is requested at 90 days, subject to repository/organization
+limits. Missing, expired or deleted artifacts fail closed, including rollback
+pins; no backfill or alternative installer is added. Existing `build-*` tags and
+releases are left alone; deletion is separate cleanup. If retention failures or
+Actions API rate limits actually disrupt consumers, revisit a roughly weekly
+real GitHub release. That is a documented fallback trigger, not a schedule or
+second delivery mechanism implemented now. `release.yml` remains manual-only.
 
-There is **no automatic pruning** of these prereleases or their tags. They stay
-available for pinned callers even after Actions artifacts expire. Manual removal
-can break those callers; check deployed pins before removing any. Commits before
-this workflow was installed, failed/cancelled CI runs and failed publication do
-not gain a release. No backfill or cleanup job is added here.
+Tracker migration is still required: its shared `Justfile` installer must use
+this contract for poll, promote and supervisor, defaulting to latest successful
+main and reserving `AGENT_BOARD_REV` for explicit rollback. Disable the automatic
+`agent-board-pin.yml` bump workflow in that consumer change. This producer change
+alone does not migrate tracker or establish a live verified artifact install.
 
 ## Manual release path
 

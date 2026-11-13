@@ -12,7 +12,7 @@ GitHub; see [forges](forges.md) for Forgejo and GitLab.
 
 Building agent-board needs Rust supporting edition 2024. The
 [manual release path](release.md#manual-release-path) provides versioned Linux
-x86_64 static binaries; [commit prereleases](release.md#commit-prereleases)
+x86_64 static binaries; [main CI artifacts](release.md#main-ci-artifacts)
 provide the same assets for green main commits. It is not installable with
 `gh extension install`.
 
@@ -57,31 +57,56 @@ does not remove the need for the system CA store described above. Callers still
 build from source until their own reviewed configuration adopts release downloads;
 this workflow does not change tracker or enroll agent-board in the release train.
 
-### Download and verify a commit prerelease
+### Download and verify a main CI artifact
 
-Pin a reviewed full 40-character commit independently of downloaded assets, for
-example the caller's `AGENT_BOARD_REV`. Set `COMMIT` to that pin, not current main.
-The tag is `build-$COMMIT`; never resolve Latest to select a pinned build. In an
-empty directory, use a recent GitHub CLI, jq and sha256sum:
+Select the latest successful **push to main** of `ci.yml`, not the latest run of
+any workflow or a PR artifact. For rollback, optionally set `AGENT_BOARD_REV` to
+a reviewed full 40-character SHA; otherwise leave it unset. In an empty directory,
+use a recent GitHub CLI, jq and sha256sum. Run these commands with Bash's
+`set -euo pipefail`. Select once and keep that run ID and head SHA together
+throughout verification (do not resolve moving main again):
 
 ```sh
 REPO=cgwalters-forge/agent-board
-TAG="build-$COMMIT"
-gh release download "$TAG" --repo "$REPO" --pattern '*-x86_64-unknown-linux-musl' --pattern SHA256SUMS --pattern release.json --pattern provenance.jsonl
+pin=()
+if [ -n "${AGENT_BOARD_REV:-}" ]; then
+  [[ "$AGENT_BOARD_REV" =~ ^[0-9a-f]{40}$ ]] || exit 1
+  pin=(--commit "$AGENT_BOARD_REV")
+fi
+gh run list --repo "$REPO" --workflow ci.yml --branch main --event push --status success --limit 1 "${pin[@]}" --json databaseId,headSha > run.json
+jq -e 'length == 1 and (.[0].headSha | test("^[0-9a-f]{40}$"))' run.json
+```
+
+Download only the verified bundle `agent-board-main`, not the intermediate
+`agent-board` build artifact. The attestation prevents substitution of a binary
+from another workflow, branch or commit, including untrusted PR builds:
+
+```sh
+RUN=$(jq -r '.[0].databaseId' run.json)
+COMMIT=$(jq -r '.[0].headSha' run.json)
+printf 'agent-board: run %s, SHA %s\n' "$RUN" "$COMMIT"
+gh run download "$RUN" --repo "$REPO" --name agent-board-main
 GH_TOKEN='' GITHUB_TOKEN='' gh attestation verify release.json --bundle provenance.jsonl --repo "$REPO" \
   --cert-identity "https://github.com/$REPO/.github/workflows/ci.yml@refs/heads/main" \
   --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
-jq -e --arg repo "$REPO" --arg tag "$TAG" --arg commit "$COMMIT" \
-  '.schema == "agent-board.release.v1" and .repository == $repo and .tag == $tag and .commit == $commit and .target == "x86_64-unknown-linux-musl"' release.json
+jq -e --arg repo "$REPO" --arg commit "$COMMIT" \
+  '.schema == "agent-board.release.v1" and .repository == $repo and .tag == "" and .commit == $commit and .target == "x86_64-unknown-linux-musl"' release.json
+```
+
+Only after the manifest verifies, check the downloaded binary digests:
+
+```sh
 jq -rj '.sha256sums' release.json > attested-SHA256SUMS
 cmp SHA256SUMS attested-SHA256SUMS
 sha256sum --check attested-SHA256SUMS
 ```
 
-Stop on any failure; only then install as above. This policy accepts only CI's
-main-branch attestation for the pinned commit, not the manual release workflow's
-identity. A missing release means publication has not succeeded (or was removed);
-it is not permission to use a different commit or an unverified binary.
+Stop on any failure; only then install as above. Callers need a token able to
+read this repository's Actions artifacts; attestation verification itself uses
+the included offline bundle with no token. A missing or expired artifact fails
+the install: do not fall back to another SHA, an old `build-*` release, source
+compilation or unverified bytes. The rollback SHA must have a retained successful
+run using this artifact format.
 
 ## Development checks
 
