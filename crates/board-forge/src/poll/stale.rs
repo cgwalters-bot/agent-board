@@ -52,6 +52,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // the change request the read ends on. A hold is a person's
         // (agent-board#562): silence there is not leave to act.
         if days == 0
+            || stop.missing_data_run.is_some()
             || !stop.stopped
             || !labelled(pull)
             || is_held(pull)

@@ -10,6 +10,36 @@ the caller's dispatch workflow ([dispatch](dispatch.md)).
 
 ## One pass
 
+### Missing-data recovery holds
+
+The concrete failure prevented is spending another fix or continuation round on
+an unchanged head after its run explicitly handed back missing required data.
+`pr.holdMissingData: true` in pass (`holdMissingData: true` in standalone poll)
+enables this hold; it is off by default. This does not prevent the first dispatch
+from prose, authorize a branch refresh, or turn a failed workflow into success.
+
+The bot-owned round marker must bind the current PR head to the exact completed,
+failed caller run in the configured dispatch repository, dispatched on `main`.
+The reader fetches that run attempt's jobs and only the failed
+`run / apply / apply` job's same-repository check annotations. It requires the exact
+standard agentic-job missing-data failure annotation. PR prose, agent comments,
+other jobs and other attempts are not evidence. There are at most two additional
+fresh reads per eligible PR, each capped at one 100-entry page within the poll's
+request budget; incomplete or unreadable responses stop processing that PR rather
+than authorize recovery. Missing or nonmatching evidence retains existing policy.
+
+The existing `needs-human` label (or operator-review request for ready PRs with
+`assignHolds`) and stopped marker hold the PR before reruns, outage refunds, stale
+recovery or `unstall` continuations. Later passes, including cold restarts, use
+that durable hold. Existing explicit label-removal and operator-answer/review
+release gates still apply; a changed head is not classified by the old run.
+No workflow semantics, permissions, approval gates or recovery budgets change.
+
+Regression replays use the apply annotations from tracker runs `43244188959` and
+`43158561643` with a synthetic poll snapshot. They are not hosted acceptance or a
+live dispatch test. Deployment requires tracker `.github/pass.json` key
+`pr.holdMissingData` set to `true`; no caller configuration is changed here.
+
 ### Declared PR dependencies (first slice of #936)
 
 The concrete failure prevented is spending review and recovery rounds on a head

@@ -97,6 +97,10 @@ const REVIEW_EVENT: &str = "pull_request_target";
 /// The event of the review job's runs the pass starts itself, with
 /// [`PollPolicy::review_pools`]; see [`reviews_head`].
 const DISPATCH_EVENT: &str = "workflow_dispatch";
+/// The trusted agentic-job apply failure, not arbitrary text from an agent.
+const MISSING_DATA_ANNOTATION: &str =
+    "the run handed back no result because required data was missing; see the run summary";
+const MISSING_DATA_PAGE_LIMIT: usize = 100;
 /// Where a repository's workflows are, as a run's `path` gives them.
 const WORKFLOWS_DIR: &str = ".github/workflows/";
 /// The connections of `PULL_QUERY` the decision reads as whole. One that is not
@@ -555,6 +559,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "operatorPaths",
     "staleDays",
     "holdDependencies",
+    "holdMissingData",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -747,6 +752,11 @@ pub struct PollPolicy {
     /// is; and a draft whose continuation is used up or failed gets one fresh
     /// continuation round on another pool before its stop. Off by default.
     pub unstall: bool,
+    /// Stop repeated recovery spending after an exact-run missing-data handback.
+    /// Off by default; only the trusted apply job's annotation is evidence.
+    pub hold_missing_data: bool,
+    /// The caller's dispatch workflow, including during previews.
+    pub fix_caller_workflow: Option<String>,
     /// The pass's `pr.directionFirst` (agent-board#840): the operator's
     /// direction (the `operatorComments` search or the pass's intake, then
     /// `notifications`) is read before the followed repositories' activity
@@ -1048,6 +1058,8 @@ pub const OPERATOR_PATHS_LIMIT: usize = 50;
 #[serde(rename_all = "camelCase")]
 pub struct PrOptions {
     #[serde(default)]
+    pub hold_missing_data: bool,
+    #[serde(default)]
     pub hold_dependencies: bool,
     #[serde(default)]
     pub action_first: bool,
@@ -1182,6 +1194,7 @@ impl PrOptions {
     /// Sets these in `policy`.
     pub fn apply(&self, policy: &mut PollPolicy) {
         let Self {
+            hold_missing_data,
             hold_dependencies,
             action_first,
             check_reruns,
@@ -1200,6 +1213,7 @@ impl PrOptions {
             stale_days,
         } = self.clone();
         policy.hold_dependencies = hold_dependencies;
+        policy.hold_missing_data = hold_missing_data;
         policy.action_first = action_first;
         policy.check_reruns = check_reruns;
         policy.unstall = unstall;
@@ -1333,6 +1347,8 @@ impl PollPolicy {
             stale_days: 0,
             check_reruns: false,
             unstall: false,
+            hold_missing_data: false,
+            fix_caller_workflow: None,
             direction_first: false,
             owner_branches: false,
             fix_plans: false,
@@ -2645,6 +2661,8 @@ pub struct Marker {
     pub at: Option<String>,
     /// Written next to the label; with the label gone, someone took it off.
     pub stopped: bool,
+    /// A missing-data stop requires explicit release, never stale recovery.
+    pub missing_data_run: Option<u64>,
     pub pool: Option<String>,
     /// What the poll last did about the merge queue, where it owns it.
     pub queue: Option<QueueState>,
@@ -2806,6 +2824,9 @@ impl Marker {
         if self.stopped {
             state["stopped"] = true.into();
         }
+        if let Some(run) = self.missing_data_run {
+            state["missing_data_run"] = run.into();
+        }
         if let Some(pool) = &self.pool {
             state["pool"] = pool.clone().into();
         }
@@ -2959,6 +2980,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
             run: state["run"].as_u64().filter(|r| *r > 0),
             at: state["at"].as_str().map(str::to_owned),
             stopped: state["stopped"].as_bool().unwrap_or(false),
+            missing_data_run: state["missing_data_run"].as_u64().filter(|id| *id > 0),
             pool: state["pool"].as_str().map(str::to_owned),
             queue: QueueState::from_json(&state["queue"]),
             // More than any cap reads as the cap reached, not as none used.
@@ -5408,6 +5430,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             checks_from: marker.checks_from.clone(),
             sha: Some(head.to_owned()),
             stopped: true,
+            missing_data_run: marker.missing_data_run,
             queue: marker.queue.as_ref().map(|q| QueueState {
                 seen: q.seen.clone(),
                 ..QueueState::default()
@@ -5777,6 +5800,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             run: None,
             at: Some(self.now.replace_nanosecond(0)?.format(&Rfc3339)?),
             stopped: false,
+            missing_data_run: None,
             pool: pool.clone(),
             queue: marker.queue.clone(),
             continued: if continuing { round } else { carried.continued },
@@ -7363,6 +7387,80 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         })
     }
 
+    /// Two bounded fresh reads, only for an unchanged head's recorded failed
+    /// run. The bot-owned marker binds the PR head to the caller run; its
+    /// workflow SHA is the caller's, not the PR's. No comment text is evidence.
+    fn missing_data(&mut self, marker: &Marker, run: &Value) -> Result<bool> {
+        let Some(id) = marker.run else {
+            return Ok(false);
+        };
+        let repo = self.config.dispatch_repo.clone();
+        let workflow = self.apply.as_ref().map(|a| a.workflow.as_str()).or(self
+            .config
+            .policy
+            .fix_caller_workflow
+            .as_deref());
+        if run["id"].as_u64() != Some(id)
+            || run["repository"]["full_name"] != repo
+            || run["event"] != DISPATCH_EVENT
+            || run["head_branch"] != DISPATCH_REF
+            || !workflow.is_some_and(|w| run["path"] == format!("{WORKFLOWS_DIR}{w}"))
+            || run["status"] != "completed"
+            || run["conclusion"] != "failure"
+        {
+            return Ok(false);
+        }
+        let attempt = run["run_attempt"]
+            .as_u64()
+            .context("missing-data run attempt")?;
+        ensure!(attempt > 0, "invalid missing-data run attempt");
+        let (jobs, next) = self.get_url(
+            &format!("{API_ROOT}repos/{repo}/actions/runs/{id}/attempts/{attempt}/jobs?per_page={MISSING_DATA_PAGE_LIMIT}"),
+            Value::clone,
+            true,
+        )?;
+        let jobs_list = jobs["jobs"]
+            .as_array()
+            .context("missing-data jobs are not an array")?;
+        ensure!(
+            next.is_none()
+                && jobs_list.len() <= MISSING_DATA_PAGE_LIMIT
+                && jobs["total_count"].as_u64() == Some(jobs_list.len() as u64),
+            "incomplete missing-data jobs"
+        );
+        let apply: Vec<_> = jobs_list
+            .iter()
+            .filter(|job| job["name"] == "run / apply / apply")
+            .collect();
+        let [job] = apply.as_slice() else {
+            return Ok(false);
+        };
+        if job["run_id"].as_u64() != Some(id)
+            || job["run_attempt"].as_u64() != Some(attempt)
+            || job["conclusion"] != "failure"
+        {
+            return Ok(false);
+        }
+        let Some(check) = check_run_id(&repo, job) else {
+            return Ok(false);
+        };
+        let (annotations, next) = self.get_url(
+            &format!("{API_ROOT}repos/{repo}/check-runs/{check}/annotations?per_page={MISSING_DATA_PAGE_LIMIT}"),
+            Value::clone,
+            true,
+        )?;
+        let annotations = annotations
+            .as_array()
+            .context("missing-data annotations are not an array")?;
+        ensure!(
+            next.is_none() && annotations.len() < MISSING_DATA_PAGE_LIMIT,
+            "incomplete missing-data annotations"
+        );
+        Ok(annotations
+            .iter()
+            .any(|a| a["annotation_level"] == "failure" && a["message"] == MISSING_DATA_ANNOTATION))
+    }
+
     /// What a diagnostic round is told of the failure, and the stop after it
     /// shows: the first failed check that is an Actions job of `repo`, the
     /// step it failed at and the end of its failure annotations. Two reads,
@@ -8074,6 +8172,21 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             .as_ref()
             .is_some_and(|r| r["status"] == "completed" && r["conclusion"] != "success");
         let outages = if failed { self.outages() } else { Outages::Off };
+        let missing_data = self.config.policy.hold_missing_data
+            && !merge_only
+            && is_harness(&pull, self.config)
+            && marker.sha.as_deref() == Some(head)
+            && !marker.stopped
+            && !marker.answering
+            && !marker.rebasing
+            && (marker.continuing || marker.rounds > 0)
+            && match fix_run.as_ref() {
+                Some(run) if failed => self.missing_data(&marker, run)?,
+                _ => false,
+            };
+        if missing_data {
+            marker.missing_data_run = marker.run;
+        }
         // Only where the label is the poll's own stop, the newest marker: a
         // label a person put on is theirs, and a stop already reset is not
         // waiting for anyone.
@@ -8098,13 +8211,23 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             (Vec::new(), Value::Null)
         };
         // An answer comes first: the operator acted.
-        let (stale_decision, stale) = if answer.is_empty() && !merge_only {
+        let (stale_decision, stale) = if answer.is_empty() && !merge_only && !missing_data {
             self.stale(repo, &pull, &checks, (&marker, &comments))?
                 .unzip()
         } else {
             (None, None)
         };
-        let decision = if let Some(decision) = stale_decision {
+        let decision = if missing_data && answer.is_empty() {
+            step(
+                "needs-human",
+                format!(
+                    "recorded run https://github.com/{}/actions/runs/{} handed back missing required data and pushed no new head for {}; automatic recovery is held",
+                    self.config.dispatch_repo,
+                    marker.run.unwrap_or_default(),
+                    short(head)
+                ),
+            )
+        } else if let Some(decision) = stale_decision {
             decision
         } else if answer.is_empty() {
             decide(
@@ -8169,7 +8292,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // comes first: a round started against a merged branch is wasted.
         let mut retarget = None;
         let stack_step = stacked.is_some();
-        if let Some((step, onto)) = stacked {
+        if !missing_data && let Some((step, onto)) = stacked {
             // A removal the queue step saw is still recorded with a stop.
             decision = Decision {
                 queue: decision.queue.take(),
@@ -8205,6 +8328,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // Retry CI before charging a fix round or stopping, but never replace
         // a stack operation, an operator answer, or an in-flight round.
         let retry_scope = (self.config.policy.reruns || self.config.policy.check_reruns)
+            && !missing_data
             && !merge_only
             && !stack_step
             && !queue_stop
@@ -15280,6 +15404,259 @@ mod tests {
                     assert_eq!(state["stopped"], true, "{name}: {state}");
                 } else {
                     assert_eq!(state["run"], run_id + 1, "{name}: {state}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_data_holds_recorded_recovery_before_unstall() {
+        // Recorded apply annotations from tracker runs 43244188959 (#906)
+        // and 43158561643 (actions#231). Other facts are a synthetic poll clock.
+        for (id, check) in [
+            (43244188959_u64, 131282843024_u64),
+            (43158561643, 130986454989),
+        ] {
+            for case in [
+                "hold",
+                "off",
+                "wrong run",
+                "wrong repository",
+                "wrong event",
+                "wrong branch",
+                "wrong workflow",
+                "wrong job",
+                "wrong job run",
+                "wrong attempt",
+                "wrong check repository",
+                "ordinary failure",
+                "warning",
+                "quoted",
+                "success",
+                "new head",
+                "forged comment",
+                "incomplete jobs",
+                "incomplete annotations",
+                "missing annotations",
+                "released",
+                "restart",
+                "preview",
+                "ready fix",
+                "failed CI",
+                "fix restart",
+            ] {
+                let mut fake = if case == "failed CI" {
+                    failed_check_github()
+                } else {
+                    github()
+                };
+                let mut marker = json!({"rounds": 0, "continued": 1, "continuing": true, "pool": "openai", "sha": HEAD, "run": id, "at": "2026-10-12T01:00:00Z"});
+                let mut run_data = json!({"id": id, "repository": {"full_name": "cgwalters-forge/tracker"}, "event": DISPATCH_EVENT, "head_branch": DISPATCH_REF, "path": ".github/workflows/dispatch.yml",
+                    "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                    "created_at": "2026-10-12T01:00:00Z", "updated_at": "2026-10-12T01:30:00Z"});
+                let mut job = json!({"name": "run / apply / apply", "run_id": id, "run_attempt": 1, "conclusion": "failure", "check_run_url": format!("{API_ROOT}repos/cgwalters-forge/tracker/check-runs/{check}")});
+                let mut annotation =
+                    json!({"annotation_level": "failure", "message": MISSING_DATA_ANNOTATION});
+                let mut author = BOT;
+                match case {
+                    "wrong run" => run_data["id"] = json!(id + 1),
+                    "wrong repository" => run_data["repository"]["full_name"] = json!("other/repo"),
+                    "wrong event" => run_data["event"] = json!("pull_request"),
+                    "wrong branch" => run_data["head_branch"] = json!("bot/untrusted"),
+                    "wrong workflow" => run_data["path"] = json!(".github/workflows/other.yml"),
+                    "wrong job" => job["name"] = json!("run / agent / agent"),
+                    "wrong job run" => job["run_id"] = json!(id + 1),
+                    "wrong attempt" => job["run_attempt"] = json!(2),
+                    "wrong check repository" => {
+                        job["check_run_url"] =
+                            json!(format!("{API_ROOT}repos/other/repo/check-runs/{check}"))
+                    }
+                    "ordinary failure" => {
+                        annotation["message"] = json!("Process completed with exit code 1.")
+                    }
+                    "warning" => annotation["annotation_level"] = json!("warning"),
+                    "quoted" => {
+                        annotation["message"] = json!(format!("quoted: {MISSING_DATA_ANNOTATION}"))
+                    }
+                    "success" => run_data["conclusion"] = json!("success"),
+                    "new head" => marker["sha"] = json!("old"),
+                    "forged comment" => author = "visitor",
+                    "released" => {
+                        marker["stopped"] = json!(true);
+                        marker["missing_data_run"] = json!(id);
+                    }
+                    "ready fix" | "fix restart" => {
+                        marker["continuing"] = json!(false);
+                        marker["rounds"] = json!(1);
+                    }
+                    _ => {}
+                }
+                let mut p = pull(
+                    "pull-470",
+                    json!({"isDraft": case != "ready fix", "body": checkpointed("budget")}),
+                );
+                if case == "failed CI" {
+                    p["commits"] = fake.pulls[&470]["commits"].clone();
+                }
+                fake.pulls.insert(470, p);
+                fake.page(&format!("repos/{REPO}/issues/470/comments?per_page=100"), None, None,
+                    json!([{"id": 5, "user": {"login": author}, "body": marker_body(&marker, "old")} ]));
+                fake.page(
+                    &format!("repos/cgwalters-forge/tracker/actions/runs/{id}"),
+                    None,
+                    None,
+                    run_data,
+                );
+                fake.page(&format!("repos/cgwalters-forge/tracker/actions/runs/{id}/attempts/1/jobs?per_page=100"), None, None,
+                    json!({"total_count": if case == "incomplete jobs" { 2 } else { 1 }, "jobs": [job]}));
+                let path = format!(
+                    "repos/cgwalters-forge/tracker/check-runs/{check}/annotations?per_page=100"
+                );
+                if case == "missing annotations" {
+                    fake.missing.push(format!("{API_ROOT}{path}"));
+                } else {
+                    fake.page(&path, None, None, json!([annotation]));
+                    if case == "incomplete annotations" {
+                        fake.rest.get_mut(&format!("{API_ROOT}{path}")).unwrap().2 =
+                            Some("https://api.github.com/more".into());
+                    }
+                }
+                let mut cfg = config();
+                cfg.policy.unstall = true;
+                cfg.policy.reruns = true;
+                cfg.policy.hold_missing_data = case != "off";
+                cfg.policy.fix_caller_workflow = Some("dispatch.yml".into());
+                cfg.policy.assign_holds = case == "ready fix";
+                cfg.policy.stale_days = 1;
+                let dispatcher = Fake::default();
+                let out = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &[REPO.into()],
+                    if case == "preview" {
+                        None
+                    } else {
+                        applying(&dispatcher)
+                    },
+                    now(),
+                )
+                .unwrap();
+                let held = matches!(
+                    case,
+                    "hold" | "restart" | "preview" | "ready fix" | "failed CI" | "fix restart"
+                );
+                let incomplete = matches!(
+                    case,
+                    "incomplete jobs" | "incomplete annotations" | "missing annotations"
+                );
+                assert_eq!(out.errors > 0, incomplete, "{case}: {:?}", out.lines);
+                assert_eq!(
+                    out.lines
+                        .iter()
+                        .any(|l| l.contains("automatic recovery is held")),
+                    held,
+                    "{case}: {:?}",
+                    out.lines
+                );
+                if held || incomplete {
+                    assert!(dispatcher.writes.borrow().is_empty(), "{case}");
+                    assert!(
+                        !fake
+                            .writes
+                            .borrow()
+                            .iter()
+                            .any(|(w, _)| w.ends_with("/rerun-failed-jobs")),
+                        "{case}"
+                    );
+                }
+                if !held && !incomplete {
+                    assert!(
+                        !dispatcher.writes.borrow().is_empty(),
+                        "{case}: {:?}",
+                        out.lines
+                    );
+                }
+                if case == "ready fix" {
+                    assert!(
+                        fake.writes
+                            .borrow()
+                            .iter()
+                            .any(|(_, b)| b["reviewers"] == json!([cfg.operator]))
+                    );
+                }
+                if held && !matches!(case, "preview" | "ready fix") {
+                    assert!(
+                        fake.writes
+                            .borrow()
+                            .iter()
+                            .any(|(_, b)| b["labels"] == json!([LABEL])),
+                        "{:?}",
+                        fake.writes.borrow()
+                    );
+                    // A cold restart reads the durable stop, not a disposable cache.
+                    let stop = fake
+                        .writes
+                        .borrow()
+                        .iter()
+                        .find_map(|(_, b)| {
+                            b["body"]
+                                .as_str()
+                                .filter(|s| s.contains("\"stopped\":true"))
+                                .map(str::to_owned)
+                        })
+                        .unwrap();
+                    fake.pulls.get_mut(&470).unwrap()["labels"] =
+                        json!({"nodes": [{"name": LABEL}]});
+                    fake.pulls.get_mut(&470).unwrap()["mergeable"] = json!(CONFLICTING);
+                    fake.page(
+                        &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                        None,
+                        None,
+                        json!([{"id": 6, "user": {"login": BOT}, "body": stop, "created_at": "2026-10-12T01:00:00Z"}]),
+                    );
+                    fake.writes.borrow_mut().clear();
+                    assert_eq!(
+                        find_marker(
+                            &[json!({"id": 6, "user": {"login": BOT}, "body": stop})],
+                            BOT
+                        )
+                        .missing_data_run,
+                        Some(id)
+                    );
+                    let again = run(
+                        &fake,
+                        &fake,
+                        &cfg,
+                        State::default(),
+                        &[],
+                        &[REPO.into()],
+                        applying(&dispatcher),
+                        now() + time::Duration::days(5),
+                    )
+                    .unwrap();
+                    assert_eq!(again.errors, 0, "{:?}", again.lines);
+                    assert!(dispatcher.writes.borrow().is_empty());
+                    assert!(
+                        fake.writes.borrow().is_empty(),
+                        "{case}: {:?}",
+                        fake.writes.borrow()
+                    );
+                }
+                if case == "off" {
+                    assert!(!dispatcher.writes.borrow().is_empty(), "{:?}", out.lines);
+                    assert!(
+                        !fake
+                            .sent
+                            .borrow()
+                            .iter()
+                            .any(|(url, _)| url.contains("/attempts/"))
+                    );
+                    println!(
+                        "tracker run {id}: off = recovery dispatched; on = needs-human, no dispatch"
+                    );
                 }
             }
         }
