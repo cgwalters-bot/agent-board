@@ -6,7 +6,7 @@
 const CHECKLIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/release.md");
 
 #[test]
-fn commit_prerelease_contract() {
+fn main_artifact_contract() {
     let ci = include_str!("../../../.github/workflows/ci.yml");
     let job = |name| {
         ci.split_once(&format!("\n  {name}:\n"))
@@ -18,22 +18,14 @@ fn commit_prerelease_contract() {
     };
     let gate = "if: github.event_name == 'push' && github.ref == 'refs/heads/main'";
     let attest = job("attest");
-    let publish = job("publish");
     assert!(attest.contains(gate));
     assert!(attest.contains("needs: ci"));
-    assert!(publish.contains(gate));
-    assert!(publish.contains("needs: [ci, attest]"));
-    assert_eq!(ci.matches("contents: write").count(), 1);
-    assert!(publish.contains("contents: write"));
     assert_eq!(ci.matches("id-token: write").count(), 1);
     assert!(attest.contains("id-token: write"));
-    for job in [attest, publish] {
-        assert!(!job.contains("checkout@"));
-        assert!(!job.contains("cargo "));
-        assert!(!job.contains("run: ./"));
+    for forbidden in ["checkout@", "cargo ", "run: ./"] {
+        assert!(!attest.contains(forbidden));
     }
     for required in [
-        "release: build-${{ github.sha }}",
         "github.event_name == 'push' && github.sha || github.ref",
         "--source-digest \"$GITHUB_SHA\"",
         ".github/workflows/ci.yml@refs/heads/main",
@@ -41,17 +33,31 @@ fn commit_prerelease_contract() {
         assert!(ci.contains(required), "missing {required}");
     }
     for required in [
-        "TAG: build-${{ github.sha }}",
-        "-f ref=\"refs/tags/$TAG\" -f sha=\"$GITHUB_SHA\"",
-        "--verify-tag --draft --prerelease --latest=false",
-        "--draft=false --latest=false",
-        "SHA256SUMS release.json provenance.jsonl",
+        "sha256sum --check SHA256SUMS\n        working-directory: dist",
+        "cp \"$BUNDLE\" dist/provenance.jsonl",
+        "--bundle dist/provenance.jsonl",
+        "name: agent-board-main\n          path: dist/\n          retention-days: 90",
+        "if-no-files-found: error",
     ] {
-        assert!(publish.contains(required), "missing {required}");
+        assert!(attest.contains(required), "missing {required}");
     }
-    for forbidden in ["--clobber", "--force", "--target main"] {
-        assert!(!publish.contains(forbidden));
+    for forbidden in [
+        "contents: write",
+        "gh release",
+        "refs/tags/",
+        "build-${{",
+        "\n  publish:\n",
+    ] {
+        assert!(!ci.contains(forbidden), "unexpected {forbidden}");
     }
+    assert!(
+        attest.find("gh attestation verify").unwrap()
+            < attest.find("name: agent-board-main").unwrap()
+    );
+    let build = include_str!("../../../.github/workflows/build.yml");
+    assert!(build.contains("default: ''"));
+    let release = include_str!("../../../.github/workflows/release.yml");
+    assert!(release.contains("release: ${{ needs.version.outputs.tag }}"));
 }
 
 const CHANGELOG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md");

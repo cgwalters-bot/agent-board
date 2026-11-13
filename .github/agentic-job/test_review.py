@@ -184,7 +184,7 @@ class ReviewContracts(unittest.TestCase):
     def test_ci_uses_the_current_ubuntu_vm_runner(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text().split("\njobs:\n", 1)[1]
         jobs = re.findall(r"^  (\w+):\n(.*?)(?=^  \w+:|\Z)", ci, re.MULTILINE | re.DOTALL)
-        self.assertEqual([name for name, _ in jobs], ["build", "specs", "rust", "forgejo", "lint", "ci", "attest", "publish"])
+        self.assertEqual([name for name, _ in jobs], ["build", "specs", "rust", "forgejo", "lint", "ci", "attest"])
         for name, job in jobs:
             with self.subTest(job=name):
                 if name == "build":
