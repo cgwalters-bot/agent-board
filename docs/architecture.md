@@ -506,12 +506,15 @@ The answers to the brief's open questions:
    if the fork is closed or stale. A matching verified closing merge supplies Done
    under normal Status precedence; person holds remain until Done. Missing,
    malformed, foreign-edited, conflicting, closed-unmerged or unreadable handoff
-   evidence refuses the board read rather than releasing work. An ordinary
+    evidence refuses that PR and holds its affected sources for the supervisor
+    rather than releasing work. Multiple active claims on one source attach no
+    verified promotion and report each conflicting PR. Failed API reads still
+    refuse the whole read. An ordinary
    open bot fork without a receipt still holds as an open PR; a closed one
    without any first-party publication marker is an abandoned attempt, not
    an error or completion. A verified merged `Part of` slice does not complete
-   its source or conflict with the next slice. This conservative
-   whole-board failure is deliberate, not a new state store. Start rechecks
+    its source or conflict with the next slice. These refusals reuse the existing
+    unknown-promotion hold, not a new state store. Start rechecks
    use the same verifier. Fork closure is **not delivered**: it needs its own
    capped, recoverable acceptance after replay proof. Caller rollout and
    staging acceptance remain tracker#1464, separately approved; no live

@@ -1917,7 +1917,10 @@ fn publication_rebases_and_signs_independently_of_dco() {
                     ));
                     // A subsequent change to the published head is still refused.
                     body(&mut replay, "/pulls/70")["head"]["sha"] = json!("d".repeat(40));
-                    assert!(handoff::enrich(&replay, &config, &mut items).is_err());
+                    let notices = handoff::enrich(&replay, &config, &mut items).unwrap();
+                    assert_eq!(notices.len(), 1);
+                    assert!(notices[0].contains("live upstream handoff identity mismatch"));
+                    assert_eq!(items[&key].promotion, Some(crate::pass::Promotion::Unknown));
                 }
             }
         }

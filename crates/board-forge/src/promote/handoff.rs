@@ -78,9 +78,8 @@ pub(super) fn success(
 }
 
 /// Enrich the existing per-pass facts. No new store, client or mutation path.
-/// Ambiguous source prose skips only that PR, with a diagnostic for the
-/// supervisor. Receipt authentication and live identity failures still refuse
-/// the read: unverified publication evidence is never authority.
+/// Invalid evidence refuses only that PR, never authorizes a promotion, and
+/// holds its source for the supervisor. Failed API reads still refuse the read.
 pub(crate) fn enrich(
     client: &(impl Rest + Transport),
     config: &Config,
@@ -132,183 +131,29 @@ pub(crate) fn enrich(
                 }
             }
         }
-        let mut seen = BTreeSet::new();
-        let mut sources = BTreeSet::new();
+        let mut claims: BTreeMap<String, Vec<(u64, Promotion)>> = BTreeMap::new();
         for (n, linked) in candidates {
-            let pull = get(client, &format!("repos/{repo}/pulls/{n}"))?;
-            ensure!(pull["number"] == n, "handoff fork number mismatch");
-            if !pull["user"]["login"]
-                .as_str()
-                .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
-            {
-                continue;
-            }
-            // GitHub represents an absent description as null. It is no
-            // source linkage, not a failure to read the board.
-            let body = pull["body"].as_str().unwrap_or_default();
-            let n = pull["number"]
-                .as_u64()
-                .filter(|n| *n > 0)
-                .context("invalid handoff fork PR")?;
-            let comments = pages(client, &format!("repos/{repo}/issues/{n}/comments"))?;
-            let receipts: Vec<_> = comments
-                .iter()
-                .filter(|c| {
-                    c["user"]["login"]
-                        .as_str()
-                        .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
-                        && c["body"]
-                            .as_str()
-                            .is_some_and(|b| b.contains(STATUS) || b.contains(FENCE))
-                })
-                .collect();
-            // Timeline candidates remain relevant even after a body edit
-            // removes its links. Receipt content selects verification, never
-            // authority.
-            ensure!(receipts.len() <= 1, "duplicate handoff records");
-            // Authenticate and decode a surviving receipt before looking up
-            // the live body's source. Retargeting that body off-board must
-            // not erase the original issue's handoff from the pass.
-            let record = receipts
-                .first()
-                .map(|receipt| read_record(client, config, repo, n, receipt, comments.len()))
-                .transpose()?;
-            // Abandoned attempts have no publication evidence. A first-party
-            // pending/legacy marker above must still verify or fail closed.
-            if record.is_none() && pull["state"] == "closed" {
-                continue;
-            }
-            let issue = match source(repo, &pull) {
-                Ok(issue) => issue,
+            let mut affected = linked;
+            match enrich_pull(client, config, repo, target, n, items, &mut affected) {
+                Ok(Some((at, promotion))) => claims.entry(at).or_default().push((n, promotion)),
+                Ok(None) => {}
+                Err(error) if error.is::<ReadFailure>() => return Err(error),
                 Err(error) => {
-                    // Missing prose cannot erase a surviving publication or
-                    // turn a historical cross-reference into spare capacity.
-                    // These facts authorize only a hold, never completion.
-                    unknown.extend(linked);
-                    if let Some(record) = &record {
-                        let at = crate::parse_github_item(
-                            &format!("{}#{}", record.source_repository, record.source_issue),
-                            None,
-                            crate::github::DEFAULT_HOST,
-                        )?;
-                        unknown.insert(crate::pass::key(&at));
-                    }
-                    skipped.push(format!(
-                        "needs-supervisor: promotion handoff {repo}#{n}: {error:#}; skipped"
-                    ));
-                    continue;
+                    unknown.extend(affected);
+                    skipped.push(notice(repo, n, &format!("{error:#}")));
                 }
-            };
-            if let Some(record) = &record {
-                ensure!(
-                    record.schema == SCHEMA
-                        && record.fork_repository == *repo
-                        && record.fork_pr == n
-                        && record.source_repository == *repo
-                        && record.source_issue == issue
-                        && record.completes_source == crate::stack::closes(body, repo, issue)
-                        && record.upstream_repository == target.upstream
-                        && record.upstream_pr > 0
-                        && oid(&record.approved_oid)
-                        && oid(&record.published_oid)
-                        && pull["head"]["sha"] == record.approved_oid,
-                    "handoff identity mismatch"
-                );
             }
-            let at = crate::parse_github_item(
-                &format!("{repo}#{issue}"),
-                None,
-                crate::github::DEFAULT_HOST,
-            )?;
-            let Some(facts) = items.get_mut(&crate::pass::key(&at)) else {
-                continue;
-            };
-            if !facts.open {
-                continue;
-            }
-            repository(&pull["base"]["repo"], repo)?;
-            let Some(record) = record else {
-                ensure!(
-                    seen.insert(n) && sources.insert(issue),
-                    "conflicting handoff fork PRs"
-                );
-                ensure!(pull["state"] == "open", "closed fork has no handoff record");
-                facts.promotion = Some(Promotion::Open(ClosingPull {
-                    number: n,
-                    repository: repo.clone(),
-                    author: Some(config.bot.clone()),
-                    updated: None,
-                }));
-                continue;
-            };
-            let head_repo = pull["head"]["repo"]["full_name"]
-                .as_str()
-                .context("missing handoff head repository")?;
-            validate_repository(head_repo)?;
-            validate_branch(&record.published_branch)?;
-            validate_branch(
-                pull["head"]["ref"]
-                    .as_str()
-                    .context("missing handoff branch")?,
-            )?;
-            let head_metadata = get(client, &format!("repos/{head_repo}"))?;
-            repository(&head_metadata, head_repo)?;
-            ensure!(
-                observed_network(&head_metadata, &target.upstream)?,
-                "handoff head-network mismatch"
-            );
-            let upstream = get(
-                client,
-                &format!("repos/{}/pulls/{}", target.upstream, record.upstream_pr),
-            )?;
-            repository(&upstream["base"]["repo"], &target.upstream)?;
-            ensure!(
-                upstream["number"] == record.upstream_pr
-                    && upstream["head"]["sha"] == record.published_oid
-                    && upstream["head"]["repo"]["full_name"] == head_repo
-                    && upstream["head"]["ref"] == record.published_branch
-                    && upstream["base"]["ref"] == target.base
-                    && upstream["user"]["login"]
-                        .as_str()
-                        .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
-                    && source(repo, &upstream)? == issue,
-                "live upstream handoff identity mismatch"
-            );
-            ensure!(
-                crate::stack::closes(
-                    upstream["body"].as_str().context("missing upstream body")?,
-                    repo,
-                    issue
-                ) == record.completes_source,
-                "upstream handoff linkage kind mismatch"
-            );
-            let partial_merge = !record.completes_source
-                && upstream["state"] == "closed"
-                && upstream["merged"] == true;
-            if !partial_merge {
-                ensure!(
-                    seen.insert(n) && sources.insert(issue),
-                    "conflicting handoff fork PRs"
-                );
-            }
-            match (upstream["state"].as_str(), upstream["merged"].as_bool()) {
-                (Some("open"), Some(false)) if upstream.get("merged_at") == Some(&Value::Null) => {
-                    // Verified publication remains active even after staleness or
-                    // fork closure. None is deliberately not a stale timestamp.
-                    facts.promotion = Some(Promotion::Open(ClosingPull {
-                        number: record.upstream_pr,
-                        repository: target.upstream.clone(),
-                        author: Some(config.bot.clone()),
-                        updated: None,
-                    }));
+        }
+        for (at, mut promotions) in claims {
+            if promotions.len() > 1 {
+                unknown.insert(at);
+                for (n, _) in promotions {
+                    skipped.push(notice(repo, n, "conflicting handoff fork PRs"));
                 }
-                (Some("closed"), Some(true)) if upstream["merged_at"].as_str().is_some() => {
-                    super::at(&upstream["merged_at"])?;
-                    if record.completes_source {
-                        facts.promotion = Some(Promotion::Merged);
-                    }
-                }
-                _ => anyhow::bail!("upstream handoff is closed-unmerged or incomplete"),
+            } else if let Some((_, promotion)) = promotions.pop()
+                && let Some(facts) = items.get_mut(&at)
+            {
+                facts.promotion = Some(promotion);
             }
         }
     }
@@ -317,7 +162,223 @@ pub(crate) fn enrich(
             facts.promotion = Some(Promotion::Unknown);
         }
     }
+    skipped.sort();
     Ok(skipped)
+}
+
+fn notice(repo: &str, n: u64, reason: &str) -> String {
+    format!("needs-supervisor: promotion handoff {repo}#{n}: {reason}; skipped")
+}
+
+// Keep request failures distinguishable from invalid per-PR evidence, including
+// requests made inside receipt authentication. Never swallow an unavailable API.
+#[derive(Debug)]
+struct ReadFailure;
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reading handoff API")
+    }
+}
+
+impl std::error::Error for ReadFailure {}
+
+struct HandoffRead<'a, T>(&'a T);
+
+impl<T: Rest> Rest for HandoffRead<'_, T> {
+    fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+        anyhow::bail!("handoff enrichment is read-only")
+    }
+
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
+        let response = self.0.get(url, validator).context(ReadFailure)?;
+        if response.status != 200 {
+            return Err(anyhow::anyhow!("GET {url}: HTTP {}", response.status))
+                .context(ReadFailure);
+        }
+        Ok(response)
+    }
+}
+
+impl<T: Transport> Transport for HandoffRead<'_, T> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.0.graphql(query, variables).context(ReadFailure)
+    }
+}
+
+fn enrich_pull(
+    client: &(impl Rest + Transport),
+    config: &Config,
+    repo: &str,
+    target: &crate::pass::promote::Fork,
+    n: u64,
+    items: &BTreeMap<String, Facts>,
+    affected: &mut BTreeSet<String>,
+) -> Result<Option<(String, Promotion)>> {
+    let client = &HandoffRead(client);
+    let pull = get(client, &format!("repos/{repo}/pulls/{n}"))?;
+    ensure!(pull["number"] == n, "handoff fork number mismatch");
+    if !pull["user"]["login"]
+        .as_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
+    {
+        return Ok(None);
+    }
+    // GitHub represents an absent description as null. It is no
+    // source linkage, not a failure to read the board.
+    let body = pull["body"].as_str().unwrap_or_default();
+    if let Ok(issue) = source(repo, &pull) {
+        affected.insert(crate::pass::key(&crate::parse_github_item(
+            &format!("{repo}#{issue}"),
+            None,
+            crate::github::DEFAULT_HOST,
+        )?));
+    }
+    let n = pull["number"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .context("invalid handoff fork PR")?;
+    let comments = pages(client, &format!("repos/{repo}/issues/{n}/comments"))?;
+    let receipts: Vec<_> = comments
+        .iter()
+        .filter(|c| {
+            c["user"]["login"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
+                && c["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains(STATUS) || b.contains(FENCE))
+        })
+        .collect();
+    // Timeline candidates remain relevant even after a body edit
+    // removes its links. Receipt content selects verification, never
+    // authority.
+    ensure!(receipts.len() <= 1, "duplicate handoff records");
+    // Authenticate and decode a surviving receipt before looking up
+    // the live body's source. Retargeting that body off-board must
+    // not erase the original issue's handoff from the pass.
+    let record = receipts
+        .first()
+        .map(|receipt| read_record(client, config, repo, n, receipt, comments.len()))
+        .transpose()?;
+    if let Some(record) = &record {
+        let at = crate::parse_github_item(
+            &format!("{}#{}", record.source_repository, record.source_issue),
+            None,
+            crate::github::DEFAULT_HOST,
+        )?;
+        affected.insert(crate::pass::key(&at));
+    }
+    // Abandoned attempts have no publication evidence. A first-party
+    // pending/legacy marker above must still verify or fail closed.
+    if record.is_none() && pull["state"] == "closed" {
+        return Ok(None);
+    }
+    let issue = source(repo, &pull)?;
+    if let Some(record) = &record {
+        ensure!(
+            record.schema == SCHEMA
+                && record.fork_repository == *repo
+                && record.fork_pr == n
+                && record.source_repository == *repo
+                && record.source_issue == issue
+                && record.completes_source == crate::stack::closes(body, repo, issue)
+                && record.upstream_repository == target.upstream
+                && record.upstream_pr > 0
+                && oid(&record.approved_oid)
+                && oid(&record.published_oid)
+                && pull["head"]["sha"] == record.approved_oid,
+            "handoff identity mismatch"
+        );
+    }
+    let at = crate::parse_github_item(
+        &format!("{repo}#{issue}"),
+        None,
+        crate::github::DEFAULT_HOST,
+    )?;
+    let at = crate::pass::key(&at);
+    let Some(facts) = items.get(&at) else {
+        return Ok(None);
+    };
+    if !facts.open {
+        return Ok(None);
+    }
+    repository(&pull["base"]["repo"], repo)?;
+    let Some(record) = record else {
+        ensure!(pull["state"] == "open", "closed fork has no handoff record");
+        return Ok(Some((
+            at,
+            Promotion::Open(ClosingPull {
+                number: n,
+                repository: repo.into(),
+                author: Some(config.bot.clone()),
+                updated: None,
+            }),
+        )));
+    };
+    let head_repo = pull["head"]["repo"]["full_name"]
+        .as_str()
+        .context("missing handoff head repository")?;
+    validate_repository(head_repo)?;
+    validate_branch(&record.published_branch)?;
+    validate_branch(
+        pull["head"]["ref"]
+            .as_str()
+            .context("missing handoff branch")?,
+    )?;
+    let head_metadata = get(client, &format!("repos/{head_repo}"))?;
+    repository(&head_metadata, head_repo)?;
+    ensure!(
+        observed_network(&head_metadata, &target.upstream)?,
+        "handoff head-network mismatch"
+    );
+    let upstream = get(
+        client,
+        &format!("repos/{}/pulls/{}", target.upstream, record.upstream_pr),
+    )?;
+    repository(&upstream["base"]["repo"], &target.upstream)?;
+    ensure!(
+        upstream["number"] == record.upstream_pr
+            && upstream["head"]["sha"] == record.published_oid
+            && upstream["head"]["repo"]["full_name"] == head_repo
+            && upstream["head"]["ref"] == record.published_branch
+            && upstream["base"]["ref"] == target.base
+            && upstream["user"]["login"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
+            && source(repo, &upstream)? == issue,
+        "live upstream handoff identity mismatch"
+    );
+    ensure!(
+        crate::stack::closes(
+            upstream["body"].as_str().context("missing upstream body")?,
+            repo,
+            issue
+        ) == record.completes_source,
+        "upstream handoff linkage kind mismatch"
+    );
+    let partial_merge =
+        !record.completes_source && upstream["state"] == "closed" && upstream["merged"] == true;
+    match (upstream["state"].as_str(), upstream["merged"].as_bool()) {
+        (Some("open"), Some(false)) if upstream.get("merged_at") == Some(&Value::Null) => {
+            // Verified publication remains active even after staleness or
+            // fork closure. None is deliberately not a stale timestamp.
+            Ok(Some((
+                at,
+                Promotion::Open(ClosingPull {
+                    number: record.upstream_pr,
+                    repository: target.upstream.clone(),
+                    author: Some(config.bot.clone()),
+                    updated: None,
+                }),
+            )))
+        }
+        (Some("closed"), Some(true)) if upstream["merged_at"].as_str().is_some() => {
+            super::at(&upstream["merged_at"])?;
+            Ok((!partial_merge).then_some((at, Promotion::Merged)))
+        }
+        _ => anyhow::bail!("upstream handoff is closed-unmerged or incomplete"),
+    }
 }
 
 fn at_time(value: &Value, field: &str) -> Result<OffsetDateTime> {
