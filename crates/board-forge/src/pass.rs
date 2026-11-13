@@ -754,8 +754,8 @@ pub struct Config {
     pub cost: Option<crate::cost::Publish>,
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
-    /// Opt-in cache path for one living status comment per issue. GitHub is
-    /// authoritative; applying passes must still be serialized.
+    /// Opt-in durable ledger path for one living status comment per issue.
+    /// Retain it across runs; applying passes must still be serialized.
     pub living_status: Option<String>,
     /// Off by default: rank epic groups before reading their admission facts.
     #[serde(default)]
