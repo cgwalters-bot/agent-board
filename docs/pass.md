@@ -212,9 +212,43 @@ mirror image: an intake with many waiting threads to retry can leave the
 walk too little to reach a repository, a `pull requests: the stage's request
 share is spent` line, until those threads settle. The intake's starts come
 before the walk's within the poll's three a pass. `operatorAnswers` on a
-followed pull request is still read in the walk. A claim records that a run
-started, not that it answered: the control snapshot's list of the operator's
-unanswered direction is a later slice of agent-board#840.
+followed pull request is still read in the walk. A claim records admission,
+not an answer.
+
+With `notifications`, applying intake also retains up to 100 operator-direction
+receipts in the poll state's `operator_direction`, outside the disposable response
+cache. The concrete failure this stops is a successful dispatch advancing the
+search cursor while the operator's unanswered question disappears from view.
+Receipts only report: they never schedule reads, retry or admit work. Each names
+the source comment, creation and first-observed times, first intake pass, last
+complete history read and, when returned by dispatch, its run URL. A receipt is
+refreshed whenever intake completely reads its thread anyway, as discovery or a
+waiting retry, even if an edited or deleted source comment no longer counts as
+new direction; a reply updates the thread, so search usually finds it again.
+Incomplete reads do not clear receipts. When full, the oldest answered receipt
+is evicted, else the oldest unanswered one, and the snapshot's sticky
+`overflow: true` records that unanswered receipts were dropped.
+
+The existing holds publication gains an optional `operator_direction` extension
+(`agent-board/operator-direction/v1`): unanswered requests first, oldest first,
+with `failure: true` after a subsequent applying intake pass is saved without a
+reply. `unanswered_passes` counts saved intake attempts, including attempts whose
+reads were deferred, not elapsed wall time. It cannot measure passes during which
+intake was disabled or never reached. `complete` is always false: search lag,
+initial lookback, history limits and budgets preclude a complete inbox guarantee.
+A missing extension means unavailable, not zero failures. No new option is added;
+`notifications: true`, persisted `state`, and a `holds` destination supply it.
+
+Reply receipts currently use intake's existing conservative manual-answer rule:
+a later nonempty bot issue comment carrying no HTML marker. Status, claim and
+acknowledgement comments cannot clear a failure. This is evidence of a reply,
+not a semantic judgment that it satisfied the request. Correlating checked-job
+answers on tracking issues back to source questions remains unfinished, so those
+can still be reported unanswered. The external control app
+(`cgwalters-forge/review`, `src/github/holds.ts`) must parse this extension and
+render its failures above normal work; its existing parser ignores the extension.
+That consumer change and a complete live inventory with checked answer delivery
+remain acceptance work for agent-board#840, not claims made by this projection.
 
 One thread's error is a `warning:` line, never a failure of the pass. A write
 GitHub will always refuse (HTTP 404 or 410, such as an issue in a repository

@@ -581,6 +581,9 @@ const START_KINDS: &[&str] = &[
 /// The hold snapshot ([`HOLDS_SCHEMA`]).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Snapshot {
+    /// Known operator requests and reply receipts; never an authorization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_direction: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub today: Option<Value>,
     /// Per-repository observed work; absent means unavailable, not empty.
@@ -747,6 +750,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, mut pass): (Wip, PassSummar
         })
         .collect();
     Snapshot {
+        operator_direction: None,
         dispatchable_work: None,
         pass_view: None,
         epic_focus: None,
@@ -2803,6 +2807,20 @@ pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
         let due = due || super::view::due(s.get("pass_view"), now.get("pass_view"));
         // Observation time alone is not activity. Counts and UTC rollover are.
         for value in [&mut s, &mut now] {
+            if let Some(fields) = value
+                .get_mut("operator_direction")
+                .and_then(Value::as_object_mut)
+            {
+                fields.remove("passes");
+                if let Some(requests) = fields.get_mut("requests").and_then(Value::as_array_mut) {
+                    for request in requests {
+                        if let Some(fields) = request.as_object_mut() {
+                            fields.remove("checked_at");
+                            fields.remove("unanswered_passes");
+                        }
+                    }
+                }
+            }
             for section in ["today", "epic_focus"] {
                 if let Some(fields) = value.get_mut(section).and_then(Value::as_object_mut) {
                     fields.remove("observed_at");
@@ -2862,8 +2880,15 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         Some(focus) => format!(",\"epic_focus\":{}", serde_json::to_string(focus)?),
         None => String::new(),
     };
+    let direction = match &snapshot.operator_direction {
+        Some(direction) => format!(
+            ",\"operator_direction\":{}",
+            serde_json::to_string(direction)?
+        ),
+        None => String::new(),
+    };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you}{work}{view}{today}{focus},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{direction}{leases}{needs_you}{work}{view}{today}{focus},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -2997,6 +3022,7 @@ pub fn fit_to(mut snapshot: Snapshot, bound: Bound) -> Result<(Snapshot, String)
     let without = |dropped: &BTreeSet<usize>,
                    needs_you: &Option<NeedsYou>,
                    pass_view: &Option<Value>| Snapshot {
+        operator_direction: snapshot.operator_direction.clone(),
         dispatchable_work: snapshot.dispatchable_work.clone(),
         pass_view: pass_view.clone(),
         epic_focus: snapshot.epic_focus.clone(),

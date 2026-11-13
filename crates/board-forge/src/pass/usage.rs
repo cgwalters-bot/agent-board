@@ -931,6 +931,13 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let stamp = self.now.format(&Rfc3339).unwrap_or_default();
         let tally = self.report.tally.clone();
         let mut snapshot = holds::snapshot(&self.report.holds, stamp, tally);
+        if self.config.notifications {
+            snapshot.operator_direction = self
+                .report
+                .state
+                .as_ref()
+                .map(|s| s.operator_direction.snapshot());
+        }
         if self.apply {
             snapshot.pass.overhead = Some(holds::overhead(
                 previous,

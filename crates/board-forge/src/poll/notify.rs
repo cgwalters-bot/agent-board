@@ -707,6 +707,25 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .into_iter()
             .filter(|s| self.directs(repo, issue, comments, s, admission_floor))
             .collect();
+        let thread = comments::waiting_key(repo, number);
+        let retained = self
+            .operator_direction
+            .requests
+            .values()
+            .any(|r| r.thread == thread);
+        if self.config.policy.notification_intake.is_some()
+            && self.apply.is_some()
+            && (!said.is_empty() || retained)
+        {
+            // Do not copy private upstream direction into the control snapshot.
+            if !self.config.ours(repo)
+                && let Some(why) = self.not_public(repo)?
+            {
+                return Ok((true, format!("notification: {why}")));
+            }
+            self.operator_direction
+                .observe(repo, issue, &said, comments, &bot, self.now)?;
+        }
         if said.is_empty() {
             return Ok((
                 true,
@@ -716,25 +735,30 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // Only what the operator said after the bot's last reply by hand,
         // and not refused for good before, is still open, here and in the
         // claims below.
-        let thread = comments::waiting_key(repo, number);
         let answered = answered_by_hand(comments, &bot);
         let (skip, said): (Vec<_>, Vec<_>) = said.into_iter().partition(|s| {
-            answered.is_some_and(|reply| before(s, reply))
+            answered.is_some_and(|reply| before((&s.key, s.at), reply))
                 || (self.intake_refused).contains(&format!("{thread}/{}", s.key))
         });
         if said.is_empty() {
-            let why = match skip.iter().any(|s| answered.is_some_and(|r| before(s, r))) {
+            let why = match skip
+                .iter()
+                .any(|s| answered.is_some_and(|r| before((&s.key, s.at), r)))
+            {
                 true => "the bot already answered the operator's direction on the thread",
                 false => "GitHub refused its write for good before; left to a person",
             };
             return Ok((true, format!("notification: left; {why}")));
         }
         self.intake_skip = skip.into_iter().map(|s| s.key).collect();
-        let keys = said.iter().map(|s| s.key.clone()).collect();
+        let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
         let since = last_read.unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let result =
             self.notification_direction_admit(repo, issue, comments, said, since, admission_floor);
         self.intake_skip.clear();
+        if let Ok((_, line)) = &result {
+            self.operator_direction.dispatched(&thread, &keys, line);
+        }
         result.map_err(|error| error.context(comments::Direction { thread, keys }))
     }
 
@@ -897,10 +921,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 /// by the poll or a run, which mark all of theirs. The operator's direction
 /// before it was answered there, and starting a run on it would do the work
 /// twice.
-fn answered_by_hand(comments: &[Value], bot: &str) -> Option<(OffsetDateTime, u64)> {
+pub(super) fn answered_by_hand(comments: &[Value], bot: &str) -> Option<(OffsetDateTime, u64)> {
     comments
         .iter()
-        .filter(|c| text(c, "/user/login") == bot && !text(c, "/body").contains("<!--"))
+        .filter(|c| {
+            text(c, "/user/login") == bot
+                && !text(c, "/body").contains("<!--")
+                && !text(c, "/body").trim().is_empty()
+        })
         .filter_map(|c| {
             let at = OffsetDateTime::parse(text(c, "/created_at"), &Rfc3339).ok()?;
             Some((at, c["id"].as_u64()?))
@@ -911,10 +939,13 @@ fn answered_by_hand(comments: &[Value], bot: &str) -> Option<(OffsetDateTime, u6
 /// Whether `said` came before the bot's `reply`. Comments are dated to the
 /// second; within one, issue comments' ids give their order, and anything
 /// else is taken as after, so that no direction is dropped on a guess.
-fn before(said: &Said, (at, id): (OffsetDateTime, u64)) -> bool {
-    said.at < at
-        || (said.at == at
-            && (said.key.strip_prefix("issuecomment-"))
+pub(super) fn before(
+    (key, created_at): (&str, OffsetDateTime),
+    (at, id): (OffsetDateTime, u64),
+) -> bool {
+    created_at < at
+        || (created_at == at
+            && (key.strip_prefix("issuecomment-"))
                 .and_then(|n| n.parse::<u64>().ok())
                 .is_some_and(|n| n < id))
 }
@@ -2112,12 +2143,212 @@ mod tests {
         assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
         assert!(dispatches(&fake).is_empty());
         assert!(replies(&fake).is_empty());
+        assert!(outcome.state.operator_direction.requests.is_empty());
         assert!(
             fake.writes
                 .borrow()
                 .iter()
                 .all(|(path, _)| path.contains("notifications/threads/"))
         );
+    }
+
+    /// When the bot's reply lands; a pass then is that much later.
+    const REPLIED: &str = "2026-10-16T13:00:00Z";
+
+    /// The bot's reply updates the thread, so `search` finds it again.
+    fn replied(fake: &Fake, mut search: Value) -> OffsetDateTime {
+        search["items"][0]["updated_at"] = REPLIED.into();
+        fake.page("search", search);
+        OffsetDateTime::parse(REPLIED, &Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn direction_receipts_survive_dispatch_search_movement_and_incomplete_reads() {
+        for dispatch_cap in [0, 1] {
+            let repo = "upstream/app";
+            let fake = intake_github(repo, false, "mention", OPERATOR);
+            let config = search_intake(&fake, repo);
+            let caps = caps::Caps::new(caps::Limits {
+                dispatch: Some(dispatch_cap),
+                ..Default::default()
+            });
+            let run_at = |state: State, apply: bool, at: OffsetDateTime| {
+                run_capped(
+                    &fake,
+                    &fake,
+                    &config,
+                    state,
+                    (&[], &[]),
+                    apply.then(|| Apply {
+                        dispatcher: &fake,
+                        workflow: "dispatch.yml".into(),
+                        pools: vec![],
+                        git_ref: None,
+                    }),
+                    Some(&caps),
+                    at,
+                )
+                .unwrap()
+            };
+            let run = |state: State, apply: bool| run_at(state, apply, now());
+            let preview = run(State::default(), false);
+            assert!(preview.state.operator_direction.requests.is_empty());
+            let first = run(State::default(), true);
+            assert_eq!(
+                first.state.operator_direction.requests.len(),
+                1,
+                "{:?}",
+                first.lines
+            );
+            assert_eq!(
+                first.state.operator_direction.snapshot()["requests"][0]["failure"],
+                false
+            );
+            assert_eq!(dispatches(&fake).len(), dispatch_cap);
+            // The question no longer appears in search; its own receipt keeps
+            // it alive. An incomplete history cannot turn it into an answer.
+            let search = fake.rest.borrow()[&format!("{API_ROOT}search")].clone();
+            fake.page("search", json!({"items": [], "incomplete_results": false}));
+            let comments = format!("{API_ROOT}repos/{repo}/issues/2/comments?per_page=100");
+            fake.unavailable.borrow_mut().insert(comments.clone());
+            let second = run(first.state, true);
+            assert_eq!(
+                second.state.operator_direction.snapshot()["requests"][0]["failure"],
+                true
+            );
+            assert_eq!(dispatches(&fake).len(), dispatch_cap);
+            fake.unavailable.borrow_mut().remove(&comments);
+            fake.rest
+                .borrow_mut()
+                .get_mut(&comments)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(said(
+                    10013,
+                    BOT,
+                    REPLIED,
+                    "The commit used the wrong author; the correction is linked here.",
+                ));
+            let third = run_at(second.state, true, replied(&fake, search));
+            let projection = third.state.operator_direction.snapshot();
+            assert_eq!(
+                projection["requests"][0]["failure"], false,
+                "{:?}",
+                third.lines
+            );
+            assert!(
+                projection["requests"][0]["reply"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("#issuecomment-10013")
+            );
+            assert_eq!(dispatches(&fake).len(), dispatch_cap);
+        }
+    }
+
+    #[test]
+    fn direction_receipts_refresh_after_the_source_no_longer_directs_the_bot() {
+        for body in [
+            Some("An edited question without a mention."),
+            Some(""),
+            None,
+        ] {
+            let repo = "upstream/app";
+            let fake = intake_github(repo, false, "mention", OPERATOR);
+            let config = search_intake(&fake, repo);
+            let first = pass(&fake, &config, State::default(), true);
+            assert_eq!(first.state.operator_direction.pending().len(), 1);
+            assert_eq!(dispatches(&fake).len(), 1);
+            let mut search = fake.rest.borrow()[&format!("{API_ROOT}search")].clone();
+            // Another mention keeps the thread in search after the edit; the
+            // receipt refreshes by its identity, not by still directing the bot.
+            search["items"][0]["body"] = "@worker owns this thread.".into();
+            let path = format!("{API_ROOT}repos/{repo}/issues/2/comments?per_page=100");
+            let mut rest = fake.rest.borrow_mut();
+            let comments = rest.get_mut(&path).unwrap().as_array_mut().unwrap();
+            if let Some(body) = body {
+                comments[0]["body"] = body.into();
+            } else {
+                comments.remove(0);
+            }
+            comments.push(said(
+                10013,
+                BOT,
+                REPLIED,
+                "Here is the answer with evidence.",
+            ));
+            drop(rest);
+            let at = replied(&fake, search);
+            let second = run(
+                &fake,
+                &fake,
+                &config,
+                first.state,
+                &[],
+                &[],
+                Some(Apply {
+                    dispatcher: &fake,
+                    workflow: "dispatch.yml".into(),
+                    pools: vec![],
+                    git_ref: None,
+                }),
+                at,
+            )
+            .unwrap();
+            assert!(
+                second.state.operator_direction.pending().is_empty(),
+                "{body:?}: {:?}",
+                second.lines
+            );
+            assert_eq!(dispatches(&fake).len(), 1);
+        }
+    }
+
+    #[test]
+    fn direction_receipt_overflow_never_blocks_work_admission() {
+        for comments in [1, direction::REQUEST_LIMIT + 1] {
+            let repo = "upstream/app";
+            let fake = intake_github(repo, false, "mention", OPERATOR);
+            let config = search_intake(&fake, repo);
+            let issue = fake.rest.borrow()[&format!("{API_ROOT}repos/{repo}/issues/2")].clone();
+            let mut state = State::default();
+            if comments == 1 {
+                let old: Vec<_> = (1000..1100)
+                    .map(|id| Said {
+                        key: format!("issuecomment-{id}"),
+                        at: now(),
+                        body: "pending".into(),
+                        changes_requested: false,
+                    })
+                    .collect();
+                state
+                    .operator_direction
+                    .observe(repo, &issue, &old, &[], BOT, now())
+                    .unwrap();
+            } else {
+                fake.page(
+                    &format!("repos/{repo}/issues/2/comments?per_page=100"),
+                    json!(
+                        (1..=comments)
+                            .map(|id| said(
+                                id as u64,
+                                OPERATOR,
+                                UPDATED,
+                                "@worker please answer this"
+                            ))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+            }
+            let first = pass(&fake, &config, state, true);
+            assert_eq!(dispatches(&fake).len(), 1, "{:?}", first.lines);
+            assert_eq!(
+                first.state.operator_direction.requests.len(),
+                direction::REQUEST_LIMIT
+            );
+            assert!(first.state.operator_direction.overflow);
+        }
     }
 
     #[test]
@@ -2904,6 +3135,17 @@ mod tests {
             };
             let first = run_pass(State::default());
             assert_eq!(first.errors, 0, "{case}: {:?}", first.lines);
+            let receipts = &first.state.operator_direction;
+            if expected.is_some() || flags.contains(&"answered") {
+                assert_eq!(receipts.requests.len(), 1, "{case}");
+                assert_eq!(
+                    receipts.requests.values().next().unwrap().reply.is_some(),
+                    flags.contains(&"answered"),
+                    "{case}"
+                );
+            } else {
+                assert!(receipts.requests.is_empty(), "{case}");
+            }
             let started = dispatches(&fake);
             assert_eq!(
                 (started.iter())
@@ -3632,6 +3874,7 @@ mod tests {
                 caps: None,
                 intaking: false,
                 intake_refused: Vec::new(),
+                operator_direction: direction::Direction::default(),
                 intake_skip: BTreeSet::new(),
                 writes: 0,
                 review_runs: BTreeMap::new(),
