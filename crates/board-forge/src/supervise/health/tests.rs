@@ -255,6 +255,11 @@ fn newer_checks_and_their_boundaries() {
     assert_eq!(status("pace", week(50), now), "ok");
     assert_eq!(status("pace", week(54), now), "fail");
     assert_eq!(status("pace", week(0), now), "fail");
+    for (used, speed, expected) in [(90, 1, "fail"), (90, 5, "ok"), (50, 5, "fail")] {
+        let mut items = week(used);
+        items[0]["speed"] = speed.into();
+        assert_eq!(status("pace", items, now), expected, "{used} at {speed}x");
+    }
     // A pool under a pace override shows, on or off its pace, and only warns
     // unless another pool is off its pace.
     let spend = json!("pace override: large override spend until 2026-10-18T00:00Z");

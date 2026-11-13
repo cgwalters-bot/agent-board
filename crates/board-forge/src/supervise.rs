@@ -409,6 +409,7 @@ pub struct Settings {
     /// agent-board.json's `pace.overrides`, which the pace check shows
     /// beside the pool they pace ([`crate::poll::pace::overrides`]).
     pub pace_overrides: Vec<crate::poll::pace::Override>,
+    pub pace_speed: f64,
     pub limits: Limits,
     pub poll_workflow: String,
     pub probe_workflow: String,
@@ -613,6 +614,11 @@ impl Settings {
             kind_pools,
             pace_overrides: crate::poll::pace::overrides(
                 option(board, "pace")?.and_then(|p| p.get("overrides")),
+            )?,
+            pace_speed: crate::poll::pace::speed(
+                option(board, "pace")?.and_then(|p| p.get("speed")),
+                "pace speed",
+                true,
             )?,
             limits: Limits::from_json(supervisor)?,
             poll_workflow: names["pollWorkflow"].clone(),

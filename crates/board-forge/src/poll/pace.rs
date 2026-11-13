@@ -16,6 +16,8 @@ use crate::supervise::millis;
 
 /// The most `pace.marginPercent` may be: a pool can use at most all of its window.
 pub const PACE_MARGIN_LIMIT: f64 = 100.0;
+/// Broker-consumer allowances are caps, not provider-window pacing.
+pub const GRANT_SOURCE: &str = "grant";
 /// How old the snapshot may be and still pace: the supervisor's default
 /// `usageStaleMinutes`. Older, it says nothing of the pools now.
 const USAGE_STALE_SECONDS: i64 = 45 * 60;
@@ -35,6 +37,7 @@ pub struct Pace {
     pub issue: u64,
     pub bot: String,
     pub margin_percent: f64,
+    pub speed: f64,
     pub overrides: Vec<Override>,
     /// A snapshot already in hand, paced by in place of the comment, which
     /// is then not read: the pass's own fresh reading, which a preview does
@@ -51,6 +54,8 @@ pub enum OverrideMode {
     Spend,
     /// Held whatever its pace, to keep the pool idle.
     Hold,
+    /// Faster pacing, without lifting snapshot holds or exhaustion.
+    Speed(f64),
 }
 
 /// `pace.overrides[]`: a committed, reviewable change to one pool's pacing
@@ -69,7 +74,7 @@ impl Override {
         let object = value.as_object().context("is not an object")?;
         for key in object.keys() {
             ensure!(
-                ["pool", "until", "mode", "reason"].contains(&key.as_str()),
+                ["pool", "until", "mode", "reason", "factor"].contains(&key.as_str()),
                 "unknown field {key}"
             );
         }
@@ -87,8 +92,13 @@ impl Override {
         let mode = match object.get("mode").and_then(Value::as_str) {
             Some("spend") => OverrideMode::Spend,
             Some("hold") => OverrideMode::Hold,
-            _ => bail!("mode is not spend or hold"),
+            Some("speed") => OverrideMode::Speed(speed(object.get("factor"), "factor", false)?),
+            _ => bail!("mode is not spend, hold or speed"),
         };
+        ensure!(
+            matches!(mode, OverrideMode::Speed(_)) || !object.contains_key("factor"),
+            "factor requires mode speed"
+        );
         let reason = match object.get("reason") {
             None => "",
             Some(reason) => reason
@@ -114,8 +124,9 @@ impl Override {
     /// `claude override spend until 2026-10-22T04:00Z (use the week's allowance)`.
     pub fn describe(&self) -> String {
         let mode = match self.mode {
-            OverrideMode::Spend => "spend",
-            OverrideMode::Hold => "hold",
+            OverrideMode::Spend => "spend".to_owned(),
+            OverrideMode::Hold => "hold".to_owned(),
+            OverrideMode::Speed(factor) => format!("speed {factor}x"),
         };
         let reason = if self.reason.is_empty() {
             String::new()
@@ -185,8 +196,15 @@ impl Pace {
         let object = value.as_object().context("pace is not an object")?;
         for key in object.keys() {
             ensure!(
-                ["repository", "issue", "bot", "marginPercent", "overrides"]
-                    .contains(&key.as_str()),
+                [
+                    "repository",
+                    "issue",
+                    "bot",
+                    "marginPercent",
+                    "overrides",
+                    "speed"
+                ]
+                .contains(&key.as_str()),
                 "unknown pace field {key}"
             );
         }
@@ -217,9 +235,164 @@ impl Pace {
             issue,
             bot: bot.to_owned(),
             margin_percent,
+            speed: speed(object.get("speed"), "pace speed", true)?,
             overrides: overrides(object.get("overrides"))?,
             snapshot: None,
         }))
+    }
+}
+
+/// A multiplier cannot slow pacing or turn malformed input into unlimited room.
+pub fn speed(value: Option<&Value>, name: &str, default: bool) -> Result<f64> {
+    if value.is_none() && default {
+        return Ok(1.0);
+    }
+    value
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 1.0)
+        .with_context(|| format!("{name} must be a finite number at least 1"))
+}
+
+/// Pass-local pacing controls; the pass already names its usage source.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Settings {
+    pub speed: f64,
+    pub margin: f64,
+    pub overrides: Vec<Override>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            margin: 0.0,
+            overrides: vec![],
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Settings {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> std::result::Result<Self, D::Error> {
+        let value = Value::deserialize(decoder)?;
+        let read = || -> Result<Self> {
+            let object = value.as_object().context("pace is not an object")?;
+            for key in object.keys() {
+                ensure!(
+                    ["speed", "marginPercent", "overrides"].contains(&key.as_str()),
+                    "unknown pace field {key}"
+                );
+            }
+            let margin = match object.get("marginPercent") {
+                None => 0.0,
+                Some(value) => value
+                    .as_f64()
+                    .filter(|n| (0.0..=PACE_MARGIN_LIMIT).contains(n))
+                    .context("pace marginPercent is not 0 to 100")?,
+            };
+            Ok(Self {
+                speed: speed(object.get("speed"), "pace speed", true)?,
+                margin,
+                overrides: overrides(object.get("overrides"))?,
+            })
+        };
+        read().map_err(serde::de::Error::custom)
+    }
+}
+
+impl Settings {
+    /// Adjust only the pass's in-memory snapshot, before maintain reserves its
+    /// share. Never lift a snapshot hold, including a broker grant's hold.
+    pub fn apply(&self, mut snapshot: Value, now: OffsetDateTime) -> Value {
+        if *self == Self::default() || snapshot["pace_adjusted"] == true {
+            return snapshot;
+        }
+        let Some(pools) = snapshot["pools"].as_object_mut() else {
+            return snapshot;
+        };
+        for (name, entry) in pools {
+            if !entry.is_object() {
+                continue;
+            }
+            let active = self
+                .overrides
+                .iter()
+                .find(|o| o.pool == *name && o.in_force(now));
+            if entry["source"] == GRANT_SOURCE {
+                // A consumer may not spend another consumer's allowance.
+                if matches!(active.map(|o| o.mode), Some(OverrideMode::Hold)) {
+                    entry["hold"] = true.into();
+                }
+                continue;
+            }
+            let factor = match active.map(|o| o.mode) {
+                Some(OverrideMode::Speed(factor)) => factor,
+                _ => self.speed,
+            };
+            if capped(entry, now).is_some() {
+                continue;
+            }
+            let mode = match active.map(|o| o.mode) {
+                Some(OverrideMode::Hold) => Mode::Held { until: None },
+                Some(OverrideMode::Spend) => match entry["used_percent"].as_f64() {
+                    Some(used) => Mode::Normal {
+                        used,
+                        ceiling: 100.0,
+                    },
+                    None => Mode::Held { until: None },
+                },
+                _ => accelerated(entry, now, self.margin, factor),
+            };
+            match mode {
+                Mode::Normal { ceiling, .. } => {
+                    // Preserve ordinary snapshots exactly; burst is not part
+                    // of the allowance maintain reserves.
+                    if factor != 1.0 || matches!(active.map(|o| o.mode), Some(OverrideMode::Spend))
+                    {
+                        entry["allowed_percent"] = ceiling.into();
+                        entry["burst"] = 0.into();
+                        entry["pace_adjusted"] = true.into();
+                    }
+                }
+                Mode::Held { .. } => {
+                    entry["hold"] = true.into();
+                }
+                _ => {}
+            }
+        }
+        snapshot["pace_adjusted"] = true.into();
+        snapshot
+    }
+}
+
+/// Shared multiplied allowance. Window length plus reset gives its start.
+pub fn allowance(entry: &Value, now: OffsetDateTime, speed: f64) -> Option<f64> {
+    let window = entry["window_minutes"].as_f64()? * 60_000.0;
+    let left =
+        (millis(&entry["resets_at"])? - (now.unix_timestamp_nanos() / 1_000_000) as i64) as f64;
+    if !window.is_finite() || window <= 0.0 || left <= 0.0 {
+        return None;
+    }
+    Some((100.0 * ((window - left) / window).clamp(0.0, 1.0) * speed).min(100.0))
+}
+
+fn accelerated(entry: &Value, now: OffsetDateTime, margin: f64, speed: f64) -> Mode {
+    if let Some(held) = capped(entry, now) {
+        return held;
+    }
+    if speed == 1.0 || entry["pace_adjusted"] == true || entry["source"] == GRANT_SOURCE {
+        return mode(entry, now, margin);
+    }
+    let Some((used, ceiling)) = entry["used_percent"]
+        .as_f64()
+        .filter(|u| u.is_finite())
+        .zip(allowance(entry, now, speed))
+    else {
+        return Mode::Held { until: None };
+    };
+    if used > ceiling + margin {
+        Mode::Held { until: None }
+    } else {
+        Mode::Normal { used, ceiling }
     }
 }
 
@@ -339,6 +512,16 @@ pub fn paces(
     margin: f64,
     overrides: &[Override],
 ) -> Paces {
+    paces_with_speed(snapshot, now, margin, overrides, 1.0)
+}
+
+pub fn paces_with_speed(
+    snapshot: Option<&Value>,
+    now: OffsetDateTime,
+    margin: f64,
+    overrides: &[Override],
+    speed: f64,
+) -> Paces {
     let snapshot = snapshot.ok_or("there is no usage snapshot")?;
     let fresh = (now.unix_timestamp_nanos() / 1_000_000) as i64 - USAGE_STALE_SECONDS * 1000;
     if millis(&snapshot["updated_at"]).is_none_or(|at| at < fresh) {
@@ -349,16 +532,12 @@ pub fn paces(
         .ok_or("the usage snapshot has no pools")?;
     let mut modes: BTreeMap<String, Mode> = pools
         .iter()
-        .map(|(name, entry)| {
-            (
-                name.clone(),
-                capped(entry, now).unwrap_or_else(|| mode(entry, now, margin)),
-            )
-        })
+        .map(|(name, entry)| (name.clone(), accelerated(entry, now, margin, speed)))
         .collect();
     for o in overrides.iter().filter(|o| o.in_force(now)) {
         let entry = pools.get(&o.pool).unwrap_or(&Value::Null);
         let mode = match (o.mode, capped(entry, now)) {
+            (OverrideMode::Speed(factor), _) => accelerated(entry, now, margin, factor),
             (OverrideMode::Spend, Some(held)) => held,
             (OverrideMode::Spend, _)
                 if (o.pool == "claude" || o.pool == "openai")
@@ -413,6 +592,10 @@ fn choose_with(
                 continue;
             }
             Mode::Overridden(Override {
+                mode: OverrideMode::Speed(_),
+                ..
+            }) => ordinary.push(pool.clone()),
+            Mode::Overridden(Override {
                 mode: OverrideMode::Hold,
                 until,
                 ..
@@ -436,6 +619,16 @@ pub fn line(
     configured: &BTreeSet<String>,
     overrides: &[Override],
     now: OffsetDateTime,
+) -> String {
+    line_with_speed(paces, configured, overrides, now, 1.0)
+}
+
+pub fn line_with_speed(
+    paces: &Paces,
+    configured: &BTreeSet<String>,
+    overrides: &[Override],
+    now: OffsetDateTime,
+    speed: f64,
 ) -> String {
     let mut line = match paces {
         Err(why) => format!("pools: {why}, so new runs wait"),
@@ -462,6 +655,15 @@ pub fn line(
             o.pool,
             minute(o.until)
         ));
+    }
+    if speed != 1.0 {
+        line.push_str(&format!("; speed {speed}x (no expiry)"));
+    }
+    for o in overrides
+        .iter()
+        .filter(|o| o.in_force(now) && matches!(o.mode, OverrideMode::Speed(_)))
+    {
+        line.push_str(&format!("; {}", o.describe()));
     }
     line
 }
@@ -598,11 +800,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 }),
         };
         let read = snapshot.and_then(|snapshot| {
-            paces(
+            paces_with_speed(
                 snapshot.as_ref(),
                 self.now,
                 pace.margin_percent,
                 &pace.overrides,
+                pace.speed,
             )
         });
         self.paces = Some(read.clone());
@@ -637,9 +840,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                                         .as_ref()
                                         .and_then(|p| p.snapshot.as_ref())
                                         .map(|s| &s["pools"][name]);
-                                    let allowed = entry
-                                        .and_then(|e| e["allowed_percent"].as_f64())
-                                        .unwrap_or(*ceiling);
+                                    let allowed =
+                                        if self.config.policy.pace.as_ref().is_some_and(|p| {
+                                            p.speed != 1.0
+                                                || p.overrides.iter().any(|o| {
+                                                    o.pool == *name
+                                                        && o.in_force(self.now)
+                                                        && matches!(o.mode, OverrideMode::Speed(_))
+                                                })
+                                        }) {
+                                            *ceiling
+                                        } else {
+                                            entry
+                                                .and_then(|e| e["allowed_percent"].as_f64())
+                                                .unwrap_or(*ceiling)
+                                        };
                                     Some((name.clone(), allowed - used))
                                 }
                                 _ => None,
@@ -661,7 +876,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let policy = &self.config.policy;
         let fix_pools = self.apply.as_ref().map_or(&[][..], |a| &a.pools[..]);
         let overrides = policy.pace.as_ref().map_or(&[][..], |p| &p.overrides[..]);
-        Some(line(&paces, &policy.pools(fix_pools), overrides, self.now))
+        Some(line_with_speed(
+            &paces,
+            &policy.pools(fix_pools),
+            overrides,
+            self.now,
+            policy.pace.as_ref().map_or(1.0, |p| p.speed),
+        ))
     }
 }
 
@@ -1306,12 +1527,12 @@ mod tests {
             (
                 "missing mode",
                 json!([without("mode")]),
-                "mode is not spend or hold",
+                "mode is not spend, hold or speed",
             ),
             (
                 "unknown mode",
                 json!([with("mode", json!("boost"))]),
-                "mode is not spend or hold",
+                "mode is not spend, hold or speed",
             ),
             (
                 "missing pool",
@@ -1367,6 +1588,97 @@ mod tests {
         ] {
             let got = check_overrides(&[entry], now, &configured).map_err(|e| e.to_string());
             assert_eq!(got, expected.map_err(str::to_owned), "{case}");
+        }
+    }
+
+    #[test]
+    fn speed_pacing_table() {
+        let now = at(NOW);
+        // used, elapsed, default speed, margin, override, expired, snapshot hold, held
+        for (used, elapsed, speed, margin, mode, expired, hold, held) in [
+            (30.0, 10.0, 1.0, 0.0, None, false, None, true),
+            (30.0, 10.0, 5.0, 0.0, None, false, None, false),
+            (51.0, 10.0, 5.0, 0.0, None, false, None, true),
+            (51.0, 10.0, 5.0, 1.0, None, false, None, false),
+            (50.0, 10.0, 5.0, 0.0, None, false, None, false),
+            (99.0, 30.0, 5.0, 0.0, None, false, None, false),
+            (100.0, 30.0, 5.0, 100.0, None, false, None, true),
+            (30.0, 10.0, 1.0, 0.0, Some("speed"), false, None, false),
+            (30.0, 10.0, 1.0, 0.0, Some("speed"), true, None, true),
+            (30.0, 10.0, 5.0, 0.0, Some("hold"), false, None, true),
+            (90.0, 10.0, 1.0, 0.0, Some("spend"), false, None, false),
+            (30.0, 10.0, 5.0, 0.0, None, false, Some(true), true),
+            (30.0, 10.0, 1.0, 0.0, Some("speed"), false, Some(true), true),
+            (30.0, 10.0, 1.0, 0.0, Some("spend"), false, Some(true), true),
+            (30.0, 10.0, 5.0, 0.0, None, false, Some(false), false),
+            (60.0, 10.0, 5.0, 0.0, None, false, Some(false), true),
+        ] {
+            let mut entry = json!({"used_percent": used, "allowed_percent": elapsed,
+                "window_minutes": 100, "resets_at": (now + time::Duration::seconds(((100.0 - elapsed) * 60.0) as i64)).format(&Rfc3339).unwrap()});
+            if let Some(hold) = hold {
+                entry["hold"] = hold.into();
+            }
+            let overrides = mode.map(|mode| {
+                let mut value = json!({"pool":"claude", "mode":mode,
+                    "until": (now + time::Duration::hours(if expired { -1 } else { 1 })).format(&Rfc3339).unwrap()});
+                if mode == "speed" { value["factor"] = 5.into(); }
+                Override::from_json(&value).unwrap()
+            }).into_iter().collect::<Vec<_>>();
+            let snapshot = snapshot(json!({"claude": entry}));
+            let read = paces_with_speed(Some(&snapshot), now, margin, &overrides, speed);
+            assert_eq!(
+                choose(&read, &names(&["claude"]), None).is_err(),
+                held,
+                "used={used} elapsed={elapsed} speed={speed} margin={margin} override={mode:?} expired={expired} hold={hold:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn speed_config_is_validated_and_reported() {
+        let now = at(NOW);
+        for factor in [json!(0.9), json!(null), json!("5"), json!(-1)] {
+            let value = json!({"pool":"claude", "mode":"speed", "factor":factor, "until":"2026-10-18T00:00:00Z"});
+            assert!(Override::from_json(&value).is_err(), "{value}");
+            assert!(serde_json::from_value::<Settings>(json!({"speed": factor})).is_err());
+        }
+        for (until, valid) in [
+            (None, false),
+            (Some("2026-10-25T00:00:00Z"), false),
+            (Some("2026-10-18T00:00:00Z"), true),
+        ] {
+            let mut value = json!({"pool":"claude", "mode":"speed", "factor":5});
+            if let Some(until) = until {
+                value["until"] = until.into();
+            }
+            let parsed = Override::from_json(&value).and_then(|o| {
+                check_overrides(
+                    std::slice::from_ref(&o),
+                    now,
+                    &BTreeSet::from(["claude".into()]),
+                )?;
+                Ok(o)
+            });
+            assert_eq!(parsed.is_ok(), valid, "{value}");
+            if let Ok(o) = parsed {
+                assert!(
+                    line_with_speed(&Ok(BTreeMap::new()), &BTreeSet::new(), &[o], now, 1.0)
+                        .contains("claude override speed 5x until 2026-10-18T00:00Z")
+                );
+            }
+        }
+        for snapshot in [
+            None,
+            Some(json!({"updated_at": NOW, "pools": {"claude": null}})),
+        ] {
+            assert!(
+                choose(
+                    &paces_with_speed(snapshot.as_ref(), now, 0.0, &[], 5.0),
+                    &names(&["claude"]),
+                    None
+                )
+                .is_err()
+            );
         }
     }
 }

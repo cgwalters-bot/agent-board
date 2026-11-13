@@ -25,7 +25,7 @@ const CODEX_WINDOWS: &[&str] = &["primary", "secondary"];
 /// The broker's grant this reads (praxis-credential-broker#41).
 const GRANT_SCHEMA: &str = "praxis-broker-grant/v1";
 /// The snapshot's pools' `source` where the grant paces them.
-pub(super) const GRANT_SOURCE: &str = "grant";
+pub(super) const GRANT_SOURCE: &str = crate::poll::pace::GRANT_SOURCE;
 /// The hold reason of a pool its grant holds.
 const GRANT_HOLD: &str = "grant";
 /// The hold reason of every pool when the grant cannot be read.

@@ -399,13 +399,11 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                         if truthy(&p["override"]) {
                             return true;
                         }
-                        let window = p["window_minutes"].as_f64().unwrap_or(f64::NAN) * 60_000.0;
-                        let left = millis(&p["resets_at"]).map_or(f64::NAN, |at| (at - now) as f64);
-                        let elapsed = 100.0 * (1.0 - left / window).clamp(0.0, 1.0);
+                        let speed = p["speed"].as_f64().unwrap_or(1.0);
+                        let elapsed = time::OffsetDateTime::from_unix_timestamp_nanos(now as i128 * 1_000_000)
+                            .ok().and_then(|now| crate::poll::pace::allowance(p, now, speed)).unwrap_or(f64::NAN);
                         let used = p["used_percent"].as_f64().unwrap_or(f64::NAN);
-                        window > 0.0
-                            && left > 0.0
-                            && (used - elapsed).abs() > limits.pace_margin_percent
+                        (used - elapsed).abs() > limits.pace_margin_percent
                     })
                     .collect(),
                 "failures" => items.iter().filter(|r| truthy(&r["reason"])).collect(),
@@ -1480,11 +1478,26 @@ impl Collector<'_> {
                 .pace_overrides
                 .iter()
                 .find(|o| {
-                    o.pool == pool && (o.until.unix_timestamp_nanos() / 1_000_000) as i64 > self.now
+                    o.pool == pool
+                        && (o.until.unix_timestamp_nanos() / 1_000_000) as i64 > self.now
+                        && !matches!(o.mode, crate::poll::pace::OverrideMode::Speed(_))
                 })
                 .map_or(Value::Null, |o| {
                     format!("pace override: {}", o.describe()).into()
                 })
+        };
+        let speed = |pool: &str| {
+            self.s
+                .pace_overrides
+                .iter()
+                .find(|o| {
+                    o.pool == pool && (o.until.unix_timestamp_nanos() / 1_000_000) as i64 > self.now
+                })
+                .and_then(|o| match o.mode {
+                    crate::poll::pace::OverrideMode::Speed(factor) => Some(factor),
+                    _ => None,
+                })
+                .unwrap_or(self.s.pace_speed)
         };
         Ok(snap["pools"]
             .as_object()
@@ -1492,7 +1505,7 @@ impl Collector<'_> {
                 pools
                     .iter()
                     .filter(|(_, p)| truthy(p))
-                    .map(|(pool, p)| json!({"used_percent": p["used_percent"], "window_minutes": p["window_minutes"], "resets_at": p["resets_at"], "html_url": url, "override": overridden(pool)}))
+                    .map(|(pool, p)| json!({"used_percent": p["used_percent"], "window_minutes": p["window_minutes"], "resets_at": p["resets_at"], "html_url": url, "override": overridden(pool), "speed": speed(pool)}))
                     .collect()
             })
             .unwrap_or_default())
