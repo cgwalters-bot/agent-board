@@ -929,15 +929,54 @@ fn the_task_is_the_playbook_the_policy_and_the_report_bounded() {
     let (head, _) = PLAYBOOK.split_once(OPERATOR).unwrap();
     assert!(task.starts_with(head));
     assert!(task.contains("Why you run: release failing."));
-    assert!(task.contains("\"maxDispatchesPerPass\": 2"));
+    assert!(task.contains("\"maxDispatchesPerPass\":2"));
     assert!(task.contains("\"no-plan\""));
-    assert!(task.contains("\"id\": \"release\""));
+    assert!(task.contains("\"id\":\"release\""));
     assert!(!task.contains("\"requests\""));
     assert!(!task.contains("\"log\""));
     let big: Vec<Value> = (0..2000)
         .map(|i| json!({"id": i, "evidence": ["https://github.com/o/r/issues/1"]}))
         .collect();
     assert!(compose(&big, &p, "r", None).is_err());
+}
+
+#[test]
+fn a_full_failure_report_fits_the_aggregate_budget_with_pass_errors_retained() {
+    let s = settings();
+    let p = policy(&s);
+    let reports: Vec<Value> = crate::supervise::health::CHECKS.iter().map(|(id, _)| json!({
+        "id":id, "status":"fail", "evidence":["https://github.com/example/control/actions/runs/123456789"],
+        "signatures":(0..3).map(|n| json!({"signature":format!("{n:064x}"), "kind":"pass/2",
+            "text":"request budget exceeded while reading pull requests ".repeat(4), "count":3,
+            "first_seen":NOW, "last_seen":NOW, "examples":["https://github.com/example/control/actions/runs/123456789"]})).collect::<Vec<_>>()
+    })).collect();
+    let task = compose(&reports, &p, "pass-errors failing", None).unwrap();
+    assert!(task.len() <= REPORT_TASK_BYTES);
+    let report: Value = serde_json::from_str(
+        task.rsplit_once("```json\n")
+            .unwrap()
+            .1
+            .strip_suffix("\n```\n")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report.as_array().unwrap().len(), reports.len());
+    assert!(
+        report
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["status"] == "fail")
+    );
+    assert!(
+        report
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "pass-errors")
+            .unwrap()["signatures"]
+            .is_array()
+    );
 }
 
 #[test]
@@ -951,7 +990,7 @@ fn the_task_names_the_configured_operator_and_no_other_login() {
             task.contains(&format!("anyone but\n{operator}, the policy's `operator`")),
             "{operator}"
         );
-        assert!(task.contains(&format!("\"operator\": \"{operator}\"")));
+        assert!(task.contains(&format!("\"operator\":\"{operator}\"")));
         assert!(!task.contains(OPERATOR), "{operator}");
         assert!(!task.contains("cgwalters"), "{operator}");
     }

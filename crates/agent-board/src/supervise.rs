@@ -729,7 +729,7 @@ mod tests {
         )
         .unwrap();
         assert!(out.starts_with("act=true\n"));
-        assert!(out.contains("\"dailyUsed\": null"));
+        assert!(out.contains("\"dailyUsed\":null"));
         let usage = advisory_usage(|| Ok(Default::default()));
         assert_eq!(usage, Some(Default::default()));
         let skip = agent::Decision {

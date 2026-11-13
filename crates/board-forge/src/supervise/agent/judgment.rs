@@ -227,6 +227,8 @@ pub enum Write {
         title: String,
         body: String,
         #[serde(default)]
+        repository: Option<String>,
+        #[serde(default)]
         signature: Option<String>,
     },
     Close {
@@ -531,6 +533,19 @@ impl Checked {
                             "Board bugs require a signature"
                         );
                     }
+                    if let Write::FileBug {
+                        repository: Some(repo),
+                        signature,
+                        ..
+                    } = w
+                    {
+                        ensure!(
+                            p.agent.pass_failure_repository.as_deref() == Some(repo)
+                                && p.settings.follow.contains(repo),
+                            "Bug repository is not the configured pass code owner"
+                        );
+                        ensure!(signature.is_some(), "Pass bugs require a signature");
+                    }
                 }
                 Write::ReplaceState { body } => {
                     let state = p
@@ -637,6 +652,11 @@ impl Checked {
             Self::Write(Write::PlanEpic { epic, .. }) => {
                 Some((p.settings.epics_repository.as_str(), *epic))
             }
+            Self::Write(Write::FileBug {
+                repository: Some(repo),
+                ..
+            }) => Some(repo.as_str())
+                .zip(receipt.and_then(|r| r["number"].as_u64().filter(|n| *n > 0))),
             Self::Write(Write::CreateIssue { .. } | Write::FileBug { .. }) => p
                 .agent
                 .tracker
@@ -656,8 +676,13 @@ impl Checked {
 
     /// Checks the target as it is now; a status update reads its changes.
     pub fn preflight(&mut self, api: &dyn Api, p: &Policy, now: i64) -> Result<()> {
-        if let Self::Write(Write::FileBug { signature, .. }) = self {
-            bug_ready(api, p, signature.as_deref())?;
+        if let Self::Write(Write::FileBug {
+            signature,
+            repository,
+            ..
+        }) = self
+        {
+            bug_ready(api, p, signature.as_deref(), repository.as_deref())?;
         }
         if let Self::Write(Write::PlanEpic { epic, .. }) = self {
             return plan_epic_ready(api, p, *epic, now);
@@ -767,6 +792,16 @@ impl Checked {
     pub fn apply(&self, api: &dyn Api, p: &Policy, ctx: &Run) -> Result<Value> {
         let (method, path, body) = match self {
             Self::Dispatch(r) => {
+                if super::recovery_target(p, r) {
+                    // Serialized executors recheck before reserving, and never
+                    // retry an ambiguous dispatch without operator intervention.
+                    super::preflight(api, p, r)?;
+                    api.send(
+                        "POST",
+                        &format!("/repos/{}/issues/{}/comments", r.repository, r.item),
+                        &json!({"body": signed(super::RECOVERY_CLAIM, None, &p.settings.footer)}),
+                    )?;
+                }
                 let target = Target {
                     caller: p.settings.dispatch_repo.clone(),
                     workflow: p.settings.dispatch_workflow.clone(),
@@ -837,11 +872,12 @@ impl Checked {
                     title,
                     body,
                     signature,
+                    repository,
                 } => {
                     // Recheck after admission: earlier writes or another pass
                     // may already have filed this signature. Callers serialize.
-                    let priority = bug_ready(api, p, signature.as_deref())?;
-                    let note = if p.agent.bug_epic.is_some() {
+                    let priority = bug_ready(api, p, signature.as_deref(), repository.as_deref())?;
+                    let note = if p.agent.bug_epic.is_some() || repository.is_some() {
                         None
                     } else {
                         Some(crate::input::SUPERVISOR_NOTE)
@@ -850,13 +886,16 @@ impl Checked {
                     if let Some(signature) = signature {
                         body = signed(&body, Some(&bug_marker(signature)), &p.settings.footer);
                     }
-                    let repo = p.agent.tracker.as_deref().context("No tracker")?;
+                    let repo = repository
+                        .as_deref()
+                        .or(p.agent.tracker.as_deref())
+                        .context("No tracker")?;
                     let receipt = api.send(
                         "POST",
                         &format!("/repos/{repo}/issues"),
                         &json!({"title": title, "body": body}),
                     )?;
-                    if let Some(epic) = p.agent.bug_epic {
+                    if let Some(epic) = p.agent.bug_epic.filter(|_| repository.is_none()) {
                         let id = receipt["id"].as_u64().context("Created bug has no ID")?;
                         api.send(
                             "POST",
@@ -1030,9 +1069,12 @@ fn bug_ready(
     api: &dyn Api,
     p: &Policy,
     signature: Option<&str>,
+    repository: Option<&str>,
 ) -> Result<Option<(String, String)>> {
     if let Some(signature) = signature {
-        let repo = p.agent.tracker.as_deref().context("No tracker")?;
+        let repo = repository
+            .or(p.agent.tracker.as_deref())
+            .context("No tracker")?;
         let marker = bug_marker(signature);
         let mut complete = false;
         for page in 1..=COMMENT_PAGES {
@@ -1055,7 +1097,7 @@ fn bug_ready(
         }
         ensure!(complete, "Open bugs truncated");
     }
-    let Some(epic) = p.agent.bug_epic else {
+    let Some(epic) = p.agent.bug_epic.filter(|_| repository.is_none()) else {
         return Ok(None);
     };
     target(p, &p.settings.epics_repository, epic)?;
@@ -1620,7 +1662,7 @@ const LAST_EDITED: &str = r#"query($owner:String!,$name:String!,$number:Int!){
   repository(owner:$owner,name:$name){issue(number:$number){lastEditedAt}}
 }"#;
 
-fn paged(api: &dyn Api, repo: &str, item: u64, resource: &str) -> Result<Vec<Value>> {
+pub(super) fn paged(api: &dyn Api, repo: &str, item: u64, resource: &str) -> Result<Vec<Value>> {
     let mut all = vec![];
     for page in 1..=COMMENT_PAGES {
         let values = api.get(&format!(
