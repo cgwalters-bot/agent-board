@@ -120,6 +120,7 @@ pub fn run(
     let (effective, mut policy) = configured(args, value.as_ref(), pools.as_ref(), now)?;
     policy.fix_bounds = FixBoundsSet::read(&args.fix_bounds)?;
     let args = &effective;
+    policy.fix_caller_workflow = args.dispatch_workflow.clone();
     ensure!(
         !args.apply || args.dispatch_workflow.is_some(),
         "--apply requires --dispatch-workflow <FILE> or config dispatchWorkflow"
