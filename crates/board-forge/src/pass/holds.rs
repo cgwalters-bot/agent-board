@@ -1946,7 +1946,27 @@ pub struct Reading<'a> {
 /// or reason stands.
 pub fn summary(body: &str) -> Summary {
     let field = |labels: &[&str]| {
+        // CommonMark: a fence closes on the same character, at least as
+        // long, with nothing after it; unclosed, it runs to the end.
+        let mut fence = None;
         body.lines()
+            .filter(|line| {
+                let Some((mark, length)) = crate::plan::code_fence(line) else {
+                    return fence.is_none();
+                };
+                match fence {
+                    Some((m, l))
+                        if m == mark
+                            && length >= l
+                            && line.trim().trim_start_matches(mark).is_empty() =>
+                    {
+                        fence = None
+                    }
+                    None => fence = Some((mark, length)),
+                    _ => {}
+                }
+                false
+            })
             .map(|l| l.trim().strip_prefix("- ").unwrap_or(l.trim()))
             .find_map(|l| {
                 let (label, rest) = l.split_once(':')?;
@@ -1959,7 +1979,12 @@ pub fn summary(body: &str) -> Summary {
             .and_then(|rest| one_line(rest, MAX_ASK))
     };
     Summary {
-        question: field(&["Decision needed", "Question for the operator"]),
+        question: field(&[
+            "Decision needed",
+            "Question for the operator",
+            "Question",
+            "Q",
+        ]),
         recommendation: field(&["Recommendation", "Recommended"]),
         revision: None,
     }

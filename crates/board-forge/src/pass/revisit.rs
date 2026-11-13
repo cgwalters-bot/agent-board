@@ -43,6 +43,9 @@ pub struct Revisit {
     pub after_days: u64,
     /// Likewise for an issue a person holds; None: `afterDays`.
     pub held_after_days: Option<u64>,
+    /// Also inspect recently active held issues for a missing operator question.
+    #[serde(default)]
+    pub repair_questions: bool,
     /// The pools a revisit runs on, in order; None: `triagePools`.
     pub pools: Option<Vec<String>>,
 }
@@ -50,6 +53,10 @@ pub struct Revisit {
 impl Revisit {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
         ensure!(config.triage.is_some(), "revisit needs triage");
+        ensure!(
+            !self.repair_questions || config.forgejo_board().is_none(),
+            "revisit repairQuestions requires a GitHub board"
+        );
         ensure!(
             (1..=PER_PASS_LIMIT).contains(&self.per_pass),
             "revisit perPass is not 1 to {PER_PASS_LIMIT}"
@@ -96,8 +103,13 @@ impl Revisit {
         held: bool,
     ) -> Option<(u64, i64)> {
         let days = self.days(held);
-        let silent = (now - updated?).whole_days();
-        (silent >= days as i64).then_some((days, silent))
+        let updated = updated?;
+        if updated > now {
+            return None;
+        }
+        let silent = (now - updated).whole_days();
+        (silent >= days as i64 || (held && self.repair_questions && silent >= 0))
+            .then_some((days, silent))
     }
 }
 
@@ -362,6 +374,22 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let issue = &due.facts.issue;
         let writers = self.writers();
         let comments = plan::issue_comments(&self.client, issue)?;
+        let repair = revisit.repair_questions && due.held.is_some();
+        if repair {
+            let said = needs::bot_summary(&comments, &config.bot).unwrap_or_default();
+            let question = said.question.as_deref().or_else(|| {
+                due.facts
+                    .why
+                    .as_deref()
+                    .and_then(|why| why.strip_prefix("Q:"))
+            });
+            if question.is_some_and(|q| q.contains('?')) && due.silent < due.days as i64 {
+                return Ok(Step::Hold(Hold::new(
+                    HoldKind::Other,
+                    "its operator question is present; not due a regular revisit",
+                )));
+            }
+        }
         let last = (comments.iter())
             .filter(|c| is(c.author.as_deref(), &writers) && c.body.starts_with(REVISIT))
             .max_by_key(|c| c.changed);
@@ -441,6 +469,14 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             due.silent
         );
         brief.push_str(&self.verdict_ask(due.facts));
+        if repair {
+            brief.push_str(
+                " This held issue needs its operator question checked. If a real decision remains, \
+                 state it and its options on one line starting \"Decision needed:\". If no operator \
+                 decision remains, report the evidence and propose release through existing policy; \
+                 do not invent a question or remove the hold yourself.",
+            );
+        }
         let context = (slots, target, revisit_hold as HoldRule);
         let read = Some((due.facts, comments.as_slice()));
         self.start_triage(issue, (&pool, brief, REVISIT), None, read, line, context)
@@ -450,6 +486,27 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_silence_requires_a_known_nonfuture_update() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        for enabled in [false, true] {
+            let settings: Revisit = serde_json::from_value(json!({
+                "perPass": 1, "afterDays": 14, "heldAfterDays": 7,
+                "repairQuestions": enabled
+            }))
+            .unwrap();
+            for (updated, held, expected) in [
+                (None, true, false),
+                (Some(now + time::Duration::hours(1)), true, false),
+                (Some(now), true, enabled),
+                (Some(now), false, false),
+                (Some(now - time::Duration::days(7)), true, true),
+            ] {
+                assert_eq!(settings.silence(updated, now, held).is_some(), expected);
+            }
+        }
+    }
 
     fn rank(epic: usize, own: usize) -> Rank {
         (epic, own, OffsetDateTime::UNIX_EPOCH, "o/r".into(), 1)
