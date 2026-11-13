@@ -42,6 +42,17 @@ impl std::error::Error for Held {}
 #[derive(Debug)]
 pub(crate) struct NotSelected(String);
 
+#[derive(Debug)]
+struct ScopeFailure(String);
+
+impl std::fmt::Display for ScopeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScopeFailure {}
+
 impl std::fmt::Display for NotSelected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -238,6 +249,9 @@ const RECORDED_FIELDS: &[&str] = &[
     "verification",
     "verified",
     "default_branch",
+    "custom_properties",
+    "origin",
+    "topics",
     "merge_commit_sha",
     "commit_id",
     "tree",
@@ -272,7 +286,115 @@ pub fn recording(fixture: &str) -> Result<String> {
 }
 
 pub fn enabled(config: &Config) -> bool {
-    config.promote.as_ref().is_some_and(|p| !p.forks.is_empty())
+    config
+        .promote
+        .as_ref()
+        .is_some_and(|p| !p.forks.is_empty() || config.midstream.is_some())
+}
+
+/// The legacy map is readable for pinned callers, but cannot authorize a
+/// destination. Only GitHub's parent and midstream metadata can do that.
+pub(crate) fn target(
+    metadata: &Value,
+    repo: &str,
+    legacy: Option<&pass::promote::Fork>,
+) -> Result<Option<pass::promote::Fork>> {
+    target_impl(metadata, repo, legacy).map_err(|error| ScopeFailure(format!("{error:#}")).into())
+}
+
+fn target_impl(
+    metadata: &Value,
+    repo: &str,
+    legacy: Option<&pass::promote::Fork>,
+) -> Result<Option<pass::promote::Fork>> {
+    repository(metadata, repo)?;
+    ensure!(
+        metadata["fork"]
+            .as_bool()
+            .context("missing repository fork flag")?,
+        "promotion requires a GitHub fork: {repo}"
+    );
+    let upstream = metadata["parent"]["full_name"]
+        .as_str()
+        .context("missing fork parent")?;
+    validate_repository(upstream)?;
+    ensure!(
+        !upstream.eq_ignore_ascii_case(repo),
+        "fork is its own parent"
+    );
+    if let Some(legacy) = legacy {
+        ensure!(
+            legacy.upstream.eq_ignore_ascii_case(upstream),
+            "promote metadata disagrees with fork parent for {repo}"
+        );
+    }
+    let topics = metadata["topics"]
+        .as_array()
+        .context("missing repository topics")?;
+    ensure!(
+        topics.iter().all(Value::is_string),
+        "invalid repository topics"
+    );
+    let properties = metadata["custom_properties"]
+        .as_object()
+        .context("missing repository custom properties")?;
+    ensure!(
+        properties.get("origin").is_none_or(Value::is_string),
+        "invalid origin property"
+    );
+    if properties.get("origin") != Some(&Value::String("fork".into()))
+        || !topics.iter().any(|topic| topic == "bot-midstream")
+    {
+        return Ok(None);
+    }
+    let base = match legacy {
+        Some(legacy) => legacy.base.as_str(),
+        None => metadata["parent"]["default_branch"]
+            .as_str()
+            .context("missing parent default branch")?,
+    };
+    validate_branch(base)?;
+    Ok(Some(pass::promote::Fork {
+        upstream: upstream.into(),
+        base: base.into(),
+    }))
+}
+
+/// Discovery is bounded by the existing midstream listing and read budget.
+/// Explicit legacy entries are checked too, so non-forks fail rather than skip.
+pub(crate) fn targets(
+    client: &impl Rest,
+    config: &Config,
+) -> Result<BTreeMap<String, pass::promote::Fork>> {
+    let settings = config.promote.as_ref().context("promote configuration")?;
+    let mut names: BTreeMap<_, _> = settings
+        .forks
+        .keys()
+        .map(|name| (name.to_ascii_lowercase(), name.clone()))
+        .collect();
+    if let Some(midstream) = &config.midstream {
+        for name in midstream.list(client, true, |value, _| {
+            value["topics"]
+                .as_array()
+                .is_some_and(|topics| topics.iter().any(|topic| topic == "bot-midstream"))
+                && value["custom_properties"]["origin"] == "fork"
+        })? {
+            names.insert(name.to_ascii_lowercase(), name);
+        }
+    }
+    let mut found = BTreeMap::new();
+    for repo in names.into_values() {
+        let metadata = get(client, &format!("repos/{repo}"))?;
+        let legacy = settings
+            .forks
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&repo))
+            .map(|(_, target)| target);
+        if let Some(target) = target(&metadata, &repo, legacy)? {
+            found.insert(repo, target);
+        }
+    }
+    Ok(found)
 }
 
 /// No forge reads at all when off. Errors are never interpreted as an empty list.
@@ -296,8 +418,7 @@ pub fn preview<C: Rest + Transport>(
         let mut lines = Vec::new();
         // Each upstream's policy is read at most once per run.
         let mut policies = BTreeMap::new();
-        let promote = config.promote.as_ref().context("promote configuration")?;
-        for (repo, target) in &promote.forks {
+        for (repo, target) in &targets(client, config)? {
             validate_repository(repo)?;
             validate_repository(&target.upstream)?;
             validate_branch(&target.base)?;

@@ -111,7 +111,7 @@ pub(super) fn apply_with<C: Rest + Transport>(
             "publication credential must authenticate as configured bot"
         );
         let mut lines = Vec::new();
-        for (repo, target) in &settings.forks {
+        for (repo, target) in &targets(client, config)? {
             let mut pulls = pages(
                 client,
                 &format!("repos/{repo}/pulls?state=open&sort=created&direction=asc"),
@@ -136,6 +136,9 @@ pub(super) fn apply_with<C: Rest + Transport>(
                             return Ok(lines);
                         }
                         Err(error) => {
+                            if error.is::<ScopeFailure>() {
+                                return Err(error);
+                            }
                             lines.push(format!("hold promote {repo}#{number}: {error:#}"));
                             continue;
                         }
@@ -666,7 +669,19 @@ fn validate(
     now: OffsetDateTime,
 ) -> Result<Command> {
     let metadata = get(client, &format!("repos/{repo}"))?;
-    repository(&metadata, repo)?;
+    let legacy = config.promote.as_ref().and_then(|settings| {
+        settings
+            .forks
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(repo))
+            .map(|(_, target)| target)
+    });
+    let observed = super::target(&metadata, repo, legacy)?
+        .context("repository no longer has midstream metadata")?;
+    ensure!(
+        observed.upstream == target.upstream && observed.base == target.base,
+        "promotion target changed"
+    );
     let number = pull["number"].as_u64().context("invalid pull number")?;
     let command = evaluate(
         client,

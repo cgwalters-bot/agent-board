@@ -19,7 +19,8 @@ pub struct Promote {
     #[serde(default)]
     pub on_approval: bool,
 
-    /// Each fork repository to its upstream and base branch; empty is off.
+    /// Legacy scope/base hints, accepted for one release. GitHub fork parent,
+    /// origin=fork and bot-midstream metadata are required before use.
     #[serde(default)]
     pub forks: BTreeMap<String, Fork>,
     /// The operator's `Signed-off-by` and committer identity; required with
@@ -48,6 +49,15 @@ pub struct Signoff {
 
 impl Promote {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
+        // A different topic would let metadata-only promotion forks evade
+        // stage 2's no-merge admission while ordinary follow can still write.
+        ensure!(
+            config
+                .midstream
+                .as_ref()
+                .is_none_or(|m| m.topic == "bot-midstream"),
+            "promotion requires midstream.topic=bot-midstream to preserve no-merge protection"
+        );
         let mut seen = BTreeSet::new();
         for (fork, to) in &self.forks {
             validate_repository(fork).context("promote forks")?;
@@ -191,9 +201,15 @@ pub(super) fn view<C: Rest + Transport>(
         exhausted: Cell::new(false),
         failed: RefCell::new(None),
     };
-    let forks = &config.promote.as_ref().map(|p| &p.forks);
+    let forks = match crate::promote::targets(&reads, config) {
+        Ok(forks) => forks,
+        Err(_) if reads.exhausted.get() => {
+            return (vec!["promote: discovery incomplete (budget)".into()], 0);
+        }
+        Err(error) => return (vec![format!("promote error: discovery: {error:#}")], 1),
+    };
     let mut candidates = Vec::new();
-    if let Some(forks) = forks {
+    {
         for repo in forks.keys() {
             match crate::promote::awaiting::candidates(&reads, config, repo) {
                 Ok(numbers) => candidates.extend(numbers.into_iter().map(|n| (repo.as_str(), n))),
