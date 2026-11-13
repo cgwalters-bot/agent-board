@@ -11,6 +11,8 @@ const IN: &str = "2026-11-11T15:00:00Z";
 /// Recorded 2026-11-11 with `fixtures/changes/config.json`, every
 /// repository's watermark at 14:05 UTC, then again after a commit: the
 /// REST bodies projected to the fields the diff reads.
+/// Query keys were refreshed for review-dismissal selection; these historical
+/// answers do not exercise dismissals (covered separately below).
 const FIRST: &str = include_str!("../../../../../fixtures/changes/agentic-job-2026-11-11.json");
 const AGAIN: &str =
     include_str!("../../../../../fixtures/changes/agentic-job-2026-11-11-again.json");
@@ -210,6 +212,8 @@ impl Rest for Fake {
 impl Transport for Fake {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         assert!(query.starts_with("query($owner:String!,$name:String!,$since:DateTime!)"));
+        assert!(query.contains("PULL_REQUEST_REVIEW,REVIEW_DISMISSED_EVENT,"));
+        assert!(query.contains("... on ReviewDismissedEvent{"));
         self.variables.borrow_mut().push(variables);
         let mut queue = self.graphql.borrow_mut();
         ensure!(!queue.is_empty(), "unexpected GraphQL request");
@@ -273,6 +277,57 @@ fn state_since(since: &str) -> State {
 
 /// What a classified item is checked for, beyond its changes.
 type Check = Box<dyn Fn(&Item)>;
+
+#[test]
+fn review_dismissals_are_changes_not_new_approvals() {
+    let review_url = "https://github.com/example/project/pull/2#pullrequestreview-1";
+    let event_url = "https://github.com/example/project/pull/2#event-2";
+    for (actor, reviewer, operator) in [
+        (Some("Owner"), Some("someone"), true),
+        (Some("someone"), Some(OPERATOR), false),
+        (None, None, false),
+    ] {
+        let review = reviewer.map(|login| json!({"url": review_url, "author": {"login": login}}));
+        let dismissal = json!({"__typename": "ReviewDismissedEvent", "createdAt": IN,
+            "actor": actor.map(|login| json!({"login": login})), "url": event_url,
+            "previousReviewState": "APPROVED", "review": review});
+        let fake = Fake {
+            gets: BTreeMap::from([(list_url(SINCE), json!({"body": listing(&[2])}))]),
+            graphql: RefCell::new(vec![json!({"repository": {"i0": node("PullRequest", 2,
+                json!({"timelineItems": events(vec![dismissal])}))}})]),
+            ..Fake::default()
+        };
+        let now = parse_time(IN).unwrap();
+        let mut state = state_since("2026-11-11T14:05:00Z");
+        let diff = read(&fake, &scope(), &mut state, now).unwrap();
+        assert_eq!(diff.requests, 2);
+        let item = &diff.repositories[0].items[0];
+        assert_eq!(item.changes, BTreeSet::from([Change::Reviewed]));
+        assert!(item.reviews.is_empty());
+        assert_eq!(
+            item.review_dismissals,
+            [ReviewDismissal {
+                by: actor.unwrap_or_default().into(),
+                at: IN.into(),
+                url: event_url.into(),
+                previous_state: "APPROVED".into(),
+                review_url: reviewer.map(|_| review_url.into()),
+                reviewer: reviewer.map(str::to_owned),
+                operator,
+            }]
+        );
+        let summary = diff.summary();
+        assert!(summary.contains("reviewed 1"), "{summary}");
+        assert_eq!(summary.contains("operator 1"), operator, "{summary}");
+        let value = serde_json::to_value(item).unwrap();
+        assert!(value.get("reviews").is_none());
+        let encoded = &value["review_dismissals"][0];
+        assert_eq!(encoded["previous_state"], "APPROVED");
+        assert_eq!(encoded.get("review_url").is_some(), reviewer.is_some());
+        assert_eq!(encoded.get("reviewer").is_some(), reviewer.is_some());
+        assert_eq!(encoded.get("operator").is_some(), operator);
+    }
+}
 
 #[test]
 fn classify_table() {
