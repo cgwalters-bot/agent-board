@@ -11,6 +11,9 @@ Dispatch starts exactly the job the newest accepted plan describes and doesn't
 add anything. The issue records where and how a job runs; the controller
 doesn't make that decision.
 
+A follow-up PR is opened as a draft with `Depends on: OWNER/REPO#N`, never ready
+while its prerequisite is open; automatic `depends_on` dispatch support is pending.
+
 ## Format
 
 A plan is one fenced block with the info string `agent-board-plan`, at the

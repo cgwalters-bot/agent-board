@@ -33,8 +33,6 @@ pub const BATCH_READS: usize = 10;
 /// Characters of a batched run's whole task. GitHub caps a dispatch's inputs
 /// at 65,535 characters together; extras that would pass this are left out.
 pub const BATCH_BRIEF_LIMIT: usize = 32_000;
-/// Text the scheduler also takes for an unrecorded dependency.
-const BLOCKED_WORDS: &[&str] = &["blocked by", "depends on", "waiting on", "waiting for"];
 const LABEL_PAGE: u64 = 100;
 
 const FAMILY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
@@ -123,7 +121,6 @@ impl Candidate {
     /// is never taken and an open primary or extra counts as a blocker.
     pub fn refusal(&self) -> Option<&'static str> {
         let labelled = |name: &str| self.labels.iter().any(|l| l.eq_ignore_ascii_case(name));
-        let body = self.body.to_lowercase();
         if !self.open {
             Some("closed")
         } else if !self.labels_complete {
@@ -132,7 +129,7 @@ impl Candidate {
             Some("labelled no-batch")
         } else if !labelled(SMALL_LABEL) {
             Some("not labelled small")
-        } else if self.blockers > 0 || BLOCKED_WORDS.iter().any(|w| body.contains(w)) {
+        } else if self.blockers > 0 || crate::dependencies::declared(&self.body) {
             Some("blocked")
         } else if self.pulls > 0 {
             Some("has a pull request")

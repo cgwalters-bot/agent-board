@@ -464,7 +464,7 @@ const KIND_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!
 /// and [`poll::is_harness`] read it.
 const FIX_PULL_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    state isCrossRepository headRefName headRefOid author { login } headRepositoryOwner { login }
+    number body state isCrossRepository headRefName headRefOid author { login } headRepositoryOwner { login }
     headRepository { nameWithOwner }
     labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
   } }
