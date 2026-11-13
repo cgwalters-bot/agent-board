@@ -5042,6 +5042,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// `number`, or the repository itself; if not, the walk stops there.
     fn share_allows(&mut self, repo: &str, number: Option<u64>) -> bool {
         if self.cut.is_none()
+            && self.remaining >= PULL_SHARE_MARGIN
             && self
                 .rest
                 .share_left()
@@ -5083,10 +5084,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     }
 
     fn spend(&mut self) -> Result<()> {
-        ensure!(
-            self.remaining > 0,
-            "poll request budget ({POLL_REQUEST_LIMIT}) exhausted"
-        );
+        if self.remaining == 0 {
+            return Err(crate::pass::ShareSpent("poll request budget exhausted".into()).into());
+        }
         self.remaining -= 1;
         Ok(())
     }
@@ -8744,12 +8744,16 @@ pub fn run_capped<R: Rest, G: Transport>(
         caps,
         now,
         None,
+        false,
     )
 }
 
 /// Continue stage 2 after its separately budgeted operator intake. Its starts
 /// still count against the poll's three-start limit and its cursors and logs
 /// remain part of the same outcome.
+/// With `shared_budget`, the hosted client alone enforces the derived share
+/// (including its allowance for finishing claimed steps and the review census).
+/// Otherwise the standalone poll keeps its own ceiling, including earlier reads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     rest: &R,
@@ -8761,6 +8765,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     caps: Option<&caps::Caps>,
     now: OffsetDateTime,
     mut direction: Option<(Outcome, usize)>,
+    shared_budget: bool,
 ) -> Result<Outcome> {
     let policy = &config.policy;
     ensure!(
@@ -8839,11 +8844,17 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         dispatched: direction.as_ref().map_or(0, |(o, _)| o.dispatched),
         merged: direction.as_ref().map_or(0, |(o, _)| o.merged),
         preview_merges: direction.as_ref().map_or(0, |(o, _)| o.preview_merges),
-        remaining: direction
-            .as_ref()
-            .map_or(POLL_REQUEST_LIMIT, |(_, requests)| {
-                POLL_REQUEST_LIMIT.saturating_sub(*requests)
-            }),
+        remaining: if shared_budget {
+            // Do not put a second ceiling inside the client's share: it must
+            // let under-way operations finish beyond the discovery boundary.
+            usize::MAX
+        } else {
+            direction
+                .as_ref()
+                .map_or(POLL_REQUEST_LIMIT, |(_, requests)| {
+                    POLL_REQUEST_LIMIT.saturating_sub(*requests)
+                })
+        },
         ..Pass::new(rest, graphql, config, now)
     };
     // Markers and claims count only as the bot's: written by another
@@ -21499,6 +21510,7 @@ mod tests {
                     Some(&caps),
                     now(),
                     Some(prior),
+                    false,
                 )
                 .unwrap();
                 assert_eq!(outcome.errors, 0, "{receipt}: {:?}", outcome.lines);
@@ -21576,6 +21588,7 @@ mod tests {
                     Some(&caps),
                     now(),
                     Some(prior),
+                    false,
                 )
                 .unwrap();
                 assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
@@ -21676,6 +21689,7 @@ mod tests {
                         Some(&caps),
                         now(),
                         Some(prior),
+                        false,
                     )
                     .unwrap();
                     assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
@@ -22297,38 +22311,42 @@ mod tests {
     /// reviews or for scheduling because the walk did not reach them.
     #[test]
     fn review_runs_of_an_unwalked_repository_still_count() {
-        let mut fake = github();
-        let mut active = ordinary_run();
-        active["status"] = "in_progress".into();
-        active["conclusion"] = Value::Null;
-        ordinary_runs(&mut fake, vec![active]);
-        let mut cfg = config();
-        cfg.policy.review_dispatch_repositories = vec![REPO.into()];
-        cfg.policy.review_pools = vec!["claude".into()];
-        let follow = [REPO.to_owned()];
-        let shared = Shared::new(&fake, 0);
-        let outcome = run(
-            &shared,
-            &fake,
-            &cfg,
-            State::default(),
-            &[],
-            &follow,
-            None,
-            now(),
-        )
-        .unwrap();
-        let pulls = format!("{API_ROOT}repos/{REPO}/pulls?state=open&per_page=100");
-        assert!(!fake.sent.borrow().iter().any(|(url, _)| *url == pulls));
-        assert!(
-            outcome
-                .lines
-                .iter()
-                .any(|l| l.starts_with("pull requests: "))
-        );
-        assert_eq!(outcome.reviewing, 1, "{:?}", outcome.lines);
-        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
-        assert!(!shared.under_way.get());
+        for hosted in [false, true] {
+            let mut fake = github();
+            let mut active = ordinary_run();
+            active["status"] = "in_progress".into();
+            active["conclusion"] = Value::Null;
+            ordinary_runs(&mut fake, vec![active]);
+            let mut cfg = config();
+            cfg.policy.review_dispatch_repositories = vec![REPO.into()];
+            cfg.policy.review_pools = vec!["claude".into()];
+            let follow = [REPO.to_owned()];
+            let shared = Shared::new(&fake, 0);
+            let outcome = run_capped_after_direction(
+                &shared,
+                &fake,
+                &cfg,
+                State::default(),
+                (&[], &follow),
+                None,
+                None,
+                now(),
+                hosted.then(|| (Outcome::default(), POLL_REQUEST_LIMIT)),
+                hosted,
+            )
+            .unwrap();
+            let pulls = format!("{API_ROOT}repos/{REPO}/pulls?state=open&per_page=100");
+            assert!(!fake.sent.borrow().iter().any(|(url, _)| *url == pulls));
+            assert!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("pull requests: "))
+            );
+            assert_eq!(outcome.reviewing, 1, "{:?}", outcome.lines);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert!(!shared.under_way.get());
+        }
     }
 
     /// A claim posted with too little of the share left still reads its
@@ -22336,52 +22354,57 @@ mod tests {
     /// pull requests, never between a claim and its run.
     #[test]
     fn a_claim_posted_at_the_share_still_starts_its_round() {
-        let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
-        let read = json!({"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 1, "sha": "older"}), "Fix round 1 of 2.")});
-        let mut fake = github();
-        let failing = json!({"contexts": {"review": {"state": "FAILURE"}}});
-        fake.pulls.insert(470, pull("pull-470", failing));
-        fake.rest.get_mut(&comments).unwrap().3 = json!([read]);
-        fake.answers.borrow_mut().insert(
-            format!("{API_ROOT}repos/{REPO}/issues/470/comments"),
-            vec![(201, json!({"id": 99}))],
-        );
-        fake.answers.borrow_mut().insert(
-            format!("{API_ROOT}repos/{REPO}/labels"),
-            vec![(422, json!({}))],
-        );
-        let dispatcher = Fake::default();
-        let shared = Shared::new(&fake, 2);
-        let dispatching = Shared::new(&dispatcher, usize::MAX);
-        let apply = Some(Apply {
-            dispatcher: &dispatching,
-            workflow: "dispatch.yml".into(),
-            pools: vec!["claude".into(), "openai".into()],
-            git_ref: None,
-        });
-        let follow = [REPO.to_owned()];
-        let outcome = run(
-            &shared,
-            &fake,
-            &config(),
-            State::default(),
-            &[],
-            &follow,
-            apply,
-            now(),
-        )
-        .unwrap();
-        assert!(shared.posted.get());
-        assert_eq!(dispatcher.writes.borrow().len(), 1, "{:?}", outcome.lines);
-        assert!(
-            outcome
-                .lines
-                .iter()
-                .any(|l| l.contains("fix: review requested changes -> ")),
-            "{:?}",
-            outcome.lines
-        );
-        assert!(!shared.under_way.get());
+        for hosted in [false, true] {
+            let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+            let read = json!({"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 1, "sha": "older"}), "Fix round 1 of 2.")});
+            let mut fake = github();
+            let failing = json!({"contexts": {"review": {"state": "FAILURE"}}});
+            fake.pulls.insert(470, pull("pull-470", failing));
+            fake.rest.get_mut(&comments).unwrap().3 = json!([read]);
+            fake.answers.borrow_mut().insert(
+                format!("{API_ROOT}repos/{REPO}/issues/470/comments"),
+                vec![(201, json!({"id": 99}))],
+            );
+            fake.answers.borrow_mut().insert(
+                format!("{API_ROOT}repos/{REPO}/labels"),
+                vec![(422, json!({}))],
+            );
+            let dispatcher = Fake::default();
+            let shared = Shared::new(&fake, 2);
+            let dispatching = Shared::new(&dispatcher, usize::MAX);
+            let apply = Some(Apply {
+                dispatcher: &dispatching,
+                workflow: "dispatch.yml".into(),
+                pools: vec!["claude".into(), "openai".into()],
+                git_ref: None,
+            });
+            let follow = [REPO.to_owned()];
+            let outcome = run_capped_after_direction(
+                &shared,
+                &fake,
+                &config(),
+                State::default(),
+                (&[], &follow),
+                apply,
+                None,
+                now(),
+                hosted.then(|| (Outcome::default(), POLL_REQUEST_LIMIT)),
+                hosted,
+            )
+            .unwrap();
+            assert!(shared.posted.get());
+            assert_eq!(dispatcher.writes.borrow().len(), 1, "{:?}", outcome.lines);
+            assert!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("fix: review requested changes -> ")),
+                "{:?}",
+                outcome.lines
+            );
+            assert!(!shared.under_way.get());
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        }
     }
 
     /// The envelope is checked where a step starts, not only by the loop

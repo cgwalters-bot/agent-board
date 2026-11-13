@@ -573,6 +573,7 @@ fn ordinary_review_unreadable_admission_never_dispatches() {
 /// cut included: it was admitted where it was queued.
 #[test]
 fn ordinary_review_queued_within_the_share_starts_past_it() {
+    for hosted in [false, true] {
     const OTHER: &str = "cgwalters-forge/zzz";
     let (mut fake, cfg) = ordinary_fixture("cgwalters", "OWNER", false);
     for path in ["events?per_page=100", "pulls?state=open&per_page=100"] {
@@ -593,11 +594,13 @@ fn ordinary_review_queued_within_the_share_starts_past_it() {
         pools: vec!["claude".into(), "openai".into()],
         git_ref: None,
     });
-    let outcome = run(&shared, &shared, &cfg, State::default(), &[], &follow, apply, now()).unwrap();
+    let outcome = run_capped_after_direction(&shared, &shared, &cfg, State::default(), (&[], &follow), apply, None, now(),
+        hosted.then(|| (Outcome::default(), POLL_REQUEST_LIMIT)), hosted).unwrap();
     assert!(shared.spent.get(), "{:?}", outcome.lines);
     let cut = format!("pull requests: the stage's request share is spent at {OTHER}");
     assert!(outcome.lines.iter().any(|l| l.starts_with(&cut)), "{:?}", outcome.lines);
     assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
     assert_eq!(outcome.dispatched, 1, "{:?}", outcome.lines);
     assert!(!shared.under_way.get());
+    }
 }

@@ -2841,6 +2841,117 @@ fn reserved_scheduling_starts_after_a_saturated_sweep() {
     assert!(report.state.unwrap().share_cursor.is_some());
 }
 
+/// The hosted walk uses its derived share, not the standalone poll's 500
+/// requests. An unfinished walk is green and resumes at its first unread PR.
+#[test]
+fn pr_budget_is_derived_and_exhaustion_resumes_without_errors() {
+    let mut forge = Forge::new(None, false);
+    let repositories = [
+        "example/first",
+        "example/second",
+        "example/third",
+        "example/zzz",
+    ];
+    for repo in repositories {
+        for number in 1..=100 {
+            followed(&mut forge.replay, (repo, number), json!({}), json!([]));
+        }
+    }
+    let open: Vec<Value> = (1..=100)
+        .map(|n| json!({"number": n, "user": {"login": "cgwalters-bot"}}))
+        .collect();
+    for entry in &mut forge.replay.requests {
+        if entry["request"]["get"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/pulls?state=open&per_page=100"))
+        {
+            entry["answer"]["body"] = json!(open);
+        }
+    }
+    let mut seen = BTreeSet::new();
+    forge
+        .replay
+        .requests
+        .retain(|entry| seen.insert(entry["request"].to_string()));
+    forge
+        .replay
+        .requests
+        .push(json!({"request": {"get": format!("{API_ROOT}user")},
+        "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+    forge
+        .replay
+        .requests
+        .push(json!({"request": {"get": format!("{API_ROOT}rate_limit")},
+        "answer": {"status": 200, "link": null, "body": {"resources": {
+            "core": {"limit": 5000, "remaining": 1400, "reset": 1700000000},
+            "graphql": {"limit": 5000, "remaining": 1400, "reset": 1700000000}}}}}));
+    let mut cfg = config(
+        json!({"wip": 0, "state": "pass-state.json", "requestShare": 50,
+        "follow": repositories, "pr": {"noMerge": repositories, "fixPools": ["claude"]}}),
+    );
+    cfg.epics = None;
+    // requestShare derives 700 requests from the recorded headroom.
+    let run = |state, limit| {
+        block(run_within(
+            &forge,
+            &forge,
+            &cfg,
+            (
+                state,
+                Mode::Actions(&own()),
+                Limits::default(),
+                forge.replay.now,
+            ),
+            &Bounds::new(
+                limit,
+                Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
+            ),
+        ))
+        .unwrap()
+    };
+    let first = run(State::default(), 700);
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    assert!(
+        first.spent.requests > poll::POLL_REQUEST_LIMIT,
+        "{}",
+        first.spent
+    );
+    assert!(first.spent.requests <= 700);
+    assert!(
+        first
+            .lines
+            .iter()
+            .any(|l| l.starts_with("pull requests: the stage's request share is spent")),
+        "{:#?}",
+        first.lines
+    );
+    let state = State::from_json(&first.state.unwrap().to_json()).unwrap();
+    let cursor = state.share_cursor.clone().unwrap();
+    let second = run(state, 700);
+    assert_eq!(second.failures, 0, "{:#?}", second.lines);
+    let first_decision = second
+        .lines
+        .iter()
+        .find(|l| l.starts_with("example/") && l.contains('#'))
+        .unwrap();
+    assert!(
+        first_decision.starts_with(&format!("{cursor} ")),
+        "{first_decision}; expected {cursor}"
+    );
+    let rate_limit = forge
+        .replay
+        .requests
+        .iter_mut()
+        .find(|entry| entry["request"]["get"] == format!("{API_ROOT}rate_limit"))
+        .unwrap();
+    for pool in ["core", "graphql"] {
+        rate_limit["answer"]["body"]["resources"][pool]["remaining"] = json!(4000);
+    }
+    let whole = apply(&forge, &cfg);
+    assert_eq!(whole.failures, 0, "{:#?}", whole.lines);
+    assert_eq!(whole.state.unwrap().share_cursor, None);
+}
+
 #[test]
 fn scheduling_reserve_is_opt_in_and_github_only() {
     assert!(!config(json!({})).reserve_scheduling);
@@ -2975,6 +3086,31 @@ fn legacy_stage_shares() {
         assert_eq!((pulls, epics), expected, "{name}");
         assert!(pulls > epics, "{name}");
     }
+    // Even without a later-stage reserve, the PR walk sees the derived read
+    // capacity. The client, not a second poll counter, enforces that share.
+    bounds.enter(Stage::PullRequests);
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    assert_eq!(
+        client.share_left(),
+        Some(PASS_REQUEST_LIMIT - WRITE_RESERVE)
+    );
+    bounds.left.set(WRITE_RESERVE);
+    assert_eq!(client.share_left(), Some(0));
+    assert!(
+        client
+            .get("https://api.github.com/x", None)
+            .err()
+            .unwrap()
+            .is::<ShareSpent>()
+    );
+    // Finishing can pass a later-stage share, but not the global read floor.
+    bounds.enter_keeping(Stage::PullRequests, 100);
+    bounds.left.set(WRITE_RESERVE + 100);
+    bounds.finishing.set(true);
+    client.get("https://api.github.com/x", None).unwrap();
 }
 
 #[test]

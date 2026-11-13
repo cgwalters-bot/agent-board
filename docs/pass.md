@@ -381,6 +381,16 @@ For more capacity for the remaining ordinary walk, in `cgwalters-forge/tracker`,
 stages share the derived budget without fixed stage shares.
 No deployed config is changed here.
 
+The hosted client gives the PR walk the pass's remaining read share, after the approved
+turn, intake and discovery, rather than the standalone poll's 500-request ceiling.
+It leaves the decision margin before starting another PR. Exhaustion during a
+read also defers that PR: the share cursor names the first unfinished decision,
+and the next applying walk starts there. This is logged as a deferral, not an
+operation error; genuine API and validation errors still fail. The early approved
+own-space turn retains its priority and existing bounds. No new setting is needed.
+Already claimed operations and the review-run census can finish beyond the read
+share, within the pass's global bounds, without a second stage-local ceiling.
+
 The original preview on 2026-11-12 against tracker's config (main
 `777e84db3923f08b8bc8dbe36c5004b035a6c0e0`), with `pr.actionFirst: true`,
 `reserveScheduling: false`, `scan.reserve: true`, a three-candidate scan cap and
