@@ -248,11 +248,17 @@ rather than risk starting the same work twice. Explicit dispatch
 refusals retain the existing bounded retry policy. Preview writes nothing and
 does not advance cursors.
 
-Each attempted intake write, including claim receipts, one link reply per new
-batch of operator comment IDs, consumes `--max-writes`;
+Each attempted intake write, including claim receipts and any link reply,
+consumes `--max-writes`;
 each dispatch POST consumes `--max-dispatch`. Admission reserves room for eight
 writes before staging, and the existing poll limit is three starts per pass.
-Acknowledgements are bot-authored comment-ID receipts on the source thread;
+Acknowledgements are bot-authored comment-ID receipts on the source thread.
+A settled triage claim there is the acknowledgement, including its tracking
+link; intake does not add a second routine reply for the same comment IDs.
+When the claim lives on a tracking issue instead, intake still posts one source
+link reply per new batch. Legacy notification receipts remain readable, and
+pending/refused claims retain their locks, retry state and failure messages.
+No state is migrated to reactions or local files.
 `pr.ownSpaceOnly` still suppresses upstream replies, without suppressing fork
 staging. An interrupted claim, exhausted cap,
 failed reply or missing fork leaves it for a later pass. GitHub has no atomic

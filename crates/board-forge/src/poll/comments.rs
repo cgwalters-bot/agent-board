@@ -2024,13 +2024,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             // tried once it is older than the run timeout ([`handled`]).
             Err(error) if error.is::<NotStarted>() => {
                 settle(&mut state, "refused");
-                self.rewrite(&at, claim, claim_body(&state, "not started."))?;
+                let text = match &tracking {
+                    Some(link) => format!("not started; tracked in {link}."),
+                    None => "not started.".into(),
+                };
+                self.rewrite(&at, claim, claim_body(&state, &text))?;
                 return Err(error);
             }
             // Anything else may have started the run: its comments are done.
             Err(error) => {
                 settle(&mut state, "comments");
-                self.rewrite(&at, claim, claim_body(&state, "may have started."))?;
+                let text = match &tracking {
+                    Some(link) => format!("may have started; tracked in {link}."),
+                    None => "may have started.".into(),
+                };
+                self.rewrite(&at, claim, claim_body(&state, &text))?;
                 return Err(error);
             }
         };
@@ -2366,7 +2374,7 @@ pub(super) mod tests {
         searched: RefCell<Vec<String>>,
         pub(in crate::poll) writes: RefCell<Vec<(String, Value)>>,
         /// The status a dispatch gets, where not a success.
-        refused: RefCell<Option<u16>>,
+        pub(in crate::poll) refused: RefCell<Option<u16>>,
         /// URLs whose GET fails as a server error would.
         pub(in crate::poll) unavailable: RefCell<BTreeSet<String>>,
         /// Whether a PATCH that records a dispatch's outcome answers 502.
