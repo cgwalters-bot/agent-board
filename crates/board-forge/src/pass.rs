@@ -2914,7 +2914,7 @@ impl Bounds {
     /// one of a step under way, a start's or an apply's, which finishes.
     fn share_spent(&self) -> bool {
         let kept = self.kept.get();
-        kept > 0
+        (kept > 0 || self.stage.get() == Stage::PullRequests)
             && !self.starting.get()
             && !self.finishing.get()
             && self.left.get() <= WRITE_RESERVE + kept
@@ -3238,6 +3238,15 @@ impl<C> Budget<'_, C> {
                 "holds publication's {HOLDS_SHARE}% request share is spent"
             );
         }
+        if !write && bounds.share_spent() {
+            bounds.cut.set(bounds.cut.get() + 1);
+            return Err(ShareSpent(format!(
+                "{} keeps its last {} requests for the stages after it",
+                bounds.stage.get().name(),
+                bounds.kept.get()
+            ))
+            .into());
+        }
         let floor = if write { 0 } else { WRITE_RESERVE };
         ensure!(
             left > floor,
@@ -3250,15 +3259,6 @@ impl<C> Budget<'_, C> {
                 "the pass keeps its last {} requests for a start",
                 bounds.reserve.get()
             );
-        }
-        if !write && bounds.share_spent() {
-            bounds.cut.set(bounds.cut.get() + 1);
-            return Err(ShareSpent(format!(
-                "{} keeps its last {} requests for the stages after it",
-                bounds.stage.get().name(),
-                bounds.kept.get()
-            ))
-            .into());
         }
         bounds.left.set(left - 1);
         if bounds.stage.get() == Stage::Holds {
@@ -3467,7 +3467,8 @@ impl<C: Rest> Rest for Budget<'_, C> {
     fn share_left(&self) -> Option<usize> {
         let bounds = self.bounds;
         let kept = bounds.kept.get();
-        (kept > 0).then(|| bounds.left.get().saturating_sub(WRITE_RESERVE + kept))
+        (kept > 0 || bounds.stage.get() == Stage::PullRequests)
+            .then(|| bounds.left.get().saturating_sub(WRITE_RESERVE + kept))
     }
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
@@ -5410,6 +5411,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Some(self.caps),
             self.now,
             direction,
+            true,
         ) {
             Ok(mut outcome) => {
                 // Out of its turn, as outside the envelope: what the last
@@ -5420,11 +5422,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             Err(error) if error.is::<ShareSpent>() => {
                 self.report.state = Some(deferred_state.clone());
+                let starts = self.finish_early_follow(prior, deferred_state, intake_starts);
                 self.line(
                     "budget: pull requests stopped at its share; discovery waits for the next pass"
                         .into(),
                 );
-                self.finish_early_follow(prior, deferred_state, intake_starts)
+                starts
             }
             Err(error) => {
                 self.report.failures += 1;
