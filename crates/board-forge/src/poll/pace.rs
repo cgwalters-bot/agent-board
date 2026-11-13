@@ -18,6 +18,9 @@ use crate::supervise::millis;
 pub const PACE_MARGIN_LIMIT: f64 = 100.0;
 /// Broker-consumer allowances are caps, not provider-window pacing.
 pub const GRANT_SOURCE: &str = "grant";
+/// A producer-certified pace hold with no exhausted provider window. Legacy
+/// `pace` holds may conceal an exhausted short window and remain binding.
+pub const PACE_ONLY_REASON: &str = "pace-only";
 /// How old the snapshot may be and still pace: the supervisor's default
 /// `usageStaleMinutes`. Older, it says nothing of the pools now.
 const USAGE_STALE_SECONDS: i64 = 45 * 60;
@@ -49,12 +52,12 @@ pub struct Pace {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OverrideMode {
     /// Not held by the poll's own pacing, and chosen over pools without an
-    /// override; a used-up window or the snapshot's `hold` still holds it, as
+    /// override; a used-up window or a non-pace snapshot hold still holds it, as
     /// the override lifts pacing, not caps.
     Spend,
     /// Held whatever its pace, to keep the pool idle.
     Hold,
-    /// Faster pacing, without lifting snapshot holds or exhaustion.
+    /// Faster pacing, without lifting non-pace snapshot holds or exhaustion.
     Speed(f64),
 }
 
@@ -301,7 +304,7 @@ impl<'de> serde::Deserialize<'de> for Settings {
 
 impl Settings {
     /// Adjust only the pass's in-memory snapshot, before maintain reserves its
-    /// share. Never lift a snapshot hold, including a broker grant's hold.
+    /// share. Lift only pace holds, never caps or a broker grant's hold.
     pub fn apply(&self, mut snapshot: Value, now: OffsetDateTime) -> Value {
         if *self == Self::default() || snapshot["pace_adjusted"] == true {
             return snapshot;
@@ -348,6 +351,7 @@ impl Settings {
                     // of the allowance maintain reserves.
                     if factor != 1.0 || matches!(active.map(|o| o.mode), Some(OverrideMode::Spend))
                     {
+                        entry["hold"] = false.into();
                         entry["allowed_percent"] = ceiling.into();
                         entry["burst"] = 0.into();
                         entry["pace_adjusted"] = true.into();
@@ -477,26 +481,28 @@ fn paced(entry: &Value, now: OffsetDateTime, margin: f64) -> Mode {
 }
 
 /// The hold a spend override does not lift, as it is a cap, not pace: a
-/// window used up, held until its reset, or indefinitely where the reset is
-/// absent or unreadable, as known exhaustion is no room; and any snapshot
-/// `hold` but `false`. The snapshot does not say why it holds
-/// (agent-board#233), and a pool over its pace may be out of its session
-/// too, so a spend override lifts only the poll's own pacing of an older
-/// entry until the snapshot gives the reasons apart.
+/// window used up, held until a fresh reading, even after reset. Only an
+/// explicit non-grant [`PACE_ONLY_REASON`] hold may be recomputed; legacy
+/// pace and unknown holds remain authoritative.
 fn capped(entry: &Value, now: OffsetDateTime) -> Option<Mode> {
     let used = entry["used_percent"].as_f64().unwrap_or(f64::NAN);
     if used >= 100.0 {
         let resets = millis(&entry["resets_at"])
             .and_then(|at| OffsetDateTime::from_unix_timestamp_nanos(at as i128 * 1_000_000).ok());
-        match resets {
-            Some(until) if until > now => return Some(Mode::Held { until: Some(until) }),
-            // A window past its reset says nothing of the new one, as in [`paced`].
-            Some(_) => {}
-            None => return Some(Mode::Held { until: None }),
-        }
+        return Some(Mode::Held {
+            // A past reset is not evidence of room in the new window.
+            until: resets.filter(|until| *until > now),
+        });
     }
     match entry.get("hold") {
         None | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true))
+            if entry["source"] != GRANT_SOURCE
+                && entry["reason"] == PACE_ONLY_REASON
+                && used.is_finite() =>
+        {
+            None
+        }
         Some(_) => Some(mode(entry, now, 0.0)),
     }
 }
@@ -1631,6 +1637,185 @@ mod tests {
                 held,
                 "used={used} elapsed={elapsed} speed={speed} margin={margin} override={mode:?} expired={expired} hold={hold:?}"
             );
+        }
+    }
+
+    #[test]
+    fn snapshot_hold_overrides_table() {
+        let now = at(NOW);
+        for (reason, source, used, settings, held) in [
+            (
+                Some("pace-only"),
+                "praxis",
+                Some(13),
+                json!({"speed": 5}),
+                false,
+            ),
+            (Some("pace-only"), "praxis", Some(13), json!({}), true),
+            (
+                Some("pace-only"),
+                "praxis",
+                Some(13),
+                json!({"mode": "spend"}),
+                false,
+            ),
+            (
+                Some("pace-only"),
+                "praxis",
+                Some(13),
+                json!({"mode": "speed", "factor": 5}),
+                false,
+            ),
+            // Legacy producers also used `pace` when a short window was exhausted.
+            (Some("pace"), "praxis", Some(13), json!({"speed": 5}), true),
+            (
+                Some("pace"),
+                "praxis",
+                Some(13),
+                json!({"mode": "spend"}),
+                true,
+            ),
+            (
+                Some("pace"),
+                "praxis",
+                Some(13),
+                json!({"mode": "speed", "factor": 5}),
+                true,
+            ),
+            (
+                Some("window"),
+                "praxis",
+                Some(13),
+                json!({"speed": 5}),
+                true,
+            ),
+            (None, "praxis", Some(13), json!({"speed": 5}), true),
+            (
+                Some("unknown"),
+                "praxis",
+                Some(13),
+                json!({"speed": 5}),
+                true,
+            ),
+            (
+                Some("pace-only"),
+                GRANT_SOURCE,
+                Some(13),
+                json!({"speed": 5}),
+                true,
+            ),
+            (
+                Some("pace-only"),
+                "praxis",
+                Some(100),
+                json!({"speed": 5}),
+                true,
+            ),
+            (Some("pace-only"), "praxis", None, json!({"speed": 5}), true),
+        ] {
+            let mut entry = json!({"source": source, "hold": true,
+                "used_percent": used, "allowed_percent": 9.5, "burst": 0,
+                "window_minutes": 100,
+                "resets_at": (now + time::Duration::minutes(53)).format(&Rfc3339).unwrap()});
+            if let Some(reason) = reason {
+                entry["reason"] = reason.into();
+            }
+            let settings = if settings.get("mode").is_some() {
+                let mut o = settings;
+                o["pool"] = "claude".into();
+                o["until"] = (now + time::Duration::hours(1))
+                    .format(&Rfc3339)
+                    .unwrap()
+                    .into();
+                json!({"overrides": [o]})
+            } else {
+                settings
+            };
+            let settings: Settings = serde_json::from_value(settings).unwrap();
+            let snapshot = snapshot(json!({"claude": entry}));
+            let adjusted = settings.apply(snapshot.clone(), now);
+            assert_eq!(
+                adjusted["pools"]["claude"]["hold"], held,
+                "{snapshot}: {settings:?}"
+            );
+            if settings == Settings::default() {
+                assert_eq!(adjusted, snapshot);
+            }
+            for snap in [&snapshot, &adjusted] {
+                let read =
+                    paces_with_speed(Some(snap), now, 0.0, &settings.overrides, settings.speed);
+                assert_eq!(
+                    choose(&read, &names(&["claude"]), None).is_err(),
+                    held,
+                    "{snap}: {settings:?}"
+                );
+            }
+            if used.is_none() {
+                // Spend must not bypass an unread hold before or after apply.
+                let spend: Settings = serde_json::from_value(json!({"overrides": [{
+                    "pool": "claude", "mode": "spend",
+                    "until": (now + time::Duration::hours(1)).format(&Rfc3339).unwrap()
+                }]}))
+                .unwrap();
+                for reading in [None, Some(Value::Null), Some(json!("13"))] {
+                    let mut snapshot = snapshot.clone();
+                    let entry = snapshot["pools"]["claude"].as_object_mut().unwrap();
+                    match reading {
+                        None => {
+                            entry.remove("used_percent");
+                        }
+                        Some(value) => {
+                            entry.insert("used_percent".into(), value);
+                        }
+                    }
+                    let adjusted = spend.apply(snapshot.clone(), now);
+                    for snap in [&snapshot, &adjusted] {
+                        let read = paces_with_speed(Some(snap), now, 0.0, &spend.overrides, 1.0);
+                        assert!(choose(&read, &names(&["claude"]), None).is_err(), "{snap}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_snapshot_holds_across_reset() {
+        let now = at(NOW);
+        for reason in ["pace", "pace-only", "window"] {
+            for reset_minutes in [-1, 0, 1] {
+                for used in [100, 101] {
+                    let snapshot = snapshot(json!({"claude": {
+                        "source": "praxis", "hold": true, "reason": reason,
+                        "used_percent": used, "allowed_percent": 99, "burst": 0,
+                        "window_minutes": 10080,
+                        "resets_at": (now + time::Duration::minutes(reset_minutes)).format(&Rfc3339).unwrap()
+                    }}));
+                    for settings in [
+                        json!({"speed": 5}),
+                        json!({"overrides": [{"pool": "claude", "mode": "speed", "factor": 5,
+                            "until": "2026-10-18T00:00:00Z"}]}),
+                        json!({"overrides": [{"pool": "claude", "mode": "spend",
+                            "until": "2026-10-18T00:00:00Z"}]}),
+                    ] {
+                        let settings: Settings = serde_json::from_value(settings).unwrap();
+                        let adjusted = settings.apply(snapshot.clone(), now);
+                        assert_eq!(adjusted["pools"]["claude"]["hold"], true, "{adjusted}");
+                        for snap in [&snapshot, &adjusted] {
+                            let read = paces_with_speed(
+                                Some(snap),
+                                now,
+                                0.0,
+                                &settings.overrides,
+                                settings.speed,
+                            );
+                            assert!(
+                                choose(&read, &names(&["claude"]), None).is_err(),
+                                "{snap}: {settings:?}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
