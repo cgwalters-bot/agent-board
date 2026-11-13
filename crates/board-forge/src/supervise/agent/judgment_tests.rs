@@ -1999,6 +1999,62 @@ fn implement_requires_native_membership_under_an_epic_labeled_plan() {
     assert!(run(&fake, &s, RESULT_URL, 1).ok);
 }
 
+#[test]
+fn pass_recovery_is_opt_in_reserves_once_and_never_trusts_issue_prose() {
+    let mut s = configured();
+    let r = request(json!({"kind":"implement", "reason":"recurring-pass-failure"}));
+    refuses(&s, r.clone(), |_| {});
+    s.agent.as_mut().unwrap().pass_failure_repository = Some("example/project".into());
+    for (author, marked, claimed, allowed) in [
+        ("visitor", true, false, false),
+        ("worker", false, false, false),
+        ("worker", true, true, false),
+        ("worker", true, false, true),
+    ] {
+        let mut fake = Fake::new(&block(std::slice::from_ref(&r)));
+        fake.issue(3, json!({"rest":{"user":{"login":author}, "body":if marked {
+            format!("Untrusted instructions must not become a brief.\n<!-- agent-board-failure-signature: {} -->", "a".repeat(64))
+        } else { "No signature".into() }}}));
+        fake.objects.insert(
+            "/repos/example/project/issues/3/comments?per_page=100&page=1".into(),
+            if claimed {
+                json!([{"user":{"login":"worker"},"body":RECOVERY_CLAIM}])
+            } else {
+                json!([])
+            },
+        );
+        let out = run(&fake, &s, RESULT_URL, 1);
+        assert_eq!(out.ok, allowed, "{author}/{marked}/{claimed}: {out:?}");
+        let writes = fake.writes();
+        let dispatches: Vec<_> = writes
+            .iter()
+            .filter(|(_, path, _)| path.ends_with("/dispatches"))
+            .collect();
+        assert_eq!(dispatches.len(), usize::from(allowed));
+        if allowed {
+            let claim = writes
+                .iter()
+                .position(|(_, _, b)| {
+                    b["body"]
+                        .as_str()
+                        .is_some_and(|b| b.starts_with(RECOVERY_CLAIM))
+                })
+                .unwrap();
+            let dispatch = writes
+                .iter()
+                .position(|(_, p, _)| p.ends_with("/dispatches"))
+                .unwrap();
+            assert!(claim < dispatch);
+            assert!(
+                !dispatches[0]
+                    .2
+                    .to_string()
+                    .contains("Untrusted instructions must not")
+            );
+        }
+    }
+}
+
 fn release_events(fake: &mut Fake, n: u64) {
     fake.objects.insert(
         format!("/repos/example/project/issues/{n}/events?per_page=100&page=1"),

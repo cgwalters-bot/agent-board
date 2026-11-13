@@ -105,6 +105,51 @@ fn grouped(events: Vec<Value>, max: usize) -> Result<Vec<Value>> {
 }
 
 impl Collector<'_> {
+    /// Inspect the newest consecutive red passes before the rest of collection
+    /// can exhaust the request budget. Each attempt contributes once per stage.
+    pub(super) fn pass_error_signatures(&self, runs: Option<&[Value]>) -> Result<Vec<Value>> {
+        let runs = runs.context("poll runs unavailable")?;
+        let mut events = vec![];
+        for run in runs
+            .iter()
+            .filter(|r| !RUNNING.contains(&r["status"].as_str().unwrap_or_default()))
+            .take_while(|r| FAILED.contains(&r["conclusion"].as_str().unwrap_or_default()))
+            .take(self.s.limits.max_items)
+        {
+            let at = millis(&run["updated_at"]).context("failed pass time")?;
+            ensure!(at <= self.now, "future failed pass");
+            if at < self.now - DAY {
+                break;
+            }
+            let id = run["id"].as_u64().context("pass run id")?;
+            let attempt = run["run_attempt"].as_u64().unwrap_or(1);
+            let jobs = self.cached_get(&format!(
+                "{}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100",
+                self.root
+            ))?;
+            let nodes = jobs["jobs"].as_array().context("pass jobs")?;
+            ensure!(
+                jobs["total_count"].as_u64() == Some(nodes.len() as u64) && nodes.len() < 100,
+                "pass jobs truncated"
+            );
+            for job in nodes
+                .iter()
+                .filter(|j| FAILED.contains(&j["conclusion"].as_str().unwrap_or_default()))
+            {
+                let job_id = job["id"].as_u64().context("pass job id")?;
+                let log = self.api.download(
+                    &format!("{}/actions/jobs/{job_id}/logs", self.root),
+                    self.s.limits.max_download_bytes,
+                )?;
+                let text = strip_colours(&String::from_utf8_lossy(&log));
+                let (stage, error) = pass_error(&text)?;
+                events.push(json!({"kind":format!("pass/{stage}"), "text":error,
+                    "url":run["html_url"], "at":run["updated_at"], "identity":format!("{id}/{attempt}")}));
+            }
+        }
+        grouped(events, self.s.limits.max_items)
+    }
+
     pub(super) fn failure_signatures(&self) -> Result<Vec<Value>> {
         grouped(
             self.failure_events()?
@@ -399,6 +444,36 @@ impl Collector<'_> {
     }
 }
 
+/// Keep stage identity outside normalization (stage 2 is not stage 3). Include
+/// a short error-chain excerpt, not the job's history or generic exit annotation.
+fn pass_error(log: &str) -> Result<(String, String)> {
+    let lines: Vec<&str> = log.lines().filter_map(log_line).collect();
+    let start = lines
+        .iter()
+        .position(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.starts_with("error:") || lower.contains("##[error]"))
+                && !lower.contains("process completed with exit code")
+        })
+        .context("failed pass has no error excerpt")?;
+    let excerpt = lines[start..]
+        .iter()
+        .take(6)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let stage = excerpt
+        .split_once("stage ")
+        .and_then(|(_, rest)| {
+            rest.split_whitespace()
+                .next()
+                .map(|s| s.trim_matches(|c: char| !c.is_ascii_digit()))
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    Ok((stage.to_owned(), excerpt.chars().take(1000).collect()))
+}
+
 fn stall_windows(events: Vec<Value>, max: usize) -> Result<Vec<Value>> {
     let mut stalls: Vec<Value> = events
         .into_iter()
@@ -444,6 +519,63 @@ const MAIN: &str = "query($owner:String!,$name:String!){repository(owner:$owner,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn three_red_passes_group_once_per_attempt_and_stop_at_recovery() {
+        let api = Forge {
+            snapshot: Value::Null,
+            truncated_jobs: false,
+        };
+        let s = crate::supervise::tests::settings();
+        let c = Collector {
+            api: &api,
+            s: &s,
+            branch: "main".into(),
+            now: 4 * HOUR_MS,
+            root: "/repos/example/control".into(),
+            cache: RefCell::new(HashMap::new()),
+        };
+        let mut runs: Vec<Value> = (1..=3)
+            .rev()
+            .map(|n| {
+                json!({"id":n,"status":"completed",
+            "conclusion":"failure", "updated_at":iso(n * HOUR_MS),
+            "html_url":format!("https://github.com/example/control/actions/runs/{n}")})
+            })
+            .collect();
+        let groups = c.pass_error_signatures(Some(&runs)).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["count"], 3);
+        assert_eq!(groups[0]["examples"].as_array().unwrap().len(), 3);
+        runs.push(runs[0].clone());
+        assert_eq!(c.pass_error_signatures(Some(&runs)).unwrap()[0]["count"], 3);
+        runs[1]["conclusion"] = json!("success");
+        assert_eq!(c.pass_error_signatures(Some(&runs)).unwrap()[0]["count"], 1);
+        assert!(c.pass_error_signatures(None).is_err());
+        let (stage, text) = pass_error(
+            "2026-11-03T00:00:00Z Error: stage 2 follow pull requests\n2026-11-03T00:00:01Z Caused by:\n2026-11-03T00:00:02Z  request budget 500 exceeded",
+        )
+        .unwrap();
+        assert_eq!(stage, "2");
+        assert!(text.contains("budget 500 exceeded"));
+        assert!(pass_error("##[error]Process completed with exit code 1").is_err());
+        assert_ne!(
+            grouped(
+                vec![
+                    json!({"kind":"pass/2","text":"Error: budget 500", "url":"run/1", "at":iso(0)})
+                ],
+                1
+            )
+            .unwrap()[0]["signature"],
+            grouped(
+                vec![
+                    json!({"kind":"pass/3","text":"Error: budget 501", "url":"run/2", "at":iso(0)})
+                ],
+                1
+            )
+            .unwrap()[0]["signature"]
+        );
+    }
 
     #[test]
     fn stall_completion_windows_boundaries_duplicates_and_no_chaining() {

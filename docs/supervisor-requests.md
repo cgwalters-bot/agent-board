@@ -290,6 +290,57 @@ this option grants no direct implement dispatch or closure authority.
 Supervisor implement requests on signature-marked bugs are refused even after
 triage: only the pass dispatches their accepted job plan's brief.
 
+### Opt-in pass failure recovery
+
+The concrete threat is a log injection spending implementation runs on arbitrary
+repositories, or repeatedly spending on the same open bug. The single opt-in
+`agent.passFailureRepository` names the code-owning repository (which must also
+be in `follow`). Absent, the existing file_bug routing and implement restrictions
+are unchanged. Existing file_bug daily caps, dispatch kinds, per-pass/day caps
+and kind-to-pool/tier eligibility still apply; none is enabled by this option.
+
+The `pass-errors` check reads bounded logs from the newest consecutive failed
+poll attempts in the last day, at most `maxItems`, before other health reads can
+exhaust the budget. Each stage plus normalized error-chain excerpt has a stable
+signature, at most three run links, and one count per run/attempt. It fails at
+`pollFailures` (default three). Missing logs or incomplete job lists are unavailable,
+not healthy. Collection is read-only and shares the existing bounds.
+
+For pass-code bugs, file_bug accepts an optional `repository` equal only to
+`passFailureRepository`, and requires a signature. It searches open issues there
+for executor signature markers before creation and again before writing, within
+the existing ten-page limit. The playbook also asks the agent to search by error
+text to find unmarked existing bugs. Caller-config bugs still go to `agent.tracker`.
+Code-owner bugs are not placed under the tracker epic, assigned, or held, and
+their prose remains untrusted data. No arbitrary repository override is admitted.
+
+An explicitly enabled implement dispatch with reason `recurring-pass-failure`
+may target a bot-filed signature issue or an existing `bug`-labeled issue in that
+one repository without an epic parent. The executor writes its fixed brief,
+not agent prose. It reserves the attempt with a bot-authored
+`agent-board-pass-recovery-requested` comment **before** dispatch. A later request
+for that open bug is refused even after a failed/ambiguous dispatch or completed
+run; an operator must investigate before removing a reservation. Executors must
+remain serialized. Pools come from the current kind/tier eligibility, not a
+default provider. Resulting PRs follow normal review and merge; the supervisor
+neither merges nor changes configuration. A newly filed bug is dispatched on a
+subsequent pass, once its real number is known, never a guessed number in the
+creation batch.
+
+The task carries compact current statuses and at most three evidence/signature
+examples per check, not full history. Aggregate compaction preserves every status
+and drops other checks' details before pass-error evidence. The trigger task is capped at 24 KiB to leave room for the
+profile, skill and operator request inside compose's unchanged 49152-byte bound;
+oversized trusted profiles or operator requests still refuse rather than losing
+instructions. This does not truncate logs on disk or weaken executor validation.
+
+To run on a red pass, the external caller must invoke its supervisor workflow on
+completion of the poll workflow, including failures. `supervise health` then
+counts the failed streak and `supervise trigger` acts at `pollFailures`, subject
+to the existing cooldown and running-agent check. Keep `skipUnchangedFailures`
+false for this path. The caller's event admission and serialization must remain
+trusted; no workflow or production configuration is changed here.
+
 ## Workflow steps
 
 The caller's workflow runs these around `health` and `trigger`; each prints

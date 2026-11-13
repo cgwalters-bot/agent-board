@@ -306,6 +306,8 @@ pub struct AgentSettings {
     /// Opt-in successor for file_bug: fixed native parent, board P1 and
     /// signature deduplication. No request may choose its own approval epic.
     pub bug_epic: Option<u64>,
+    /// Explicit code owner for pass-error bugs and bounded implement requests.
+    pub pass_failure_repository: Option<String>,
     pub project: Option<String>,
     /// The reviewed profile and skill the agent's task starts with
     /// ([`profile`]); without it `compose` and `session` refuse.
@@ -353,6 +355,7 @@ pub const AGENT_OPTIONS: &[&str] = &[
     "skipUnchangedFailures",
     "passConfig",
     "bugEpic",
+    "passFailureRepository",
     "releaseList",
 ];
 /// The agent object's other keys, without which it stays off or is refused.
@@ -725,6 +728,15 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
         state,
         tracker,
         bug_epic,
+        pass_failure_repository: get("passFailureRepository")?
+            .map(|v| {
+                let repo = v
+                    .as_str()
+                    .context("supervisor agent.passFailureRepository")?;
+                validate_repository(repo)?;
+                Ok::<_, anyhow::Error>(repo.to_owned())
+            })
+            .transpose()?,
         project,
         profile: profile::Profile::from_json(get("profile")?)?,
         skip_unchanged_failures: get("skipUnchangedFailures")?
@@ -1246,6 +1258,7 @@ pub(crate) mod tests {
                 "project",
                 "passConfig",
                 "bugEpic",
+                "passFailureRepository",
                 "releaseList",
             ]
             .map(|k| format!("agent.{k}")),

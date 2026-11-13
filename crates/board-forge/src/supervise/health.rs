@@ -34,6 +34,10 @@ pub const CHECKS: &[(&str, &str)] = &[
     ),
     ("poll", "Inspect consecutive failed poll runs."),
     (
+        "pass-errors",
+        "File one owning-repository bug per recurring pass error and request a fix.",
+    ),
+    (
         "runs",
         "Inspect the timeout and cancel only after checking the run.",
     ),
@@ -468,6 +472,7 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                 // A feature merged off stays off until its option is named
                 // (tracker#733): each one left unset is shown, and only warns.
                 "unset" => items.iter().collect(),
+                "pass-errors" => items.iter().filter(|i| i["count"].as_u64().is_some_and(|n| n >= limits.poll_failures as u64)).collect(),
                 "signatures" | "stranded" | "main" | "needs-you" | "queue-aged" | "reviews"
                 | "apply-failures" | "stalls" => {
                     items.iter().filter(|i| i["problem"] != false).collect()
@@ -527,6 +532,7 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             }
             if [
                 "signatures",
+                "pass-errors",
                 "stranded",
                 "main",
                 "needs-you",
@@ -1891,6 +1897,9 @@ pub fn collect(
             ),
             true,
         )
+    });
+    capture("pass-errors", &|o| {
+        c.pass_error_signatures(got(o, "poll").as_deref())
     });
     capture("runs", &|_| {
         let mut all = vec![];
