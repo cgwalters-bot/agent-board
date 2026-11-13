@@ -314,11 +314,7 @@ impl Sources {
                             );
                             classification(&response.body)?;
                             properties(&response.body)?;
-                            // Do not enrol an explicitly named owned private
-                            // repository in any organization-backed list.
-                            if response.body["private"] == true
-                                && response.body["custom_properties"]["origin"] == "fork"
-                            {
+                            if response.body["private"] == true {
                                 inventory.push(response.body);
                             }
                         }
@@ -458,24 +454,29 @@ fn metadata_listing(
             .as_str()
             .context("repository name missing")?;
         let reason;
-        if value["archived"] == true
-            || (value["private"] == true && !explicit.contains(&name.to_ascii_lowercase()))
-        {
+        let explicitly_named = explicit.contains(&name.to_ascii_lowercase());
+        if (value["archived"] == true || value["private"] == true) && !explicitly_named {
             reason = "archived or private";
         } else {
             let properties = properties(value)?;
+            let topics = value["topics"]
+                .as_array()
+                .with_context(|| format!("{name}: topics missing"))?;
+            ensure!(
+                topics.iter().all(Value::is_string),
+                "{name}: invalid topics"
+            );
+            let selected = topics.iter().any(|t| t == topic);
+            // Missing or stale custom properties must not turn a known fork
+            // into owned mergeable work. Preserve topic-only admission too,
+            // including detached forks retained by explicit caller entries.
             if properties
                 .get("origin")
                 .is_some_and(|origin| origin == "fork")
+                || value["fork"] == true
+                || selected
             {
-                let topics = value["topics"]
-                    .as_array()
-                    .with_context(|| format!("{name}: topics missing"))?;
-                ensure!(
-                    topics.iter().all(Value::is_string),
-                    "{name}: invalid topics"
-                );
-                if topics.iter().any(|t| t == topic) {
+                if selected {
                     ensure!(
                         Instant::now() < deadline,
                         "organization resolution deadline reached"
@@ -499,7 +500,7 @@ fn metadata_listing(
                         // Refuse the configuration rather than let that staged
                         // repository reach the poll without no-merge protection.
                         ensure!(
-                            !explicit.contains(&name.to_ascii_lowercase()),
+                            !explicitly_named,
                             "{name}: followed midstream parent missing"
                         );
                         lines.push(format!(
@@ -524,17 +525,21 @@ fn metadata_listing(
                             (name.to_owned(), json!({"upstream":parent,"base":base})),
                         );
                         repos.push(name.to_owned());
-                        lines.push(format!("repositories: detail {name}: midstream (origin fork, topic {topic}), parent {parent}, base {base}"));
+                        lines.push(format!("repositories: detail {name}: midstream (topic {topic}), parent {parent}, base {base}"));
                         continue;
                     }
                 } else {
                     reason = "fork without midstream topic";
                 }
+            } else if value["archived"] == true || value["private"] == true {
+                // Literal entries survive, but cannot widen discovery to
+                // archived/private owned repositories in other lists.
+                reason = "archived or private owned repository";
             } else {
                 owned += 1;
                 repos.push(name.to_owned());
                 lines.push(format!(
-                    "repositories: detail {name}: owned (origin is not fork)"
+                    "repositories: detail {name}: owned (not a fork or midstream)"
                 ));
                 continue;
             }
@@ -669,6 +674,46 @@ mod tests {
                 false,
             ),
             (
+                "explicit archived",
+                "fork",
+                json!(["bot-midstream"]),
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
+            (
+                "missing origin tagged fork",
+                "",
+                json!(["bot-midstream"]),
+                false,
+                true,
+                false,
+                true,
+                true,
+            ),
+            (
+                "missing origin detached midstream",
+                "",
+                json!(["bot-midstream"]),
+                false,
+                true,
+                false,
+                true,
+                true,
+            ),
+            (
+                "missing origin untagged fork",
+                "",
+                json!([]),
+                false,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
                 "explicit override",
                 "fork",
                 json!(["bot-midstream"]),
@@ -719,8 +764,13 @@ mod tests {
                 false,
             ),
         ] {
-            let repo = json!({"full_name":"team/repo", "fork":origin == "fork" && parent, "archived":archived,
-                "private":false,"custom_properties":{"origin":origin},"topics":topics});
+            let github_fork = (origin == "fork" && parent)
+                || matches!(
+                    case,
+                    "missing origin tagged fork" | "missing origin untagged fork"
+                );
+            let repo = json!({"full_name":"team/repo", "fork":github_fork, "archived":archived,
+                "private":false,"custom_properties":if origin.is_empty() {json!({})} else {json!({"origin":origin})},"topics":topics});
             let fixture = json!({"schema":"agent-board/pass-replay/v1","now":"2026-11-10T00:00:00Z", "requests":[
                 {"request":{"get":format!("{API_ROOT}orgs/team/repos?type=public&sort=full_name&per_page=100&page=1")},
                  "answer":{"status":200,"body":[repo]}},
@@ -832,7 +882,9 @@ mod tests {
             assert_eq!(
                 recorded["requests"].as_array().unwrap().len(),
                 1 + usize::from(
-                    origin == "fork" && topics == json!(["bot-midstream"]) && !archived
+                    (origin == "fork" || github_fork || topics == json!(["bot-midstream"]))
+                        && topics == json!(["bot-midstream"])
+                        && (!archived || explicit)
                 ),
                 "{case}"
             );
@@ -872,11 +924,19 @@ mod tests {
             "custom_properties":{"origin":"fork"},"topics":["bot-midstream"],
             "parent":{"full_name":"up/repo","default_branch":"main"}});
         let mut cases = vec![("valid".to_owned(), repo.clone(), true)];
-        for field in ["fork", "archived", "private", "custom_properties"] {
+        for field in ["fork", "archived", "private", "custom_properties", "topics"] {
             let mut missing = repo.clone();
             missing.as_object_mut().unwrap().remove(field);
             cases.push((format!("missing {field}"), missing, false));
-            for invalid in [Value::Null, json!("false"), json!([])] {
+            for invalid in [
+                Value::Null,
+                json!("false"),
+                if field == "topics" {
+                    json!({})
+                } else {
+                    json!([])
+                },
+            ] {
                 let mut body = repo.clone();
                 body[field] = invalid;
                 cases.push((format!("invalid {field}: {}", body[field]), body, false));
@@ -887,6 +947,18 @@ mod tests {
             body["custom_properties"]["origin"] = invalid;
             cases.push(("invalid origin".to_owned(), body, false));
         }
+        let mut missing_origin = repo.clone();
+        missing_origin["custom_properties"] = json!({});
+        cases.push(("missing origin".to_owned(), missing_origin, true));
+        let mut conflicting_origin = repo.clone();
+        conflicting_origin["custom_properties"]["origin"] = json!("first-party");
+        cases.push(("conflicting origin".to_owned(), conflicting_origin, true));
+        let mut archived = repo.clone();
+        archived["archived"] = json!(true);
+        cases.push(("archived explicit".to_owned(), archived, true));
+        let mut invalid_topics = repo.clone();
+        invalid_topics["topics"] = json!([true]);
+        cases.push(("invalid topic".to_owned(), invalid_topics, false));
         let mut missing_parent = repo.clone();
         missing_parent.as_object_mut().unwrap().remove("parent");
         cases.push(("missing parent".to_owned(), missing_parent, false));

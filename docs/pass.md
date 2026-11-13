@@ -4968,9 +4968,13 @@ Private midstreams explicitly named in `follow` or `promote.forks` retain topic
 admission through exact-name metadata reads; they are never enrolled by a private
 organization listing.
 
-Public, non-archived repositories whose custom property `origin` is `fork`
-are admitted only with the configured midstream topic. Everything else receives
-owned-repository rules; archived and private repositories remain excluded.
+Public, non-archived repositories whose custom property `origin` is `fork`, or
+which GitHub identifies as forks, are admitted only with the configured midstream
+topic. Topic-selected repositories always receive midstream protection, even
+when the origin property is absent. Everything else receives owned-repository
+rules; archived and private repositories remain excluded from discovery.
+Explicitly named archived midstreams retain their protective membership just
+like private midstreams, without admitting unrelated archived repositories.
 A selected fork without a parent is excluded and reported by name; if retained by
 another `follow` entry or named in `promote.forks`, it refuses the configuration
 instead, so a follow cannot survive without midstream no-merge protection. Missing or
