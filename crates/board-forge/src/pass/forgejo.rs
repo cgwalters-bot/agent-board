@@ -234,6 +234,7 @@ fn run_within(
     bounds: &Bounds,
 ) -> Result<Report> {
     config.check()?;
+    config.check_pace(now)?;
     let board = config
         .forgejo_board()
         .context("Forgejo pass needs a Forgejo board")?;
@@ -1998,7 +1999,7 @@ fn refresh<B: Broker>(
     report
         .lines
         .push(format!("usage: {}", usage::pools(&snapshot).join("; ")));
-    Ok(Some(snapshot))
+    Ok(Some(config.pace.apply(snapshot, now)))
 }
 
 #[cfg(test)]

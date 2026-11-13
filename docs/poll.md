@@ -663,6 +663,15 @@ none is added by the selector. Headroom, turn, configured order and duplicate
 mentions do not weight a pool's chance. Each pass ends
 with a `pools:` line naming every pool's mode.
 
+`pace.speed` is a finite number at least 1 (default 1, unchanged pacing).
+For a faster but still spread-out pace, set it to 5: the allowance becomes
+`min(100, speed × elapsed%)`, and a pool waits when
+`used% > allowance + marginPercent`. This opt-in calculation replaces the
+snapshot's allowance for a pool that is not held; the default retains the
+snapshot's burst-aware behavior above. Exhaustion, missing usage and any snapshot
+`hold` other than `false` still hold. The `pools:` line names a non-default
+multiplier (with no expiry for the global setting).
+
 `pace.overrides` (absent by default) changes one pool's pacing for a while
 from the committed file rather than by editing the margin and pool lists and
 remembering to revert (agent-board#235). Each entry has a `pool`, a required
@@ -671,16 +680,36 @@ remembering to revert (agent-board#235). Each entry has a `pool`, a required
 and eligible spend pools are drawn uniformly before ordinary pools; a used-up window still holds
 it (indefinitely where its reset is absent or unreadable), and so does missing
 usage, since an override lifts pacing, not caps. `hold` holds the pool
-until `until` whatever its pace. An entry past its `until` is ignored and named
+until `until` whatever its pace. `speed` uses a required finite `factor` ≥ 1
+in place of `pace.speed`, without spend's selection priority. For example:
+
+```json
+{"pace":{"repository":"example/ops","issue":1,"bot":"usage-bot",
+  "overrides":[{"pool":"claude","mode":"speed","factor":5,
+    "until":"2026-11-15T00:00:00Z","reason":"use quota before reset"}]}}
+```
+
+Choose an `until` within seven days of the pass's clock. This bound prevents a
+forgotten temporary speed-up from persisting indefinitely. An entry past its `until` is ignored and named
 in the `pools:` line (`override for claude expired at …`), so a forgotten one
 shows rather than pins behavior. A missing or past-the-bound `until`, an unknown
 `mode` or field, a pool named twice, or a pool no setting names (each tier as
 its pools) refuses the poll's configuration. The `pools:` line names each
 override in force with its reason, and the supervisor's pace check shows it
-as evidence, warning rather than failing for that pool. The snapshot's own
+as evidence, warning rather than failing for spend/hold; speed is checked against
+the multiplied allowance. The snapshot's own
 `hold` (agent-board#233) does not say why it holds, and a pool over its pace
 may be out of its session too, so any `hold` but `false` still holds a spend
-pool until the snapshot reports pace and cap reasons apart.
+pool (and a speed pool) until the snapshot reports pace and cap reasons apart.
+The pass's direct usage refresh already writes pace into `allowed_percent` and
+`hold` (`pass/usage.rs`); broker grants supply their own paced allowance. Window
+length and reset, with `used_percent`, suffice to recompute speed allowance,
+but **not to release an existing snapshot hold** under this contract. A caller
+whose snapshot is already pace-held will see no release from a 5x override:
+it needs a snapshot producer change to expose independently enforceable caps
+and a non-held reading, not a broker policy change in agent-board. Broker
+consumer grants remain authoritative: neither speed nor spend enlarges their
+allowance, and their entries lack provider window timing for recomputing speed.
 
 Pools have tiers (agent-board#228): `fixPools` and each `kindPools` entry may
 name a tier, `tier-1` or `tier-2`, instead of a pool, so that tier-1 work

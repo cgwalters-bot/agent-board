@@ -5108,13 +5108,14 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
 | `maintain.repos.sinceDays`, `maintain.repos.min`, `maintain.repos.max` | The repositories whose incoming pull requests a daily digest assesses: those with at least `min` (≥ 1) of the operator's opened or reviewed pull requests updated in `sinceDays` (1–365) days, the `max` (1–20) most active, derived once a day, see [maintain](#maintain); required |
 | `maintain.repos.include`, `maintain.repos.exclude` | Repositories always kept (at most `max`) and never kept, no duplicates across both; `[]`, `[]` |
-| `maintain.share` | The share (0 < share < 1) of each pool's allowance the digest keeps while due; needs `pools`; section absent (off) |
+| `maintain.share` | The share (0 < share < 1) of each pool's allowance the digest keeps while due; needs `pools`; section absent (off). With `pace.speed` or a speed override, reserves from the multiplied allowance, not the original one, for both the digest and the other stages. |
 | `maintain.digest.repository`, `maintain.digest.issue` | The digest issue, outside `maintain.repos.include`; its run is dispatched where the repository is public, else only planned; required |
 | `maintain.hourUtc` | The hour, 0–23 UTC, from which a day's digest is due; required |
 | `overlap.staleDraftHours` | With `overlap` set, an overlapping draft or PR labelled `needs-human` or `hold` unchanged this many hours (0–168; 0 never) does not hold a start, nor does a documentation-only overlap of a first-Priority issue, see [scheduling](#scheduling); `4`; section absent (off) |
 | `overlap.staleHours` | With `overlap` set, how long (0–168 hours; 0 off) a pull request that overlap holds name, and that only a person moves, may stand still before it gets one needs-you card in place of its items' stall alarms, see [blockers](#blockers); `24`; section absent (off) |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
+| `pace.speed`, `pace.marginPercent`, `pace.overrides` | Opt-in faster pacing, default speed 1 and margin 0; see [pacing](poll.md#configuration). Speed is finite and ≥ 1. An override names `pool`, `mode: "speed"`, `factor` ≥ 1 and required RFC 3339 `until` at most 7 days ahead (also supports `spend` and `hold`). Snapshot holds, missing readings and exhausted windows still hold. |
 | `usage.url` | Broker usage endpoint; absent reads the published snapshot instead of refreshing |
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |

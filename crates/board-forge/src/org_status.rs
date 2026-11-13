@@ -384,7 +384,13 @@ fn pools(api: &dyn Api, s: &Settings, now: OffsetDateTime) -> Result<Value> {
         );
     }
     let snapshot = found.flatten();
-    let paces = pace::paces(snapshot.as_ref(), now, pace.margin_percent, &pace.overrides);
+    let paces = pace::paces_with_speed(
+        snapshot.as_ref(),
+        now,
+        pace.margin_percent,
+        &pace.overrides,
+        pace.speed,
+    );
     let entries: BTreeMap<String, Value> = snapshot
         .as_ref()
         .and_then(|s| s["pools"].as_object())
@@ -410,7 +416,7 @@ fn pools(api: &dyn Api, s: &Settings, now: OffsetDateTime) -> Result<Value> {
         "updated_at": snapshot.as_ref().map_or(Value::Null, |s| s["updated_at"].clone()),
         "pools": entries,
         // The poll's own line, so that both say the same of each pool.
-        "line": pace::line(&paces, &BTreeSet::new(), &pace.overrides, now),
+        "line": pace::line_with_speed(&paces, &BTreeSet::new(), &pace.overrides, now, pace.speed),
     }))
 }
 

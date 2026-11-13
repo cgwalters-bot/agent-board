@@ -710,6 +710,8 @@ pub struct Config {
     #[serde(default)]
     pub mix: BTreeMap<String, mix::Setting>,
     pub usage: Option<Usage>,
+    #[serde(default)]
+    pub pace: poll::pace::Settings,
     /// Off unless set.
     pub holds: Option<HoldsAt>,
     /// Existing operator decisions document, read only with holds.needsYou.
@@ -1257,6 +1259,14 @@ fn valid_pool(name: &str) -> bool {
 }
 
 impl Config {
+    fn check_pace(&self, now: OffsetDateTime) -> Result<()> {
+        poll::pace::check_overrides(
+            &self.pace.overrides,
+            now,
+            &self.pools.0.iter().map(|(name, _)| name.clone()).collect(),
+        )
+    }
+
     fn intakes(&self, repository: &str) -> bool {
         self.issue_intake
             && self
@@ -1949,8 +1959,9 @@ impl Config {
                 repository: usage.repository.clone(),
                 issue: usage.issue,
                 bot: self.bot.clone(),
-                margin_percent: 0.0,
-                overrides: vec![],
+                margin_percent: self.pace.margin,
+                speed: self.pace.speed,
+                overrides: self.pace.overrides.clone(),
                 snapshot: snapshot.cloned(),
             }),
             fix_bounds: self.fix_bounds.clone(),
@@ -2097,7 +2108,14 @@ pub fn room(
     if resets <= now {
         return Err(format!("{pool}'s window has reset since its reading"));
     }
-    Ok(allowed(settings.target, window, resets, now) - used)
+    let allowance = if entry["pace_adjusted"] == true {
+        entry["allowed_percent"]
+            .as_f64()
+            .ok_or_else(|| format!("{pool} has no allowance"))?
+    } else {
+        allowed(settings.target, window, resets, now)
+    };
+    Ok(allowance - used)
 }
 
 /// The share of its paced window, in percent, a pool may have used by
@@ -4044,6 +4062,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     (mut state, mode, limits, now): (State, Mode<'_>, Limits, OffsetDateTime),
     bounds: &Bounds,
 ) -> Result<Report> {
+    config.check_pace(now)?;
     if let Some(path) = &config.living_status {
         living::check_paths(path, config.state.as_deref())?;
         *bounds.living.borrow_mut() = Some(living::Store::load(path, &config.bot, now)?);
@@ -6397,7 +6416,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             };
             self.snapshot = Some(read);
         }
-        self.snapshot.clone().flatten()
+        let snapshot = self
+            .snapshot
+            .clone()
+            .flatten()
+            .map(|s| self.config.pace.apply(s, self.now));
+        self.snapshot = Some(snapshot.clone());
+        snapshot
     }
 
     /// [`budget_hold`] by the pass's snapshot, read only with a budget.

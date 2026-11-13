@@ -4242,6 +4242,18 @@ fn replay_scenarios() {
             0,
         ),
         (
+            "a speed override reaches dispatch from a real non-held broker reading",
+            Box::new(|r, c| {
+                with_broker(r, c, json!({"body": usage::tests::broker()}));
+                c["planPools"] = json!(["openai"]);
+                c["triagePools"] = json!(["openai"]);
+                c["pace"] = json!({"overrides":[{"pool":"openai","mode":"speed","factor":5,"until":"2026-10-24T00:00:00Z"}]});
+            }),
+            vec!["start triage cgwalters-forge/tracker#446 pool=openai"],
+            6,
+            0,
+        ),
+        (
             "an unreadable broker with a stale snapshot is one failure, and it holds",
             Box::new(|r, c| {
                 r.now += time::Duration::minutes(45);
@@ -18428,6 +18440,118 @@ fn config_table() {
         (pace.repository.as_str(), pace.issue, pace.bot.as_str()),
         ("cgwalters-forge/bot-ops", 1, "cgwalters-bot")
     );
+}
+
+#[test]
+fn speed_and_spend_preserve_grants_and_maintain_share() {
+    let now = at("2026-10-23T12:00:00Z");
+    for mode in ["speed", "spend"] {
+        let mut entry = json!({"pool":"claude", "mode":mode, "until":"2026-10-24T00:00:00Z"});
+        if mode == "speed" {
+            entry["factor"] = 5.into();
+        }
+        let config = config(json!({"pace":{"speed":5, "overrides":[entry]}}));
+        let original = json!({"updated_at":"2026-10-23T12:00:00Z", "pools":{"claude":{
+            "source":usage::GRANT_SOURCE, "hold":false,"allowed_percent":40,"used_percent":35}}});
+        let snapshot = config.pace.apply(original.clone(), now);
+        assert_eq!(snapshot["pools"], original["pools"], "{mode}");
+        let settings = &config.pools.0[0].1;
+        assert_eq!(room(Some(&snapshot), "claude", settings, now), Ok(5.0));
+        let reserved = maintain::reserve(&snapshot, 0.8, "other stages");
+        assert!(room(Some(&reserved), "claude", settings, now).is_err());
+        for (snapshot, held) in [(&snapshot, false), (&reserved, true)] {
+            let modes =
+                poll::pace::paces_with_speed(Some(snapshot), now, 0.0, &config.pace.overrides, 5.0);
+            assert_eq!(
+                poll::pace::choose(&modes, &["claude".into()], None).is_err(),
+                held,
+                "{mode}"
+            );
+        }
+    }
+}
+
+#[test]
+fn speed_room_and_maintain_reserve_use_the_same_allowance() {
+    let now = at("2026-10-23T12:00:00Z");
+    let until = "2026-10-24T12:00:00Z";
+    for (pace, used, held, maintain_held) in [
+        (json!({}), 30.0, false, true),
+        (json!({"speed": 5}), 30.0, false, false),
+        (
+            json!({"overrides": [{"pool":"claude","mode":"speed","factor":5,"until":until}]}),
+            30.0,
+            false,
+            false,
+        ),
+        (json!({"speed":5}), 85.0, false, true),
+        (json!({"speed":5}), 100.0, true, true),
+        (
+            json!({"speed":5,"overrides":[{"pool":"claude","mode":"hold","until":until}]}),
+            30.0,
+            true,
+            true,
+        ),
+    ] {
+        let config = config(json!({"pace":pace}));
+        config.check_pace(now).unwrap();
+        let snapshot = json!({"updated_at":"2026-10-23T12:00:00Z", "pools": {"claude": {
+            "observed_at":"2026-10-23T12:00:00Z", "hold":false,
+            "used_percent": used, "allowed_percent":35, "burst":0,
+            "window_minutes":10080, "resets_at":"2026-10-28T18:00:00Z"}}});
+        let adjusted = config.pace.apply(snapshot, now);
+        assert_eq!(
+            config.pace.apply(adjusted.clone(), now),
+            adjusted,
+            "idempotent: {pace}"
+        );
+        let settings = &config
+            .pools
+            .0
+            .iter()
+            .find(|(n, _)| n == "claude")
+            .unwrap()
+            .1;
+        assert_eq!(
+            room(Some(&adjusted), "claude", settings, now).is_err(),
+            held,
+            "room: {pace}"
+        );
+        let reserved = maintain::reserve(&adjusted, 0.8, "other stages");
+        assert_eq!(
+            room(Some(&reserved), "claude", settings, now).is_err(),
+            maintain_held,
+            "reserve: {pace}"
+        );
+        let poll = config.poll(Some(&reserved));
+        let pace = poll.policy.pace.unwrap();
+        let modes = poll::pace::paces_with_speed(
+            Some(&reserved),
+            now,
+            pace.margin_percent,
+            &pace.overrides,
+            pace.speed,
+        );
+        assert_eq!(
+            poll::pace::choose(&modes, &["claude".into()], None).is_err(),
+            maintain_held,
+            "poll: {pace:?}"
+        );
+    }
+    for pace in [
+        json!({"speed":0.9}),
+        json!({"overrides":[{"pool":"claude","mode":"speed","factor":0.9,"until":until}]}),
+        json!({"overrides":[{"pool":"claude","mode":"speed","factor":5}]}),
+    ] {
+        let mut value: Value =
+            serde_json::from_str(include_str!("../../../../fixtures/pass/config.json")).unwrap();
+        value["pace"] = pace;
+        assert!(Config::parse(&value.to_string()).is_err());
+    }
+    let config = config(
+        json!({"pace":{"overrides":[{"pool":"claude","mode":"speed","factor":5,"until":"2026-11-01T00:00:00Z"}]}}),
+    );
+    assert!(config.check_pace(now).is_err());
 }
 
 #[test]
