@@ -667,9 +667,9 @@ with a `pools:` line naming every pool's mode.
 For a faster but still spread-out pace, set it to 5: the allowance becomes
 `min(100, speed × elapsed%)`, and a pool waits when
 `used% > allowance + marginPercent`. This opt-in calculation replaces the
-snapshot's allowance for a pool that is not held; the default retains the
-snapshot's burst-aware behavior above. Exhaustion, missing usage and any snapshot
-`hold` other than `false` still hold. The `pools:` line names a non-default
+snapshot's allowance, including for an explicit non-grant `reason: "pace-only"`
+hold; the default retains the snapshot's burst-aware behavior above. Exhaustion,
+missing usage and all other snapshot holds still hold. The `pools:` line names a non-default
 multiplier (with no expiry for the global setting).
 
 `pace.overrides` (absent by default) changes one pool's pacing for a while
@@ -678,7 +678,7 @@ remembering to revert (agent-board#235). Each entry has a `pool`, a required
 `until` (RFC 3339, at most 7 days ahead), a `mode` and an optional one-line
 `reason`. In force, `spend` means the pool is not held by the poll's own pacing
 and eligible spend pools are drawn uniformly before ordinary pools; a used-up window still holds
-it (indefinitely where its reset is absent or unreadable), and so does missing
+it until a fresh reading, even after its reset, and so does missing
 usage, since an override lifts pacing, not caps. `hold` holds the pool
 until `until` whatever its pace. `speed` uses a required finite `factor` ≥ 1
 in place of `pace.speed`, without spend's selection priority. For example:
@@ -697,17 +697,15 @@ shows rather than pins behavior. A missing or past-the-bound `until`, an unknown
 its pools) refuses the poll's configuration. The `pools:` line names each
 override in force with its reason, and the supervisor's pace check shows it
 as evidence, warning rather than failing for spend/hold; speed is checked against
-the multiplied allowance. The snapshot's own
-`hold` (agent-board#233) does not say why it holds, and a pool over its pace
-may be out of its session too, so any `hold` but `false` still holds a spend
-pool (and a speed pool) until the snapshot reports pace and cap reasons apart.
-The pass's direct usage refresh already writes pace into `allowed_percent` and
-`hold` (`pass/usage.rs`); broker grants supply their own paced allowance. Window
-length and reset, with `used_percent`, suffice to recompute speed allowance,
-but **not to release an existing snapshot hold** under this contract. A caller
-whose snapshot is already pace-held will see no release from a 5x override:
-it needs a snapshot producer change to expose independently enforceable caps
-and a non-held reading, not a broker policy change in agent-board. Broker
+the multiplied allowance. The pass's direct usage refresh reports pace and cap
+reasons separately: an explicit non-grant `hold: true, reason: "pace-only"` with
+usage below 100% can be released by speed or spend. The producer emits that
+reason only when no window is exhausted. A legacy `"pace"` reason can conceal
+an exhausted short window and remains authoritative, as do `"window"`, missing
+or unknown reasons and non-boolean holds. An exhausted short window reports
+`"window"` even when the pool is also over pace or its reset has passed without
+a fresh reading. Window length and reset, with
+`used_percent`, suffice to recompute speed allowance. Broker
 consumer grants remain authoritative: neither speed nor spend enlarges their
 allowance, and their entries lack provider window timing for recomputing speed.
 
@@ -731,7 +729,7 @@ a request for any automatic pool of it.
 
 This changes new selections only, never an active job's pool. An explicit
 operator/plan pool restricts the candidate set, not a preference to replace when
-held. Snapshot holds and exhausted caps win over spend; administrative hold
+held. Non-pace snapshot holds and exhausted caps win over spend; administrative hold
 always excludes its pool. Eligibility describes known usage, not a promise the
 provider's next request cannot return 429. There are no new retries or dispatches.
 

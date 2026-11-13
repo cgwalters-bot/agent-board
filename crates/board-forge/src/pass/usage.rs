@@ -4,6 +4,7 @@
 //! than by whatever another job last published. An applying pass publishes
 //! it to the bot's usage comment, where the review app reads it too.
 use super::*;
+use crate::poll::pace::PACE_ONLY_REASON;
 
 /// The broker's answer this reads.
 const BROKER_SCHEMA: &str = "praxis-broker-usage/v1";
@@ -189,7 +190,8 @@ fn unread(at: &str) -> Value {
 /// A pool's snapshot entry from its windows, held without a window of a
 /// day or more that has yet to reset and was read in the last 30 hours. The longest window is paced: its use
 /// against [`allowed`], plus `burst` points but never past the target, and a
-/// shorter window used up holds until it resets. Its `observed_at` is that
+/// shorter window used up holds until a fresh reading, even after reset.
+/// Only `pace-only` certifies that no window is exhausted. Its `observed_at` is that
 /// window's own, so a recent short-window reading does not freshen it.
 fn pace(
     windows: &[Window],
@@ -221,19 +223,23 @@ fn pace(
     let mut reason = None;
     let mut next = None;
     if paced.used > limit {
-        reason = Some("pace");
+        reason = Some(if paced.used < 100.0 {
+            PACE_ONLY_REASON
+        } else {
+            "pace"
+        });
         next = Some(match paced.used > goal {
             true => paced.resets,
             false => paced.resets - window + (paced.used - burst) / goal * window,
         });
     }
-    let now_seconds = seconds(now);
     for (_, spent) in windows
         .iter()
         .enumerate()
-        .filter(|(i, w)| *i != index && w.resets > now_seconds && w.used >= 100.0)
+        .filter(|(i, w)| *i != index && w.used >= 100.0)
     {
-        reason.get_or_insert("window");
+        // A cap must remain authoritative even when this pool is also over pace.
+        reason = Some("window");
         next = Some(next.map_or(spent.resets, |n: f64| n.max(spent.resets)));
     }
     Ok(json!({
@@ -1295,7 +1301,13 @@ pub(super) mod tests {
             }
             let (used, limit) = (e["used_percent"].as_f64(), e["limit_percent"].as_f64());
             let over = used.unwrap() > limit.unwrap();
-            assert_eq!(over, e["reason"] == "pace", "{name}: {pool} {e}");
+            if e["reason"] != "window" {
+                assert_eq!(
+                    over,
+                    e["reason"] == PACE_ONLY_REASON || e["reason"] == "pace",
+                    "{name}: {pool} {e}"
+                );
+            }
         }
     }
 
@@ -1337,12 +1349,16 @@ pub(super) mod tests {
                 "openai over pace and burst",
                 vec![("/codex/primary/used_percent", json!(10))],
                 free,
-                Some((true, Some("pace"), Some("2026-10-24T00:22:44.21Z"))),
+                Some((
+                    true,
+                    Some(PACE_ONLY_REASON),
+                    Some("2026-10-24T00:22:44.21Z"),
+                )),
             ),
             (
                 "claude over target, past its burst",
                 vec![("/anthropic/unified_7d/utilization", json!(0.96))],
-                Some((true, Some("pace"), Some("2026-10-26T23:00:00Z"))),
+                Some((true, Some(PACE_ONLY_REASON), Some("2026-10-26T23:00:00Z"))),
                 free,
             ),
             (
@@ -1355,7 +1371,7 @@ pub(super) mod tests {
                 "openai over pace, five hours used up before it catches up",
                 codex_spent(1200),
                 free,
-                Some((true, Some("pace"), Some("2026-10-24T00:22:44.21Z"))),
+                Some((true, Some("window"), Some("2026-10-24T00:22:44.21Z"))),
             ),
             (
                 "claude over target with five hours used up: the later",
@@ -1363,14 +1379,26 @@ pub(super) mod tests {
                     ("/anthropic/unified_7d/utilization", json!(0.96)),
                     ("/anthropic/unified_5h/utilization", json!(1.0)),
                 ],
-                Some((true, Some("pace"), Some("2026-10-26T23:00:00Z"))),
+                Some((true, Some("window"), Some("2026-10-26T23:00:00Z"))),
                 free,
             ),
             (
                 "openai over pace, five hours used up past it",
                 codex_spent(36000),
                 free,
-                Some((true, Some("pace"), Some("2026-10-24T01:06:40Z"))),
+                Some((true, Some("window"), Some("2026-10-24T01:06:40Z"))),
+            ),
+            (
+                "claude's exhausted week is not pace-only",
+                vec![("/anthropic/unified_7d/utilization", json!(1.0))],
+                Some((true, Some("pace"), Some("2026-10-26T23:00:00Z"))),
+                free,
+            ),
+            (
+                "openai over pace, exhausted five hours past reset without a new reading",
+                codex_spent(0),
+                free,
+                Some((true, Some("window"), Some("2026-10-24T00:22:44.21Z"))),
             ),
             (
                 "claude with five hours only, as after a restart",
@@ -1418,6 +1446,36 @@ pub(super) mod tests {
                 e.is_object().then_some(hold)
             };
             assert_eq!((got("claude"), got("openai")), (claude, openai), "{name}");
+            for settings in [
+                json!({}),
+                json!({"speed": 5}),
+                json!({"overrides": [
+                    {"pool": "claude", "mode": "spend", "until": "2026-10-24T00:00:00Z"},
+                    {"pool": "openai", "mode": "spend", "until": "2026-10-24T00:00:00Z"}
+                ]}),
+            ] {
+                let settings: crate::poll::pace::Settings =
+                    serde_json::from_value(settings).unwrap();
+                let adjusted = settings.apply(snap.clone(), now());
+                if settings == crate::poll::pace::Settings::default() {
+                    assert_eq!(adjusted, snap, "{name}");
+                } else {
+                    for pool in ["claude", "openai"] {
+                        let entry = &snap["pools"][pool];
+                        let pace_held = settings.speed != 1.0
+                            && entry["used_percent"].as_f64().is_some_and(|used| {
+                                used > crate::poll::pace::allowance(entry, now(), settings.speed)
+                                    .unwrap()
+                            });
+                        assert_eq!(
+                            adjusted["pools"][pool]["hold"],
+                            (entry["hold"] == true && entry["reason"] != PACE_ONLY_REASON)
+                                || pace_held,
+                            "{name}: {pool}: {settings:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1434,6 +1492,52 @@ pub(super) mod tests {
         let pools = ["claude".to_owned(), "openai".to_owned()];
         let why = choose(&paces, &pools, None).unwrap_err();
         assert!(why.contains("claude") && why.contains("openai"), "{why}");
+    }
+
+    #[test]
+    fn overlapping_pace_and_window_holds_remain_binding() {
+        use crate::poll::pace::{Settings, choose, paces_with_speed};
+        let mut broker = broker();
+        broker["codex"]["secondary"] = json!({"used_percent": 10, "window_minutes": 10080,
+            "reset_after_seconds": 593600, "observed_at": 1792768000});
+        broker["codex"]["primary"] = json!({"used_percent": 100, "window_minutes": 300,
+            "reset_after_seconds": 1200, "observed_at": 1792768000});
+        let snap = snapshot(&broker, &pools(), now()).unwrap();
+        assert_eq!(snap["pools"]["openai"]["reason"], "window");
+        // The base producer kept the pace reason on this overlapping hold;
+        // the exhausted short window was otherwise absent from the snapshot.
+        let mut legacy = snap.clone();
+        legacy["pools"]["openai"]["reason"] = "pace".into();
+        for settings in [
+            json!({"speed": 5}),
+            json!({"overrides": [{"pool": "openai", "mode": "speed", "factor": 5,
+                "until": "2026-10-24T00:00:00Z"}]}),
+            json!({"overrides": [{"pool": "openai", "mode": "spend",
+                "until": "2026-10-24T00:00:00Z"}]}),
+        ] {
+            let settings: Settings = serde_json::from_value(settings).unwrap();
+            // Both snapshots remain fresh after the short window's reset;
+            // neither has a new reading proving there is room.
+            for now in [now(), now() + time::Duration::minutes(30)] {
+                for snap in [&snap, &legacy] {
+                    let adjusted = settings.apply(snap.clone(), now);
+                    assert_eq!(adjusted["pools"]["openai"]["hold"], true);
+                    for snap in [snap, &adjusted] {
+                        let modes = paces_with_speed(
+                            Some(snap),
+                            now,
+                            0.0,
+                            &settings.overrides,
+                            settings.speed,
+                        );
+                        assert!(
+                            choose(&modes, &["openai".into()], None).is_err(),
+                            "{snap}: {settings:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The snapshot's `budget`, which the review app reads: the broker's
