@@ -439,13 +439,16 @@ approved work visible without granting the pass upstream write authority.
   regardless of detected DCO checks. It creates a deterministic
   `bot/promote/APPROVED_OID` branch in the same head repository,
   never overwriting an existing ref. The approved fork branch remains untouched;
-  approval and human-text provenance stay bound to that original head. A retry
-  reconstructs the same branch/head and observes its upstream PR before writing.
-  If the upstream base changed since creating that branch, a different prepared
-  head holds for inspection instead of overwriting it or creating a duplicate PR.
-  An existing upstream PR on the original branch that needs rewriting holds for
-  manual migration, rather than creating a duplicate PR. The upstream base and
-  approved head are checked again before pushing the new branch.
+  approval and human-text provenance stay bound to that original head. The
+  branch name has only the approved head, so a rebuild after upstream advanced
+  would be a different head on the same name: a retry reads the fork PR's
+  receipt before rebuilding anything (below). Without a receipt for this head,
+  a publication branch already at another head holds for inspection before any
+  write, never overwritten, and a rebuild needs its upstream PR to be at the
+  rebuilt head. An existing upstream PR on the original branch that needs
+  rewriting holds for manual migration, rather than creating a duplicate PR.
+  The upstream base and approved head are checked again before pushing the new
+  branch.
   Draft creation is deliberate:
   GitHub's branch-based POST can race a push, so it must not mark an unapproved
   head ready. Verify the branch immediately before publication and verify the
@@ -453,17 +456,30 @@ approved work visible without granting the pass upstream write authority.
   A mismatch records no success and closes nothing; a draft may have been
   created and needs inspection. This is not atomic snapshot publication.
 * **Recovery and noise.** A single bot-authored status comment on the fork PR
-  records the pending approved head, then is edited to the result (or uncertain
-  publication error). On retries edit it to pending first; multiple receipts
-  refuse. Confirmed same-head, unchanged-text upstream PRs with the matching
-  success receipt are skipped without writes, so later candidates can progress.
-  An ambiguous
-  POST failure is not retried in the same invocation: the next invocation observes
-  existing upstream PRs first, and never creates a second one intentionally.
-  Concurrent invocations still need caller serialization; GitHub does not offer
-  an atomic create-if-absent status comment. Nothing except the PR is posted
-  upstream. Fork PRs remain open: capped, recoverable fork closure requires
-  separate acceptance after the handoff replay proof.
+  is the receipt. Before the first write it records the approved head and the
+  head and branch about to be published, as an `agent-board-promoting` machine
+  record; it is then edited to the success record (or the uncertain publication
+  error, keeping the pending record). On retries edit it to pending first;
+  multiple receipts refuse. A retry reads the receipt before any rebuild, and
+  a receipt with a machine record counts only when the forge's edit evidence
+  shows the bot alone wrote and edited it, as the handoff's. A success record
+  for the current approved head whose upstream PR is open at the recorded head
+  and branch is skipped without writes, or has its text updated from that head,
+  so later candidates progress and nothing is rebuilt on a later base. A
+  pending record whose branch is at the recorded head resumes from it: the
+  upstream PR is created or updated without a Git run. A pending record whose
+  branch was never pushed publishes again under a new receipt; a branch at
+  another head holds. A receipt without a machine record is replaced without
+  edit evidence: it steers nothing, and the bot's edit makes the bot its last
+  editor again. One
+  candidate's hold is one line, and the next candidate is read; only the write
+  step's failure ends the invocation, as its writes were the one slot. An
+  ambiguous POST failure is not retried in the same invocation: the next
+  invocation observes existing upstream PRs first, and never creates a second
+  one intentionally. Concurrent invocations still need caller serialization;
+  GitHub does not offer an atomic create-if-absent status comment. Nothing
+  except the PR is posted upstream. Fork PRs remain open: capped, recoverable
+  fork closure requires separate acceptance after the handoff replay proof.
   No unsigned head is published: sign-off completeness is checked independently
   of DCO detection before publication. Live publication and bot-fork staging
   verification remain unverified by the offline fixtures.

@@ -12,6 +12,13 @@ use std::{
 const GIT_SECONDS: u64 = 120;
 const FETCH_DEPTH: &str = "1001";
 
+/// The deterministic publication branch of an approved head. It names the
+/// approved commit only: a rewrite onto a later upstream base is a new head
+/// on the same name, so a retry must read its receipt before rebuilding.
+pub(super) fn branch(head: &str) -> String {
+    format!("bot/promote/{head}")
+}
+
 pub(super) trait Rewrite {
     fn prepare(
         &mut self,
@@ -292,7 +299,7 @@ impl Git {
             parent = sha.to_owned();
         }
         ensure!(parent == head, "incomplete promotion replay");
-        Ok((rebased, format!("bot/promote/{head}")))
+        Ok((rebased, branch(head)))
     }
 }
 
