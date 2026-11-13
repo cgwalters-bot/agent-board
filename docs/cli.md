@@ -759,6 +759,7 @@ Options:
 - `--replay <FILE>`: Preview a recorded pass (a replay fixture) at its clock instead of reading the forge; needs no token. A Forgejo fixture replays only on the instance it was recorded on. On GitHub, with --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage
 - `--record <FILE>`: Preview live, and save every read and its answer to FILE as a replay fixture
 - `--check-config`: Only check --config and --fix-bounds as a pass would, and exit. Explicit repository lists need no token or forge reads; organization entries need GH_TOKEN to resolve their bounded listing before policy validation. For a caller's pull request CI, so a configuration the pass refuses fails review instead of every pass after merge
+- `--verbose`: Show repository resolution details as well as counts
 
 ## agent-board pass next
 

@@ -3275,7 +3275,7 @@ fn organization_sources_preserve_promotion_replay_and_reconcile_config_loading()
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("organization entries require forks: false")
+            .contains("forks: true is supported only in follow, workRepositories and pr.noMerge")
     );
     std::fs::remove_dir_all(dir).unwrap();
 }

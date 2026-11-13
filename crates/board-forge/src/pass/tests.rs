@@ -20670,12 +20670,23 @@ fn no_merge_preserves_followed_rounds_and_holds() {
     let approval = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
         "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
         "pageInfo": {"hasPreviousPage": false}});
-    let sources = ["listed", "topic", "promote", "missing-topic", "authored"];
+    let sources = [
+        "listed",
+        "topic",
+        "promote",
+        "missing-topic",
+        "authored",
+        "metadata",
+        "metadata-private",
+    ];
     for (queued, source) in [false, true]
         .into_iter()
         .flat_map(|q| sources.map(|s| (q, s)))
     {
-        let topic = matches!(source, "topic" | "promote" | "missing-topic");
+        let topic = matches!(
+            source,
+            "topic" | "promote" | "missing-topic" | "metadata" | "metadata-private"
+        );
         for (name, change, action) in [
             ("ready", json!({}), "wait: pr.noMerge:"),
             ("conflict", json!({"mergeable": "CONFLICTING"}), "rebase:"),
@@ -20731,7 +20742,10 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                         "answer": {"status": 200, "link": link, "body": body}}));
                 }
             }
-            if source == "promote" || source == "missing-topic" {
+            if matches!(
+                source,
+                "promote" | "missing-topic" | "metadata" | "metadata-private"
+            ) {
                 settings["follow"] = json!([REPO]);
                 settings["promote"] = json!({"forks": {REPO: {"upstream":"example/upstream", "base":"main"}},
                     "signoff":{"name":"Op", "email":"op@example.invalid"}, "policyRepository":"cgwalters-forge/tracker"});
@@ -20741,7 +20755,9 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                 for (path, body) in [
                     (
                         format!("repos/{REPO}"),
-                        json!({"full_name":REPO,"fork":true,"parent":{"full_name":"example/upstream"}}),
+                        json!({"full_name":REPO,"fork":true,"private":source == "metadata-private","archived":false,
+                            "custom_properties":{"origin":"fork"},"topics":["bot-midstream"],
+                            "parent":{"full_name":"example/upstream","default_branch":"main"}}),
                     ),
                     (
                         format!("repos/{REPO}/issues/188/timeline?per_page=100&page=1"),
@@ -20811,7 +20827,30 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                     .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
                     "answer": {"status": 200, "link": null, "body": body}}));
             }
-            let cfg = config(settings);
+            let cfg = if source.starts_with("metadata") {
+                settings["follow"] = json!([{"org":"cgwalters-forge","forks":true}]);
+                if source == "metadata-private" {
+                    settings["follow"].as_array_mut().unwrap().push(json!(REPO));
+                } else {
+                    settings["promote"]["forks"] = json!({});
+                }
+                forge.replay.requests.retain(|entry| {
+                    !entry["request"]["get"]
+                        .as_str()
+                        .is_some_and(|url| url.contains("orgs/cgwalters-forge/repos"))
+                });
+                forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}orgs/cgwalters-forge/repos?type=public&sort=full_name&per_page=100&page=1")},
+                    "answer":{"status":200,"body":if source == "metadata-private" {json!([])} else {json!([{"full_name":REPO,"fork":true,"archived":false,"private":false,
+                        "custom_properties":{"origin":"fork"},"topics":["bot-midstream"]}])}}}));
+                let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(settings.as_object().unwrap().clone());
+                Config::parse_sources(&value.to_string()).unwrap()
+            } else {
+                config(settings)
+            };
             for report in [preview(&cfg, &forge.replay), apply(&forge, &cfg)] {
                 let lines = &report.lines;
                 if source == "missing-topic" {

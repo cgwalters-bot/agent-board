@@ -4952,6 +4952,35 @@ existing authority; it does not change fix bounds, merge rules or write caps.
 Source normalization rejects duplicate object fields so an ambiguous scope
 such as two `dispatchRepo` keys cannot silently become the last value.
 
+To resolve owned repositories and midstream forks together, use
+`{"org":"cgwalters-forge","forks":true}` in `follow` or `workRepositories`
+and keep `midstream: {"owner":"cgwalters-forge","topic":"bot-midstream"}`.
+This is opt-in; `forks:false` retains its non-fork behavior. `forks:true` is
+supported only in `follow`, `workRepositories` and `pr.noMerge`, and requires
+the matching `midstream.owner`. The concrete threat is enrolling a staged fork
+without its no-merge protection: resolution adds each admitted midstream to
+`follow`, `workRepositories` and `pr.noMerge` together, and derives its
+`promote.forks` entry from GitHub's parent and the parent's default branch.
+Existing promotion signoff and policy settings remain required. Explicit
+promotion entries override derived mappings, ignoring case; explicit list
+entries remain additive (including out-of-org repositories).
+Private midstreams explicitly named in `follow` or `promote.forks` retain topic
+admission through exact-name metadata reads; they are never enrolled by a private
+organization listing.
+
+Public, non-archived repositories whose custom property `origin` is `fork`
+are admitted only with the configured midstream topic. Everything else receives
+owned-repository rules; archived and private repositories remain excluded.
+A selected fork without a parent is excluded and reported by name; if retained by
+another `follow` entry or named in `promote.forks`, it refuses the configuration
+instead, so a follow cannot survive without midstream no-merge protection. Missing or
+malformed metadata and failed reads refuse the configuration, before stages
+run. The listing and selected forks' parent reads use the existing response
+cache and request budget. The pass logs one metadata summary with owned,
+midstream and excluded counts; `pass --verbose` shows per-repository reasons
+and expanded lists. Stage 2 reuses this resolved midstream set, not a second
+topic-only inventory.
+
 The concrete failure bounded here is a large or incomplete organization
 inventory consuming the pass or silently narrowing its policy. Resolution
 allows at most ten distinct organizations and ten pages of 100 repositories

@@ -575,6 +575,8 @@ pub struct Config {
     /// these and validates the concrete policy before taking any stage.
     #[serde(skip)]
     repository_sources: Option<String>,
+    #[serde(skip)]
+    resolved_midstreams: Option<Vec<String>>,
     pub operator: String,
     pub bot: String,
     pub dispatch_repo: String,
@@ -1334,8 +1336,9 @@ impl Config {
         };
         let mut value = serde_json::from_str(text).context("pass config is not JSON")?;
         let sources = crate::repository_lists::Sources::take(&mut value)?;
-        sources.resolve(&mut value, client, lines)?;
+        let midstreams = sources.resolve(&mut value, client, lines)?;
         let mut config = Self::parse(&value.to_string())?;
+        config.resolved_midstreams = midstreams;
         config.pools = source_pools(text)?;
         config.fix_bounds = self.fix_bounds.clone();
         Ok(Some(config))
@@ -5210,7 +5213,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(midstream) = &config.midstream {
             let (owner, topic) = (&midstream.owner, &midstream.topic);
             // Unread, a midstream also in `follow` would be merged in.
-            match midstream.read(&self.client) {
+            match config
+                .resolved_midstreams
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| midstream.read(&self.client))
+            {
                 Ok(read) => {
                     self.midstreams = Some(read.clone());
                     midstreams = read;

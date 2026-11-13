@@ -41,6 +41,9 @@ pub struct Pass {
     /// Only check --config and --fix-bounds as a pass would, and exit. Explicit repository lists need no token or forge reads; organization entries need GH_TOKEN to resolve their bounded listing before policy validation. For a caller's pull request CI, so a configuration the pass refuses fails review instead of every pass after merge.
     #[arg(long, conflicts_with_all = ["apply", "replay", "record"])]
     pub check_config: bool,
+    /// Show repository resolution details as well as counts.
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 /// What `pass --check-config` prints for a configuration the pass accepts.
@@ -299,7 +302,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             let preview = (Mode::Preview, limits);
             let report = pass::forgejo::run(&replay, &replay, &config, preview, replay.now)?;
             let finished = replay.finish();
-            print_report(&report, out)?;
+            print_report(&report, out, args.verbose)?;
             return finished.with_context(|| format!("{} replayed another pass", path.display()));
         }
         let own = args
@@ -340,7 +343,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             }
             None => pass::forgejo::run(&client, &broker, &config, (mode, limits), now)?,
         };
-        return print_report(&report, out);
+        return print_report(&report, out, args.verbose);
     }
     config.fix_bounds = FixBoundsSet::read(&bounds)?;
     if args.check_config {
@@ -352,7 +355,9 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             let mut lines = Vec::new();
             config.resolve(&client, &mut lines)?;
             for line in lines {
-                eprintln!("{line}");
+                if args.verbose || !line.starts_with("repositories: detail ") {
+                    eprintln!("{line}");
+                }
             }
         }
         writeln!(out, "{CONFIG_OK}")?;
@@ -433,7 +438,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             }
         }
     };
-    print_report(&report, out)
+    print_report(&report, out, args.verbose)
 }
 
 /// The pass's client, and `changes`'s (docs/pass.md#local-github-credentials).
@@ -492,9 +497,11 @@ fn load_state(path: &str) -> State {
     }
 }
 
-fn print_report(report: &Report, out: &mut impl Write) -> Result<()> {
+fn print_report(report: &Report, out: &mut impl Write, verbose: bool) -> Result<()> {
     for line in &report.lines {
-        writeln!(out, "{line}")?;
+        if verbose || !line.starts_with("repositories: detail ") {
+            writeln!(out, "{line}")?;
+        }
     }
     writeln!(out, "{}", report.summary_line())?;
     ensure!(report.failures == 0, "{}", report.failure_summary());
