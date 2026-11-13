@@ -851,10 +851,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok(result.unwrap_or((false, "notification: planning not recorded".into())));
         }
         if self.apply.is_some() && self.config.writes_in(repo) {
-            let acknowledged: BTreeSet<String> = comments
+            // A settled triage claim on the source is already the visible
+            // acknowledgement, including its tracking link. Use the fresh
+            // read above to see this pass's claim too. An external route's
+            // records live elsewhere and must not hide its only source reply.
+            let source = if external { comments } else { &records };
+            let acknowledged: BTreeSet<String> = source
                 .iter()
                 .filter(|c| text(c, "/user/login") == bot)
-                .filter_map(|c| parse_marker(INTAKE_REPLY, text(c, "/body")))
+                .filter_map(|c| {
+                    let body = text(c, "/body");
+                    parse_marker(INTAKE_REPLY, body).or_else(|| {
+                        parse_marker(CLAIM, body)
+                            .filter(|state| text(state, "/from").starts_with(comments::TRIAGE_FROM))
+                    })
+                })
                 .flat_map(|state| {
                     nodes(&state, "/comments")
                         .iter()
@@ -1158,6 +1169,155 @@ mod tests {
             .filter(|(_, body)| text(body, "/body").contains(INTAKE_REPLY))
             .map(|(_, body)| body.clone())
             .collect()
+    }
+
+    /// The source's claims are also its acknowledgements. Tracking receipts
+    /// elsewhere still need one source reply; failures retain their own prose.
+    #[test]
+    fn intake_acknowledgement_outcomes_and_locations() {
+        for (name, repo, pull, status, field, prose, replies_expected) in [
+            (
+                "started",
+                "upstream/app",
+                false,
+                None,
+                "comments",
+                "claimed; started.",
+                0,
+            ),
+            (
+                "tracked",
+                "upstream/app",
+                true,
+                None,
+                "comments",
+                "claimed; tracked in",
+                0,
+            ),
+            ("external", OTHER, false, None, "comments", "", 1),
+            (
+                "refused",
+                "upstream/app",
+                false,
+                Some(404),
+                "refused",
+                "not started.",
+                0,
+            ),
+            (
+                "ambiguous",
+                "upstream/app",
+                false,
+                Some(502),
+                "comments",
+                "may have started.",
+                0,
+            ),
+            (
+                "refused tracked",
+                "upstream/app",
+                true,
+                Some(404),
+                "refused",
+                "not started; tracked in",
+                0,
+            ),
+            (
+                "ambiguous tracked",
+                "upstream/app",
+                true,
+                Some(502),
+                "comments",
+                "may have started; tracked in",
+                0,
+            ),
+        ] {
+            let fake = intake_github(repo, pull, "mention", OPERATOR);
+            let config = search_intake(&fake, repo);
+            *fake.refused.borrow_mut() = status;
+            let first = pass(&fake, &config, State::default(), true);
+            assert_eq!(first.errors, 0, "{name}: {:?}", first.lines);
+            assert_eq!(replies(&fake).len(), replies_expected, "{name}");
+            let source = fake.rest.borrow()
+                [&format!("{API_ROOT}repos/{repo}/issues/2/comments?per_page=100")]
+                .clone();
+            let claims: Vec<_> = source
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| parse_marker(CLAIM, text(c, "/body")).is_some())
+                .collect();
+            if repo != OTHER {
+                assert_eq!(claims.len(), 1, "{name}");
+                assert!(text(claims[0], "/body").contains(prose), "{name}");
+                let state = parse_marker(CLAIM, text(claims[0], "/body")).unwrap();
+                assert_eq!(state[field], json!(["issuecomment-11"]), "{name}");
+                assert!(state.get("pending").is_none(), "{name}");
+                if pull {
+                    assert!(
+                        text(claims[0], "/body").contains(&format!(
+                            "https://github.com/{DISPATCH}/issues/{}",
+                            state["issue"]
+                        )),
+                        "{name}"
+                    );
+                }
+            } else {
+                assert!(claims.is_empty(), "{name}");
+            }
+            assert_eq!(dispatches(&fake).len(), 1, "{name}");
+            *fake.refused.borrow_mut() = None;
+            // Lose the local cursor. Only a definite refusal is retried;
+            // settled success and ambiguous starts must never dispatch twice.
+            let second = pass(&fake, &config, State::default(), true);
+            assert_eq!(second.errors, 0, "{name}: {:?}", second.lines);
+            assert_eq!(
+                dispatches(&fake).len(),
+                if field == "refused" { 2 } else { 1 },
+                "{name}"
+            );
+            assert_eq!(replies(&fake).len(), replies_expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn intake_keeps_legacy_source_receipts_and_pending_locks() {
+        let repo = "upstream/app";
+        for (field, pending) in [("comments", false), ("pending", true)] {
+            for notification_reply in [false, true] {
+                let fake = intake_github(repo, false, "mention", OPERATOR);
+                let config = search_intake(&fake, repo);
+                let mut state = json!({"from": "comment:issuecomment-11"});
+                state[field] = json!(["issuecomment-11"]);
+                let path = format!("{API_ROOT}repos/{repo}/issues/2/comments?per_page=100");
+                {
+                    let mut rest = fake.rest.borrow_mut();
+                    let source = rest.get_mut(&path).unwrap().as_array_mut().unwrap();
+                    source.push(said(
+                        12,
+                        BOT,
+                        UPDATED,
+                        &format!("<!-- {CLAIM}: {state} -->\nTriage: claimed."),
+                    ));
+                    if notification_reply {
+                        source.push(said(
+                            13,
+                            BOT,
+                            UPDATED,
+                            &format!(
+                                "<!-- {INTAKE_REPLY}: {} -->\nTracking.",
+                                json!({"comments":["issuecomment-11"]})
+                            ),
+                        ));
+                    }
+                }
+                let outcome = pass(&fake, &config, State::default(), true);
+                assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                assert!(dispatches(&fake).is_empty());
+                assert!(fake.writes.borrow().is_empty());
+                assert_eq!(!outcome.state.intake_waiting.is_empty(), pending);
+            }
+        }
     }
 
     /// cgwalters-forge/tracker: a midstream fork with issues disabled refused
@@ -1940,9 +2100,18 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0]["repo"], DISPATCH);
         let item = inputs[0]["item"].as_str().unwrap();
+        assert!(replies(&fake).is_empty());
+        let source = fake.rest.borrow()
+            [&format!("{API_ROOT}repos/{repo}/issues/2/comments?per_page=100")]
+            .clone();
+        let claim = source
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| parse_marker(CLAIM, text(c, "/body")).is_some())
+            .unwrap();
         assert!(
-            text(&replies(&fake)[0], "/body")
-                .contains(&format!("https://github.com/{DISPATCH}/issues/{item}"))
+            text(claim, "/body").contains(&format!("https://github.com/{DISPATCH}/issues/{item}"))
         );
         fake.page(
             &listing(INTAKE_FIRST),
@@ -1951,7 +2120,7 @@ mod tests {
         let again = pass(&fake, &config, State::default(), true);
         assert_eq!(again.errors, 0, "{:?}", again.lines);
         assert_eq!(dispatches(&fake).len(), 1);
-        assert_eq!(replies(&fake).len(), 1);
+        assert!(replies(&fake).is_empty());
     }
 
     /// Structured review intent is sufficient for a fix, not arbitrary prose
@@ -2389,7 +2558,7 @@ mod tests {
         assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
         assert_eq!(dispatches(&fake)[0]["repo"], repo);
         assert_eq!(dispatches(&fake)[0]["item"], "2");
-        assert_eq!(replies(&fake).len(), 1);
+        assert!(replies(&fake).is_empty());
         let fake = intake_github(OTHER, false, "mention", OPERATOR);
         let mut config = intake_config();
         config.policy.own_space_only = true;
