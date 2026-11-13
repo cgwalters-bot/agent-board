@@ -10381,12 +10381,15 @@ fn assign_holds_wait_on_the_operator() {
             ),
         ),
     ];
-    for (name, events, assignees, answer, labelled, writes, expected) in cases {
+    for ((name, events, assignees, answer, labelled, writes, expected), read_free) in cases
+        .into_iter()
+        .flat_map(|case| [false, true].map(|enabled| (case.clone(), enabled)))
+    {
         let (line, held, again) = expected;
         for board_triage in [true, false] {
             let name = format!("{name} (triaged first: {board_triage})");
             let config = outside_harness(config(
-                json!({"triageFollowUpDays": 3, "assignHolds": true}),
+                json!({"triageFollowUpDays": 3, "assignHolds": true, "readFreeHolds": read_free}),
             ));
             assert!(config.poll(None).policy.assign_holds);
             let mut forge = Forge::new(None, false);
@@ -15715,6 +15718,150 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             assert_eq!(holds, 3, "limit {limit}: {:#?}", report.lines);
             assert!(report.lines.iter().any(|l| l == overlap), "limit {limit}");
         }
+    }
+}
+
+/// Board-proven holds must not spend the assignment read that could reach
+/// ready work (agent-board#803). No hold is cached across passes.
+#[test]
+fn read_free_holds_reach_ready_work_before_the_budget_stop() {
+    assert!(!config(json!({})).read_free_holds);
+    for value in [json!(true), json!(false), Value::Null] {
+        assert!(forgejo::check_options(&json!({"readFreeHolds": value})).is_err());
+    }
+    let cases = [
+        (
+            "design",
+            json!({"labels": {"nodes": [{"name": "needs-design"}], "totalCount": 1}}),
+            "labelled needs-design",
+        ),
+        ("blocked", json!({}), "board Status is Blocked"),
+        (
+            "dependency",
+            json!({"issueDependenciesSummary": {"blockedBy": 1}}),
+            "1 open dependencies",
+        ),
+        (
+            "pull",
+            json!({"closedByPullRequestsReferences": {"nodes": [{"number": 999, "state": "OPEN", "repository": {"nameWithOwner": "cgwalters-forge/tracker"}, "author": {"login": "cgwalters-bot"}}], "totalCount": 1}}),
+            "pull request cgwalters-forge/tracker#999 is open",
+        ),
+    ];
+    for (name, edit, why) in cases {
+        let fixture = || {
+            let mut forge = Forge::new(None, false);
+            only(&mut forge.replay, &FIRST[..2]);
+            assignments(&mut forge.replay, 446, &[], &[]);
+            assignments(&mut forge.replay, 459, &[], &[]);
+            for entry in &mut forge.replay.requests {
+                let nodes =
+                    entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+                for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+                    if node["content"]["number"] == 446 {
+                        for (key, value) in edit.as_object().unwrap() {
+                            node["content"][key] = value.clone();
+                        }
+                        if name == "blocked" {
+                            node["status"] = json!({"name": "Blocked"});
+                        }
+                    }
+                }
+            }
+            forge
+        };
+        for enabled in [false, true] {
+            let forge = fixture();
+            let cfg = config(
+                json!({"wip": 8, "assignHolds": true, "readFreeHolds": enabled,
+                "skipActiveWork": name == "pull"}),
+            );
+            let report = apply_within(&forge, &cfg, PASS_REQUEST_LIMIT);
+            assert_eq!(report.failures, 0, "{name}/{enabled}: {:#?}", report.lines);
+            assert!(
+                report.lines.contains(&format!("hold {}: {why}", FIRST[0])),
+                "{name}/{enabled}: {:#?}",
+                report.lines
+            );
+            let reads = report.spent.by_cause.get(FIRST[0]).copied().unwrap_or(0);
+            assert_eq!(reads, usize::from(!enabled), "{name}/{enabled}");
+            if name == "pull" {
+                assert_eq!(report.triage_skipped.borrow()["pull-request"], 1);
+            }
+        }
+        // A one-request margin suffices: the hold is the same, but it no
+        // longer consumes the last read before the start reserve.
+        let mut recovered = false;
+        for limit in 120..=150 {
+            let starts: Vec<_> = [false, true]
+                .into_iter()
+                .map(|enabled| {
+                    let forge = fixture();
+                    let cfg =
+                        config(json!({"wip": 8, "assignHolds": true, "readFreeHolds": enabled}));
+                    let report = apply_within(&forge, &cfg, limit);
+                    assert_eq!(
+                        report.failures, 0,
+                        "{name}/{enabled}/{limit}: {:#?}",
+                        report.lines
+                    );
+                    assert!(report.spent.requests <= limit);
+                    forge.dispatches().len()
+                })
+                .collect();
+            recovered |= starts[1] > starts[0];
+        }
+        assert!(recovered, "{name}: no budget recovered a ready start");
+    }
+}
+
+#[test]
+fn read_free_holds_keep_unproven_facts_on_the_normal_path() {
+    for case in ["visitor", "incomplete pulls", "incomplete labels"] {
+        let mut reports = Vec::new();
+        for enabled in [false, true] {
+            let mut forge = Forge::new(None, false);
+            only(&mut forge.replay, &FIRST[..1]);
+            assignments(&mut forge.replay, 446, &[], &[]);
+            for entry in &mut forge.replay.requests {
+                let nodes =
+                    entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+                for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+                    if node["content"]["number"] != 446 {
+                        continue;
+                    }
+                    match case {
+                        "visitor" => {
+                            node["content"]["closedByPullRequestsReferences"] = json!({
+                            "nodes": [{"number": 999, "state": "OPEN", "repository": {"nameWithOwner": "cgwalters-forge/tracker"}, "author": {"login": "visitor"}}], "totalCount": 1})
+                        }
+                        "incomplete pulls" => {
+                            node["content"]["closedByPullRequestsReferences"] =
+                                json!({"nodes": [], "totalCount": 2})
+                        }
+                        _ => node["content"]["labels"]["totalCount"] = json!(999),
+                    }
+                }
+            }
+            // An unreadable reference remains unknown, not a read-free hold.
+            forge.replay.requests.push(json!({
+                "request": graphql_key(PULLS_QUERY, &json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446, "cursor": null})),
+                "answer": {"data": {"repository": {"issue": {"closedByPullRequestsReferences": {
+                    "nodes": [], "totalCount": 2, "pageInfo": {"hasNextPage": false}
+                }}}}}
+            }));
+            let cfg = config(json!({"wip": 8, "assignHolds": true, "readFreeHolds": enabled}));
+            let report = apply_within(&forge, &cfg, PASS_REQUEST_LIMIT);
+            assert_eq!(report.failures, 0, "{case}/{enabled}: {:#?}", report.lines);
+            assert_eq!(
+                forge.dispatches().len(),
+                usize::from(case == "visitor"),
+                "{case}/{enabled}: {:#?}",
+                report.lines
+            );
+            reports.push(report);
+        }
+        assert_eq!(reports[0].lines, reports[1].lines, "{case}");
+        assert_eq!(reports[0].spent, reports[1].spent, "{case}");
     }
 }
 

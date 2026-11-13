@@ -677,6 +677,10 @@ pub struct Config {
     /// releases the wait ([`wait`]).
     #[serde(default)]
     pub assign_holds: bool,
+    /// Off by default: settle holds already proven by board facts before
+    /// reading assignment history, leaving request headroom for ready work.
+    #[serde(default)]
+    pub read_free_holds: bool,
     /// Off at 0: else an issue still open after its implement plan's run
     /// ended is triaged again this many days after the plan's dispatch
     /// record ([`Scheduler::replan`]).

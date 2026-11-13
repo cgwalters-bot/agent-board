@@ -232,6 +232,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         snapshot: Option<&Value>,
         target: &Target,
     ) -> Result<Step> {
+        if let Some(step) = self.read_free_hold(facts, slots) {
+            return Ok(step);
+        }
         let (note, unlabelled) = match self.config.assign_holds && facts.open {
             false => (None, false),
             true => match self.operator_wait(facts)? {
@@ -260,6 +263,33 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             step.note(&note);
         }
         Ok(step)
+    }
+
+    /// A board-proven hold needs neither assignment history nor comments.
+    /// This never releases a wait or admits a start. Assignment housekeeping
+    /// waits until no independent hold stands; needs-human migration/release
+    /// still takes its normal path. Unknown facts are completed as before.
+    fn read_free_hold(&self, facts: &Facts, slots: &Slots) -> Option<Step> {
+        if !self.config.read_free_holds
+            || !facts.labels_complete
+            || !facts.pulls_complete
+            || (self.config.assign_holds && facts.labelled(NEEDS_HUMAN))
+        {
+            return None;
+        }
+        let writers = self.writers();
+        let no_runs = BTreeMap::new();
+        let busy = if self.config.skip_active_work {
+            &no_runs
+        } else {
+            &slots.busy
+        };
+        // Preserve skipActiveWork's PR precedence and skipped-work count.
+        if self.config.skip_active_work && active::trusted_pull(facts, &writers).is_some() {
+            return under_way(facts, busy, &writers)
+                .map(|held| self.active_hold("pull-request", held));
+        }
+        hold(facts, busy, &writers).map(Step::Hold)
     }
 
     /// Whether `facts` waits on the operator: labelled [`NEEDS_HUMAN`], which
