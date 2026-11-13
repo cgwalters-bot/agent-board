@@ -333,17 +333,32 @@ impl Collector<'_> {
                     marker.stopped && marker.id.is_some() && c["id"].as_u64() == marker.id
                 }) {
                     let at = millis(&comment["updated_at"]).context("poll stop time")?;
-                    if at <= self.now && at >= self.now - DAY {
+                    let supervised = pull["labels"]["nodes"].as_array().is_some_and(|labels| {
+                        labels.iter().any(|l| {
+                            l["name"].as_str().is_some_and(|n| {
+                                n.eq_ignore_ascii_case(crate::stop::SUPERVISOR_LABEL)
+                            })
+                        })
+                    });
+                    if at <= self.now && (at >= self.now - DAY || supervised) {
                         let reason = comment["body"]
                             .as_str()
                             .and_then(|b| b.lines().nth(1))
                             .and_then(|b| {
                                 b.strip_prefix("The poll stopped following this pull request: ")
+                                    .and_then(|b| b.split_once(". It is labelled"))
+                                    .or_else(|| {
+                                        b.strip_prefix(crate::stop::SUPERVISOR_PREFIX)
+                                            .and_then(|b| b.rsplit_once("; tracking "))
+                                    })
                             })
-                            .and_then(|b| b.split_once(". It is labelled"))
                             .map(|(r, _)| r)
                             .context("poll stop reason")?;
-                        events.push(json!({"kind": "poll-stop", "text": reason, "url": pull["url"], "at": comment["updated_at"]}));
+                        events.push(if supervised {
+                            json!({"kind": "needs-supervisor", "text": reason, "url": pull["url"], "at":iso(self.now), "first_at":comment["created_at"]})
+                        } else {
+                            json!({"kind": "poll-stop", "text": reason, "url": pull["url"], "at": comment["updated_at"]})
+                        });
                     }
                 }
             }
@@ -366,6 +381,7 @@ impl Collector<'_> {
                         | HoldKind::NeedsOperator
                         | HoldKind::NeedsIssue
                         | HoldKind::NeedsClose
+                        | HoldKind::NeedsSupervisor
                 ) || (kind == HoldKind::NeedsHuman && pull_urls.contains(target));
                 events.push(json!({"kind": format!("hold/{}", kind.name()), "text": reason, "url": target, "at": snap["at"], "first_at": hold["since"], "problem": problem}));
                 if hold["kind"] == "needs-human" {

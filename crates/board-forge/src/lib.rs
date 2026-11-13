@@ -38,6 +38,7 @@ pub mod session;
 pub mod session_apply;
 pub mod stack;
 pub mod status;
+pub mod stop;
 pub mod supervise;
 pub use github::{github_item_url, is_github_login, parse_github_item, validate_github_project};
 

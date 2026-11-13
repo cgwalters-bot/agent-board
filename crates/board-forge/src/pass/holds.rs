@@ -116,6 +116,8 @@ pub enum HoldKind {
     Closed,
     /// Labelled `needs-human`, by a person or a triage verdict.
     NeedsHuman,
+    /// Infrastructure stop, owned by the supervisor rather than the operator.
+    NeedsSupervisor,
     /// Triage needs a follow-up issue number, not a human decision. Left
     /// visible to the controller without labelling or assigning the source.
     NeedsIssue,
@@ -184,6 +186,7 @@ impl HoldKind {
         match self {
             Self::Closed => "closed",
             Self::NeedsHuman => "needs-human",
+            Self::NeedsSupervisor => "needs-supervisor",
             Self::NeedsIssue => "needs-issue",
             Self::NeedsClose => "needs-close",
             Self::NeedsDesign => "needs-design",

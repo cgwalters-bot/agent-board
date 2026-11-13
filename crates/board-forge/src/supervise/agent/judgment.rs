@@ -9,6 +9,8 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+mod infrastructure;
+
 pub const ACTIONS: &[&str] = &[
     "comment",
     "create_issue",
@@ -18,6 +20,7 @@ pub const ACTIONS: &[&str] = &[
     "remove_needs_human",
     "clear_needs_human",
     "release_listed",
+    "supervisor_hold",
     "replace_state",
     "status_update",
 ];
@@ -206,6 +209,15 @@ pub enum PlanReason {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Write {
+    /// Find/file a grouped infrastructure bug, link it in the existing stop,
+    /// and release only on a merged PR that closes that bug.
+    SupervisorHold {
+        repository: String,
+        item: u64,
+        owner: String,
+        #[serde(default)]
+        fix: Option<u64>,
+    },
     PlanEpic {
         epic: u64,
         reason: PlanReason,
@@ -473,6 +485,7 @@ impl Checked {
                 Write::RemoveNeedsHuman { .. } => "remove_needs_human",
                 Write::ClearNeedsHuman { .. } => "clear_needs_human",
                 Write::ReleaseListed { .. } => "release_listed",
+                Write::SupervisorHold { .. } => "supervisor_hold",
                 Write::ReplaceState { .. } => "replace_state",
                 Write::StatusUpdate { .. } => "status_update",
             },
@@ -491,6 +504,9 @@ impl Checked {
                 }
                 | Write::RemoveNeedsHuman { repository, item }
                 | Write::ReleaseListed { repository, item }
+                | Write::SupervisorHold {
+                    repository, item, ..
+                }
                 | Write::ClearNeedsHuman {
                     repository, item, ..
                 },
@@ -505,6 +521,13 @@ impl Checked {
         }
         if let Self::Write(w) = self {
             match w {
+                Write::SupervisorHold { owner, fix, .. } => {
+                    target(p, owner, fix.unwrap_or(1))?;
+                    ensure!(
+                        crate::poll::our_space(&p.settings.dispatch_repo, &p.settings.bot, owner),
+                        "Infrastructure bugs must stay in our space"
+                    );
+                }
                 Write::PlanEpic { epic, .. } => {
                     target(p, &p.settings.epics_repository, *epic)?;
                 }
@@ -656,6 +679,16 @@ impl Checked {
 
     /// Checks the target as it is now; a status update reads its changes.
     pub fn preflight(&mut self, api: &dyn Api, p: &Policy, now: i64) -> Result<()> {
+        if let Self::Write(Write::SupervisorHold {
+            repository,
+            item,
+            owner,
+            fix,
+        }) = self
+        {
+            infrastructure::ready(api, p, repository, *item, owner, *fix)?;
+            return Ok(());
+        }
         if let Self::Write(Write::FileBug { signature, .. }) = self {
             bug_ready(api, p, signature.as_deref())?;
         }
@@ -798,6 +831,14 @@ impl Checked {
                 };
             }
             Self::Write(w) => match w {
+                Write::SupervisorHold {
+                    repository,
+                    item,
+                    owner,
+                    fix,
+                } => {
+                    return infrastructure::apply(api, p, repository, *item, owner, *fix);
+                }
                 Write::PlanEpic {
                     epic,
                     reason: PlanReason::NoRunnableWork,

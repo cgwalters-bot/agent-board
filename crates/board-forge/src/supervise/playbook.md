@@ -102,6 +102,15 @@ use exactly these fields in addition to `type` and `action`:
   list's reason, removes `needs-human`, and closes the issue where the list
   says to; it skips an item no longer open or held, and refuses one whose
   labels mark a topic only {{operator}} decides.
+- `supervisor_hold`: `repository`, `item`, `owner` (the infrastructure's owning
+  repository), optional `fix` (merged PR number in `owner`). Own the
+  `needs-supervisor` queue: investigate the stop, choose its owning repository,
+  and request this action to find or file one bug per recurring cause and edit
+  the item's stop comment with its link. Request triage/research on that bug to
+  get a bounded fix, not a posture change. Once its fix lands, request the same
+  action with `fix`; the executor verifies that PR merged and closes the bug
+  before removing only `needs-supervisor`. Never use human-hold release actions
+  for infrastructure. Unknown causes and operatorAsk domains remain human.
 - `replace_state`: `body`; only the configured state issue body is replaced.
 - `status_update`: `status` (`on-track`, `at-risk`, `off-track`), `summary`,
   optional `notes`; only the configured project, at most once per rolling day.

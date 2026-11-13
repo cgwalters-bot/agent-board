@@ -76,7 +76,12 @@ pub(crate) const MAX_TASK_BYTES: usize = 48 * 1024;
 const AGENT_JOB: &str = "agent";
 /// Labels on an issue the scheduler leaves alone: an epic or a question is
 /// the operator's, a hold waits for a person.
-const HELD_LABELS: &[&str] = &["epic", "question", "needs-human"];
+const HELD_LABELS: &[&str] = &[
+    "epic",
+    "question",
+    "needs-human",
+    crate::stop::SUPERVISOR_LABEL,
+];
 /// Run states in which a dispatch run still holds its target.
 const RUNNING: &[&str] = &["queued", "in_progress", "waiting", "requested", "pending"];
 const RUN_PAGES: usize = 5;

@@ -49,7 +49,7 @@ use time::format_description::well_known::Rfc3339;
 /// The window a project's first status update covers.
 pub const FIRST_WINDOW: time::Duration = time::Duration::days(7);
 /// Labels whose change puts an item under **Held**.
-pub const HOLD_LABELS: &[&str] = &["needs-human", "needs-design"];
+pub const HOLD_LABELS: &[&str] = &["needs-human", "needs-design", crate::stop::SUPERVISOR_LABEL];
 
 const ITEMS_QUERY: &str = "query($id:ID!,$cursor:String,$since:DateTime!){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{content{__typename \
 ... on Issue{number title url state createdAt closedAt repository{nameWithOwner isPrivate} labels(first:100){nodes{name} pageInfo{hasNextPage}} timelineItems(first:100,since:$since,itemTypes:[LABELED_EVENT,UNLABELED_EVENT]){nodes{__typename ... on LabeledEvent{createdAt label{name}} ... on UnlabeledEvent{createdAt label{name}}} pageInfo{hasNextPage}}} \

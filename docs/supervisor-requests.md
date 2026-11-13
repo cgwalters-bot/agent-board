@@ -85,6 +85,38 @@ successful extraction is renamed into place; failures clean staging and leave
 no partially published report. A complete archive need not contain `times.json`:
 as before, a missing times file after successful lookup is no previous sweep.
 
+### Infrastructure holds
+
+`agent.dailyCaps.supervisor_hold` enables one checked lifecycle action (absent or
+zero keeps it off). Set a small cap, such as `3`, alongside the caller pass's
+`pr.supervisorHolds: true`. The existing executor serializes and counts these
+actions in its per-day ledger; batch size and request limits are unchanged.
+
+The concrete threat is an agent using a generic refusal to release a posture
+decision. `supervisor_hold` accepts `repository`, `item`, `owner`, and optionally
+`fix`. Both repositories must be followed, the owner must be our own space, and
+the current item must have a recognized bot-authored poll stop and only an
+infrastructure hold, not a human/design/operator-only label. It finds or files a
+bug in `owner`, with fixed text requesting investigation and a bounded fix.
+Repeated causes in that repository share an open bug; a new occurrence after
+closure gets a new bug. The supervisor requests
+triage/research on it using the existing dispatch protocol; the bug's prose is
+data, never an implementation brief or permission to change target bounds.
+
+Lookup reads one complete page of fewer than 100 `agent-board-infrastructure`
+issues, including closed ones; the executor creates that label when needed.
+A full page, duplicate open markers or missing evidence refuses before writes. This
+initial bounded implementation therefore refuses once that queue reaches 100.
+The supervisor edits the existing stop comment with the bug link,
+preserving its poll marker. `fix` must identify a merged PR in the owning
+repository whose complete closing references name the bug already recorded on
+this hold, and which merged after the hold began. Replacing its owner or bug
+is refused. Link the bug in a separate action before requesting release. The executor checks
+again before release and removes only `needs-supervisor`, leaving human holds
+untouched. A closed bug alone is not proof of a landed fix. A concurrent re-hold
+with a different stop refuses. No credential, target bounds, spending, workflow
+permission or upstream posting authority is added.
+
 ### Triggering the agent
 
 `supervise trigger` decides whether the agent

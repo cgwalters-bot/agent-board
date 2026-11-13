@@ -141,6 +141,9 @@ pub(super) fn review_asks(
     collected.unread = undecided.clone();
     let mut evidence = BTreeMap::new();
     for wait in waits {
+        if wait.kind == crate::stop::SUPERVISOR_LABEL {
+            continue;
+        }
         let head = Some(wait.head.clone()).filter(|h| holds::full_head(h));
         let Some(((repository, number), head)) =
             pull_ref(&format!("{}#{}", wait.repository, wait.number)).zip(head)

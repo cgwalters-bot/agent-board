@@ -107,6 +107,7 @@ fn render(
     let needs_human: Vec<Value> = outcome
         .waits
         .iter()
+        .filter(|w| w.kind != crate::stop::SUPERVISOR_LABEL)
         .map(|w| {
             json!({
                 "repository": w.repository, "number": w.number, "head": w.head,
@@ -114,7 +115,7 @@ fn render(
             })
         })
         .collect();
-    let snapshot = json!({
+    let mut snapshot = json!({
         "schema": SCHEMA,
         "generated_at": now.format(&Rfc3339)?,
         "mode": if apply { "apply" } else { "preview" },
@@ -126,6 +127,10 @@ fn render(
         "undecided_repositories": outcome.undecided,
         "errors": outcome.errors,
     });
+    let supervisor: Vec<Value> = outcome.waits.iter().filter(|w| w.kind == crate::stop::SUPERVISOR_LABEL).map(|w| json!({"repository":w.repository,"number":w.number,"head":w.head,"kind":w.kind,"reason":w.reason})).collect();
+    if !supervisor.is_empty() {
+        snapshot["needs_supervisor"] = json!(supervisor);
+    }
     // Escape backticks in JSON strings so repository-controlled reasons cannot
     // close the protocol fence. JSON readers recover the original text.
     let json = serde_json::to_string_pretty(&snapshot)?.replace('`', "\\u0060");

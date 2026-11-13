@@ -10,6 +10,27 @@ layer. Existing [PR follow-up](poll.md),
 [job-plan](job-plans.md) and [epic-plan](epic-plans.md) protocols remain the
 authority for their operations. The differences below are intentional.
 
+## Infrastructure stops
+
+The concrete risk is treating a refusal about credentials, security, spending or
+target authority as permission for the framework to release an operator hold.
+`pr.supervisorHolds: true` opts GitHub PR follow-up into routing recognized
+infrastructure stops to `needs-supervisor`; it is off by default. The standalone
+poll reads `supervisorHolds` at top level. Existing pass write/request caps apply.
+Exhausted conflict-only rebase rounds and completed rounds that leave no new head
+go to the supervisor, while operator review and upstream posting stay human.
+Routing uses typed controller outcomes, not infrastructure-looking check names
+or checkpoint prose. Other failures stay human; this initial slice does not route
+dispatch/setup refusals, pin mismatches or non-PR scheduling stops. It is not
+authority to widen bounds, spend more money or change posture. Existing human
+holds are not migrated automatically. A supervisor label always blocks follow-up,
+including after the setting is disabled, and is excluded from the operator inbox.
+
+The stop comment is short: `Held for the supervisor: [<cause>] <reason>; tracking pending.`
+The supervisor's capped `supervisor_hold` action edits that comment with the bug
+link and removes only its infrastructure label after verifying a merged fix.
+See [supervisor holds](supervisor-requests.md#infrastructure-holds).
+
 ## Local configuration defaults
 
 From the root of a trusted caller checkout, `agent-board pass` reads
@@ -5124,6 +5145,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.ownerBranches` | Skip a round, leaving it to the operator, on a head other than the bot's fork whose repository's default branch has no `.github/agentic-job/accept-owner-branches` naming it, which agentic-job's apply would refuse to push to; one contents read per such round, see [the poll](poll.md); `false` |
 | `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md). Stage 4 likewise starts no plan whose item is outside our own space: its candidate waits on the operator (`needs-operator`, `hold OWNER/REPO#N: its plan's OWNER/REPO#N is outside our own space …`) and draws no revisit. The bot's own pull requests are exempt: on them stage 2 takes its rounds, rebases and edits of them, and stage 4 starts `fixPlans`' fix runs, writing only on that pull request; a merge or stop there stays held; `false` |
 | `pr.operatorReviewFixes` | With `notifications`, route nonempty operator changes-requested reviews on the bot's PR to existing bounded fix rounds instead of intake triage; mixed batches and other intents stay in triage. See [operator intake](poll.md); `false` |
+| `pr.supervisorHolds` | Route recognized PR infrastructure stops to `needs-supervisor`, not the operator; existing write/request caps apply. See [infrastructure stops](#infrastructure-stops); `false` |
 | `pr.foldRounds` | Minimize as outdated the bot's routine marker each new round, refund, check rerun or review start supersedes, at the end of the pass, so a pull request shows its current round with the earlier ones folded; stops are never folded; at most 20 a pass, one `--max-writes` step; see [the poll](poll.md); `false` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |

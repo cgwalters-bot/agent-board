@@ -278,6 +278,7 @@
     "pr.unstall": {"verdict": "refused", "reason": "PR follow-up (stage 2) reruns GitHub Actions review runs"},
     "pr.directionFirst": {"verdict": "refused", "reason": "PR follow-up (stage 2) orders GitHub's operator-direction search"},
     "pr.operatorReviewFixes": {"verdict": "refused", "reason": "PR follow-up (stage 2) routes GitHub operator reviews to fix rounds"},
+    "pr.supervisorHolds": {"verdict": "refused", "reason": "PR infrastructure holds (stage 2) use the GitHub supervisor executor"},
     "pr.ownSpaceOnly": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.foldRounds": {"verdict": "refused", "reason": "PR follow-up (stage 2) minimizes GitHub comments"},
     "pr.reviewPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
