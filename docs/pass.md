@@ -497,13 +497,14 @@ continues to resolve the variant models; no deployed configuration changes here.
 
 The concrete risk when replacing dispatch and apply comments is losing their
 replay guards and starting the same work twice. `livingStatus` is an optional
-**cache file path**, off by default. With it, pass-owned job-plan
+**durable state file path**, off by default. With it, pass-owned job-plan
 comments, dispatch notices and epic apply receipts share one bot-owned status
 comment per issue. Its sections show the current plan's prose, the last dispatch
 and run link, and the last apply's prose. Machine plans, confirmed actions and
-fingerprints are stored in an HTML-escaped hidden records block in the comment,
-so a cold start can recover replay guards. Hidden is not private: these records
-are public GitHub comment content, just like the original protocol comments.
+fingerprints stay in that local ledger, not in the comment. A small hidden
+state reference identifies the ledger revision; it contains no action lists or
+closed-issue inventory. A missing or stale ledger causes refusal, not a fresh
+start that could repeat a dispatch or apply.
 Existing issue bodies, sub-issue links, labels and Project writes are unchanged.
 
 The pass writes the ledger atomically and syncs it before sending each comment
@@ -516,20 +517,25 @@ Discovery uses the existing bounded comment scan. Failed public edits remain pen
 ledger and are retried within the write/request caps after re-reading the issue's
 bounded comment history to verify ownership; this never replays apply actions.
 Public prose is limited to 2,000 characters per
-section; the cache is limited to 1,000 records and 4 MiB and the comment to 60,000
+section; the ledger is limited to 1,000 records, 1,000 known comment references
+and 4 MiB and the comment to 60,000
 bytes, and refuses further
 growth rather than evict replay guards.
 
-The first bot-authored marker comment is authoritative, not the cached id. Both
+The first bot-authored marker comment determines the public id, not the cached id. Both
 `<!-- agent-board-status -->` and the original versioned marker are recognized.
-A missing or stale cache is recovered on the bounded GitHub scan. Later duplicates
+Old embedded-record comments are imported on the bounded GitHub scan, then edited
+to remove the full records. Later duplicates
 are merged into the first before being minimized, within the existing request and
-write caps. Foreign or unknown editors still cause refusal: this prevents someone
+write caps. Their last validated references remain in the ledger so a minimized
+duplicate cannot block discovery after the authoritative comment advances.
+Foreign or unknown editors still cause refusal: this prevents someone
 else's edits from becoming trusted machine records. Legacy prose-only comments
 keep their sections, but machine records lost before this format cannot be recovered.
-Keep applying passes serialized (discovery and POST are not atomic), but durable
-cache retention is no longer required. Retaining it still permits retrying failed
-public edits without replaying apply actions. State paths may not be symlinks and
+Keep applying passes serialized (discovery and POST are not atomic), and retain
+and back up the ledger across runs. After migration GitHub cannot recover lost
+machine state: restore the durable file before continuing. Failed public edits
+can be retried without replaying apply actions. State paths may not be symlinks and
 their canonical destinations must differ. Standalone dispatch
 and epic apply refuse a living-status issue without its configured pass. Do not
 turn the option off on an issue that has adopted it.

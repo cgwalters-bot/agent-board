@@ -1,4 +1,4 @@
-//! One bot-owned status comment. GitHub is authoritative; the local file is a cache.
+//! One bot-owned status comment. Machine records stay in the durable local ledger.
 use super::*;
 use crate::epic_apply;
 use serde::Serialize;
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const MARKER: &str = "<!-- agent-board-status v1 -->";
 const ORIGINAL_MARKER: &str = "<!-- agent-board-status -->";
 pub(super) const RECORDS: &str = "<!-- agent-board-status-records\n";
+const STATE: &str = "<!-- agent-board-status-state: ";
 const COMMENT_BYTES: usize = 60_000;
 pub(super) const MINIMIZE: &str = "mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }";
 pub(super) const MINIMIZED: &str =
@@ -24,6 +25,10 @@ struct Entry {
     published: Option<String>,
     #[serde(default)]
     prose: BTreeMap<String, String>,
+    // Last validated reference per public comment, including minimized duplicates.
+    // Those comments remain readable after the authoritative status advances.
+    #[serde(default)]
+    references: BTreeMap<u64, String>,
 }
 
 #[cfg(test)]
@@ -42,6 +47,82 @@ mod tests {
 
     fn dispatched(id: u64) -> Value {
         json!({"body": format!("<!-- agent-board-dispatch: {id}@time -->\nDispatched [plan](https://github.com/o/r/issues/1#issuecomment-{id}): [run](https://github.com/o/r/actions/runs/8).")})
+    }
+
+    fn legacy_body(entry: &Entry) -> String {
+        format!(
+            "{MARKER}\n{RECORDS}{}\n-->",
+            serde_json::to_string(&entry.records).unwrap()
+        )
+    }
+
+    #[test]
+    fn machine_records_stay_local_and_missing_or_stale_state_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let path = path.to_str().unwrap();
+        let mut store = Store::load(path, "bot", at()).unwrap();
+        let stale = store.ledger.entries.clone();
+        let body = json!({"body":format!("Applied updates.\n```{}\n{{\"plan\":\"secret-plan\",\"actions\":[\"closed issue 99\"]}}\n```", epic_apply::APPLY_MARKER)});
+        let write = store.prepare("POST", URL, &body).unwrap().unwrap();
+        let public = text(&write.body, "/body").to_owned();
+        assert!(public.contains("Applied updates."));
+        assert!(!public.contains("secret-plan"));
+        assert!(!public.contains("closed issue"));
+        assert!(!public.contains(RECORDS));
+        assert_eq!(state_reference(&public).unwrap().len(), 64);
+        store.finish(&write, &mut (201, json!({"id":30}))).unwrap();
+        let vars = json!({"owner":"o","name":"r","number":1});
+        let data = json!({"repository":{"issue":{"comments":{"nodes":[{
+            "body":public,"url":"https://github.com/o/r/issues/1#issuecomment-30",
+            "author":{"login":"bot"},"lastEditedAt":null
+        }]}}}});
+        let mut restored = Store::load(path, "bot", at()).unwrap();
+        restored.expand(&vars, &mut data.clone()).unwrap();
+        assert!(restored.pending().is_empty());
+        assert_eq!(restored.ledger.entries["o/r#1"].records.len(), 1);
+
+        for entries in [stale, BTreeMap::from([("o/r#1".into(), Entry::default())])] {
+            restored.ledger.entries = entries.clone();
+            let error = restored.expand(&vars, &mut data.clone()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("restore its durable livingStatus file")
+            );
+            assert_eq!(restored.ledger.entries.len(), entries.len());
+        }
+    }
+
+    #[test]
+    fn legacy_records_migrate_to_local_state_without_losing_replay_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source =
+            Store::load(dir.path().join("old.json").to_str().unwrap(), "bot", at()).unwrap();
+        let write = source
+            .prepare("POST", URL, &dispatched(10))
+            .unwrap()
+            .unwrap();
+        source.finish(&write, &mut (201, json!({"id":30}))).unwrap();
+        let body = legacy_body(&source.ledger.entries["o/r#1"]);
+        let mut target =
+            Store::load(dir.path().join("new.json").to_str().unwrap(), "bot", at()).unwrap();
+        let mut data = json!({"repository":{"issue":{"comments":{"nodes":[{
+            "body":body,"url":"https://github.com/o/r/issues/1#issuecomment-30",
+            "author":{"login":"bot"},"lastEditedAt":null
+        }]}}}});
+        target
+            .expand(&json!({"owner":"o","name":"r","number":1}), &mut data)
+            .unwrap();
+        assert_eq!(
+            target.ledger.entries["o/r#1"].records,
+            source.ledger.entries["o/r#1"].records
+        );
+        let write = target.pending().pop().unwrap();
+        assert_eq!(write.method, "PATCH");
+        assert!(!text(&write.body, "/body").contains(RECORDS));
+        target.acknowledge(&write).unwrap();
+        assert!(target.pending().is_empty());
     }
 
     #[test]
@@ -187,7 +268,7 @@ mod tests {
         )
         .unwrap();
         let node = |id, body: &str| json!({"url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),"body":body,"author":{"login":"bot"},"lastEditedAt":null});
-        let mut data = json!({"repository":{"issue":{"comments":{"nodes":[node(30, MARKER),node(40, text(&write.body,"/body"))]}}}});
+        let mut data = json!({"repository":{"issue":{"comments":{"nodes":[node(30, MARKER),node(40, &legacy_body(&source.ledger.entries["o/r#1"]))]}}}});
         target
             .expand(&json!({"owner":"o","name":"r","number":1}), &mut data)
             .unwrap();
@@ -208,8 +289,8 @@ mod tests {
             .unwrap();
         assert!(write.url.ends_with("/comments/30"));
         let before = target.ledger.entries["o/r#1"].records.len();
-        assert!(target.prepare("POST", URL, &json!({"body":format!("{}\n```{}\n{{}}\n```", "x".repeat(COMMENT_BYTES), plan::PLAN_FENCE)})).is_err());
-        assert_eq!(target.ledger.entries["o/r#1"].records.len(), before);
+        target.prepare("POST", URL, &json!({"body":format!("{}\n```{}\n{{}}\n```", "x".repeat(COMMENT_BYTES), plan::PLAN_FENCE)})).unwrap();
+        assert_eq!(target.ledger.entries["o/r#1"].records.len(), before + 1);
         assert!(
             target
                 .pending()
@@ -441,6 +522,28 @@ fn identity(body: &str) -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
+fn state_id(entry: &Entry) -> String {
+    // The POST response assigns URLs after the public body has been prepared.
+    // Keep the reference stable across that assignment and duplicate relocation.
+    let records: Vec<_> = entry
+        .records
+        .iter()
+        .map(|record| {
+            let mut record = record.clone();
+            record["url"] = Value::Null;
+            record
+        })
+        .collect();
+    format!("{:x}", Sha256::digest(Value::Array(records).to_string()))
+}
+
+fn state_reference(body: &str) -> Option<&str> {
+    body.lines().find_map(|line| {
+        line.strip_prefix(STATE)
+            .and_then(|s| s.strip_suffix(" -->"))
+    })
+}
+
 fn public_body(entry: &Entry) -> String {
     let mut out = format!("{MARKER}\n## Board status\n");
     for section in ["Current plan", "Last dispatch", "Last apply"] {
@@ -465,22 +568,7 @@ fn public_body(entry: &Entry) -> String {
             out.push_str(&format!("\n### {section}\n{prose}\n"));
         }
     }
-    // Escape HTML delimiters so arbitrary plan prose cannot terminate the comment.
-    let mut records = Vec::new();
-    for record in &entry.records {
-        let mut record = record.clone();
-        if plan::comment_id(text(&record, "/url")) == entry.id {
-            record["url"] = Value::Null;
-        }
-        if !records.contains(&record) {
-            records.push(record);
-        }
-    }
-    let records = Value::Array(records)
-        .to_string()
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e");
-    out.push_str(&format!("\n{RECORDS}{records}\n-->"));
+    out.push_str(&format!("\n{STATE}{} -->", state_id(entry)));
     out
 }
 
@@ -526,6 +614,15 @@ impl Store {
                 <= MAX_RECORDS,
             "status ledger record bound exceeded"
         );
+        ensure!(
+            ledger
+                .entries
+                .values()
+                .map(|e| e.references.len())
+                .sum::<usize>()
+                <= MAX_RECORDS,
+            "status ledger reference bound exceeded"
+        );
         for (key, entry) in &ledger.entries {
             let (repo, number) = key
                 .rsplit_once('#')
@@ -567,6 +664,15 @@ impl Store {
 
     fn save(&self) -> Result<()> {
         use std::io::Write;
+        ensure!(
+            self.ledger
+                .entries
+                .values()
+                .map(|e| e.references.len())
+                .sum::<usize>()
+                <= MAX_RECORDS,
+            "status ledger reference bound exceeded"
+        );
         ensure!(
             self.ledger
                 .entries
@@ -853,7 +959,22 @@ impl Store {
                 "status comment has a foreign or unknown editor"
             );
             let id = plan::comment_id(text(node, "/url")).context("status comment id missing")?;
+            if body.contains(STATE) {
+                let reference = state_reference(body).context("invalid status state reference")?;
+                ensure!(
+                    self.ledger.entries.get(&key).is_some_and(|entry| {
+                        reference == state_id(entry)
+                            || entry.published.as_deref().and_then(state_reference)
+                                == Some(reference)
+                            || entry.references.get(&id).map(String::as_str) == Some(reference)
+                    }),
+                    "status ledger missing or stale for {key}; restore its durable livingStatus file before continuing"
+                );
+            }
             let entry = self.ledger.entries.entry(key.clone()).or_default();
+            if let Some(reference) = state_reference(body) {
+                entry.references.insert(id, reference.into());
+            }
             let first = self
                 .discovered
                 .get(&key)
@@ -914,6 +1035,9 @@ impl Store {
                         .next()
                         .unwrap_or_default()
                         .split(RECORDS)
+                        .next()
+                        .unwrap_or_default()
+                        .split(STATE)
                         .next()
                         .unwrap_or_default()
                         .trim();

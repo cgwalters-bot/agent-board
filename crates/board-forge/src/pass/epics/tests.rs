@@ -1742,7 +1742,7 @@ fn apply_creates_once_with_final_priorities() {
 }
 
 #[test]
-fn living_apply_recovers_machine_receipt_after_cache_loss_and_replays_nothing() {
+fn living_apply_requires_durable_state_and_replays_nothing_after_restore() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("status.json");
     let settings = json!({"livingStatus": ledger});
@@ -1761,11 +1761,23 @@ fn living_apply_recovers_machine_receipt_after_cache_loss_and_replays_nothing() 
     let body = text(receipts[0], "/body");
     assert!(body.starts_with(living::MARKER), "{body}");
     assert!(body.contains("Applied [this epic plan]"), "{body}");
-    let prose = body.split(living::RECORDS).next().unwrap();
-    assert!(!prose.contains("```"), "{body}");
-    assert!(!prose.contains("fingerprint"), "{body}");
+    assert!(!body.contains(living::RECORDS), "{body}");
+    assert!(!body.contains("```"), "{body}");
+    assert!(!body.contains("fingerprint"), "{body}");
     drop(comments);
-    std::fs::remove_file(ledger).unwrap();
+    let backup = std::fs::read(&ledger).unwrap();
+    std::fs::remove_file(&ledger).unwrap();
+    let before = forge.written().len();
+    let report = local_with(&forge, 10, settings.clone());
+    assert!(report.failures > 0, "{:#?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains("restore its durable livingStatus file"))
+    );
+    assert_eq!(forge.written().len(), before, "{:#?}", report.lines);
+    std::fs::write(&ledger, backup).unwrap();
     forge.added.borrow_mut().push(posted(
         &forge.replay,
         890,
@@ -1784,6 +1796,34 @@ fn living_apply_recovers_machine_receipt_after_cache_loss_and_replays_nothing() 
             "graphql minimizeComment"
         ]
     );
+    let before = forge.written().len();
+    let report = local_with(&forge, 10, settings.clone());
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(forge.written().len(), before, "{:#?}", report.lines);
+
+    // Advance the authoritative status, leaving the minimized duplicate's old
+    // reference on GitHub. A restarted pass must recognize that merged revision.
+    let mut store =
+        living::Store::load(ledger.to_str().unwrap(), "cgwalters-bot", forge.replay.now).unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    let receipt = saved["entries"]["cgwalters-forge/tracker#890"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| text(r, "/body").contains(epic_apply::APPLY_MARKER))
+        .unwrap();
+    let write = store
+        .prepare(
+            "PATCH",
+            &format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/comments/900"),
+            &json!({"body":format!("Updated status.\n{}", text(receipt, "/body"))}),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(write.method, "PATCH");
+    let mut response = forge.send(write.method, &write.url, &write.body).unwrap();
+    store.finish(&write, &mut response).unwrap();
+    drop(store);
     let before = forge.written().len();
     let report = local_with(&forge, 10, settings);
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
