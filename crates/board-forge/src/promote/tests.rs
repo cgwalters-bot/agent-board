@@ -111,6 +111,10 @@ fn scenario() -> Replay {
     pull(&mut replay)["body"] = json!(format!("Part of {REPO}#31"));
     pull(&mut replay)["title"] = json!("Implement the slice");
     plan_comments(&mut replay, json!([]));
+    replay.requests.push(json!({"request":{"get":format!("{API}repos/{REPO}/issues/31")},
+        "answer":{"status":200,"body":{"number":31,"repository_url":format!("{API}repos/{REPO}"),"body":"A fork issue."}}}));
+    replay.requests.push(json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/issues/9")},
+        "answer":{"status":200,"body":{"number":9,"repository_url":format!("{API}repos/composefs/composefs-rs")}}}));
     replay
 }
 
@@ -322,6 +326,132 @@ fn plan_comments(replay: &mut Replay, nodes: Value) {
         Replay::from_json(&serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap())
             .unwrap();
     replay.requests.extend(recorded.requests);
+}
+
+#[test]
+fn upstream_association_controls_only_the_derived_closing_line() {
+    for (link, expected) in [
+        ("No association", Ok(format!("Part of {REPO}#31"))),
+        (
+            "Upstream: #9",
+            Ok(format!(
+                "Part of {REPO}#31\n\nFixes composefs/composefs-rs#9"
+            )),
+        ),
+        ("Upstream: #1\nUpstream: #2", Err("ambiguous")),
+        ("Upstream: other-org/project#9", Err("malformed")),
+    ] {
+        let mut replay = scenario();
+        body(&mut replay, "/issues/31")["body"] = json!(link);
+        let p = pull(&mut replay).clone();
+        let result = promotion_body(&replay, REPO, &p, "composefs/composefs-rs");
+        match expected {
+            Ok(expected) => assert_eq!(result.unwrap(), expected),
+            Err(cause) => assert!(format!("{:#}", result.unwrap_err()).contains(cause)),
+        }
+        // The association never changes the fork PR's approved text.
+        assert_eq!(p["body"], format!("Part of {REPO}#31"));
+    }
+    let mut replay = scenario();
+    body(&mut replay, "/issues/31")["body"] = json!("Upstream: #9");
+    let p = pull(&mut replay).clone();
+    assert!(
+        format!(
+            "{:#}",
+            promotion_body(&replay, REPO, &p, "other/project").unwrap_err()
+        )
+        .contains("differs from configured target")
+    );
+}
+
+fn source_evidence(replay: &mut Replay, actor: &str, changed: &str) {
+    struct Answer(Value);
+    impl Transport for Answer {
+        fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+    let text = body(replay, "/issues/31")["body"].clone();
+    let answer = Answer(json!({"repository":{"issue":{"number":31,
+        "url":format!("https://github.com/{REPO}/issues/31"),"body":text,
+        "createdAt":PUSH,"author":{"login":"cgwalters-bot"},
+        "lastEditedAt":changed,"editor":{"login":actor}}}}));
+    let recorder = crate::pass::Recorder::new(&answer);
+    recorder
+        .graphql(
+            SOURCE_TEXT_QUERY,
+            json!({"owner":"cgwalters-forge","name":"composefs-rs","number":31}),
+        )
+        .unwrap();
+    let recorded =
+        Replay::from_json(&serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap())
+            .unwrap();
+    for entry in recorded.requests {
+        replay.requests.retain(|r| r["request"] != entry["request"]);
+        replay.requests.push(entry);
+    }
+}
+
+#[test]
+fn source_association_requires_trusted_text_before_the_command() {
+    for (actor, changed, allowed) in [
+        ("cgwalters-bot", PUSH, true),
+        ("cgwalters", PUSH, true),
+        ("visitor", PUSH, false),
+        ("cgwalters", COMMAND, false),
+        ("cgwalters-bot", "2026-11-01T00:00:00Z", false),
+    ] {
+        let (mut forge, config) = publication();
+        body(&mut forge.replay, "/issues/31")["body"] = json!("Upstream: #9");
+        source_evidence(&mut forge.replay, actor, changed);
+        let result = apply(&forge, &config, forge.replay.now, 3);
+        if allowed {
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(forge.writes.borrow().len(), 3);
+        } else {
+            let lines = result.unwrap();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("upstream link source")),
+                "{actor} {changed}: {lines:?}"
+            );
+            assert!(forge.writes.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn confirmed_publication_cannot_retarget_from_a_later_source_edit() {
+    let (mut forge, config) = publication();
+    body(&mut forge.replay, "/issues/31")["body"] = json!("Upstream: #9");
+    source_evidence(&mut forge.replay, "cgwalters-bot", PUSH);
+    let first = apply(&forge, &config, forge.replay.now, 3).unwrap();
+    assert!(first[0].starts_with("promoted "), "{first:?}");
+    let writes = forge.writes.take();
+    let mut published = upstream_pr();
+    published["title"] = writes[1].2["title"].clone();
+    published["body"] = writes[1].2["body"].clone();
+    *upstream(&mut forge.replay) = json!([published]);
+    comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":writes[2].2["body"]}));
+    sync_metadata(&mut forge.replay);
+    let second = apply(&forge, &config, forge.replay.now, 3).unwrap();
+    assert!(second[0].starts_with("already promoted "), "{second:?}");
+    assert!(forge.writes.borrow().is_empty());
+    let mut other = entry(&mut forge.replay, "composefs/composefs-rs/issues/9").clone();
+    other["request"]["get"] = json!(format!("{API}repos/composefs/composefs-rs/issues/10"));
+    other["answer"]["body"]["number"] = json!(10);
+    forge.replay.requests.push(other);
+    body(&mut forge.replay, "/issues/31")["body"] = json!("Upstream: #10");
+    source_evidence(&mut forge.replay, "cgwalters", COMMAND);
+    let third = apply(&forge, &config, forge.replay.now, 3).unwrap();
+    assert!(
+        third
+            .iter()
+            .any(|line| line.contains("fresh command required")),
+        "{third:?}"
+    );
+    assert!(forge.writes.borrow().is_empty());
 }
 
 fn candidate(human: bool) -> String {
@@ -1735,8 +1865,12 @@ pub(crate) fn handoff_scenario() -> (Replay, Config) {
 
 #[test]
 fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
-    for existing in [false, true] {
+    for (existing, linked) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut forge, config) = publication();
+        if linked {
+            body(&mut forge.replay, "/issues/31")["body"] = json!("Upstream: #9");
+            source_evidence(&mut forge.replay, "cgwalters-bot", PUSH);
+        }
         if existing {
             let mut pr = upstream_pr();
             pr["base"] = json!({"ref":"main","repo":{"full_name":"composefs/composefs-rs"}});
@@ -1763,7 +1897,15 @@ fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
             )
         );
         assert_eq!(publication.2["title"], forge.fresh["title"]);
-        assert_eq!(publication.2["body"], forge.fresh["body"]);
+        let expected_body = if linked {
+            format!(
+                "{}\n\nFixes composefs/composefs-rs#9",
+                forge.fresh["body"].as_str().unwrap()
+            )
+        } else {
+            forge.fresh["body"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(publication.2["body"], expected_body);
         if existing {
             assert_eq!(publication.2.as_object().unwrap().len(), 2);
         } else {

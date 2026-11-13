@@ -204,6 +204,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             &self.stepped,
             &self.report.accepted_plans.borrow(),
             &snapshot.holds,
+            &self.report.upstreams.borrow(),
         );
         self.report.observation = Some(Observation {
             snapshot,

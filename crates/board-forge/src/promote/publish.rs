@@ -186,6 +186,7 @@ fn prepare<C: Rest + Transport>(
         current == command,
         "operator command changed before publication"
     );
+    let body = authorized_promotion_body(client, config, repo, &fresh, &target.upstream, &command)?;
     let head = command.head;
     let owner = fresh["head"]["repo"]["owner"]["login"]
         .as_str()
@@ -301,6 +302,7 @@ fn prepare<C: Rest + Transport>(
         },
     };
     let mut publication = fresh.clone();
+    publication["body"] = json!(body);
     publication["head"]["sha"] = json!(what.published);
     publication["head"]["ref"] = json!(what.branch);
     if let Some(pr) = &what.existing {
@@ -311,7 +313,7 @@ fn prepare<C: Rest + Transport>(
             &target.upstream,
             &target.base,
         )?;
-        if confirmed && pr["title"] == fresh["title"] && pr["body"] == fresh["body"] {
+        if confirmed && pr["title"] == publication["title"] && pr["body"] == publication["body"] {
             // Confirmed and unchanged: no writes, and no rebuild on a later
             // upstream base that would disagree with the open upstream PR.
             return Ok(Step::Line(format!(
@@ -568,7 +570,7 @@ fn publish<C: Rest + Transport>(
             reference["object"]["sha"] == what.published,
             "publication branch moved"
         );
-        let text = json!({"title":fresh["title"], "body":fresh["body"]});
+        let text = json!({"title":publication["title"], "body":publication["body"]});
         let published = if let Some(pr) = &what.existing {
             let n = pr["number"]
                 .as_u64()
@@ -613,7 +615,7 @@ fn publish<C: Rest + Transport>(
             );
         }
         ensure!(
-            published["title"] == fresh["title"] && published["body"] == fresh["body"],
+            published["title"] == publication["title"] && published["body"] == publication["body"],
             "upstream returned different text"
         );
         let n = published["number"]

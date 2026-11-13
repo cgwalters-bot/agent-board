@@ -320,7 +320,7 @@ approved work visible without granting the pass upstream write authority.
   publication rebase); the issue's accepted plan's `stacks_on`; DCO facts from required
   base-branch checks or base-head check runs; and unchanged title/body text.
   This prevents duplicate publication, stale bases, unmerged dependencies,
-  unsafe sign-off rewrites and references changing meaning upstream. Only a
+   unsafe sign-off rewrites and references changing meaning upstream. Only a
   unique closing or `Part of` reference to an issue in the fork ties a PR to
   its plan; ambiguous/missing linkage holds. No plan or no `stacks_on` means
   unstacked. A parent's open fork PR, open upstream PR or closed-unmerged PR
@@ -329,8 +329,19 @@ approved work visible without granting the pass upstream write authority.
   When required, report missing operator sign-offs; commits needing a sign-off
   that are merges or by neither bot nor operator hold. Empty bodies, bare
   `#N` references and closing references to the fork hold, never get rewritten.
-  All reads use the existing budget and complete bounded pagination (ten
-  100-row pages); unreadable/incomplete evidence holds.
+   All reads use the existing budget and complete bounded pagination (ten
+   100-row pages); unreadable/incomplete evidence holds.
+   The source issue may carry one whole `Upstream: #N` line. Only the number
+   is stored: GitHub's verified fork parent supplies the repository and must
+   agree with the configured promotion target. A malformed or duplicate line,
+   missing parent evidence, or an issue read that returns a PR holds with an
+   `upstream link` cause, never a guessed destination. Publication preserves
+   the approved title/body and appends only `Fixes OWNER/REPO#N` for that link;
+   no link preserves the body byte-for-byte. GraphQL must identify the source
+   text's author or last editor as the bot/operator and its creation/edit must
+   strictly predate the selected operator command or approval. A later edit
+   requires fresh authorization, including after confirmed publication. The
+   extra reads use the same budget.
 * **Policy gate.** Only a candidate that passed every read gate above reads
   its upstream's record, once per run, from
   `policyRepository/policyPath/OWNER/REPO.md` on that repository's default
@@ -388,7 +399,8 @@ approved work visible without granting the pass upstream write authority.
   containing `Generated-by:` holds. Only upstream policy results are cached:
   every PR's provenance is independently evaluated. Passing reports `(policy
   human-text; provenance verified)`, not live publication. No labels or notices
-  are written, and title/body text is never altered or supplemented.
+   are written. The only body supplement is the mechanically derived upstream
+   closing reference above; it is not a claim of operator-authored prose.
 * **Kept.** The upstream contribution-policy gate; the operator's sign-off
   added to every promoted commit, whether or not upstream checks DCO; the stacked wait (a pull
   request whose dependency is not yet upstream waits); one notice per reason

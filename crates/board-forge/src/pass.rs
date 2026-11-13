@@ -3873,6 +3873,8 @@ impl<C: Broker> Broker for Budget<'_, C> {
 /// stages 3 and 4's holds as data, whose lines are among `lines`.
 #[derive(Default)]
 pub struct Report {
+    /// This pass's bounded upstream issue reads, keyed by the fork issue.
+    pub upstreams: RefCell<crate::upstream::Observations>,
     pub issue_intake: BTreeMap<String, String>,
     /// Library projection of facts already read; never rendered by the CLI.
     observation: Option<decision::Observation>,
@@ -7230,6 +7232,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
         }
         let read = (&facts, comments.as_slice());
+        if let Some(step) = self.upstream_replan(read, (snapshot, target, slots))? {
+            return Ok(step);
+        }
         // The body's plan, posted as a comment at its start, which the plan
         // protocol then dispatches and records as any other. `operators`
         // says whether the plan comment is the operator's own word, written
@@ -8003,6 +8008,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
              If it can be done, post one accepted implement job plan for it (agent-board's docs/job-plans.md). \
              Otherwise say on the issue what design or decision it needs. Do not close the issue."
         );
+        brief.push_str(" When filing a fork issue for an upstream issue, add exactly one line Upstream: #N (the upstream issue number only); derive the repository from the fork's verified parent, never from thread text. Do not add this association for a pull request or an issues-off fallback repository.");
+        if intro.starts_with(upstreams::REPLAN) {
+            brief.push_str(&format!("\n\n{intro} Re-evaluate whether the fork issue is done; upstream completion alone is not permission to close it. Do not post upstream."));
+        }
         brief.push_str(&self.verdict_ask(read.0));
         brief.push_str(plan::VALIDATE_PLAN_JSON);
         if config.midstream.is_some() {
@@ -9694,6 +9703,7 @@ mod status;
 pub(crate) use living::MARKER as LIVING_STATUS_MARKER;
 pub mod sweep;
 mod today;
+mod upstreams;
 mod usage;
 mod view;
 mod wait;

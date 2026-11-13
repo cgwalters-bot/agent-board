@@ -2203,8 +2203,24 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 "a pull request {bot} did not open. Runs for it take this issue as their item and answer here; {bot}'s comment there links to it."
             ),
         };
+        // The pass's intake routes come from verified fork-parent metadata.
+        // A fallback tracker has no such parent, and a PR is not an issue.
+        let upstream = if tracker != self.config.dispatch_repo
+            && self
+                .config
+                .policy
+                .notification_intake
+                .as_ref()
+                .and_then(|routes| routes.get(&repo.to_ascii_lowercase()))
+                == Some(&tracker)
+            && url == format!("https://github.com/{repo}/issues/{number}")
+        {
+            format!("Upstream: #{number}\n\n")
+        } else {
+            String::new()
+        };
         let body = format!(
-            "The operator commented on {url}, {about}\n{}\n\n{}",
+            "{upstream}The operator commented on {url}, {about}\n{}\n\n{}",
             quoted(said),
             self.config.policy.footer
         );
