@@ -14,6 +14,7 @@ agent-board [OPTIONS] <COMMAND>
 
 Commands:
 
+- [`migrate`](#agent-board-migrate): Explicit migrations; preview by default, never a scheduled pass stage
 - [`intake`](#agent-board-intake): Report new Forgejo issues and comments; no bodies, routing or forge writes
 - [`action`](#agent-board-action): Validate proposed operator mutations; never execute them
 - [`triage`](#agent-board-triage): Apply an operator-reviewed triage verdict list (preview unless --apply)
@@ -59,6 +60,35 @@ Global options:
 - `--owner <OWNER>`: Organization or user owning the live project
 - `--project <PROJECT>`: Live project number, not its node ID
 - `--board-config <FILE>`: Trusted default-branch agent-board.json whose `board` names the forge (GitHub by default)
+
+## agent-board migrate
+
+Explicit migrations; preview by default, never a scheduled pass stage
+
+```text
+agent-board migrate [OPTIONS] <COMMAND>
+```
+
+Commands:
+
+- [`midstream-issues`](#agent-board-migrate-midstream-issues): Preview tracker issue transfers to currently admitted midstream forks (docs/pass.md)
+
+## agent-board migrate midstream-issues
+
+Preview tracker issue transfers to currently admitted midstream forks (docs/pass.md)
+
+```text
+agent-board migrate midstream-issues [OPTIONS]
+```
+
+Options:
+
+- `--config <FILE>`: Trusted caller pass configuration; no new target authority (default: `.github/pass.json`)
+- `--apply`: Transfer issues; otherwise perform read-only preview
+- `--max <N>`: Positive per-run transfer cap; preview defaults to one
+- `--state <FILE>`: Durable transfer journal; retain it across retries. Required for apply
+- `--replay <FILE>`: Preview a recorded set of reads without credentials
+- `--record <FILE>`: Save live preview reads for offline replay (may contain issue bodies)
 
 ## agent-board intake
 
