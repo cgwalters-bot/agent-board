@@ -3727,6 +3727,18 @@ impl Decision {
         self
     }
 
+    /// An empty round is infrastructure only when the poll started it on its
+    /// own. An operator's answer or comments that pushed nothing is theirs,
+    /// whatever ended the run; so is a stale stop's round, whose close
+    /// ([`stale`]) needs the operator's label to stay on.
+    fn empty_round(self, marker: &Marker) -> Self {
+        if marker.answering || !marker.comments.is_empty() {
+            self
+        } else {
+            self.infrastructure(crate::stop::Cause::EmptyFix)
+        }
+    }
+
     fn followed(mut self, since: Option<OffsetDateTime>) -> Self {
         self.waiting = WaitReason::Followed { since };
         self
@@ -3962,7 +3974,7 @@ fn started(
                     short(head)
                 ),
             )
-            .infrastructure(crate::stop::Cause::EmptyFix);
+            .empty_round(marker);
         }
     }
     if marker.run.is_none() && older_than(now, marker.at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
@@ -3973,7 +3985,7 @@ fn started(
                 short(head)
             ),
         )
-        .infrastructure(crate::stop::Cause::EmptyFix);
+        .empty_round(marker);
     }
     step("wait", format!("{round}{RUNNING}{}", short(head))).followed(since)
 }
@@ -18641,6 +18653,31 @@ mod tests {
                     "{body}"
                 );
             }
+        }
+        // Only the poll's own empty round is infrastructure.
+        for (why, answering, comments, cause) in [
+            ("fix", false, vec![], Some(crate::stop::Cause::EmptyFix)),
+            ("operator answer pending", true, vec!["9".into()], None),
+            ("the stale stop's round pending", true, vec![], None),
+            ("operator comments", false, vec!["9".into()], None),
+        ] {
+            let decision = started(
+                &config(),
+                &Marker {
+                    rounds: 1,
+                    sha: Some(HEAD.into()),
+                    at: Some("2026-10-01T00:00:00Z".into()),
+                    answering,
+                    comments,
+                    ..Marker::default()
+                },
+                (None, &Outages::Off),
+                HEAD,
+                why,
+                now(),
+            );
+            assert_eq!(decision.action, "needs-human", "{why}");
+            assert_eq!(decision.infrastructure, cause, "{why}");
         }
         // Free-text failures may mention infrastructure but cannot choose a cause.
         let cfg = config();
