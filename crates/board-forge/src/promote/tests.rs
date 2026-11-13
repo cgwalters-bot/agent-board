@@ -3,6 +3,7 @@ use super::*;
 use crate::{pass::Replay, poll::RestResponse};
 use serde_json::json;
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 const FIXTURE: &str = include_str!("../../../../fixtures/promote/public-2026-11-04.json");
 const CONFIG: &str = include_str!("../../../../fixtures/promote/config.json");
@@ -1482,6 +1483,62 @@ struct PublishingForge {
     fail: Option<usize>,
     writer: String,
     returned_number: bool,
+    /// The head repository's `bot/promote/*` branch: absent until a fake
+    /// rewrite pushes it, or a scenario plants it.
+    promote_ref: Rc<RefCell<Option<String>>>,
+    /// Upstream PRs listed for that branch.
+    promoted: RefCell<Vec<Value>>,
+}
+
+/// A rewrite whose head is a function of the upstream base alone, so a base
+/// advance gives another head on the same branch, as the real replay does.
+struct FakeRewrite {
+    conflict: bool,
+    /// Every compare prepared: a rebuild is one Git run.
+    prepared: Vec<Value>,
+    pushed: Rc<RefCell<Option<String>>>,
+}
+
+impl FakeRewrite {
+    fn new(forge: &PublishingForge) -> Self {
+        FakeRewrite {
+            conflict: false,
+            prepared: vec![],
+            pushed: Rc::clone(&forge.promote_ref),
+        }
+    }
+
+    fn head(base: &str) -> String {
+        base[..1].repeat(40)
+    }
+}
+
+impl rewrite::Rewrite for FakeRewrite {
+    fn prepare(
+        &mut self,
+        _: &Config,
+        _: &pass::promote::Fork,
+        pull: &Value,
+        compare: &Value,
+    ) -> Result<(String, String)> {
+        self.prepared.push(compare.clone());
+        ensure!(!self.conflict, "rebase conflict");
+        Ok((
+            Self::head(compare["base_commit"]["sha"].as_str().unwrap()),
+            rewrite::branch(pull["head"]["sha"].as_str().unwrap()),
+        ))
+    }
+    fn publish(&mut self, _: &str, _: &str, head: &str) -> Result<()> {
+        let mut pushed = self.pushed.borrow_mut();
+        if let Some(existing) = pushed.as_deref() {
+            ensure!(
+                existing == head,
+                "promotion branch already exists at another head"
+            );
+        }
+        *pushed = Some(head.to_owned());
+        Ok(())
+    }
 }
 
 impl Rest for PublishingForge {
@@ -1497,11 +1554,15 @@ impl Rest for PublishingForge {
             };
             Some(body(&mut replay, "pulls?state=open")[1].clone())
         } else if url.contains("/pulls?state=all&head=cgwalters-bot%3Abot%2Fpromote") {
-            Some(json!([]))
+            Some(json!(self.promoted.borrow().clone()))
+        } else if url.contains("/git/ref/heads/bot%2Fpromote") {
+            let Some(sha) = self.promote_ref.borrow().clone() else {
+                return Err(anyhow::Error::from(crate::github::NotFound)
+                    .context(format!("GET {url}: GitHub HTTP status 404")));
+            };
+            Some(json!({"object":{"sha":sha}}))
         } else if url.contains("/git/ref/heads/") {
-            Some(
-                json!({"object":{"sha":if self.moved { "a".repeat(40) } else if url.contains("bot%2Fpromote") { "c".repeat(40) } else { HEAD.into() }}}),
-            )
+            Some(json!({"object":{"sha":if self.moved { "a".repeat(40) } else { HEAD.into() }}}))
         } else {
             None
         };
@@ -1524,14 +1585,21 @@ impl Rest for PublishingForge {
             anyhow::bail!("simulated lost response");
         }
         if url.contains("/pulls") {
-            let mut result = upstream_pr();
+            // An update answers with the PR it edits; a creation with a new one.
+            let mut result = self
+                .promoted
+                .borrow()
+                .iter()
+                .find(|p| url.ends_with(&format!("/pulls/{}", p["number"])))
+                .cloned()
+                .unwrap_or_else(upstream_pr);
             result["base"] = json!({"ref":"main","repo":{"full_name":"composefs/composefs-rs"}});
             result["title"] = body["title"].clone();
             result["body"] = body["body"].clone();
             if let Some(head) = body["head"].as_str() {
                 result["head"]["ref"] = json!(head.split_once(':').unwrap().1);
                 if head.contains(":bot/promote") {
-                    result["head"]["sha"] = json!("c".repeat(40));
+                    result["head"]["sha"] = json!(self.promote_ref.borrow().clone());
                 }
             }
             if self.returned_head {
@@ -1568,10 +1636,74 @@ fn publication() -> (PublishingForge, Config) {
         fail: None,
         writer: "cgwalters-bot".into(),
         returned_number: false,
+        promote_ref: Rc::new(RefCell::new(None)),
+        promoted: RefCell::new(vec![]),
     };
     let mut config = Config::parse(CONFIG).unwrap();
     config.promote.as_mut().unwrap().publish = true;
     (forge, config)
+}
+
+/// A second hypothetical PR on another branch, derived from exactly the
+/// same scenario reads, as the next candidate after #34.
+fn with_second(forge: &mut PublishingForge) {
+    fn second(value: &mut Value) {
+        match value {
+            Value::String(text) => {
+                *text = text
+                    .replace("/34", "/35")
+                    .replace("agent-run-39714560993", "agent-run-second")
+            }
+            Value::Array(values) => values.iter_mut().for_each(second),
+            Value::Object(values) => {
+                if values.get("number") == Some(&json!(34)) {
+                    values.insert("number".into(), json!(35));
+                }
+                values.values_mut().for_each(second);
+            }
+            _ => {}
+        }
+    }
+    let mut requests = forge.replay.requests.clone();
+    requests.iter_mut().for_each(second);
+    forge.replay.requests.extend(requests);
+    let mut next = forge.fresh.clone();
+    second(&mut next);
+    body(&mut forge.replay, "pulls?state=open")
+        .as_array_mut()
+        .unwrap()
+        .push(next);
+}
+
+/// The fork receipt and upstream PR the fake forge accepted from a rewritten
+/// publication's writes, kept for the next invocation.
+fn keep_rewritten(forge: &mut PublishingForge, writes: &[(String, String, Value)]) {
+    let mut pr = upstream_pr();
+    pr["head"]["sha"] = json!(forge.promote_ref.borrow().clone().unwrap());
+    pr["head"]["ref"] = json!(rewrite::branch(HEAD));
+    pr["title"] = writes[1].2["title"].clone();
+    pr["body"] = writes[1].2["body"].clone();
+    forge.promoted.borrow_mut().push(pr);
+    comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":writes[2].2["body"]}));
+    sync_metadata(&mut forge.replay);
+}
+
+/// Upstream's base advances: a rebuild today would give another head. The
+/// new base commit's checks read as the old one's did.
+fn advance_base(forge: &mut PublishingForge) {
+    let old = body(&mut forge.replay, "composefs-rs/branches/main")["commit"]["sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let new = "d".repeat(40);
+    let mut checks = entry(&mut forge.replay, &format!("commits/{old}/check-runs")).clone();
+    let key = checks["request"]["get"]
+        .as_str()
+        .unwrap()
+        .replace(&old, &new);
+    checks["request"]["get"] = json!(key);
+    forge.replay.requests.push(checks);
+    body(&mut forge.replay, "composefs-rs/branches/main")["commit"]["sha"] = json!(new);
 }
 
 /// Scenario edits of recorded public responses: a hypothetical successful
@@ -1704,27 +1836,6 @@ fn interrupted_publication_never_emits_handoff_authority() {
 
 #[test]
 fn publication_rebases_and_signs_independently_of_dco() {
-    struct ReplayRewrite {
-        conflict: bool,
-        pushed: bool,
-    }
-    impl rewrite::Rewrite for ReplayRewrite {
-        fn prepare(
-            &mut self,
-            _: &Config,
-            _: &pass::promote::Fork,
-            _: &Value,
-            compare: &Value,
-        ) -> Result<(String, String)> {
-            assert_eq!(compare["commits"].as_array().unwrap().len(), 2);
-            ensure!(!self.conflict, "rebase conflict");
-            Ok(("c".repeat(40), "bot/promote/fixture".into()))
-        }
-        fn publish(&mut self, _: &str, _: &str, _: &str) -> Result<()> {
-            self.pushed = true;
-            Ok(())
-        }
-    }
     for dco in [false, true] {
         for behind in [0, 1] {
             for conflict in [false, true] {
@@ -1745,13 +1856,13 @@ fn publication_rebases_and_signs_independently_of_dco() {
                 compare["commits"] = json!([first, second]);
                 compare["ahead_by"] = json!(2);
                 compare["total_commits"] = json!(2);
-                let mut git = ReplayRewrite {
-                    conflict,
-                    pushed: false,
-                };
+                let mut git = FakeRewrite::new(&forge);
+                git.conflict = conflict;
                 let lines =
                     publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
-                assert_eq!(git.pushed, !conflict, "{lines:?}");
+                assert_eq!(git.prepared.len(), 1);
+                assert_eq!(git.prepared[0]["commits"].as_array().unwrap().len(), 2);
+                assert_eq!(forge.promote_ref.borrow().is_some(), !conflict, "{lines:?}");
                 assert_eq!(forge.writes.borrow().len(), if conflict { 0 } else { 3 });
                 assert!(
                     lines[0].starts_with(if conflict { "hold promote" } else { "promoted" }),
@@ -1772,8 +1883,8 @@ fn publication_rebases_and_signs_independently_of_dco() {
                     sync_metadata(&mut replay);
                     let upstream = body(&mut replay, "/pulls/70");
                     upstream["body"] = forge.fresh["body"].clone();
-                    upstream["head"]["sha"] = json!("c".repeat(40));
-                    upstream["head"]["ref"] = json!("bot/promote/fixture");
+                    upstream["head"]["sha"] = json!(forge.promote_ref.borrow().clone());
+                    upstream["head"]["ref"] = json!(rewrite::branch(HEAD));
                     let facts = crate::pass::Facts {
                         issue: crate::parse_github_item(
                             &format!("{REPO}#31"),
@@ -1959,34 +2070,7 @@ fn publication_caps_and_existing_receipt_are_bounded() {
 #[test]
 fn confirmed_publication_does_not_starve_the_next_candidate() {
     let (mut forge, config) = publication();
-    // A second hypothetical PR on another branch, derived from exactly the
-    // same scenario reads. Preserve it across two invocations of the job.
-    fn second(value: &mut Value) {
-        match value {
-            Value::String(text) => {
-                *text = text
-                    .replace("/34", "/35")
-                    .replace("agent-run-39714560993", "agent-run-second")
-            }
-            Value::Array(values) => values.iter_mut().for_each(second),
-            Value::Object(values) => {
-                if values.get("number") == Some(&json!(34)) {
-                    values.insert("number".into(), json!(35));
-                }
-                values.values_mut().for_each(second);
-            }
-            _ => {}
-        }
-    }
-    let mut requests = forge.replay.requests.clone();
-    requests.iter_mut().for_each(second);
-    forge.replay.requests.extend(requests);
-    let mut next = forge.fresh.clone();
-    second(&mut next);
-    body(&mut forge.replay, "pulls?state=open")
-        .as_array_mut()
-        .unwrap()
-        .push(next);
+    with_second(&mut forge);
     let first = apply(&forge, &config, forge.replay.now, 3).unwrap();
     assert!(first[0].contains("#34 ->"));
     // Retain what the fake forge accepted: upstream PR and final fork receipt.
@@ -1998,10 +2082,199 @@ fn confirmed_publication_does_not_starve_the_next_candidate() {
     comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":writes[2].2["body"]}));
     sync_metadata(&mut forge.replay);
     let second = apply(&forge, &config, forge.replay.now, 3).unwrap();
-    assert_eq!(second.len(), 1);
-    assert!(second[0].contains("#35 ->"), "{second:?}");
+    assert_eq!(
+        second[0],
+        format!("already promoted {REPO}#34 -> composefs/composefs-rs#70 head={HEAD}")
+    );
+    assert!(second[1].contains("#35 ->"), "{second:?}");
     assert_eq!(forge.writes.borrow().len(), 3);
     assert!(forge.writes.borrow()[0].1.contains("/issues/35/comments"));
+}
+
+#[test]
+fn confirmed_rewritten_publication_is_not_rebuilt_after_an_upstream_advance() {
+    let (mut forge, config) = publication();
+    body(&mut forge.replay, "/compare/")["behind_by"] = json!(1);
+    let mut git = FakeRewrite::new(&forge);
+    let first = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+    assert!(first[0].starts_with("promoted "), "{first:?}");
+    let writes = forge.writes.take();
+    keep_rewritten(&mut forge, &writes);
+    advance_base(&mut forge);
+    // The receipt decides: no rebuild, no writes, and the next candidate's turn.
+    let second = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+    assert_eq!(
+        second,
+        [format!(
+            "already promoted {REPO}#34 -> composefs/composefs-rs#70 head={HEAD}"
+        )]
+    );
+    assert_eq!(git.prepared.len(), 1);
+    assert!(forge.writes.borrow().is_empty());
+    // Changed fork text updates the published PR, still without a rebuild.
+    let edited = json!(format!("Part of {REPO}#31\n\nEdited after publication."));
+    forge.fresh["body"] = edited.clone();
+    pull(&mut forge.replay)["body"] = edited.clone();
+    let third = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+    assert!(third[0].starts_with("promoted "), "{third:?}");
+    assert_eq!(git.prepared.len(), 1);
+    let writes = forge.writes.borrow();
+    assert_eq!(writes.len(), 3);
+    assert!(writes[0].1.ends_with("/issues/comments/99"));
+    assert_eq!(
+        (writes[1].0.as_str(), writes[1].1.as_str()),
+        (
+            "PATCH",
+            &*format!("{API}repos/composefs/composefs-rs/pulls/70")
+        )
+    );
+    assert_eq!(writes[1].2["body"], edited);
+    let receipt = writes[2].2["body"].as_str().unwrap();
+    let record = crate::plan::fenced_json(receipt, "agent-board-promoted")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record["published_oid"], FakeRewrite::head("b41c"));
+    assert_eq!(record["published_branch"], rewrite::branch(HEAD));
+}
+
+#[test]
+fn partial_publication_resumes_or_republishes_after_an_upstream_advance() {
+    for case in [
+        "pushed and created",
+        "pushed only",
+        "nothing pushed",
+        "branch at another head",
+        "unrecorded branch at another head",
+        "record edited by another",
+        "original branch published meanwhile",
+    ] {
+        let (mut forge, config) = publication();
+        body(&mut forge.replay, "/compare/")["behind_by"] = json!(1);
+        let mut git = FakeRewrite::new(&forge);
+        // The branch is pushed, then the upstream POST's response is lost.
+        forge.fail = Some(2);
+        assert!(publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).is_err());
+        let writes = forge.writes.take();
+        let receipt = writes[2].2["body"].as_str().unwrap().to_owned();
+        assert!(receipt.contains("was not confirmed"), "{case}: {receipt}");
+        assert!(receipt.contains("```agent-board-promoting"), "{case}");
+        let pushed = forge.promote_ref.borrow().clone().unwrap();
+        assert_eq!(pushed, FakeRewrite::head("b41c"));
+        let body = match case {
+            "unrecorded branch at another head" => {
+                format!(
+                    "Promoting approved head {HEAD} to composefs/composefs-rs.\n\n{}",
+                    handoff::STATUS
+                )
+            }
+            _ => receipt,
+        };
+        comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":body}));
+        sync_metadata(&mut forge.replay);
+        match case {
+            "pushed and created" => {
+                let mut pr = upstream_pr();
+                pr["head"]["sha"] = json!(pushed);
+                pr["head"]["ref"] = json!(rewrite::branch(HEAD));
+                forge.promoted.borrow_mut().push(pr);
+            }
+            "nothing pushed" => *forge.promote_ref.borrow_mut() = None,
+            "branch at another head" | "unrecorded branch at another head" => {
+                *forge.promote_ref.borrow_mut() = Some("e".repeat(40))
+            }
+            "record edited by another" => {
+                // A collaborator's edit of the bot's record steers nothing.
+                let edited = "2026-10-23T01:00:00Z";
+                comments(&mut forge.replay)[1]["updated_at"] = json!(edited);
+                let metadata = &mut comment_metadata(&mut forge.replay)[1];
+                metadata["lastEditedAt"] = json!(edited);
+                metadata["editor"] = json!({"login":"visitor"});
+            }
+            "original branch published meanwhile" => {
+                *upstream(&mut forge.replay) = json!([upstream_pr()]);
+            }
+            _ => {}
+        }
+        forge.fail = None;
+        advance_base(&mut forge);
+        let lines = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+        let writes = forge.writes.borrow();
+        let held = match case {
+            // Never force-updated, and held before any write.
+            "branch at another head" | "unrecorded branch at another head" => {
+                Some("publication branch")
+            }
+            "record edited by another" => Some("untrusted handoff author/edit evidence"),
+            "original branch published meanwhile" => {
+                Some("existing upstream PR needs manual migration")
+            }
+            _ => None,
+        };
+        if let Some(why) = held {
+            assert!(
+                lines[0].starts_with(&format!("hold promote {REPO}#34: {why}")),
+                "{case}: {lines:?}"
+            );
+            assert!(writes.is_empty(), "{case}");
+            continue;
+        }
+        assert!(lines[0].starts_with("promoted "), "{case}: {lines:?}");
+        assert_eq!(writes.len(), 3, "{case}");
+        assert!(writes[0].1.ends_with("/issues/comments/99"), "{case}");
+        let rebuilt = case == "nothing pushed";
+        // A republication rebuilds on today's base under a new pending record.
+        assert_eq!(git.prepared.len(), if rebuilt { 2 } else { 1 }, "{case}");
+        let published = if rebuilt {
+            FakeRewrite::head("d")
+        } else {
+            pushed.clone()
+        };
+        let pending = crate::plan::fenced_json_as(
+            writes[0].2["body"].as_str().unwrap(),
+            "agent-board-promoting",
+            "record",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pending["published_oid"], published, "{case}");
+        assert_eq!(
+            writes[1].0,
+            if case == "pushed and created" {
+                "PATCH"
+            } else {
+                "POST"
+            },
+            "{case}"
+        );
+        let record = crate::plan::fenced_json(
+            writes[2].2["body"].as_str().unwrap(),
+            "agent-board-promoted",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record["published_oid"], published, "{case}");
+        assert_eq!(record["published_branch"], rewrite::branch(HEAD), "{case}");
+    }
+}
+
+#[test]
+fn a_held_candidate_does_not_stop_the_next() {
+    let (mut forge, config) = publication();
+    with_second(&mut forge);
+    // #34's fresh re-read disagrees with the listing; #35 is unaffected.
+    forge.fresh["title"] = json!("Changed after approval");
+    let lines = apply(&forge, &config, forge.replay.now, 3).unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with(&format!(
+            "hold promote {REPO}#34: fork PR title changed before publication"
+        )),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("#35 ->"), "{lines:?}");
+    let writes = forge.writes.borrow();
+    assert_eq!(writes.len(), 3);
+    assert!(writes[0].1.contains("/issues/35/comments"));
 }
 
 #[test]

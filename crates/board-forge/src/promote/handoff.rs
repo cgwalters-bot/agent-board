@@ -3,24 +3,26 @@ use super::*;
 use crate::pass::{ClosingPull, Facts, Promotion};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA: &str = "agent-board/promoted/v1";
-const FENCE: &str = "agent-board-promoted";
+pub(super) const SCHEMA: &str = "agent-board/promoted/v1";
+pub(super) const FENCE: &str = "agent-board-promoted";
 pub(super) const STATUS: &str = "<!-- agent-board-promote-status -->";
 
+/// A confirmed publication: what the pass hands off, and what a publication
+/// retry skips or updates without rebuilding the published head.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Record {
-    schema: String,
-    fork_repository: String,
-    fork_pr: u64,
-    approved_oid: String,
-    published_oid: String,
-    published_branch: String,
-    upstream_repository: String,
-    upstream_pr: u64,
-    source_repository: String,
-    source_issue: u64,
-    completes_source: bool,
+pub(super) struct Record {
+    pub(super) schema: String,
+    pub(super) fork_repository: String,
+    pub(super) fork_pr: u64,
+    pub(super) approved_oid: String,
+    pub(super) published_oid: String,
+    pub(super) published_branch: String,
+    pub(super) upstream_repository: String,
+    pub(super) upstream_pr: u64,
+    pub(super) source_repository: String,
+    pub(super) source_issue: u64,
+    pub(super) completes_source: bool,
 }
 
 pub(super) fn source(repo: &str, pull: &Value) -> Result<u64> {
@@ -308,6 +310,22 @@ fn read_record(
     receipt: &Value,
     comments: usize,
 ) -> Result<Record> {
+    authenticate(client, config, repo, n, receipt, comments)?;
+    let body = receipt["body"].as_str().context("missing handoff body")?;
+    decode(body)?.context("no machine handoff record (readable receipt is not authority)")
+}
+
+/// The bot wrote the receipt and nobody else edited it, by the forge's own
+/// edit evidence for all `comments` of fork PR `n`. A REST login alone would
+/// let a collaborator's edit of the bot's comment steer a retry.
+pub(super) fn authenticate(
+    client: &impl Transport,
+    config: &Config,
+    repo: &str,
+    n: u64,
+    receipt: &Value,
+    comments: usize,
+) -> Result<()> {
     let item = crate::parse_github_item(&format!("{repo}#{n}"), None, crate::github::DEFAULT_HOST)?;
     let metadata = crate::plan::comment_metadata(client, &item, true)?;
     ensure!(
@@ -341,18 +359,27 @@ fn read_record(
             },
         "untrusted handoff author/edit evidence"
     );
-    let body = receipt["body"].as_str().context("missing handoff body")?;
-    let value = crate::plan::fenced_json(body, FENCE)?
-        .context("no machine handoff record (readable receipt is not authority)")?;
+    Ok(())
+}
+
+/// The canonical machine record in a receipt body, or none when the body has
+/// no record fence. A fence that does not decode is an error, never absence.
+pub(super) fn decode(body: &str) -> Result<Option<Record>> {
+    let Some(value) = crate::plan::fenced_json_as(body, FENCE, "handoff record")? else {
+        return Ok(None);
+    };
     let record: Record = serde_json::from_value(value).context("invalid handoff record")?;
-    // Value must not normalize duplicate keys into apparently valid authority.
-    let wire = format!(
-        "```{FENCE}\n{}\n```",
-        serde_json::to_string_pretty(&record)?
-    );
+    canonical(body, FENCE, &record)?;
+    Ok(Some(record))
+}
+
+/// `record` is `body`'s one `fence` block, byte for byte as the bot writes
+/// it: a Value must not normalize duplicate keys into apparently valid authority.
+pub(super) fn canonical(body: &str, fence: &str, record: &impl Serialize) -> Result<()> {
+    let wire = format!("```{fence}\n{}\n```", serde_json::to_string_pretty(record)?);
     ensure!(
-        body.contains(&wire) && body.matches(&format!("```{FENCE}")).count() == 1,
-        "noncanonical handoff record"
+        body.contains(&wire) && body.matches(&format!("```{fence}")).count() == 1,
+        "noncanonical {fence} record"
     );
-    Ok(record)
+    Ok(())
 }
