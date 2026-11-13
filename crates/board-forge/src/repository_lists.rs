@@ -149,10 +149,15 @@ impl Sources {
                                     .with_context(|| format!("{path}: organization entry"))?;
                                 ensure!(is_github_login(&org.org), "{path}: invalid organization");
                                 let Visibility::Public = org.visibility;
-                                ensure!(
-                                    !org.forks,
-                                    "{path}: organization entries require forks: false"
-                                );
+                                if org.forks {
+                                    ensure!(
+                                        matches!(
+                                            path.as_str(),
+                                            "/follow" | "/workRepositories" | "/pr/noMerge"
+                                        ),
+                                        "{path}: forks: true is supported only in follow, workRepositories and pr.noMerge"
+                                    );
+                                }
                             } else {
                                 entry
                                     .as_str()
@@ -193,9 +198,16 @@ impl Sources {
         value: &mut Value,
         client: &impl Rest,
         lines: &mut Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<Option<Vec<String>>> {
         let deadline = Instant::now() + Duration::from_secs(RESOLUTION_SECONDS);
         let mut cache = BTreeMap::new();
+        let mut inventories = BTreeMap::new();
+        let mut midstreams = BTreeMap::new();
+        let metadata = self
+            .0
+            .values()
+            .flatten()
+            .any(|entry| entry["forks"] == true);
         for (path, entries) in &self.0 {
             let mut resolved = BTreeMap::new();
             for entry in entries {
@@ -209,14 +221,121 @@ impl Sources {
                         .context("organization missing")?
                         .to_ascii_lowercase();
                     if !cache.contains_key(&org) {
-                        let repos = listing(client, &org, deadline)?;
-                        lines.push(format!(
-                            "repositories: org {org} resolved [{}]",
-                            repos.join(", ")
-                        ));
+                        let inventory = inventory(client, &org, deadline)?;
+                        let repos = owned_listing(&inventory);
+                        if !metadata {
+                            lines.push(format!(
+                                "repositories: org {org} resolved [{}]",
+                                repos.join(", ")
+                            ));
+                        }
+                        inventories.insert(org.clone(), inventory);
                         cache.insert(org.clone(), repos);
                     }
-                    for repo in &cache[&org] {
+                    let forks = entry["forks"] == true;
+                    let key = format!("{org}/metadata");
+                    if forks && !cache.contains_key(&key) {
+                        ensure!(
+                            value["midstream"]["owner"]
+                                .as_str()
+                                .is_some_and(|owner| owner.eq_ignore_ascii_case(&org)),
+                            "organization {org} with forks: true requires matching midstream.owner"
+                        );
+                        let topic = value["midstream"]["topic"]
+                            .as_str()
+                            .context("midstream.topic missing")?;
+                        // Public discovery must not revoke admission for an
+                        // explicitly named private midstream. Read only exact
+                        // caller names missing from the public inventory.
+                        let mut explicit: BTreeSet<_> = value["follow"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .chain(
+                                value["promote"]["forks"]
+                                    .as_object()
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|(name, _)| name.as_str()),
+                            )
+                            .filter(|name| {
+                                name.split_once('/')
+                                    .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(&org))
+                            })
+                            .map(str::to_ascii_lowercase)
+                            .collect();
+                        let inventory = inventories
+                            .get_mut(&org)
+                            .context("organization inventory disappeared")?;
+                        // A legacy owned source can retain a detached staged
+                        // repository (GitHub fork=false, origin=fork). Treat
+                        // its effective follows like literal names below.
+                        if self.0.get("/follow").is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry["forks"] == false
+                                    && entry["org"]
+                                        .as_str()
+                                        .is_some_and(|name| name.eq_ignore_ascii_case(&org))
+                            })
+                        }) {
+                            explicit.extend(
+                                owned_listing(inventory)
+                                    .into_iter()
+                                    .map(|name| name.to_ascii_lowercase()),
+                            );
+                        }
+                        for name in &explicit {
+                            if inventory.iter().any(|v| {
+                                v["full_name"]
+                                    .as_str()
+                                    .is_some_and(|v| v.eq_ignore_ascii_case(name))
+                            }) {
+                                continue;
+                            }
+                            validate_repository(name)?;
+                            ensure!(
+                                Instant::now() < deadline,
+                                "organization resolution deadline reached"
+                            );
+                            let response = client
+                                .get(&format!("{API_ROOT}repos/{name}"), None)
+                                .with_context(|| format!("read explicit midstream {name}"))?;
+                            ensure!(
+                                response.status == 200,
+                                "{name}: explicit metadata returned {}",
+                                response.status
+                            );
+                            ensure!(
+                                response.body["full_name"]
+                                    .as_str()
+                                    .is_some_and(|v| v.eq_ignore_ascii_case(name)),
+                                "{name}: explicit metadata identity changed"
+                            );
+                            classification(&response.body)?;
+                            properties(&response.body)?;
+                            // Do not enrol an explicitly named owned private
+                            // repository in any organization-backed list.
+                            if response.body["private"] == true
+                                && response.body["custom_properties"]["origin"] == "fork"
+                            {
+                                inventory.push(response.body);
+                            }
+                        }
+                        let (repos, mappings) = metadata_listing(
+                            client, &org, topic, inventory, &explicit, deadline, lines,
+                        )?;
+                        midstreams.extend(mappings);
+                        cache.insert(key.clone(), repos);
+                    }
+                    let repos = &cache[if forks { &key } else { &org }];
+                    for repo in repos {
+                        if forks
+                            && path == "/pr/noMerge"
+                            && !midstreams.contains_key(&repo.to_ascii_lowercase())
+                        {
+                            continue;
+                        }
                         resolved
                             .entry(repo.to_ascii_lowercase())
                             .or_insert_with(|| repo.clone());
@@ -228,15 +347,222 @@ impl Sources {
                 .context("repository list disappeared")? =
                 json!(resolved.into_values().collect::<Vec<_>>());
             lines.push(format!(
-                "repositories: {path} resolved {}",
+                "repositories: {}{path} resolved {}",
+                if metadata { "detail " } else { "" },
                 value.pointer(path).context("repository list disappeared")?
             ));
         }
-        Ok(())
+        if metadata {
+            // Enrolment and no-merge travel together: discovering a fork must
+            // never accidentally authorize merging staged work into it.
+            for path in ["follow", "workRepositories"] {
+                append(
+                    value,
+                    path,
+                    midstreams.values().map(|(name, _)| name.clone()),
+                )?;
+            }
+            if value.get("pr").is_none() {
+                value["pr"] = json!({});
+            }
+            append(
+                &mut value["pr"],
+                "noMerge",
+                midstreams.values().map(|(name, _)| name.clone()),
+            )?;
+            if !midstreams.is_empty() {
+                if value.get("promote").is_none() {
+                    value["promote"] = json!({});
+                }
+                if value["promote"].get("forks").is_none() {
+                    value["promote"]["forks"] = json!({});
+                }
+                let explicit = value["promote"]["forks"]
+                    .as_object_mut()
+                    .context("promote.forks must be an object")?;
+                for (key, (name, mapping)) in &midstreams {
+                    if !explicit.keys().any(|name| name.eq_ignore_ascii_case(key)) {
+                        explicit.insert(name.clone(), mapping.clone());
+                    }
+                }
+            }
+            Ok(Some(
+                midstreams.into_values().map(|(name, _)| name).collect(),
+            ))
+        } else {
+            Ok(None)
+        }
     }
 }
 
+fn append(value: &mut Value, key: &str, names: impl Iterator<Item = String>) -> Result<()> {
+    if value.get(key).is_none() {
+        value[key] = json!([]);
+    }
+    let list = value[key]
+        .as_array_mut()
+        .with_context(|| format!("{key} must be a list"))?;
+    for name in names {
+        if !list
+            .iter()
+            .any(|v| v.as_str().is_some_and(|v| v.eq_ignore_ascii_case(&name)))
+        {
+            list.push(json!(name));
+        }
+    }
+    list.sort_by_key(|v| v.as_str().unwrap_or_default().to_ascii_lowercase());
+    Ok(())
+}
+
+type Mappings = BTreeMap<String, (String, Value)>;
+
+fn classification(value: &Value) -> Result<()> {
+    for field in ["fork", "archived", "private"] {
+        value[field].as_bool().with_context(|| {
+            format!(
+                "repository {}: missing or invalid {field}",
+                value["full_name"]
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn properties(value: &Value) -> Result<&serde_json::Map<String, Value>> {
+    let name = &value["full_name"];
+    let properties = value["custom_properties"]
+        .as_object()
+        .with_context(|| format!("{name}: custom_properties missing or invalid"))?;
+    ensure!(
+        properties.get("origin").is_none_or(Value::is_string),
+        "{name}: invalid origin property"
+    );
+    Ok(properties)
+}
+
+fn metadata_listing(
+    client: &impl Rest,
+    org: &str,
+    topic: &str,
+    inventory: &[Value],
+    explicit: &BTreeSet<String>,
+    deadline: Instant,
+    lines: &mut Vec<String>,
+) -> Result<(Vec<String>, Mappings)> {
+    let mut repos = Vec::new();
+    let mut mappings = BTreeMap::new();
+    let mut excluded = 0;
+    let mut owned = 0;
+    for value in inventory {
+        let name = value["full_name"]
+            .as_str()
+            .context("repository name missing")?;
+        let reason;
+        if value["archived"] == true
+            || (value["private"] == true && !explicit.contains(&name.to_ascii_lowercase()))
+        {
+            reason = "archived or private";
+        } else {
+            let properties = properties(value)?;
+            if properties
+                .get("origin")
+                .is_some_and(|origin| origin == "fork")
+            {
+                let topics = value["topics"]
+                    .as_array()
+                    .with_context(|| format!("{name}: topics missing"))?;
+                ensure!(
+                    topics.iter().all(Value::is_string),
+                    "{name}: invalid topics"
+                );
+                if topics.iter().any(|t| t == topic) {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "organization resolution deadline reached"
+                    );
+                    let response = client
+                        .get(&format!("{API_ROOT}repos/{name}"), None)
+                        .with_context(|| format!("read midstream parent {name}"))?;
+                    ensure!(
+                        response.status == 200,
+                        "{name}: metadata returned {}",
+                        response.status
+                    );
+                    ensure!(
+                        response.body["full_name"]
+                            .as_str()
+                            .is_some_and(|v| v.eq_ignore_ascii_case(name)),
+                        "{name}: metadata identity changed"
+                    );
+                    if response.body["parent"].is_null() {
+                        // An explicit follow survives discovery exclusions.
+                        // Refuse the configuration rather than let that staged
+                        // repository reach the poll without no-merge protection.
+                        ensure!(
+                            !explicit.contains(&name.to_ascii_lowercase()),
+                            "{name}: followed midstream parent missing"
+                        );
+                        lines.push(format!(
+                            "repositories: refused {name}: midstream parent missing"
+                        ));
+                        reason = "midstream parent missing";
+                    } else {
+                        ensure!(
+                            response.body["fork"] == true,
+                            "{name}: origin fork has no GitHub fork parent"
+                        );
+                        let parent = response.body["parent"]["full_name"]
+                            .as_str()
+                            .with_context(|| format!("{name}: parent name missing"))?;
+                        validate_repository(parent)?;
+                        let base = response.body["parent"]["default_branch"]
+                            .as_str()
+                            .filter(|v| !v.trim().is_empty())
+                            .with_context(|| format!("{name}: parent default branch missing"))?;
+                        mappings.insert(
+                            name.to_ascii_lowercase(),
+                            (name.to_owned(), json!({"upstream":parent,"base":base})),
+                        );
+                        repos.push(name.to_owned());
+                        lines.push(format!("repositories: detail {name}: midstream (origin fork, topic {topic}), parent {parent}, base {base}"));
+                        continue;
+                    }
+                } else {
+                    reason = "fork without midstream topic";
+                }
+            } else {
+                owned += 1;
+                repos.push(name.to_owned());
+                lines.push(format!(
+                    "repositories: detail {name}: owned (origin is not fork)"
+                ));
+                continue;
+            }
+        }
+        excluded += 1;
+        lines.push(format!("repositories: detail {name}: excluded ({reason})"));
+    }
+    lines.push(format!(
+        "repositories: metadata {org}: {owned} owned, {} midstream, {excluded} excluded",
+        mappings.len()
+    ));
+    Ok((repos, mappings))
+}
+
+#[cfg(test)]
 fn listing(client: &impl Rest, org: &str, deadline: Instant) -> Result<Vec<String>> {
+    Ok(owned_listing(&inventory(client, org, deadline)?))
+}
+
+fn owned_listing(inventory: &[Value]) -> Vec<String> {
+    inventory
+        .iter()
+        .filter(|v| v["fork"] == false && v["archived"] == false && v["private"] == false)
+        .filter_map(|v| v["full_name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn inventory(client: &impl Rest, org: &str, deadline: Instant) -> Result<Vec<Value>> {
     let mut repos = BTreeMap::new();
     for page in 1..=PAGE_LIMIT {
         ensure!(
@@ -272,18 +598,8 @@ fn listing(client: &impl Rest, org: &str, deadline: Instant) -> Result<Vec<Strin
                     .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(org)),
                 "organization listing contains foreign repository {name}"
             );
-            let fork = value["fork"]
-                .as_bool()
-                .context("org repository missing fork")?;
-            let archived = value["archived"]
-                .as_bool()
-                .context("org repository missing archived")?;
-            let private = value["private"]
-                .as_bool()
-                .context("org repository missing private")?;
-            if !fork && !archived && !private {
-                repos.insert(name.to_ascii_lowercase(), name.to_owned());
-            }
+            classification(value)?;
+            repos.insert(name.to_ascii_lowercase(), value.clone());
         }
         if values.len() < PAGE_SIZE
             && !response
@@ -308,6 +624,294 @@ mod tests {
 
     // Recorded 2026-11-10, projected to the fields resolution uses.
     const RECORDING: &str = include_str!("../../../fixtures/pass/org-repositories.json");
+
+    #[test]
+    fn metadata_rules_and_explicit_overrides() {
+        for (case, origin, topics, archived, parent, explicit, included, promoted) in [
+            (
+                "owned",
+                "upstream",
+                json!([]),
+                false,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                "midstream",
+                "fork",
+                json!(["bot-midstream"]),
+                false,
+                true,
+                false,
+                true,
+                true,
+            ),
+            (
+                "unselected fork",
+                "fork",
+                json!([]),
+                false,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                "archived",
+                "fork",
+                json!(["bot-midstream"]),
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                "explicit override",
+                "fork",
+                json!(["bot-midstream"]),
+                false,
+                true,
+                true,
+                true,
+                true,
+            ),
+            (
+                "explicit excluded",
+                "fork",
+                json!([]),
+                false,
+                true,
+                true,
+                true,
+                false,
+            ),
+            (
+                "missing parent",
+                "fork",
+                json!(["bot-midstream"]),
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                "explicit missing parent",
+                "fork",
+                json!(["bot-midstream"]),
+                false,
+                false,
+                true,
+                false,
+                false,
+            ),
+            (
+                "mixed sources missing parent",
+                "fork",
+                json!(["bot-midstream"]),
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let repo = json!({"full_name":"team/repo", "fork":origin == "fork" && parent, "archived":archived,
+                "private":false,"custom_properties":{"origin":origin},"topics":topics});
+            let fixture = json!({"schema":"agent-board/pass-replay/v1","now":"2026-11-10T00:00:00Z", "requests":[
+                {"request":{"get":format!("{API_ROOT}orgs/team/repos?type=public&sort=full_name&per_page=100&page=1")},
+                 "answer":{"status":200,"body":[repo]}},
+                {"request":{"get":format!("{API_ROOT}repos/team/repo")},
+                 "answer":{"status":200,"body":{"full_name":"team/repo","fork":parent,
+                    "parent":if parent {json!({"full_name":"up/repo","default_branch":"trunk"})} else {Value::Null}}}}
+            ]});
+            let replay = Replay::from_json(&fixture).unwrap();
+            let recorder = crate::pass::Recorder::new(&replay);
+            let org = json!({"org":"team","forks":true});
+            let mut value = json!({"midstream":{"owner":"team","topic":"bot-midstream"},
+                "budget":{"harnessRepositories":[{"org":"team","forks":false}]},
+                "follow":[org],"workRepositories":[org],"pr":{"noMerge":[org]}});
+            if explicit {
+                value["follow"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("TEAM/repo"));
+                value["promote"] =
+                    json!({"forks":{"TEAM/repo":{"upstream":"other/repo","base":"stable"}}});
+            }
+            if case == "mixed sources missing parent" {
+                value["follow"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"org":"team","forks":false}));
+            }
+            if case == "missing parent" {
+                let mut config_value = value.clone();
+                config_value["operator"] = json!("operator");
+                config_value["bot"] = json!("bot");
+                config_value["dispatchRepo"] = json!("team/dispatch");
+                config_value["dispatchWorkflow"] = json!("dispatch.yml");
+                let config = crate::pass::Config::parse_sources(&config_value.to_string()).unwrap();
+                let resolved = config.resolve(&replay, &mut Vec::new()).unwrap().unwrap();
+                assert!(resolved.follow.is_empty());
+                assert!(resolved.work_repositories.is_empty());
+            }
+            let sources = Sources::take(&mut value).unwrap();
+            let mut lines = Vec::new();
+            if matches!(
+                case,
+                "explicit missing parent" | "mixed sources missing parent"
+            ) {
+                let error = sources
+                    .resolve(&mut value, &recorder, &mut lines)
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("followed midstream parent missing")
+                );
+                continue;
+            }
+            let resolved = sources
+                .resolve(&mut value, &recorder, &mut lines)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                value["follow"].as_array().unwrap().len(),
+                usize::from(included),
+                "{case}: {value}"
+            );
+            assert_eq!(
+                value["workRepositories"].as_array().unwrap().len(),
+                usize::from(included && !matches!(case, "explicit excluded")),
+                "{case}"
+            );
+            assert_eq!(
+                value["pr"]["noMerge"].as_array().unwrap().len(),
+                usize::from(promoted),
+                "{case}"
+            );
+            assert_eq!(resolved.len(), usize::from(promoted), "{case}");
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.starts_with("repositories: org ")
+                        || line.starts_with("repositories: /")),
+                "{lines:?}"
+            );
+            if promoted {
+                assert_eq!(
+                    value["promote"]["forks"],
+                    if explicit {
+                        json!({"TEAM/repo":{"upstream":"other/repo","base":"stable"}})
+                    } else {
+                        json!({"team/repo":{"upstream":"up/repo","base":"trunk"}})
+                    },
+                    "{case}"
+                );
+            }
+            if !parent {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("refused team/repo: midstream parent missing"))
+                );
+            }
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.starts_with("repositories: metadata"))
+                    .count(),
+                1
+            );
+            let recorded: Value =
+                serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap();
+            assert_eq!(
+                recorded["requests"].as_array().unwrap().len(),
+                1 + usize::from(
+                    origin == "fork" && topics == json!(["bot-midstream"]) && !archived
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_failures_refuse_configuration() {
+        for (status, body) in [
+            (403, json!({})),
+            (200, json!({"full_name":"other/repo","fork":true})),
+            (
+                200,
+                json!({"full_name":"team/repo","fork":true,"parent":{"full_name":"up/repo"}}),
+            ),
+        ] {
+            let fixture = json!({"schema":"agent-board/pass-replay/v1","now":"2026-11-10T00:00:00Z", "requests":[
+                {"request":{"get":format!("{API_ROOT}orgs/team/repos?type=public&sort=full_name&per_page=100&page=1")},
+                 "answer":{"status":200,"body":[{"full_name":"team/repo","fork":true,"archived":false,"private":false,
+                    "custom_properties":{"origin":"fork"},"topics":["bot-midstream"]}]}},
+                {"request":{"get":format!("{API_ROOT}repos/team/repo")},"answer":{"status":status,"body":body}}
+            ]});
+            let replay = Replay::from_json(&fixture).unwrap();
+            let mut value = json!({"midstream":{"owner":"team","topic":"bot-midstream"},"follow":[{"org":"team","forks":true}]});
+            let sources = Sources::take(&mut value).unwrap();
+            assert!(
+                sources
+                    .resolve(&mut value, &replay, &mut Vec::new())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_private_metadata_is_validated_before_classification() {
+        let repo = json!({"full_name":"team/repo","fork":true,"archived":false,"private":true,
+            "custom_properties":{"origin":"fork"},"topics":["bot-midstream"],
+            "parent":{"full_name":"up/repo","default_branch":"main"}});
+        let mut cases = vec![("valid".to_owned(), repo.clone(), true)];
+        for field in ["fork", "archived", "private", "custom_properties"] {
+            let mut missing = repo.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            cases.push((format!("missing {field}"), missing, false));
+            for invalid in [Value::Null, json!("false"), json!([])] {
+                let mut body = repo.clone();
+                body[field] = invalid;
+                cases.push((format!("invalid {field}: {}", body[field]), body, false));
+            }
+        }
+        for invalid in [Value::Null, json!(true), json!([])] {
+            let mut body = repo.clone();
+            body["custom_properties"]["origin"] = invalid;
+            cases.push(("invalid origin".to_owned(), body, false));
+        }
+        let mut missing_parent = repo.clone();
+        missing_parent.as_object_mut().unwrap().remove("parent");
+        cases.push(("missing parent".to_owned(), missing_parent, false));
+        let mut null_parent = repo.clone();
+        null_parent["parent"] = Value::Null;
+        cases.push(("null parent".to_owned(), null_parent, false));
+        for (case, body, valid) in cases {
+            let fixture = json!({"schema":"agent-board/pass-replay/v1","now":"2026-11-10T00:00:00Z", "requests":[
+                {"request":{"get":format!("{API_ROOT}orgs/team/repos?type=public&sort=full_name&per_page=100&page=1")},
+                 "answer":{"status":200,"body":[]}},
+                {"request":{"get":format!("{API_ROOT}repos/team/repo")},"answer":{"status":200,"body":body}}
+            ]});
+            let replay = Replay::from_json(&fixture).unwrap();
+            let mut value = json!({"midstream":{"owner":"team","topic":"bot-midstream"},
+                "follow":[{"org":"team","forks":true},"team/repo"]});
+            let sources = Sources::take(&mut value).unwrap();
+            let result = sources.resolve(&mut value, &replay, &mut Vec::new());
+            assert_eq!(result.is_ok(), valid, "{case}: {result:?}");
+            if valid {
+                assert_eq!(result.unwrap(), Some(vec!["team/repo".to_owned()]));
+                assert_eq!(value["pr"]["noMerge"], json!(["team/repo"]));
+                assert_eq!(value["workRepositories"], json!(["team/repo"]));
+            }
+        }
+    }
 
     #[test]
     fn public_discovery_keeps_issues_disabled_members_and_explicit_private_names() {
@@ -523,7 +1127,6 @@ mod tests {
     fn invalid_sources_fail_before_any_read() {
         for entry in [
             json!({"org":"../team","forks":false}),
-            json!({"org":"team","forks":true}),
             json!({"org":"team"}),
             json!({"org":"team","forks":false,"extra":true}),
             json!({"org":"team","forks":false,"visibility":"private"}),
