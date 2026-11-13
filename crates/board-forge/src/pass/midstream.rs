@@ -67,6 +67,25 @@ pub(super) fn routes(
     Ok(routes)
 }
 
+/// Resolve planning destinations through the same parent evidence as intake,
+/// independently of promotion overrides. Reads share the pass's request budget.
+pub(super) fn planning(
+    client: &impl Rest,
+    repositories: &[String],
+    work: &[String],
+    tracker: &str,
+) -> Result<String> {
+    let read = routes(client, repositories, tracker)?;
+    Ok(plan::project_work_brief(
+        tracker,
+        read.forks.iter().filter_map(|(upstream, fork)| {
+            work.iter()
+                .any(|r| r.eq_ignore_ascii_case(fork))
+                .then_some((upstream.as_str(), fork.as_str()))
+        }),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Midstream {
