@@ -2,44 +2,11 @@
 
 > This text is LLM generated.
 
-agent-board coordinates coding agents through a project board without depending
-on any one forge. The work is recorded in the board and its issues. agent-board
-decides what job each issue should get, starts it once through a pluggable
-dispatcher, and follows the pull requests that come back. GitHub is fully
-supported, Forgejo and GitLab boards are read-only.
+agent-board coordinates coding agents through a forge's project board, issues
+and pull requests. It is for people and agents managing coding work on the forge.
 
-**Documentation: <https://cgwalters-forge.github.io/agent-board/>**, built from
-[`docs/`](docs/) and [`site/`](site/).
+**Documentation: <https://cgwalters-forge.github.io/agent-board/>**
 
-## Install
-
-    cargo install --locked --git https://github.com/cgwalters-forge/agent-board agent-board
-
-With a repository checkout, try the first pass without a model or forge token:
-
-```sh
-agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json --max-dispatch 1 --max-writes 3 --max-status-changes 5
-```
-
-`pass: preview` means nothing is written or dispatched; the final counts are
-proposals based on recorded facts, not successful live operations. Follow
-[setup](docs/setup.md#try-it-offline) to check out the repository, run the rehearsal
-and understand its output, then [connect one lane](docs/setup.md#connect-one-lane)
-for the live prerequisites only the operator can complete. Leave writes and
-schedules off; the offline rehearsal does not verify a live deployment.
-
-## Run it locally
-
-From a trusted caller checkout's root, preview with `agent-board pass`: it reads
-`.github/pass.json`. Put reviewed bounds paths in `fixBounds` (relative to the
-config file) and caps in `maxDispatch`, `maxWrites` and `maxStatusChanges`;
-explicit flags override them. See [local defaults](docs/pass.md#local-configuration-defaults).
-For GitHub, credentials come from `GH_TOKEN`, then `GITHUB_TOKEN`,
-then your `gh auth login --hostname github.com` login; no token export is needed.
-`DISPATCH_TOKEN` is optional and defaults to the same credential. Preview does
-not write or start runs. Applying still requires the configured bot's identity
-and local caps from config or flags; see [setup](docs/setup.md#connect-one-lane).
-
-## License
+Read the same [documentation in this checkout](site/index.md) without the network.
 
 Apache-2.0 or MIT, at your option.

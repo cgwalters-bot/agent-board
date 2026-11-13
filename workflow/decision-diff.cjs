@@ -18,7 +18,7 @@ const path = require('node:path');
 
 const DEFAULT_CONFIG = 'fixtures/pass/config.json';
 const DEFAULT_RECORDING = 'fixtures/pass/board-2026-10-23.json';
-// The quickstart's caps (README): what the replay fixture's test expects.
+// The offline rehearsal's caps (docs/setup.md): what the replay fixture's test expects.
 const PASS_CAPS = ['--max-dispatch', '1', '--max-writes', '3', '--max-status-changes', '5'];
 // CI allows the rust job 20 minutes; a replay reads one file and sends nothing.
 const BUILD_TIMEOUT_MS = 20 * 60 * 1000;

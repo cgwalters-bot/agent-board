@@ -52,7 +52,7 @@ build-release:
 test-forgejo:
     cargo test --locked -p agent-board --test forgejo_live -- --ignored --nocapture
 
-# README's credential-free recorded pass; preview only, no live writes/dispatch.
+# Setup's credential-free recorded pass; preview only, no live writes/dispatch.
 replay:
     cargo run --locked -q -p agent-board -- pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json --max-dispatch 1 --max-writes 3 --max-status-changes 5
 
@@ -69,7 +69,7 @@ cli-docs:
 test-action-schema:
     node tests/operator-actions.cjs
 
-# The documentation site in site/, a rendering of docs/ and the README, as
+# The documentation site in site/, rendering docs/ under site/index.md, as
 # agentic-job's (its Justfile has the same recipes). Dependencies come from
 # the lock alone, without their install scripts. SITE_BASE, SITE_URL and
 # SITE_SOURCE_URL (site/astro.config.mjs) place it.

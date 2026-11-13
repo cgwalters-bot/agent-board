@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { LLM_NOTICE, firstHeading, headingAnchor, llmNotice, pageId, remarkRepositoryLinks, rewrite } from "./links.mjs";
 
 const opts = { base: "/agent-board/", source: "https://forge.example/o/r/blob/abc/" };
+
+test("README is a minimal documentation entry point", () => {
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  assert.equal(firstHeading(readme), "agent-board");
+  assert.equal(llmNotice(readme), "");
+  assert.match(readme, /https:\/\/cgwalters-forge\.github\.io\/agent-board\//);
+  assert.match(readme, /\[.+?\]\(site\/index\.md\)/);
+  assert.match(readme, /Apache-2\.0 or MIT, at your option\./);
+  assert.doesNotMatch(readme, /^##? (?!agent-board$)|^```|^ {4}\S/m);
+});
 
 test("rewrite", () => {
   for (const [url, from, want] of [
@@ -10,7 +21,7 @@ test("rewrite", () => {
     ["job-plans.md", "docs/epic-plans.md", "/agent-board/docs/job-plans/"],
     ["job-plans.md#batching", "docs/design.md", "/agent-board/docs/job-plans/#batching"],
     // The landing page is a page too; the README is not, and goes to the forge.
-    ["../README.md#install", "docs/job-plans.md", "https://forge.example/o/r/blob/abc/README.md#install"],
+    ["../README.md", "docs/job-plans.md", "https://forge.example/o/r/blob/abc/README.md"],
     ["docs/design.md#current-implementation-limits", "README.md", "/agent-board/docs/design/#current-implementation-limits"],
     ["../docs/job-plans.md", "site/index.md", "/agent-board/docs/job-plans/"],
     ["index.md", "site/index.md", "/agent-board/"],
