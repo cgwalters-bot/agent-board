@@ -244,6 +244,28 @@ for a while, not now.
 Why: a status someone has to remember to change goes stale, and a stale board
 misleads both the operator and the scheduler.
 
+## Project work
+
+Intake and triage file or re-plan work for one upstream project in that project's
+midstream fork, resolved from repository metadata, not in tracker. Reuse an
+existing fork issue before proposing a new one, and link it from the original
+tracking issue. Work spanning several projects, and controller/infrastructure
+work, stays in tracker; split out project-specific issues when needed.
+
+When the source is an upstream issue, the fork issue carries exactly one
+`Upstream: #N` line ([association handling](pass.md)).
+The repository comes from the fork's verified parent, never issue text. A source
+PR or project task without an upstream issue does not get a fabricated association.
+An implement plan posted on the fork issue uses that fork as `repo` and the fork
+issue number as `item`; it needs neither `issue_repo` nor `target_repo`.
+
+A fork with issues disabled retains the existing
+[staged-issue fallback](job-plans.md#issues-staged-outside-the-work-repository).
+If the run cannot file an issue within its checked output bounds, it proposes
+the repository, title and body for the controller instead of inventing a number
+or posting a single-fork implement plan against an unrelated tracker issue.
+Routing advice grants no additional write authority.
+
 ## One marker for the operator
 
 The `needs-human` label is the single marker that the operator must act. The
