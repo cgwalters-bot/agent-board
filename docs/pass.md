@@ -1861,6 +1861,22 @@ held board turning spare quota into a planning run per epic per pass. The
 caller is `cgwalters-forge/tracker`'s `.github/pass.json`; for example
 `"epics": {"heldPlanHours": 24}` beside its existing `epics` keys.
 
+Request-budget starvation can also leave ready children unread while the pass
+spends requests checking already-held candidates (#803). `readFreeHolds: true`
+(GitHub only, off by default) applies existing board-proven holds before reading
+assignment history: hold labels, board Blocked, open dependencies, trusted
+closing pull requests and known runs in flight. It uses this pass's facts, not
+a persistent hold cache, and keeps candidate priority, focus and cursor order.
+Incomplete labels or closing references take the normal read path. With
+`assignHolds`, `needs-human` still takes the normal migration/release path;
+an assignment alone is not a read-free hold because an operator reply may have
+released it. Assignment cleanup on an independently held candidate waits until
+that other hold clears. `skipActiveWork` still checks research before a run-only
+hold and counts trusted PR skips. File overlap still needs the accepted plan
+and is not inferred from board facts. No eligibility, start recheck, request/time
+reserve, WIP or spending cap changes. The external caller is
+`cgwalters-forge/tracker`, `.github/pass.json`, `readFreeHolds: true`.
+
 The opt-in supervisor [`plan_epic`](supervisor-requests.md#lines) action is an
 explicit exception: its executor's exact fixed marker comment, authored by the
 configured bot and unedited, newer than the epic's last planning request,
@@ -5095,6 +5111,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `triageReplans` | GitHub only: a triage that planned nothing is asked to plan again once its wait passes, changed inputs or not, at most this many times (0–10) in a row, after which an unchanged issue waits on the operator, see [scheduling](#scheduling); needs `triageFollowUpDays`; `0` (off) |
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, one refused for news since the verdict waiting as `needs-close`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
+| `readFreeHolds` | GitHub only: apply board-proven holds before assignment reads, leaving request budget for ready candidates; no cached holds or new eligibility; `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `replanInvalid` | GitHub only: request one replacement of an invalid bot-written job plan or unparseable epic plan before asking the operator; existing holds and start caps remain; `false` |
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |

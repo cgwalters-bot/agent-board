@@ -199,6 +199,7 @@
     "triageReplans": {"verdict": "refused", "reason": "the triage follow-up that asks again is only built for GitHub"},
     "triageClose": {"verdict": "native", "forgejo": "close with a comment naming the verdict; no close reason"},
     "assignHolds": {"verdict": "refused", "reason": "the operator's wait is read from GitHub's assignment timeline"},
+    "readFreeHolds": {"verdict": "refused", "reason": "board-proven holds before assignment reads are only built for GitHub"},
     "skipActiveWork": {"verdict": "refused", "reason": "active work suppression is only built for GitHub"},
     "idleReplan": {"verdict": "refused", "reason": "bounded idle epic replanning is only built for GitHub"},
     "replanInvalid": {"verdict": "refused", "reason": "invalid bot-plan recovery is only built for GitHub"},
