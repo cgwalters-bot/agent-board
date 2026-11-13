@@ -584,6 +584,79 @@ the option. No deployed caller configuration changes here. Caller activation:
 The supervisor's public epic-health census reports an explicit warning for these
 issues: it cannot infer machine progress from prose without the pass's ledger.
 
+## Midstream issue migration
+
+The threat is moving an issue out from under a job or retargeting it from
+untrusted issue prose. `agent-board migrate midstream-issues` is a standalone
+maintenance command, **not** a pass stage. Nothing invokes it automatically.
+It previews by default against the caller's existing pass configuration:
+
+```sh
+agent-board migrate midstream-issues --config .github/pass.json --max 10
+```
+
+Only the currently topic-admitted midstream forks are possible destinations.
+The existing organization resolver is reused; issue text cannot enroll a fork.
+Open issues in `dispatchRepo` must have exactly one item on the configured
+project. Whole `Target:`/`repo:` lines, `target:` labels, the accepted plan's
+`repo`/`target_repo`, and a known fork's title prefix contribute evidence.
+Unknown or conflicting evidence holds, rather than giving one source precedence.
+Epics, infrastructure/harness labels, operator decisions and the configured
+operator-ask exclusions hold. No prose/model classification is used.
+
+Each line identifies the source, destination (or `unresolved`), upstream
+association and refusal cause. Only `Upstream: #N` is accepted, using #949's
+parser and the validated fork parent for its repository. One distinct issue URL
+under that parent can supply a missing association; conflicting references hold.
+The migration never emits the old qualified `Upstream: OWNER/REPO#N` syntax.
+Disabled issues, archived destinations, inaccessible repositories and incomplete
+metadata hold; this command never enables issues or changes repository settings.
+
+Apply is an explicit operator maintenance operation, using the configured bot
+identity and a durable journal outside version control:
+
+```sh
+agent-board migrate midstream-issues --config .github/pass.json --apply --max 1 --state /path/to/migration.json
+```
+
+`--max` must be positive; preview defaults to one. Each transfer, including its
+optional source association edit, is one existing write-cap step. The entire
+command shares the pass's 650-request/15-minute envelope. Source content,
+accepted plan, admission and destination metadata are rechecked before writing.
+Any open PR or active Actions run in the source, destination or upstream parent
+holds all work for that repository. Open closing-reference or cross-referenced
+PRs in any repository also hold; incomplete reference reads fail closed.
+Accepted plans still naming the source identity hold until a reviewed replacement-plan
+handoff exists: moving their comments alone would leave scheduler identity checks stale.
+Run during a maintenance window with dispatch paused;
+these checks are not a distributed lock against another controller starting work.
+
+GitHub issue transfer preserves comments and redirects; no copy-and-close path
+exists. The stable issue node, exact board item/project identity, Priority value,
+parent and issue content are verified afterward. The new URL/number is recorded
+as the canonical identity, not assumed equal to the source number. A pending
+intent is synced before any forge write. A timeout is reconciled by node ID before
+any further transfer; a confirmed transfer is not resent. Failed preservation or
+unresolved results stop the run, leaving its intent for investigation. An unresolved
+intent still at the source is **not** automatically retried: inspect GitHub and
+resolve that entry before authorizing another attempt. Keep the journal for
+retries; do not delete it to work around a hold. An exclusive local journal lock
+prevents concurrent applies using the same state; a crashed run can leave a lock
+which also requires inspection before removal.
+
+`--record FILE` captures a read-only preview; `--replay FILE` repeats it without
+credentials. Both conflict with apply. Recordings contain issue/comment bodies:
+review them before publishing. Synthetic failure tests cover timeouts, refusal,
+stale sources, incomplete reads, cap exhaustion and changed destination numbers;
+they do not prove GitHub preserves board state in a live transfer.
+
+Rollout remains blocked on operator-enabled fork issues where disabled,
+admission of any missing work targets through the existing configuration process,
+a replacement-plan handoff for planned issues, a maintenance window, and a controlled transfer verifying real project/Priority/
+parent preservation. This change neither transfers live issues nor retires tracker
+staging. The `target_repo` staging contract remains necessary for issues-off forks.
+Part of [tracker#1599](https://github.com/cgwalters-forge/tracker/issues/1599).
+
 ## What is built
 
 The GitHub pass implements the configuration below and stages 1 to 5, except

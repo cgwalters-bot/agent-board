@@ -1,0 +1,17 @@
+{
+  "recorded": "2026-11-13; tracker issue title/label projections from gh issue list; synthetic mutations are identified separately",
+  "cases": [
+    {"source": "tracker#163", "title": "osbuild: bootc deployment mount that runs the target image's bootc", "body": "", "labels": ["target:osbuild", "P1"], "hold": "unadmitted"},
+    {"source": "tracker#384", "title": "work on https://github.com/bootc-dev/bootc/issues/2539", "body": "", "labels": ["P1", "target:other"], "hold": "unadmitted"},
+    {"source": "synthetic: prefix", "title": "bootc: repair regression", "body": "", "labels": [], "destination": "cgwalters-forge/bootc"},
+    {"source": "synthetic: target", "title": "repair regression", "body": "Target: bootc-dev/bootc", "labels": [], "destination": "cgwalters-forge/bootc"},
+    {"source": "synthetic: conflict", "title": "bootc: repair regression", "body": "Target: cgwalters-forge/ostree", "labels": [], "hold": "conflicting"},
+    {"source": "synthetic: epic", "title": "bootc: epic", "body": "", "labels": ["epic"], "hold": "excluded"},
+    {"source": "synthetic: mixed-case epic", "title": "bootc: epic", "body": "", "labels": ["Epic"], "hold": "excluded"},
+    {"source": "synthetic: mixed-case infrastructure", "title": "bootc: CI", "body": "", "labels": ["Infrastructure"], "hold": "excluded"},
+    {"source": "synthetic: mixed-case operator", "title": "bootc: choose policy", "body": "", "labels": ["Needs-Human"], "hold": "excluded"},
+    {"source": "synthetic: infrastructure", "title": "bootc: CI", "body": "", "labels": ["infrastructure"], "hold": "excluded"},
+    {"source": "synthetic: operator", "title": "bootc: choose policy", "body": "", "labels": ["operator-decision"], "hold": "excluded"},
+    {"source": "synthetic: unknown", "title": "repair regression", "body": "", "labels": [], "hold": "no structured"}
+  ]
+}

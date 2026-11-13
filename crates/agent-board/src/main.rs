@@ -17,6 +17,7 @@ mod intake;
 mod item;
 mod lease;
 mod live;
+mod migrate;
 mod org_status;
 mod overlap;
 mod pass;
@@ -84,6 +85,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Explicit migrations; preview by default, never a scheduled pass stage.
+    Migrate(migrate::Migrate),
     /// Report new Forgejo issues and comments; no bodies, routing or forge writes.
     Intake(intake::Intake),
     /// Validate proposed operator mutations; never execute them.
@@ -569,6 +572,7 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
     }
     match &cli.command {
         Command::Intake(args) => intake::run(args, &cli, &mut io::stdout().lock()),
+        Command::Migrate(args) => migrate::run(args, &mut io::stdout().lock()),
         Command::HelpMarkdown => {
             use clap::CommandFactory;
             io::stdout()

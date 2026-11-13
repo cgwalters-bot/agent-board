@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub(crate) mod cache;
+pub mod migrate;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
