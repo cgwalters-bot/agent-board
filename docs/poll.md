@@ -10,6 +10,54 @@ the caller's dispatch workflow ([dispatch](dispatch.md)).
 
 ## One pass
 
+### Declared PR dependencies (first slice of #936)
+
+The concrete failure prevented is spending review and recovery rounds on a head
+whose prerequisite has not landed. `pr.holdDependencies: true` in the pass (or
+`holdDependencies: true` in standalone poll configuration) enables one mechanism;
+it is off by default. It applies only to followed bot PRs with admitted harness
+heads, and writes only in the configured own space. No workflow, token permission,
+or caller configuration is changed here.
+
+The poll unions GitHub's native `blocked_by` relationships with body references
+following `Depends on: OWNER/REPO#N`, `Depends on #N`, `blocked by`, `waiting on`
+or `waiting for`. Canonical GitHub issue/PR URLs and repeated declarations work;
+references are sorted and deduplicated. Batching shares the dependency wording.
+At most ten distinct blockers are read (up to two REST reads each); native
+relationships must fit one page. Reads use the existing poll request budget and
+fresh responses. Missing/incomplete facts, malformed declarations and inaccessible
+relationships do not authorize readiness. A PR must merge; an issue must close
+with reason `completed`, not `not_planned`.
+
+An unmet dependency keeps the PR draft and labelled `blocked`, before draft
+review intake, fixes, rebases, continuations or queue admission. One bot-authored
+`agent-board-dependencies` comment is the durable marker, edited only when state
+changes, not a new comment every pass. The pass line and hold snapshot's machine
+step context name the blockers. A closed-unmerged PR or abandoned issue instead
+adds `needs-supervisor` and emits the existing person-wait snapshot with its cause.
+Human holds, requested operator review, incomplete labels and write caps remain
+gates. Existing stop labels are never removed.
+
+After a recorded hold clears, a fresh comparison must show that the head includes
+the default branch before the poll marks it ready. Otherwise it reserves and asks
+GitHub for one head-pinned REBASE update, keeping the draft; a later pass verifies
+the result before readiness triggers review. An ambiguous or conflicting update
+is not automatically retried and goes to `needs-supervisor`; a person can update
+the branch and remove that label. A released marker prevents the poll from
+promoting a later human-created draft again. Unfinished checkpoints, partial work
+and placeholder titles stay draft. A draft with no recorded dependency hold is
+not automatically promoted. Non-default bases currently require supervisor
+retargeting.
+
+Remaining #936 work: derived pin blockers and minimum-revision CI diagnostics,
+pin workflow starts, `depends_on` plan/dispatch plumbing, and automatic stacked
+retargeting. This is not the full dependency feature. For tracker deployment,
+update the pin and set `cgwalters-forge/tracker` `.github/pass.json` key
+`pr.holdDependencies` to `true` (and `.github/poll/agent-board.json` key
+`holdDependencies` to `true` if standalone poll is still used). Verify these in a
+read-only preview before applying. The controller skill is in the caller, not
+this checkout.
+
 ### Disposable REST responses (partial #794)
 
 The concrete threats are reusing one credential's private representation with

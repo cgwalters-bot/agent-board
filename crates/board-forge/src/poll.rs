@@ -25,6 +25,7 @@ pub(crate) mod action_first;
 pub mod approval;
 pub mod bounds;
 pub mod comments;
+mod dependencies;
 pub mod drafts;
 pub mod lock;
 pub mod notify;
@@ -553,6 +554,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "noMerge",
     "operatorPaths",
     "staleDays",
+    "holdDependencies",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -616,6 +618,9 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// Prevent recovery/review work on a PR with unmet body dependencies.
+    /// Off by default, bounded to ten distinct dependencies per PR.
+    pub hold_dependencies: bool,
     /// Prevent upstream/draft reads from starving ready own-space merges.
     /// Off by default; discovery and actions retain the poll's request bounds.
     pub action_first: bool,
@@ -1043,6 +1048,8 @@ pub const OPERATOR_PATHS_LIMIT: usize = 50;
 #[serde(rename_all = "camelCase")]
 pub struct PrOptions {
     #[serde(default)]
+    pub hold_dependencies: bool,
+    #[serde(default)]
     pub action_first: bool,
     #[serde(default)]
     pub check_reruns: bool,
@@ -1175,6 +1182,7 @@ impl PrOptions {
     /// Sets these in `policy`.
     pub fn apply(&self, policy: &mut PollPolicy) {
         let Self {
+            hold_dependencies,
             action_first,
             check_reruns,
             unstall,
@@ -1191,6 +1199,7 @@ impl PrOptions {
             operator_paths,
             stale_days,
         } = self.clone();
+        policy.hold_dependencies = hold_dependencies;
         policy.action_first = action_first;
         policy.check_reruns = check_reruns;
         policy.unstall = unstall;
@@ -1329,6 +1338,7 @@ impl PollPolicy {
             fix_plans: false,
             own_space_only: false,
             action_first: false,
+            hold_dependencies: false,
             fold_rounds: false,
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
@@ -4649,6 +4659,7 @@ impl Stepped {
     pub fn progress(&self) -> Progress {
         match self.action {
             "needs-human" => Progress::Person,
+            "blocked" => Progress::Waiting,
             "skip" | "wait" => match self.waiting {
                 WaitReason::Followed { .. } => Progress::Waiting,
                 WaitReason::Unreviewed => Progress::Unreviewed,
@@ -5581,6 +5592,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         review_run: Option<&Value>,
     ) -> Result<String> {
         let continuing = action == "continue";
+        if let Some(why) = self.dependency_work_hold(repo, pull)? {
+            return Ok(format!("not started: {why}"));
+        }
         let rebasing = action == "rebase";
         let pools = self
             .apply
@@ -5856,6 +5870,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let number = pull["number"]
             .as_u64()
             .context("pull request has no number")?;
+        if !matches!(decision.action, "skip" | "wait" | "refund" | "needs-human")
+            && let Some(why) = self.dependency_work_hold(repo, pull)?
+        {
+            return Ok(Some(format!("not taken: {why}")));
+        }
         let id = pull["id"]
             .as_str()
             .filter(|id| !id.is_empty())
@@ -6034,6 +6053,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// a pass for each base; the new head waits for its review. `not` starts
     /// the line of one that waits for another pass.
     fn update(&mut self, repo: &str, pull: &Value, not: &str) -> Result<String> {
+        if let Some(why) = self.dependency_work_hold(repo, pull)? {
+            return Ok(format!("{not}{why}"));
+        }
         let id = text(pull, "/id");
         ensure!(!id.is_empty(), "pull request has no id");
         let head = text(pull, "/headRefOid");
@@ -6675,7 +6697,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         let before = self.writes;
         let (repo, pull) = (review.repo.as_str(), &review.pull);
-        if ordinary_reviews(self.config, repo) {
+        if ordinary_reviews(self.config, repo) || self.config.policy.hold_dependencies {
             let (owner, name) = repo.split_once('/').context("review repository")?;
             let current = self.read_pull(owner, name, review.number)?;
             if current["state"] != "OPEN"
@@ -6689,6 +6711,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     Some("not started: pull request changed or is held".into()),
                     false,
                 ));
+            }
+            if let Some(why) = self.dependency_work_hold(repo, &current)? {
+                return Ok((Some(format!("not started: {why}")), false));
             }
         }
         let done = match &self.apply {
@@ -7925,6 +7950,20 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             && let Some(reason) = review_hold(self.config, &pull)
         {
             return Ok(self.person_skip(repo, number, merge_only, &pull, reason));
+        }
+        if self.config.policy.hold_dependencies
+            && !is_harness(&pull, self.config)
+            && let Some(why) = self.dependency_work_hold(repo, &pull)?
+        {
+            return Ok((format!("{repo}#{number} blocked: {why}"), false, None, None));
+        }
+        if self.config.policy.hold_dependencies
+            && is_harness(&pull, self.config)
+            && !is_held(&pull)
+            && !labelled(&pull)
+            && let Some(result) = self.dependency_hold(repo, number, &pull, &comments)?
+        {
+            return Ok(result);
         }
         if drafts::eligible(self.config, repo, &pull) {
             return self.draft_review(repo, &mut pull, &comments, &marker, intake);
@@ -9335,6 +9374,12 @@ pub(crate) fn planned_fix_control<R: Rest, G: Transport>(
     let mut pass = Pass::new(rest, graphql, config, now);
     pass.followed = follow.iter().map(|r| r.to_ascii_lowercase()).collect();
     let (owner, name) = repo.split_once('/').ok_or("its repository has no owner")?;
+    if let Some(why) = pass
+        .dependency_work_hold(repo, pull)
+        .map_err(|e| format!("dependency admission could not be read: {e:#}"))?
+    {
+        return Err(why);
+    }
     if config.policy.owner_branches {
         let cross = pull["isCrossRepository"].as_bool().unwrap_or(false);
         let own =
@@ -9454,6 +9499,13 @@ pub(crate) fn planned_fix_hold<R: Rest, G: Transport>(
     now: OffsetDateTime,
 ) -> Result<Option<String>> {
     let mut pass = Pass::new(rest, graphql, config, now);
+    if config.policy.hold_dependencies {
+        let (owner, name) = repo.split_once('/').context("repository")?;
+        let pull = pass.read_pull(owner, name, number)?;
+        if let Some(why) = pass.dependency_work_hold(repo, &pull)? {
+            return Ok(Some(why));
+        }
+    }
     let read = pass.paged(
         &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
         true,
@@ -9477,6 +9529,13 @@ pub(crate) fn charge_planned_fix<R: Rest, G: Transport>(
     now: OffsetDateTime,
 ) -> Result<std::result::Result<PlannedCharge, String>> {
     let mut pass = Pass::new(rest, graphql, config, now);
+    if config.policy.hold_dependencies {
+        let (owner, name) = repo.split_once('/').context("repository")?;
+        let pull = pass.read_pull(owner, name, number)?;
+        if let Some(why) = pass.dependency_work_hold(repo, &pull)? {
+            return Ok(Err(why));
+        }
+    }
     let user = pass.get("user")?;
     if text(&user, "/login") != config.bot {
         return Ok(Err(format!(
@@ -9546,6 +9605,7 @@ mod tests {
 
     include!("poll/reviews_tests.rs");
     include!("poll/drafts_tests.rs");
+    include!("poll/dependencies_tests.rs");
     include!("poll/report_tests.rs");
 
     /// A marker as a pass with the default attribution posts it.
@@ -12796,6 +12856,7 @@ mod tests {
         /// on, if one does.
         hold_after: Option<usize>,
         late_review_requests: Option<Value>,
+        late_pull_fields: Option<Value>,
         pull_reads: RefCell<usize>,
         /// The `mergeQueue` the report's query gives, null for a read that
         /// fails; none gives a repository without a merge queue.
@@ -12992,6 +13053,13 @@ mod tests {
                 && let Some(requests) = &self.late_review_requests
             {
                 pull["reviewRequests"] = requests.clone();
+            }
+            if *self.pull_reads.borrow() > 1
+                && let Some(fields) = self.late_pull_fields.as_ref().and_then(Value::as_object)
+            {
+                for (key, value) in fields {
+                    pull[key] = value.clone();
+                }
             }
             Ok(json!({"repository": {"pullRequest": pull}}))
         }

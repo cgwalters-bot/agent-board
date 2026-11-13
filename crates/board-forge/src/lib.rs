@@ -13,6 +13,7 @@ pub mod changes;
 pub mod ci_health;
 pub mod cost;
 pub mod decisions;
+pub mod dependencies;
 pub mod dispatch;
 pub mod epic;
 pub mod epic_apply;

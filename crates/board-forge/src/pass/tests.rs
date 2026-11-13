@@ -16275,7 +16275,7 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         poll::bounds::FixBoundsSet::new(vec![poll::bounds::FixBounds::parse(&text).unwrap()])
     };
     let brief = format!("Rebase it onto main. {NO_UPSTREAM_COMMENT}");
-    let pull = json!({"state": "OPEN", "isCrossRepository": true, "headRefName": "bot/rebase-erofs",
+    let pull = json!({"number": 429, "body": "", "state": "OPEN", "isCrossRepository": true, "headRefName": "bot/rebase-erofs",
         "headRefOid": HEAD, "author": {"login": "cgwalters-bot"}, "headRepositoryOwner": {"login": "cgwalters-forge"},
         "headRepository": {"nameWithOwner": CONTROL},
         "labels": {"nodes": [{"name": "rebase"}], "pageInfo": {"hasNextPage": false}}});
@@ -16322,6 +16322,8 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         ("a head outside headOwners", true, Some(UPSTREAM), &brief, edit(json!({"headRepositoryOwner": {"login": "visitor"}})), (vec![], 0),
             held("it is not cgwalters-bot's pull request from a head it may push to")),
         ("held", true, Some(UPSTREAM), &brief, edit(labelled("Hold")), (vec![], 0), held("it is labelled hold")),
+        ("dependency held", true, Some(UPSTREAM), &brief,
+            edit(json!({"body": "Depends on other/repo#12"})), (vec![], 0), held("blocked by other/repo#12")),
         ("needs-human", true, Some(UPSTREAM), &brief, edit(labelled("needs-human")), (vec![], 0), held("it is labelled needs-human")),
         // Admitted, then labelled before the start's first write.
         ("held at the recheck", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), held("it is labelled hold")),
@@ -16377,6 +16379,7 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
     for (name, on, repo, brief, read, (markers, round), expected) in cases {
         let mut config = config(json!({"wip": 5, "pr": {"headOwners": ["cgwalters-forge"]}}));
         config.fix_plans = on;
+        config.pr.poll.hold_dependencies = name == "dependency held";
         config.follow = vec![UPSTREAM.into(), CONTROL.into()];
         config.pr.poll.owner_branches = name == "ownerBranches missing";
         config.pr.poll.own_space_only = name.starts_with("ownSpaceOnly");
@@ -16384,6 +16387,24 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
             config.fix_bounds = bounds(repo);
         }
         let mut forge = Forge::new(None, false);
+        if name == "dependency held" {
+            for (path, body) in [
+                (
+                    format!("repos/{UPSTREAM}/issues/429/dependencies/blocked_by?per_page=11"),
+                    json!([]),
+                ),
+                (
+                    "repos/other/repo/issues/12".into(),
+                    json!({"number":12,"state":"open"}),
+                ),
+            ] {
+                forge
+                    .replay
+                    .requests
+                    .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+                    "answer": {"status":200,"link":null,"body":body}}));
+            }
+        }
         forge
             .replay
             .requests
@@ -16635,6 +16656,12 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         );
         if !expected.starts_with("start ") {
             assert!(forge.dispatches().is_empty(), "{name}");
+            if name == "dependency held" {
+                assert!(
+                    forge.comments_on(CONTROL, 70).is_empty(),
+                    "charged a held dependency"
+                );
+            }
             assert!(
                 forge.comments_on(UPSTREAM, 429).is_empty(),
                 "{name}: charged"
