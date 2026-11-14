@@ -52,6 +52,9 @@ struct Forge {
     labeled: bool,
     milestoned: bool,
     missing_metadata: &'static str,
+    assignable: Option<Value>,
+    assignable_during_preflight: bool,
+    metadata_reads: Cell<usize>,
     edit_during_preflight: bool,
     linked: bool,
     cross_reference: bool,
@@ -183,10 +186,19 @@ impl Transport for Forge {
             );
         }
         if query == DESTINATION {
+            self.metadata_reads.set(self.metadata_reads.get() + 1);
+            let assignable = if !self.assignable_during_preflight || self.metadata_reads.get() > 1 {
+                self.assignable.clone()
+            } else {
+                None
+            };
             return Ok(json!({"repository":{
                 "nameWithOwner":format!("{}/{}", variables["owner"].as_str().unwrap(), variables["name"].as_str().unwrap()),
                 "labels":{"nodes":if self.missing_metadata == "labels" {vec![]} else {vec![json!({"name":"migration: retained"})]},"pageInfo":{"hasNextPage":false}},
-                "milestones":{"nodes":if self.missing_metadata == "milestone" {vec![]} else {vec![json!({"title":"Next","dueOn":null})]},"pageInfo":{"hasNextPage":false}}
+                "milestones":{"nodes":if self.missing_metadata == "milestone" {vec![]} else {vec![json!({"title":"Next","dueOn":null})]},"pageInfo":{"hasNextPage":false}},
+                "assignableUsers":if variables["assigned"] == true {
+                    assignable.unwrap_or_else(|| json!({"nodes":[{"id":"user-2"},{"id":"user-1"}],"pageInfo":{"hasNextPage":false}}))
+                } else { Value::Null }
             }}));
         }
         if query == TRANSFER {
@@ -327,6 +339,91 @@ impl Transport for Forge {
         board["__typename"] = json!("ProjectV2Item");
         board["content"] = json!({"id":node["id"]});
         Ok(json!({"node":node, "board":board}))
+    }
+}
+
+#[test]
+fn destination_assignee_eligibility_is_required_before_intent() {
+    for assignable in [
+        Value::Null,
+        json!({"nodes":[],"pageInfo":{"hasNextPage":false}}),
+        json!({"nodes":[{"id":"user-1"}],"pageInfo":{"hasNextPage":false}}),
+        json!({"nodes":[{"id":"user-1"},{"id":"user-2"}],"pageInfo":{"hasNextPage":true}}),
+        json!({"nodes":[{"id":null}],"pageInfo":{"hasNextPage":false}}),
+        json!({"nodes":[{"id":"user-1"},{"id":"user-2"}]}),
+    ] {
+        for (apply, late) in [(false, false), (true, false), (true, true)] {
+            let forge = Forge {
+                assignable: Some(assignable.clone()),
+                assignable_during_preflight: late,
+                ..Forge::default()
+            };
+            let mut journal = Journal::default();
+            let mut lines = Vec::new();
+            let result = run(
+                &forge,
+                &config(),
+                apply,
+                1,
+                &mut journal,
+                |saved| {
+                    assert!(saved.receipts.is_empty(), "must not save transfer intent");
+                    Ok(())
+                },
+                |line| {
+                    lines.push(line);
+                    Ok(())
+                },
+            );
+            let diagnostic = if late {
+                format!("{:#}", result.unwrap_err())
+            } else {
+                result.unwrap();
+                assert!(lines.iter().any(|line| line.starts_with("hold ")));
+                lines.join("\n")
+            };
+            assert!(
+                diagnostic.contains("assignableUsers")
+                    || diagnostic.contains("cannot retain source assignees")
+                    || diagnostic.contains("missing id"),
+                "{assignable}, apply={apply}, late={late}: {diagnostic}"
+            );
+            assert!(journal.receipts.is_empty());
+            assert_eq!(forge.transfers.get(), 0);
+            assert_eq!(forge.metadata_reads.get(), if late { 2 } else { 1 });
+        }
+    }
+}
+
+#[test]
+fn unassigned_issues_need_no_destination_assignee_evidence() {
+    for apply in [false, true] {
+        let forge = Forge {
+            assignees: Some(json!({"nodes":[],"pageInfo":{"hasNextPage":false}})),
+            assignable: Some(Value::Null),
+            ..Forge::default()
+        };
+        let mut journal = Journal::default();
+        let mut lines = Vec::new();
+        run(
+            &forge,
+            &config(),
+            apply,
+            1,
+            &mut journal,
+            |_| Ok(()),
+            |line| {
+                lines.push(line);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(lines.iter().any(|line| line.starts_with(if apply {
+            "transferred "
+        } else {
+            "preview "
+        })));
+        assert_eq!(forge.transfers.get(), usize::from(apply));
     }
 }
 

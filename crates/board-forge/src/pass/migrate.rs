@@ -45,11 +45,12 @@ const SNAPSHOT: &str = r#"query MigrationIssue($id:ID!, $item:ID!) {
 const TRANSFER: &str = r#"mutation MigrationTransfer($issue:ID!, $repository:ID!) {
   transferIssue(input:{issueId:$issue,repositoryId:$repository}) { issue { id number url } }
 }"#;
-const DESTINATION: &str = r#"query MigrationMetadata($owner:String!, $name:String!) {
+const DESTINATION: &str = r#"query MigrationMetadata($owner:String!, $name:String!, $assigned:Boolean!) {
   repository(owner:$owner, name:$name) {
     nameWithOwner
     labels(first:100) { nodes { name } pageInfo { hasNextPage } }
     milestones(first:100) { nodes { title dueOn } pageInfo { hasNextPage } }
+    assignableUsers(first:100) @include(if:$assigned) { nodes { id } pageInfo { hasNextPage } }
   }
 }"#;
 
@@ -358,7 +359,10 @@ fn compatible_metadata(client: &impl Transport, before: &Before, fork: &Fork) ->
         .repository
         .split_once('/')
         .context("invalid fork name")?;
-    let data = client.graphql(DESTINATION, json!({"owner":owner,"name":name}))?;
+    let data = client.graphql(
+        DESTINATION,
+        json!({"owner":owner,"name":name,"assigned":!before.assignees.is_empty()}),
+    )?;
     ensure!(
         data.get("errors").is_none(),
         "destination metadata GraphQL errors"
@@ -387,6 +391,21 @@ fn compatible_metadata(client: &impl Transport, before: &Before, fork: &Fork) ->
         ensure!(
             milestones.contains(&before.milestone),
             "destination missing matching milestone title and due date"
+        );
+    }
+    // Detect known ownership loss before transfer, not only in its readback.
+    // Unassigned issues need no destination eligibility evidence.
+    if !before.assignees.is_empty() {
+        let assignable = connection(repository, "assignableUsers")?
+            .iter()
+            .map(|user| required(user, "id"))
+            .collect::<Result<BTreeSet<_>>>()?;
+        ensure!(
+            before
+                .assignees
+                .iter()
+                .all(|id| assignable.contains(id.as_str())),
+            "destination cannot retain source assignees"
         );
     }
     Ok(())
