@@ -626,6 +626,47 @@ killed outright still leaves its IDs in the log. The threats these bounds stop
 are stage credentials reaching production and deletion of resources this run
 did not create.
 
+#### Opt-in model-free Actions task
+
+The threat is executing arbitrary caller or task code with stage administration
+credentials. The optional `"actions": true` in the trusted deploy JSON instead
+installs only the compiled-in [`stage-smoke-task.yml`](../live/stage-smoke-task.yml)
+in the fresh, private scratch repository. It dispatches that workflow once using
+the normal dispatch request. The job checks out no code, uses no external action,
+receives no stage token and runs no agent or model: only its own repository's
+`GITHUB_TOKEN`, with Issues write, comments on and closes the scratch issue. Input
+values go through environment variables, not shell interpolation. Omitted or
+`false` keeps the existing fake engine; `--apply` and ready preflight reads are
+still required. A fixture or preflight never installs or dispatches a workflow.
+
+This mode requires Contents and Workflows write to install the workflow, Actions
+write to dispatch/read its run, and organization Actions policy admitting a
+GitHub-hosted runner. These are additional stage-only capabilities, not production
+reporting authority. Nothing provisions credentials or changes organization
+policy. Keep the enclosing `stage-deploy` environment default-branch restricted;
+reports remain artifacts in the stage repository, not production issue writes.
+
+The runner reserves at most 10 writes before cleanup, including the workflow's
+two issue writes even if dispatch fails ambiguously. It refuses to retry a
+dispatch, including the dispatch interface's compatibility fallback, so it
+first reads the installed workflow at most 12 times, five seconds apart, until
+Actions reports it registered and active. It polls the returned run ID at most
+40 times, five seconds apart, checking the overall deadline before each read;
+a run not yet readable counts against those polls. The repository, installed commit, workflow path and
+dispatch event must match, and the run must finish successfully. Only then does
+it independently read the exact result comment and completed issue; it never
+substitutes local result writes. It records the run ID and installed commit in
+the report before waiting. Cleanup still follows failure or cancellation using
+the original creation receipts. A killed process can still leave resources;
+use the logged receipts, not prefix sweeping.
+
+This is an Actions-backed **task**, not an installed pass scheduler or the
+agentic-job dispatch/review/apply system. The report explicitly records that
+limitation and the README setup's copied dispatch/review caller workflows.
+No green live report or installed recurrence is claimed. For #282 the reasonable
+engineering choice is model-free execution and stage-local artifact reporting;
+inference admission/budget and production reporting are not needed for this slice.
+
 The `agent-board.deploy-smoke.v1` report adds `writes` (cleanup included) and a
 `smoke` object with `steps` (`ok`, `failed` or `cancelled`), `receipts`, `cleanup`
 (`deleted` or `failed`) and `leftovers`. Remove leftovers by hand using
@@ -649,8 +690,10 @@ decisions:
 1. Choose the staging repository (owner `cgwalters-forge-stage`) and commit a
    trusted `.github/agent-board/stage-deploy.json` to its protected default
    branch, in the shape of [the fixture](../fixtures/deploy-config.json), with
-   reviewed values. Its `workflow` is only named to the fake engine and checked
-   to exist: `stage-deploy.yml` itself will do.
+    reviewed values. Its `workflow` is checked to exist and named to the default
+    fake engine: `stage-deploy.yml` itself will do. With `actions: true`, the
+    task workflow is instead installed in the scratch repository as described
+    above; the configured workflow remains a preflight prerequisite.
 2. Copy `live/stage-deploy.yml` to that repository's `.github/workflows/`, and
    allow the pinned `actions/checkout` and `actions/upload-artifact`.
 3. Create environment `stage-deploy` with a deployment branch restriction to the

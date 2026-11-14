@@ -1,0 +1,34 @@
+# Embedded by test deploy: installed only in the fresh, private scratch repository.
+# No checkout, stage credential, external action, agent or inference.
+name: model-free stage task
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        required: true
+      item:
+        required: true
+      kind:
+        required: true
+      task:
+        required: true
+permissions: {}
+jobs:
+  task:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 2
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY: ${{ inputs.repo }}
+          ITEM: ${{ inputs.item }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ $EXPECTED_REPOSITORY == "$REPOSITORY" && $ITEM =~ ^[1-9][0-9]*$ ]]
+          gh api --method POST "repos/$REPOSITORY/issues/$ITEM/comments" -f body="agent-board Actions smoke result: run $RUN_ID"
+          gh api --method PATCH "repos/$REPOSITORY/issues/$ITEM" -f state=closed -f state_reason=completed

@@ -1310,7 +1310,7 @@ Options:
 
 - `--config <FILE>`: Trusted default-branch deployment configuration (never dispatcher input)
 - `--fixture <FILE>`: Offline JSON array of the four GraphQL responses; no credentials or network
-- `--apply`: After a ready preflight, run the smoke path (writes): a fresh scratch repository and project, one fake-engine task, its result and derived Status, then cleanup by creation receipt
+- `--apply`: After a ready preflight, run the configured smoke engine (writes), then cleanup by creation receipt
 
 ## agent-board test project
 

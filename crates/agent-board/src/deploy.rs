@@ -28,7 +28,7 @@ pub struct Options {
     /// Offline JSON array of the four GraphQL responses; no credentials or network.
     #[arg(long, value_name = "FILE")]
     fixture: Option<PathBuf>,
-    /// After a ready preflight, run the smoke path (writes): a fresh scratch repository and project, one fake-engine task, its result and derived Status, then cleanup by creation receipt.
+    /// After a ready preflight, run the configured smoke engine (writes), then cleanup by creation receipt.
     #[arg(long, conflicts_with = "fixture")]
     apply: bool,
 }
@@ -44,6 +44,9 @@ struct Config {
     workflow_revision: String,
     agent_board_revision: String,
     environment: String,
+    /// Model-free Actions in the scratch repository, never an agent caller.
+    #[serde(default)]
+    actions: bool,
 }
 
 impl Config {
