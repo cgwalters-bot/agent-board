@@ -787,6 +787,11 @@ pending first transfer blocks the second candidate until preservation is verifie
 reconciliation never resends the first transfer. Preview can report reconciliation
 without saving it or transferring the next candidate. Apply saves the reconciled
 canonical identity before advancing, and only new transfers consume `--max`.
+If that reconciliation save fails, the command stops before the next transfer.
+The regression matrix also rejects this save on two successive process restarts:
+the durable pending bytes remain unchanged and no new transfer occurs until saving
+succeeds. A `reconciled` output line reports readback, not proof that
+the subsequent journal save succeeded; retain the journal and check the exit status.
 
 Rollout remains blocked on operator-enabled fork issues where disabled,
 admission of any missing work targets through the existing configuration process,
