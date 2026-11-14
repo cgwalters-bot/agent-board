@@ -605,16 +605,134 @@ fn read_follows_running_checks_and_reads_nothing_once_they_settle() {
         read(&fake, &scope(), &mut state, now).unwrap().summary(),
         "changes: 0 items in 0 of 1 repositories; 1 requests, 1 revalidated\n"
     );
-    // A still-running head stays pending without being a change, and one
-    // whose checks went away is dropped.
-    for (commits, left) in [(running, 1), (json!({"nodes": []}), 0)] {
-        fake.graphql.borrow_mut().push(
-            json!({"repository": {"i0": node("PullRequest", 2, json!({"commits": commits}))}}),
-        );
+    // A still-running head or absent rollup stays pending without being a
+    // change. Closing the PR releases its slot even without a check result.
+    for (fields, left) in [
+        (json!({"commits": running}), 1),
+        (json!({}), 1),
+        (json!({"state": "CLOSED"}), 0),
+    ] {
+        fake.graphql
+            .borrow_mut()
+            .push(json!({"repository": {"i0": node("PullRequest", 2, fields)}}));
         state.pending.insert("example/project#2".to_owned());
         let diff = read(&fake, &scope(), &mut state, now).unwrap();
         assert!(diff.repositories[0].items.is_empty());
         assert_eq!(state.pending.len(), left);
+    }
+}
+
+#[test]
+fn late_check_registration_survives_commit_and_an_empty_update_list() {
+    for result in ["SUCCESS", "FAILURE"] {
+        let now = parse_time("2026-11-11T16:00:00Z").unwrap();
+        let mut fake = Fake::default();
+        fake.gets.insert(
+            list_url("2026-11-11T13:55:00Z"),
+            json!({"body": listing(&[2])}),
+        );
+        fake.graphql.borrow_mut().push(json!({"repository": {
+            "i0": node("PullRequest", 2, json!({"timelineItems": events(vec![
+                json!({"__typename": "PullRequestCommit", "commit": {
+                    "abbreviatedOid": "abc1234", "committedDate": IN
+                }})
+            ])}))
+        }}));
+        let mut state = state_since(SINCE);
+        let diff = read(&fake, &scope(), &mut state, now).unwrap();
+        let item = &diff.repositories[0].items[0];
+        assert_eq!(item.changes, [Change::Pushed].into());
+        assert!(item.checks.is_none());
+        assert_eq!(state.pending, [format!("{REPO}#2")].into());
+        diff.commit(&mut state);
+        state = State::from_json(&state.to_json().unwrap()).unwrap();
+        assert_eq!(state.pending, [format!("{REPO}#2")].into());
+
+        fake.gets.insert(
+            list_url("2026-11-11T15:55:00Z"),
+            json!({"etag": "empty", "body": []}),
+        );
+        // CI has not registered yet. The PR is no longer listed, but remains
+        // discoverable; committing a quiet read must not forget it.
+        fake.graphql.borrow_mut().push(json!({"repository": {
+            "i0": node("PullRequest", 2, json!({"updatedAt": BEFORE}))
+        }}));
+        let diff = read(&fake, &scope(), &mut state, now).unwrap();
+        assert_eq!(diff.requests, 2);
+        assert!(diff.repositories[0].items.is_empty());
+        diff.commit(&mut state);
+        assert_eq!(state.pending, [format!("{REPO}#2")].into());
+
+        // The first registered checks can already be settled. They do not
+        // bump updatedAt, and remain a change on repeated uncommitted reads.
+        for commit in [false, true] {
+            fake.graphql.borrow_mut().push(json!({"repository": {
+                "i0": node("PullRequest", 2, json!({"updatedAt": BEFORE,
+                    "commits": {"nodes": [{"commit": {
+                        "statusCheckRollup": {"state": result}
+                    }}]}}))
+            }}));
+            let diff = read(&fake, &scope(), &mut state, now).unwrap();
+            assert_eq!((diff.requests, diff.revalidated), (2, 1));
+            let item = &diff.repositories[0].items[0];
+            assert_eq!(item.changes, [Change::Checked].into());
+            assert_eq!(item.checks.as_deref(), Some(result));
+            assert_eq!(state.pending, [format!("{REPO}#2")].into());
+            if commit {
+                diff.commit(&mut state);
+            }
+        }
+        // Acknowledgement releases the slot and returns to list-only reads.
+        assert!(state.pending.is_empty());
+        let diff = read(&fake, &scope(), &mut state, now).unwrap();
+        assert_eq!((diff.requests, diff.revalidated), (1, 1));
+        assert!(diff.repositories[0].items.is_empty());
+    }
+}
+
+#[test]
+fn absent_checks_share_the_existing_pending_bound() {
+    let now = parse_time("2026-11-11T16:00:00Z").unwrap();
+    for (kind, count, enrolled) in [
+        ("PullRequest", PENDING_LIMIT - 1, true),
+        ("PullRequest", PENDING_LIMIT, false),
+        ("Issue", PENDING_LIMIT - 1, false),
+    ] {
+        let fake = Fake {
+            gets: BTreeMap::from([(
+                list_url("2026-11-11T13:55:00Z"),
+                json!({"body": listing(&[2])}),
+            )]),
+            ..Fake::default()
+        };
+        let mut state = state_since(SINCE);
+        let numbers: Vec<_> = std::iter::once(2).chain(10..10 + count as u64).collect();
+        state.pending = numbers[1..].iter().map(|n| format!("{REPO}#{n}")).collect();
+        for batch in numbers.chunks(DETAIL_BATCH) {
+            let nodes: serde_json::Map<_, _> = batch
+                .iter()
+                .enumerate()
+                .map(|(k, n)| {
+                    let value = if *n == 2 {
+                        node(kind, *n, json!({}))
+                    } else {
+                        node(
+                            "PullRequest",
+                            *n,
+                            json!({"commits": {"nodes": [{"commit": {
+                                "statusCheckRollup": {"state": "PENDING"}
+                            }}]}}),
+                        )
+                    };
+                    (format!("i{k}"), value)
+                })
+                .collect();
+            fake.graphql.borrow_mut().push(json!({"repository": nodes}));
+        }
+        let diff = read(&fake, &scope(), &mut state, now).unwrap();
+        assert_eq!(diff.requests, 1 + numbers.len().div_ceil(DETAIL_BATCH));
+        assert_eq!(state.pending.contains(&format!("{REPO}#2")), enrolled);
+        assert_eq!(state.pending.len(), count + usize::from(enrolled));
     }
 }
 

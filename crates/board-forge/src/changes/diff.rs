@@ -21,8 +21,9 @@
 //! labelled; comments, the operator's flagged; reviews; pushes, and the check
 //! state of an open pull request's head; sub-issue and parent links; project
 //! membership and Status changes. A pull request whose head checks were
-//! still running is read again on later runs until they settle, so that
-//! their result is a change too, although it bumps nothing GitHub lists. An
+//! still running or have not registered is read again on later runs until
+//! they settle, so that their result is a change too, although it bumps
+//! nothing GitHub lists. An
 //! item whose update the timeline does not explain is still listed, as
 //! `updated`. Nothing else is read: a Project field change alone, which
 //! does not update the item, does not surface it.
@@ -68,7 +69,7 @@ pub const DETAIL_BATCH: usize = 25;
 /// The summary's longest form: a header, then a line per changed repository.
 pub const SUMMARY_LINES: usize = 20;
 /// The most pull requests whose checks are followed until they settle; one
-/// past it is reported with its running checks and not followed.
+/// past it is reported with its current checks and not followed.
 pub const PENDING_LIMIT: usize = 100;
 /// The organization's custom property that marks a fork as the bot's.
 const ORIGIN_PROPERTY: &str = "origin";
@@ -192,7 +193,7 @@ pub struct State {
     #[serde(default)]
     pub repositories: BTreeMap<String, Watermark>,
     /// Open pull requests (`owner/repo#N`, lower case) whose head checks
-    /// were running, or settled but have not yet been committed.
+    /// were absent or running, or settled but have not yet been committed.
     #[serde(default)]
     pub pending: BTreeSet<String>,
 }
@@ -523,16 +524,18 @@ pub fn read<C: Rest + Transport>(
         let numbers: BTreeSet<u64> = changed.union(&pending).copied().collect();
         let mut items = vec![];
         for (number, mut item) in details(&client, name, &numbers, &since, &scope.operator)? {
-            let running = item.kind == Kind::PullRequest
+            let awaiting_checks = item.kind == Kind::PullRequest
                 && item.state == "open"
                 && item
                     .checks
                     .as_deref()
-                    .is_some_and(|c| RUNNING_CHECKS.contains(&c));
+                    .is_none_or(|c| RUNNING_CHECKS.contains(&c));
             let reference = format!("{prefix}{number}");
-            if running {
+            if awaiting_checks {
                 // Followed until they settle, the first PENDING_LIMIT of
-                // them; the rest were reported with their running checks.
+                // them; the rest were reported with their current checks.
+                // A missing rollup is not a settled result: CI may register
+                // after this read without updating the PR's REST timestamp.
                 if pending_count < PENDING_LIMIT && state.pending.insert(reference) {
                     pending_count += 1;
                 }
