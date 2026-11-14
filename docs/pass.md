@@ -603,6 +603,13 @@ project. Whole `Target:`/`repo:` lines, `target:` labels, the accepted plan's
 Unknown or conflicting evidence holds, rather than giving one source precedence.
 Epics, infrastructure/harness labels, operator decisions and the configured
 operator-ask exclusions hold. No prose/model classification is used.
+An unlabeled parent can otherwise look like ordinary single-project work and
+be moved out of tracker. To prevent that, any issue with sub-issues also holds,
+including parents whose children are all closed. The existing source snapshot
+reads only `subIssues(first:1).totalCount`, not child bodies or extra pages;
+missing, null or invalid counts hold rather than implying a leaf. Apply rechecks
+this evidence before recording transfer intent. A leaf with its own parent
+remains eligible, subject to the other checks and parent-link preservation.
 
 Each line identifies the source, destination (or `unresolved`), upstream
 association and refusal cause. Only `Upstream: #N` is accepted, using #949's

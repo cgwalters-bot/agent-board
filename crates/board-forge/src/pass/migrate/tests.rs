@@ -19,6 +19,7 @@ fn node(number: u64) -> Value {
         "repository":{"nameWithOwner":"cgwalters-forge/tracker"},
         "title":"bootc: repair regression", "body":"", "updatedAt":"2026-11-13T00:00:00Z", "state":"OPEN",
         "parent":{"id":"epic", "url":"https://github.com/cgwalters-forge/tracker/issues/1599"},
+        "subIssues":{"totalCount":0},
         "milestone":null,
         "labels":{"nodes":[],"pageInfo":{"hasNextPage":false}},
         "closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},
@@ -51,6 +52,8 @@ struct Forge {
     cross_reference: bool,
     plan: bool,
     stale: bool,
+    children: Option<Value>,
+    children_during_preflight: bool,
     count: u64,
     body: RefCell<String>,
 }
@@ -166,6 +169,12 @@ impl Transport for Forge {
             .unwrap();
         let mut node = node(number);
         node["body"] = json!(*self.body.borrow());
+        if let Some(children) = &self.children {
+            node["subIssues"] = children.clone();
+        }
+        if self.children_during_preflight && self.snapshots.get() > 1 {
+            node["subIssues"] = json!({"totalCount":1});
+        }
         if self.labeled {
             node["labels"]["nodes"] = json!([{"name":"migration: retained"}]);
         }
@@ -386,6 +395,61 @@ fn disabled_incomplete_active_and_exhausted_caps_hold_without_writes() {
     };
     assert!(execute(&forge, true, 1, &mut Journal::default()).0.is_err());
     assert_eq!(forge.transfers.get(), 0);
+}
+
+#[test]
+fn structural_epics_and_unreadable_child_counts_never_transfer() {
+    for (children, reason) in [
+        (json!({"totalCount":1}), "parent with sub-issues"),
+        (json!({"totalCount":1000}), "parent with sub-issues"),
+        (Value::Null, "missing or invalid sub-issue count"),
+        (json!({}), "missing or invalid sub-issue count"),
+        (
+            json!({"totalCount":null}),
+            "missing or invalid sub-issue count",
+        ),
+        (
+            json!({"totalCount":-1}),
+            "missing or invalid sub-issue count",
+        ),
+        (
+            json!({"totalCount":"0"}),
+            "missing or invalid sub-issue count",
+        ),
+    ] {
+        for apply in [false, true] {
+            let forge = Forge {
+                children: Some(children.clone()),
+                ..Default::default()
+            };
+            let mut journal = Journal::default();
+            let (result, lines) = execute(&forge, apply, 1, &mut journal);
+            result.unwrap();
+            assert!(
+                lines[0].starts_with("hold ") && lines[0].contains(reason),
+                "{lines:?}"
+            );
+            assert_eq!(forge.transfers.get(), 0);
+            assert!(journal.receipts.is_empty());
+        }
+    }
+    // The fixture has a parent of its own: leaf children remain transferable.
+    let forge = Forge::default();
+    execute(&forge, true, 1, &mut Journal::default()).0.unwrap();
+    assert_eq!(forge.transfers.get(), 1);
+}
+
+#[test]
+fn child_added_during_preflight_stops_before_transfer_intent() {
+    let forge = Forge {
+        children_during_preflight: true,
+        ..Default::default()
+    };
+    let mut journal = Journal::default();
+    let (result, _) = execute(&forge, true, 1, &mut journal);
+    assert!(format!("{:#}", result.unwrap_err()).contains("parent with sub-issues"));
+    assert_eq!(forge.transfers.get(), 0);
+    assert!(journal.receipts.is_empty());
 }
 
 #[test]
