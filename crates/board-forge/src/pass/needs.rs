@@ -554,13 +554,44 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         inventory::revalidate(&mut list, &nodes, proposal_label);
         self.inbox_epics(&mut list, &nodes, false);
         reading.summaries = self.summaries(&list);
+        let mut questions;
+        let snapshot = if config.operator_questions_only {
+            questions = snapshot.clone();
+            for hold in &mut questions.holds {
+                // A technical hold is still published for agents, but never
+                // promoted to an operator ask by falling back to its reason.
+                // An explicit approval label is its own operator ask.
+                let approval =
+                    hold.kind == HoldKind::PrOpen && holds::approval_of(&hold.reason).is_some();
+                hold.operator &= approval
+                    || hold.item.as_ref().is_some_and(|item| {
+                        reading
+                            .summaries
+                            .1
+                            .get(&item.to_ascii_lowercase())
+                            .and_then(Option::as_ref)
+                            .is_some_and(|summary| summary.question.is_some())
+                    });
+            }
+            &questions
+        } else {
+            snapshot
+        };
         let mut list = holds::needs_you(snapshot, previous, &reading);
         inventory::revalidate(&mut list, &nodes, proposal_label);
         self.inbox_epics(&mut list, &nodes, true);
+        if config.operator_questions_only && reading.summaries.0 != Read::Complete {
+            list.complete = false;
+        }
         carry::evidence(&mut list, previous, &nodes);
         list.retain_evidence(reading.reviews.approval_evidence.as_ref());
+        if config.operator_questions_only {
+            let focused =
+                epics::focus_items(&list, &nodes, config.focus().as_ref().map(key).as_deref());
+            list.focus_priority_order(&focused, &options);
+        }
         if config.holds.as_ref().is_some_and(|h| h.act_now) {
-            list.rank_act_now(&snapshot.holds);
+            list.rank_act_now(&snapshot.holds, config.operator_questions_only);
         }
         holds::preserve_changed_at(&mut list, previous);
         list
@@ -734,13 +765,34 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             // A blocking hold is on a pull request, whose summary an issue
             // read cannot find.
             let pull = ask.action.kind == RefKind::PullRequest;
-            let summary = cached_summary(
-                &self.client,
-                &issue,
-                pull,
-                &self.config.bot,
-                list.summary_cache.get(&ask.key),
-            );
+            let summary = if self.config.operator_questions_only {
+                (|| -> Result<Summary> {
+                    let comments = if pull {
+                        plan::pull_request_comments(&self.client, &issue)?
+                    } else {
+                        plan::issue_comments(&self.client, &issue)?
+                    };
+                    let body = if pull {
+                        None
+                    } else {
+                        Some(plan::comment(&self.issue_node(&issue)?)?)
+                    };
+                    Ok(current_question(
+                        body.as_ref(),
+                        &comments,
+                        &self.config.operator,
+                        &self.config.bot,
+                    ))
+                })()
+            } else {
+                cached_summary(
+                    &self.client,
+                    &issue,
+                    pull,
+                    &self.config.bot,
+                    list.summary_cache.get(&ask.key),
+                )
+            };
             match summary {
                 Ok(summary) => {
                     said.insert(ask.key.clone(), Some(summary));

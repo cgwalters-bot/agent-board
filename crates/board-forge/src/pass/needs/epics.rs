@@ -79,6 +79,49 @@ fn chain(start: &str, nodes: &BTreeMap<String, Node>) -> EpicChain {
     }
 }
 
+/// Use every validated ancestor, not just the two endpoints exposed to v2
+/// consumers. Missing ancestry cannot invent membership in the focus epic.
+pub(super) fn focus_items(
+    list: &NeedsYou,
+    nodes: &BTreeMap<String, Value>,
+    focus: Option<&str>,
+) -> BTreeSet<String> {
+    let Some(focus) = focus else {
+        return BTreeSet::new();
+    };
+    list.items
+        .iter()
+        .filter(|ask| {
+            let mut at = Some(ask.item.to_ascii_lowercase());
+            let mut seen = BTreeSet::new();
+            while let Some(current) = at {
+                if !seen.insert(current.clone()) {
+                    break;
+                }
+                if current.eq_ignore_ascii_case(focus) {
+                    return true;
+                }
+                let Some(node) = nodes.get(&current) else {
+                    break;
+                };
+                let parent = match node.get("closingIssuesReferences") {
+                    Some(closing)
+                        if closing["totalCount"].as_u64() == Some(1)
+                            && closing["nodes"].as_array().is_some_and(|n| n.len() == 1) =>
+                    {
+                        &closing["nodes"][0]
+                    }
+                    Some(_) => break,
+                    None => &node["parent"],
+                };
+                at = reference(parent).map(|p| key(&p));
+            }
+            false
+        })
+        .map(|ask| ask.key.clone())
+        .collect()
+}
+
 fn activity(at: &str, nodes: &BTreeMap<String, Node>) -> EpicActivity {
     let mut pending = vec![at.to_owned()];
     let mut seen = BTreeSet::new();

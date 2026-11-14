@@ -678,6 +678,11 @@ pub struct Config {
     #[serde(default)]
     pub replan_invalid: bool,
 
+    /// Keep engineering decisions with agents; only explicit architectural or
+    /// operator-owned questions wait on the operator. Off by default.
+    #[serde(default)]
+    pub operator_questions_only: bool,
+
     /// Off unless set: stage 4 waits on the operator by assigning them
     /// rather than by the [`NEEDS_HUMAN`] label, and any response of theirs
     /// releases the wait ([`wait`]).
@@ -896,6 +901,59 @@ impl OperatorAsk {
     /// (agent-board#826).
     fn operator_verdict(&self, body: &str) -> bool {
         plan::triage_operator(body).is_some_and(|d| self.domains.contains(&d))
+    }
+}
+
+/// This is an explicit protocol, not a classifier of arbitrary issue prose.
+/// The caller must first authenticate the author and last editor.
+fn operator_question(body: &str, owned: bool) -> bool {
+    (owned || plan::triage_operator(body).as_deref() == Some("architecture"))
+        && holds::summary(body).question.is_some_and(|q| {
+            ![
+                "decide what",
+                "decide the design",
+                "assigned to",
+                "its newest plan",
+            ]
+            .iter()
+            .any(|prefix| q.to_ascii_lowercase().starts_with(prefix))
+        })
+}
+
+/// New direction supersedes an old question, even when it contains no new ask.
+/// Generated hold receipts and bookkeeping are not new direction.
+fn current_question(
+    body: Option<&plan::Comment>,
+    comments: &[plan::Comment],
+    operator: &str,
+    bot: &str,
+) -> holds::Summary {
+    let current = comments
+        .iter()
+        .chain(body)
+        .filter(|c| {
+            !c.body.starts_with(&format!("<!-- {HOLD_MARKER}:"))
+                && (plan::written_by(c, operator)
+                    || plan::written_by(c, bot)
+                        && (plan::triage_verdict(&c.body).is_some()
+                            || plan::has_fence(&c.body, PLAN_FENCE)
+                            || holds::summary(&c.body).question.is_some()))
+        })
+        .max_by_key(|c| (c.changed, c.created));
+    let Some(c) = current else {
+        return holds::Summary::default();
+    };
+    let owned = plan::written_by(c, operator);
+    if owned && let Some(question) = c.body.lines().find_map(holds::question) {
+        return holds::Summary {
+            question: Some(question),
+            ..holds::Summary::default()
+        };
+    }
+    if operator_question(&c.body, owned) {
+        holds::summary(&c.body)
+    } else {
+        holds::Summary::default()
     }
 }
 
@@ -7489,7 +7547,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let (plan, from) = match plan::newest_plan(&comments, &writers) {
                 Ok(found) => found,
                 Err(error) => {
-                    if config.replan_invalid
+                    if (config.replan_invalid || config.operator_questions_only)
                         && plan::repairable(&comments, &writers, &config.bot, PLAN_FENCE).is_some()
                     {
                         let intro = format!("{}: {error:#}", plan::INVALID_REPLAN);
@@ -8246,6 +8304,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             brief.push_str(&format!("\n\n{intro} Re-evaluate whether the fork issue is done; upstream completion alone is not permission to close it. Do not post upstream."));
         }
         brief.push_str(&self.verdict_ask(read.0));
+        if config.operator_questions_only {
+            brief.push_str(" Decide engineering details yourself, including plan repair and triage follow-through; never assign the operator. Only a big-picture architectural decision may ask them: state one concrete question on a **Decision needed:** line and put \"operator\":\"architecture\" in the schedule-triage verdict block. A generic request to decide what a verdict means is not an operator question.");
+        }
         brief.push_str(plan::VALIDATE_PLAN_JSON);
         if config.midstream.is_some() {
             brief.push_str(" For work staged here for an issues-off midstream fork, keep repo and item as this tracking issue. Take the work target from its target: staging label or its Target: line and resolve it to the topic-admitted midstream fork, not its upstream. Set target_repo to that fork's OWNER/NAME in the implement plan, and require a draft PR there; do not guess an ambiguous target. Omit target_repo for work in this issue's repository.");
@@ -8369,6 +8430,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 format!("its triage, {}, gave no verdict", record.url),
             ),
         };
+        if config.operator_questions_only
+            && !from.body.starts_with(AGAIN)
+            && let Some((_, c, verdict)) = &verdict
+            && ASK_VERDICTS.contains(&verdict.as_str())
+            && !operator_question(&c.body, false)
+            && !CLOSE_VERDICTS.iter().any(|(v, _)| v == verdict)
+        {
+            return self.triage(read, AGAIN, (snapshot, target, slots));
+        }
         let operator = [config.operator.as_str()];
         if let Some((_, c, verdict)) = &verdict
             && verdict == "needs-issue"
@@ -8494,11 +8564,21 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             && self.inputs(facts, comments)? == carried
         {
             if replans > 0 {
+                let decision = if config.operator_questions_only {
+                    "agent triage waits for changed inputs"
+                } else {
+                    "the operator decides"
+                };
                 let why = format!(
-                    "{said}; nothing changed since its triage, the {} in a row that planned nothing (triageReplans); the operator decides, or it is triaged again once something changes or {operator} comments",
+                    "{said}; nothing changed since its triage, the {} in a row that planned nothing (triageReplans); {decision}, or it is triaged again once something changes or {operator} comments",
                     again + 1
                 );
-                return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+                let kind = if config.operator_questions_only {
+                    HoldKind::TriageCooldown
+                } else {
+                    HoldKind::NeedsOperator
+                };
+                return Ok(Step::Hold(Hold::new(kind, why)));
             }
             let why = format!(
                 "{said}; nothing changed since its triage, triaged again once something does, or once {operator} comments"
@@ -8576,7 +8656,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let closing = CLOSE_VERDICTS.iter().find(|(v, _)| *v == verdict);
         let mut close = closing.filter(|_| self.config.triage_close);
-        let assign = self.config.assign_holds;
+        let assign = self.config.assign_holds && !self.config.operator_questions_only;
         let operator = &self.config.operator;
         let mut label = match assign {
             true => format!("assign {operator}"),
@@ -8609,7 +8689,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     (None, _) => Acted::Nothing,
                 });
             }
-            None if ASK_VERDICTS.contains(&verdict) => (HoldKind::NeedsHuman, label),
+            None if ASK_VERDICTS.contains(&verdict)
+                && (!self.config.operator_questions_only || operator_question(&c.body, false)) =>
+            {
+                (HoldKind::NeedsHuman, label)
+            }
             None => return Ok(Acted::Nothing),
         };
         let rule = match (close, assign) {
@@ -8829,12 +8913,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         verdict: &plan::Comment,
         comments: &'c [plan::Comment],
     ) -> Result<Option<wait::Response<'c>>> {
-        match self.config.assign_holds {
-            true => self.assignment_answer(issue, verdict, comments),
-            false => Ok(self
-                .verdict_answer(issue, verdict, comments)?
-                .map(wait::Response::Comment)),
+        if self.config.assign_holds {
+            let response = self.assignment_answer(issue, verdict, comments)?;
+            if response.is_some() || !self.config.operator_questions_only {
+                return Ok(response);
+            }
         }
+        Ok(self
+            .verdict_answer(issue, verdict, comments)?
+            .map(wait::Response::Comment))
     }
 
     /// A triage again once an asking verdict's hold was `released`, with
@@ -8989,6 +9076,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let Some((n, c, verdict)) = self.newest_verdict(comments) else {
             return Ok(None);
         };
+        if self.config.operator_questions_only
+            && ASK_VERDICTS.contains(&verdict.as_str())
+            && !operator_question(&c.body, false)
+            && !CLOSE_VERDICTS.iter().any(|(v, _)| *v == verdict)
+        {
+            return self.triage((facts, comments), AGAIN, context).map(Some);
+        }
         if ASK_VERDICTS.contains(&verdict.as_str())
             && let Some(released) = self.verdict_release(&facts.issue, c, &comments[n + 1..])?
         {

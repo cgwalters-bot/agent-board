@@ -220,6 +220,42 @@ fn waiting(operator: &str, since: &str) -> Hold {
     Hold::new(HoldKind::NeedsHuman, why)
 }
 
+/// A later, authenticated pass hold receipt ties this assignment to the pass:
+/// the bot's unedited [`hold_marker`] comment, not a run's output
+/// ([`run_output`]), naming an earlier unedited triage verdict of the bot's
+/// and explicitly recording assignment of this operator, not a label hold.
+/// An agent's comment posted as the bot can carry the marker, so the marker
+/// alone proves nothing. Assignments lacking a receipt (including interrupted
+/// migrations) are not ours to clean automatically. A subsequent assignment
+/// invalidates an older receipt.
+fn pass_assignment(
+    comments: &[plan::Comment],
+    assigned: &Assignment,
+    bot: &str,
+    operator: &str,
+) -> bool {
+    let unedited = |c: &plan::Comment| plan::written_by(c, bot) && !c.edited && c.editor.is_none();
+    comments.iter().any(|receipt| {
+        unedited(receipt)
+            && receipt.created >= assigned.since
+            && !run_output(&receipt.body)
+            && comments.iter().any(|verdict| {
+                unedited(verdict)
+                    && verdict.created <= assigned.since
+                    && plan::triage_verdict(&verdict.body).is_some()
+                    && plan::comment_id(&verdict.url).is_some_and(|id| {
+                        receipt.body.lines().next() == Some(hold_marker(id).as_str())
+                            && receipt.body.lines().any(|line| {
+                                line == format!(
+                                    "[This triage verdict]({}) waits on {operator}: assigned to {operator}; any response of theirs releases it.",
+                                    verdict.url
+                                )
+                            })
+                    })
+            })
+    })
+}
+
 impl<C: Rest + Transport> Scheduler<'_, C> {
     /// [`Self::consider`], first held on or released from the operator's
     /// wait where [`Config::assign_holds`] is set. A write that fails is the
@@ -235,14 +271,15 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         if let Some(step) = self.read_free_hold(facts, slots) {
             return Ok(step);
         }
-        let (note, unlabelled) = match self.config.assign_holds && facts.open {
-            false => (None, false),
-            true => match self.operator_wait(facts)? {
-                Waited::Held(held) => return Ok(Step::Hold(held)),
-                Waited::Go(note) => (note, false),
-                Waited::Unlabelled(note) => (Some(note), true),
-            },
-        };
+        let (note, unlabelled) =
+            match (self.config.assign_holds || self.config.operator_questions_only) && facts.open {
+                false => (None, false),
+                true => match self.operator_wait(facts)? {
+                    Waited::Held(held) => return Ok(Step::Hold(held)),
+                    Waited::Go(note) => (note, false),
+                    Waited::Unlabelled(note) => (Some(note), true),
+                },
+            };
         // A label taken off no longer holds it.
         let released;
         let facts = match unlabelled {
@@ -273,7 +310,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         if !self.config.read_free_holds
             || !facts.labels_complete
             || !facts.pulls_complete
-            || (self.config.assign_holds && facts.labelled(NEEDS_HUMAN))
+            || ((self.config.assign_holds || self.config.operator_questions_only)
+                && facts.labelled(NEEDS_HUMAN))
         {
             return None;
         }
@@ -301,6 +339,22 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let operator = config.operator.as_str();
         let issue = &facts.issue;
         if facts.labels_complete && facts.labelled(NEEDS_HUMAN) {
+            if config.operator_questions_only {
+                // Never turn a label into a new assignment. A concrete ask
+                // remains labelled; an engineering verdict returns to triage.
+                let comments = plan::issue_comments(&self.client, issue)?;
+                if !self.explicit_operator_question(issue, &comments)? {
+                    return self.release_harness(
+                        issue,
+                        "engineering wait has no operator question".into(),
+                        Release::Label,
+                    );
+                }
+                return Ok(Waited::Held(Hold::new(
+                    HoldKind::NeedsHuman,
+                    format!("labelled {NEEDS_HUMAN}"),
+                )));
+            }
             if self.harness_item(facts) {
                 let comments = match plan::issue_comments(&self.client, issue) {
                     Ok(comments) => comments,
@@ -327,6 +381,19 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             Err(held) => return Ok(Waited::Held(held)),
         };
         let since = assigned.since.format(&Rfc3339).unwrap_or_default();
+        if config.operator_questions_only
+            && !pass_assignment(&comments, &assigned, &config.bot, operator)
+        {
+            // Same bot account is not proof that this pass owns the wait.
+            return Ok(Waited::Go(None));
+        }
+        if config.operator_questions_only && !self.explicit_operator_question(issue, &comments)? {
+            return self.release_harness(
+                issue,
+                format!("bot assignment since {since} has no concrete operator question"),
+                Release::Assignment,
+            );
+        }
         let Some(response) = response(&assigned, &comments, (operator, &self.writers())) else {
             if self.releasable(facts, &comments) {
                 let why = format!("assigned to {operator} since {since}");
@@ -385,8 +452,18 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                     plan::send(&self.client, "DELETE", &url, &Value::Null, 404)?;
                 }
             }
+            let explanation = if self.config.operator_questions_only {
+                "Engineering work belongs to agent triage, not the operator."
+            } else {
+                RELEASE_TEXT
+            };
+            let reason = if self.config.operator_questions_only {
+                format!("\nReason: {why}.")
+            } else {
+                String::new()
+            };
             let body = format!(
-                "{RELEASE_MARKER}\n{RELEASE_TEXT}\n\n{}",
+                "{RELEASE_MARKER}\n{explanation}{reason}\n\n{}",
                 crate::Footer::default()
             );
             let url = format!(
@@ -395,7 +472,12 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             );
             plan::send(&self.client, "POST", &url, &json!({"body": body}), 0)?;
         }
-        let note = format!("; {why}, harness work: {act}, released for planning");
+        let work = if self.config.operator_questions_only {
+            "engineering work"
+        } else {
+            "harness work"
+        };
+        let note = format!("; {why}, {work}: {act}, released for planning");
         Ok(match what {
             Release::Assignment => Waited::Go(Some(note)),
             Release::Label => Waited::Unlabelled(note),
@@ -434,6 +516,13 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             Ok(standing) => standing?,
             Err(held) => return Some(held),
         };
+        if self.config.operator_questions_only {
+            match self.explicit_operator_question(&facts.issue, &comments) {
+                Ok(true) => (),
+                Ok(false) => return None,
+                Err(error) => return Some(unreadable(error)),
+            }
+        }
         if response(&assigned, &comments, (operator, &self.writers())).is_some() {
             return None;
         }
@@ -492,6 +581,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// only the bot's event is a wait. GitHub answers a login it may not
     /// assign by leaving it out rather than with an error, so that is one.
     pub(super) fn assign(&self, issue: &ItemRef) -> Result<()> {
+        ensure!(
+            !self.config.operator_questions_only,
+            "operatorQuestionsOnly never assigns the operator"
+        );
         let operator = &self.config.operator;
         self.unassign(issue)?;
         let body = json!({"assignees": [operator]});
@@ -508,6 +601,22 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             issue.display()
         );
         Ok(())
+    }
+
+    fn explicit_operator_question(
+        &self,
+        issue: &ItemRef,
+        comments: &[plan::Comment],
+    ) -> Result<bool> {
+        let body = plan::comment(&self.issue_node(issue)?)?;
+        Ok(current_question(
+            Some(&body),
+            comments,
+            &self.config.operator,
+            &self.config.bot,
+        )
+        .question
+        .is_some())
     }
 
     /// The response to the bot's assignment for the verdict `verdict`,
