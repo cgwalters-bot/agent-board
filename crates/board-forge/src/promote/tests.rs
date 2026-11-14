@@ -1622,6 +1622,9 @@ struct PublishingForge {
     promote_ref: Rc<RefCell<Option<String>>>,
     /// Upstream PRs listed for that branch.
     promoted: RefCell<Vec<Value>>,
+    publication_checks: Value,
+    checks_by_head: BTreeMap<String, Value>,
+    checked_heads: RefCell<Vec<String>>,
 }
 
 /// A rewrite whose head is a function of the upstream base alone, so a base
@@ -1681,6 +1684,12 @@ impl Rest for PublishingForge {
             Some(json!({"login":self.writer}))
         } else if url == format!("{API}repos/{REPO}/pulls/34") {
             Some(self.fresh.clone())
+        } else if url.starts_with(&format!("{API}repos/{REPO}/rules/branches/")) {
+            Some(
+                json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci","integration_id":42}]}}]),
+            )
+        } else if url.starts_with(&format!("{API}repos/{REPO}/branches/")) {
+            Some(json!({"protected":false}))
         } else if url == format!("{API}repos/{REPO}/pulls/35") {
             let mut replay = Replay {
                 now: self.replay.now,
@@ -1751,6 +1760,15 @@ impl Rest for PublishingForge {
 
 impl Transport for PublishingForge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if query.contains("object(expression:$head)") {
+            let head = variables["head"].as_str().unwrap();
+            self.checked_heads.borrow_mut().push(head.to_owned());
+            let checks = self
+                .checks_by_head
+                .get(head)
+                .unwrap_or(&self.publication_checks);
+            return Ok(json!({"repository":{"object":{"oid":head,"statusCheckRollup":checks}}}));
+        }
         self.replay.graphql(query, variables)
     }
 }
@@ -1772,6 +1790,12 @@ fn publication() -> (PublishingForge, Config) {
         returned_number: false,
         promote_ref: Rc::new(RefCell::new(None)),
         promoted: RefCell::new(vec![]),
+        publication_checks: json!({"contexts":{"totalCount":1,"nodes":[{
+            "__typename":"CheckRun","databaseId":1,"name":"ci","status":"COMPLETED","conclusion":"SUCCESS",
+            "checkSuite":{"app":{"databaseId":42},"workflowRun":{"event":"push","workflow":{"databaseId":7}}}
+        }],"pageInfo":{"hasNextPage":false,"endCursor":null}}}),
+        checks_by_head: BTreeMap::new(),
+        checked_heads: RefCell::new(vec![]),
     };
     let mut config = Config::parse(CONFIG).unwrap();
     config.promote.as_mut().unwrap().publish = true;
@@ -2257,6 +2281,138 @@ fn confirmed_publication_does_not_starve_the_next_candidate() {
     assert!(second[1].contains("#35 ->"), "{second:?}");
     assert_eq!(forge.writes.borrow().len(), 3);
     assert!(forge.writes.borrow()[0].1.contains("/issues/35/comments"));
+}
+
+#[test]
+fn publication_checks_gate_the_replayed_oid_and_resume_without_reapproval() {
+    for case in [
+        "failed",
+        "pending",
+        "missing",
+        "wrong app",
+        "no rollup",
+        "incomplete",
+        "pagination",
+        "malformed",
+    ] {
+        let (mut forge, config) = publication();
+        body(&mut forge.replay, "/compare/")["behind_by"] = json!(33);
+        let green = forge.publication_checks.clone();
+        let contexts = &mut forge.publication_checks["contexts"];
+        match case {
+            "failed" => contexts["nodes"][0]["conclusion"] = json!("FAILURE"),
+            "pending" => contexts["nodes"][0]["status"] = json!("IN_PROGRESS"),
+            "missing" => {
+                contexts["nodes"] = json!([]);
+                contexts["totalCount"] = json!(0);
+            }
+            "wrong app" => contexts["nodes"][0]["checkSuite"]["app"]["databaseId"] = json!(99),
+            "no rollup" => forge.publication_checks = Value::Null,
+            "incomplete" => contexts["totalCount"] = json!(2),
+            "pagination" => contexts["pageInfo"] = json!({"hasNextPage":true,"endCursor":"same"}),
+            "malformed" => contexts["nodes"][0]["name"] = Value::Null,
+            _ => unreachable!(),
+        }
+        let mut git = FakeRewrite::new(&forge);
+        let result = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git);
+        if ["incomplete", "pagination", "malformed"].contains(&case) {
+            assert!(result.is_err(), "{case}: {result:?}");
+        } else {
+            assert!(result.unwrap()[0].contains("hold promote"), "{case}");
+        }
+        let published = forge.promote_ref.borrow().clone().unwrap();
+        assert_ne!(published, HEAD);
+        assert!(
+            forge
+                .checked_heads
+                .borrow()
+                .iter()
+                .all(|oid| oid == &published)
+        );
+        assert_eq!(git.prepared.len(), 1);
+        let writes = forge.writes.take();
+        assert_eq!(
+            writes.len(),
+            2,
+            "{case}: only pending receipt and diagnostic"
+        );
+        assert!(writes.iter().all(|(_, path, _)| !path.contains("/pulls")));
+        let receipt = writes.last().unwrap().2["body"].clone();
+        assert!(
+            !receipt
+                .as_str()
+                .unwrap()
+                .contains("```agent-board-promoted")
+        );
+        comments(&mut forge.replay).as_array_mut().unwrap().push(json!({
+            "id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":receipt
+        }));
+        sync_metadata(&mut forge.replay);
+        forge.publication_checks = green;
+        let lines = publish::apply_with(&forge, &config, forge.replay.now, 3, &mut git).unwrap();
+        assert!(lines[0].starts_with("promoted "), "{case}: {lines:?}");
+        assert_eq!(
+            git.prepared.len(),
+            1,
+            "{case}: receipt avoids another rebase"
+        );
+        let writes = forge.writes.borrow();
+        let receipt = writes.last().unwrap().2["body"].as_str().unwrap();
+        assert!(receipt.contains(&format!("approval of {HEAD} carried over")));
+        assert!(receipt.contains(&published));
+    }
+}
+
+#[test]
+fn retained_pending_checks_yield_to_the_next_candidate_without_writes() {
+    let (mut forge, config) = publication();
+    with_second(&mut forge);
+    body(&mut forge.replay, "/compare/")["behind_by"] = json!(1);
+    let base = body(&mut forge.replay, "composefs-rs/branches/main")["commit"]["sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut pending = forge.publication_checks.clone();
+    pending["contexts"]["nodes"][0]["status"] = json!("IN_PROGRESS");
+    forge
+        .checks_by_head
+        .insert(FakeRewrite::head(&base), pending);
+    let mut git = FakeRewrite::new(&forge);
+    let first = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+    assert!(first[0].contains("required checks pending"), "{first:?}");
+    let writes = forge.writes.take();
+    assert_eq!(writes.len(), 2);
+    comments(&mut forge.replay)
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,
+            "body":writes.last().unwrap().2["body"]
+        }));
+    sync_metadata(&mut forge.replay);
+    let second = publish::apply_with(&forge, &config, forge.replay.now, 3, &mut git).unwrap();
+    assert_eq!(second.len(), 2, "{second:?}");
+    assert!(second[0].contains("required checks pending"));
+    assert!(
+        second[1].starts_with(&format!("promoted {REPO}#35")),
+        "{second:?}"
+    );
+    assert_eq!(git.prepared.len(), 1);
+    let writes = forge.writes.borrow();
+    assert_eq!(writes.len(), 3);
+    assert!(writes[0].1.ends_with("/issues/35/comments"));
+}
+
+#[test]
+fn publication_checks_do_not_accept_green_checks_on_the_approved_head() {
+    let (mut forge, config) = publication();
+    body(&mut forge.replay, "/compare/")["behind_by"] = json!(1);
+    forge.publication_checks["contexts"]["nodes"][0]["conclusion"] = json!("FAILURE");
+    let mut git = FakeRewrite::new(&forge);
+    let lines = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+    assert!(lines[0].contains("required checks failed"), "{lines:?}");
+    assert!(!forge.checked_heads.borrow().contains(&HEAD.to_owned()));
+    assert!(forge.promoted.borrow().is_empty());
 }
 
 #[test]

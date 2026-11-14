@@ -326,6 +326,12 @@ fn prepare<C: Rest + Transport>(
             )));
         }
     }
+    // A retained branch can wait without spending this pass's write slot.
+    // Otherwise an early candidate whose CI never reports would starve every
+    // later candidate by rewriting its pending receipt on every invocation.
+    if what.base.is_none() {
+        publication_checks(client, repo, &fresh, &what.published)?;
+    }
     let needed = STEP_WRITES + usize::from(what.base.is_some());
     if max_writes < needed {
         return Ok(Step::Held(held(repo, number, needed)));
@@ -573,6 +579,15 @@ fn publish<C: Rest + Transport>(
             reference["object"]["sha"] == what.published,
             "publication branch moved"
         );
+        publication_checks(client, repo, &fresh, &what.published)?;
+        let reference = get(
+            client,
+            &format!("repos/{head_repo}/git/ref/heads/{}", encode(&what.branch)),
+        )?;
+        ensure!(
+            reference["object"]["sha"] == what.published,
+            "publication branch moved while reading checks"
+        );
         let text = json!({"title":publication["title"], "body":publication["body"]});
         let published = if let Some(pr) = &what.existing {
             let n = pr["number"]
@@ -641,16 +656,28 @@ fn publish<C: Rest + Transport>(
                 &format!("repos/{repo}/issues/comments/{status_id}"),
                 json!({"body":body}),
             )?;
+            if error.is::<Held>() {
+                return Ok(format!(
+                    "hold promote {repo}#{number}: {error:#}; publication head={} retained for retry",
+                    what.published
+                ));
+            }
             return Err(error);
         }
     };
-    let body = handoff::success(
+    let mut body = handoff::success(
         repo,
         &fresh,
         &publication,
         &target.upstream,
         upstream_number,
     )?;
+    if what.published != head {
+        body.push_str(&format!(
+            "\n\nOperator approval of {head} carried over to publication head {} after a clean replay and passing fork required checks; no new review was requested.",
+            what.published
+        ));
+    }
     send(
         client,
         "PATCH",
@@ -658,6 +685,135 @@ fn publish<C: Rest + Transport>(
         json!({"body":body}),
     )?;
     Ok(format!("promoted {repo}#{number} -> {url} head={head}"))
+}
+
+const PUBLICATION_CHECKS: &str = "query($owner:String!,$name:String!,$head:String!,$after:String){repository(owner:$owner,name:$name){object(expression:$head){... on Commit{oid statusCheckRollup{contexts(first:100,after:$after){totalCount nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl checkSuite{app{databaseId} workflowRun{event workflow{databaseId}}}} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}";
+
+/// Read checks at the exact publication oid, not the approved oid or the
+/// upstream default. The fork PR's base defines the required contexts even
+/// when the publication ref lives in the bot's fork. Missing results hold;
+/// retries resume the authenticated pending receipt without replaying again.
+fn publication_checks(
+    client: &(impl Rest + Transport),
+    repo: &str,
+    pull: &Value,
+    head: &str,
+) -> Result<()> {
+    let base = pull["base"]["ref"].as_str().context("missing fork base")?;
+    validate_branch(base)?;
+    let rules = pages(
+        client,
+        &format!("repos/{repo}/rules/branches/{}", encode(base)),
+    )?;
+    for rule in &rules {
+        ensure!(rule["type"].is_string(), "missing fork rule type");
+        if rule["type"] == "required_status_checks" {
+            ensure!(
+                rule["parameters"]["required_status_checks"].is_array(),
+                "unreadable fork required status checks"
+            );
+        }
+    }
+    let branch = get(client, &format!("repos/{repo}/branches/{}", encode(base)))?;
+    let required = crate::poll::required_checks(&json!(rules), &branch)?;
+    for check in &required {
+        ensure!(
+            check["context"].as_str().is_some_and(|s| !s.is_empty())
+                && check
+                    .get("integration_id")
+                    .is_none_or(|id| id.is_null() || id.is_u64()),
+            "unreadable fork required check"
+        );
+    }
+    let head_repo = pull["head"]["repo"]["full_name"]
+        .as_str()
+        .context("missing publication repository")?;
+    validate_repository(head_repo)?;
+    let (owner, name) = head_repo
+        .split_once('/')
+        .context("invalid head repository")?;
+    let mut after = None;
+    let mut cursors = BTreeSet::new();
+    let mut rows = Vec::new();
+    let mut total = None;
+    for _ in 0..MAX_PAGES {
+        let response = client
+            .graphql(
+                PUBLICATION_CHECKS,
+                json!({"owner":owner,"name":name,"head":head,"after":after}),
+            )
+            .context("read publication checks")?;
+        let commit = &response["repository"]["object"];
+        hold!(
+            commit["oid"] == head,
+            "publication commit checks not yet available"
+        );
+        let rollup = &commit["statusCheckRollup"];
+        // A null rollup is GitHub's explicit 'no checks yet', not evidence of
+        // success. In particular it must not vacuously pass an unprotected base.
+        hold!(!rollup.is_null(), "publication checks have not reported");
+        let contexts = &rollup["contexts"];
+        let count = contexts["totalCount"]
+            .as_u64()
+            .context("missing publication check count")?;
+        ensure!(
+            total.is_none_or(|n| n == count),
+            "publication checks changed during pagination"
+        );
+        total = Some(count);
+        let page = contexts["nodes"]
+            .as_array()
+            .context("missing publication checks")?;
+        ensure!(page.len() <= PAGE_SIZE, "oversized publication checks page");
+        for row in page {
+            match row["__typename"].as_str() {
+                Some("CheckRun") => ensure!(
+                    row["name"].as_str().is_some_and(|s| !s.is_empty())
+                        && row["databaseId"].is_u64()
+                        && row["checkSuite"]["app"]["databaseId"].is_u64()
+                        && row["status"].is_string()
+                        && (row["status"] != "COMPLETED" || row["conclusion"].is_string()),
+                    "unreadable publication check run"
+                ),
+                Some("StatusContext") => ensure!(
+                    row["context"].as_str().is_some_and(|s| !s.is_empty())
+                        && row["state"].is_string(),
+                    "unreadable publication status"
+                ),
+                _ => anyhow::bail!("unknown publication check kind"),
+            }
+        }
+        rows.extend(page.iter().cloned());
+        let more = contexts["pageInfo"]["hasNextPage"]
+            .as_bool()
+            .context("missing publication checks pagination")?;
+        if !more {
+            ensure!(rows.len() as u64 == count, "incomplete publication checks");
+            let evidence = json!({"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":rows}}}}]}});
+            let checks = crate::poll::classify_checks(&evidence, &required);
+            hold!(
+                checks.failed.is_empty(),
+                "publication required checks failed: {:?}",
+                checks.failed
+            );
+            hold!(
+                checks.pending.is_empty(),
+                "publication required checks pending: {}",
+                checks.pending.join(", ")
+            );
+            return Ok(());
+        }
+        let cursor = contexts["pageInfo"]["endCursor"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("missing publication checks cursor")?;
+        ensure!(
+            !page.is_empty() && cursors.insert(cursor.to_owned()),
+            "publication checks pagination did not advance"
+        );
+        after = Some(cursor.to_owned());
+    }
+    anyhow::bail!("publication checks exceed {MAX_PAGES} pages")
 }
 
 fn validate(
