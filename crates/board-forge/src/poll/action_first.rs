@@ -120,6 +120,7 @@ pub(crate) fn run_approved_capped<R: Rest, G: Transport>(
     outcome.merged = pass.merged;
     outcome.preview_merges = pass.preview_merges;
     outcome.updated = pass.updated;
+    outcome.pressure = pass.pressure;
     outcome.deferred = pass.deferred;
     outcome.review_intake = pass.review_intake;
     outcome.reviewing = pass.reviewing;

@@ -491,6 +491,7 @@ mod tests {
             merged: 0,
             preview_merges: 0,
             queues: BTreeMap::new(),
+            pressure: Default::default(),
             updated: Default::default(),
             outages: None,
             paces: None,

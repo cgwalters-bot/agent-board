@@ -8402,6 +8402,60 @@ fn action_first_approved_search_decides_all_seventeen_despite_scheduling_reserve
 }
 
 #[test]
+fn open_pr_cap_applies_before_the_approved_search() {
+    let repo = "cgwalters-forge/work";
+    for cap in [None, Some(2)] {
+        let mut forge = Forge::new(None, false);
+        followed(
+            &mut forge.replay,
+            (repo, 2),
+            json!({"reviews":{"nodes":[{"state":"APPROVED","author":{"__typename":"User","login":"cgwalters"},"commit":{"oid":"abc"},"submittedAt":"2026-10-23T00:00:00Z","body":"Approved"}],"pageInfo":{"hasPreviousPage":false}}}),
+            json!([]),
+        );
+        for entry in &mut forge.replay.requests {
+            if entry["request"]["get"]
+                == format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100")
+            {
+                entry["answer"]["body"] = json!([{"number":1,"user":{"login":"cgwalters-bot"}}, {"number":2,"user":{"login":"cgwalters-bot"}}]);
+            }
+        }
+        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{repo}/pulls/1/files?per_page=100")},"answer":{"status":200,"body":[{"filename":"README.md"}],"link":null}}));
+        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{repo}")},"answer":{"status":200,"body":{"allow_rebase_merge":true},"link":null}}));
+        let mut cfg =
+            config(json!({"follow":[repo],"pr":{"actionFirst":true,"fixPools":["claude"]}}));
+        cfg.open_pr_cap = cap;
+        let poll = cfg.poll(None);
+        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}{}", poll::action_first::approved_path(&poll))},"answer":{"status":200,"link":null,"body":{"incomplete_results":false,"total_count":1,"items":[{"repository_url":format!("{API_ROOT}repos/{repo}"),"number":2,"pull_request":{},"user":{"login":"cgwalters-bot"}}]}}}));
+        let caps = Caps::new(Limits::default());
+        let (outcome, _) = poll::action_first::run_approved_capped(
+            &forge,
+            &forge,
+            &poll,
+            &[repo.into()],
+            None,
+            &caps,
+            forge.replay.now,
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert_eq!(
+            outcome.preview_merges,
+            usize::from(cap.is_none()),
+            "{:?}",
+            outcome.lines
+        );
+        assert_eq!(
+            outcome
+                .lines
+                .iter()
+                .any(|l| l.contains("open-pr-cap: land")),
+            cap.is_some()
+        );
+    }
+}
+
+#[test]
 fn action_first_approved_early_exit_carries_unread_review_requests() {
     let repo = "cgwalters-forge/agentic-job";
     let head = "a".repeat(40);
@@ -15982,6 +16036,73 @@ fn apply_keeps_a_starts_requests_for_it() {
 /// The operator's implement plan for tracker#446, without a pool.
 fn implement_plan(replay: &mut Replay) {
     job_plan(replay, ("implement", 446), "cgwalters", None);
+}
+
+#[test]
+fn open_pr_cap_candidate_matrix() {
+    for cap in [None, Some(2)] {
+        for count in [0, 1, 2, 3] {
+            for kind in ["implement", "triage"] {
+                let mut cfg = config(json!({"wip":3}));
+                cfg.open_pr_cap = cap;
+                let mut forge = Forge::new(None, false);
+                let fixture = &mut forge.replay;
+                only(fixture, &["cgwalters-forge/tracker#446"]);
+                job_plan(fixture, (kind, 446), "cgwalters", None);
+                unpathed(fixture);
+                let mut pulls: Vec<Value> = (0..count)
+                    .map(|n| json!({"number":1000+n,"user":{"login":"cgwalters-bot"}}))
+                    .collect();
+                pulls.push(json!({"number":2000,"user":{"login":"visitor"}}));
+                fixture.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/pulls?state=open&per_page=100")},"answer":{"status":200,"body":pulls,"link":null}}));
+                let report = block(run(
+                    &forge,
+                    &forge,
+                    &cfg,
+                    State::default(),
+                    (Mode::Preview, Limits::default()),
+                    forge.replay.now,
+                ))
+                .unwrap();
+                let held = kind == "implement" && cap.is_some_and(|cap| count >= cap);
+                assert_eq!(
+                    report.failures, 0,
+                    "{cap:?}/{count}/{kind}: {:?}",
+                    report.lines
+                );
+                assert_eq!(
+                    report
+                        .holds
+                        .iter()
+                        .any(|e| e.hold.kind == HoldKind::OpenPrCap),
+                    held,
+                    "{cap:?}/{count}/{kind}: {:?}",
+                    report.lines
+                );
+                assert_eq!(
+                    report.lines.iter().any(
+                        |l| l.starts_with(&format!("start {kind} cgwalters-forge/tracker#446"))
+                    ),
+                    !held,
+                    "{cap:?}/{count}/{kind}: {:?}",
+                    report.lines
+                );
+                if cap.is_some() && kind == "implement" {
+                    assert!(
+                        report
+                            .summary_line()
+                            .contains(&format!("\"cgwalters-forge/tracker\":{count}"))
+                    );
+                    assert!(report.summary_line().contains("/cap 2"));
+                }
+            }
+        }
+    }
+    for cap in [0, pressure::CAP_LIMIT + 1] {
+        let mut cfg = config(json!({}));
+        cfg.open_pr_cap = Some(cap);
+        assert!(cfg.check().is_err());
+    }
 }
 
 /// `author`'s `kind` plan of tracker `item` on tracker#446, comment 9, with

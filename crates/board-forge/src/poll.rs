@@ -636,6 +636,8 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// Pass-only opt-in repository backpressure; no new fix authority.
+    pub open_pr_cap: Option<usize>,
     /// Avoid parking mechanical queue failures and exhausted work on the operator.
     /// Off by default; two triages and one bounded round grant per PR.
     pub agent_recovery: bool,
@@ -1309,6 +1311,7 @@ impl PollPolicy {
         .context("mergeQueue fixedFlakes")?;
         check_flake_fixes(&fixed_flakes)?;
         let mut policy = Self {
+            open_pr_cap: None,
             queue_only_repository: None,
             maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
             merge_queue,
@@ -4609,9 +4612,18 @@ fn describe(repo: &str, event: &Value, config: &Config) -> Option<String> {
     Some(format!("{repo}#{number} activity: {login} {what} ({role})"))
 }
 
+/// Read-only backpressure observations shared by the pass's poll phases.
+#[derive(Clone, Default)]
+struct Pressure {
+    open: BTreeMap<String, Vec<Value>>,
+    files: BTreeMap<(String, u64), Option<BTreeSet<String>>>,
+}
+
 /// The result of one pass.
 #[derive(Clone, Default)]
 pub struct Outcome {
+    pressure: Pressure,
+    pub(crate) open_pr_counts: BTreeMap<String, usize>,
     pub(crate) approved_read: bool,
     pub(crate) decided: BTreeSet<(String, u64)>,
     pub(crate) preview_merges: usize,
@@ -4970,6 +4982,7 @@ struct Pass<'a, R, G> {
     /// entries were read, and the entries and their files, with what this pass
     /// added to it after.
     queues: BTreeMap<(String, String), (bool, Vec<Entry>)>,
+    pressure: Pressure,
     /// The base branches, by repository, a behind pull request was brought
     /// up to date with this pass. Once that one merges the base moves again,
     /// so updating the others in the same pass would spend their reviews
@@ -5140,6 +5153,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             merged: 0,
             preview_merges: 0,
             queues: BTreeMap::new(),
+            pressure: Pressure::default(),
             updated: BTreeSet::new(),
             outages: None,
             paces: None,
@@ -8406,7 +8420,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     .iter()
                     .any(|(name, _)| name == recovery::QUEUE_CONFLICT));
         if tries.is_some()
-            && (rebase || (self.config.policy.agent_recovery && decision.action == "merge"))
+            && (rebase
+                || ((self.config.policy.agent_recovery
+                    || self.config.policy.open_pr_cap.is_some())
+                    && decision.action == "merge"))
             && let Some(ahead) = self.ahead(repo, &pull)?
         {
             decision = step(
@@ -8529,6 +8546,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             && review_hold(self.config, &pull).is_none()
         {
             decision = self.recovery_step(repo, &pull, &marker, &comments, decision)?;
+        }
+        if matches!(
+            decision.action,
+            "fix" | "rebase" | "continue" | "merge" | "update" | RUN_RERUN
+        ) && let Some(older) = self.pressure_ahead(repo, &pull)?
+        {
+            decision = step(
+                "wait",
+                format!("open-pr-cap: land {repo}#{older} first; overlapping paths"),
+            );
         }
         // Repairs and their triage share the fix scope checks here. The caller
         // independently checks each dispatched kind against its own bounds.
@@ -8903,14 +8930,87 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if !self.share_allows(repo, first) {
             return Ok(());
         }
-        let open = self.paged(
-            &format!("repos/{repo}/pulls?state=open&per_page=100"),
-            false,
-        )?;
+        let open = if self.config.policy.open_pr_cap.is_some() {
+            self.pressure_open(repo)?
+        } else {
+            self.paged(
+                &format!("repos/{repo}/pulls?state=open&per_page=100"),
+                false,
+            )?
+        };
+        if self.config.policy.open_pr_cap.is_some() {
+            let count = crate::pass::pressure::census(&open, &self.config.bot)?;
+            outcome
+                .open_pr_counts
+                .insert(repo.to_ascii_lowercase(), count);
+        }
         let open: Vec<Value> = (open.into_iter())
             .filter(|p| p["number"].as_u64().is_some_and(|n| turn.takes(n)))
             .collect();
         self.follow_open(repo, open, outcome)
+    }
+
+    /// Under pressure, an older open bot PR owns shared paths until it lands.
+    /// Number order is creation order within a GitHub repository. Reading all
+    /// older heads also preserves this order across the poll's resume cursor.
+    fn pressure_ahead(&mut self, repo: &str, pull: &Value) -> Result<Option<u64>> {
+        let Some(cap) = self.config.policy.open_pr_cap else {
+            return Ok(None);
+        };
+        let open = self.pressure_open(repo)?;
+        let mut bot: Vec<u64> = open
+            .iter()
+            .filter(|p| text(p, "/user/login").eq_ignore_ascii_case(&self.config.bot))
+            .filter_map(|p| p["number"].as_u64())
+            .collect();
+        if bot.len() < cap {
+            return Ok(None);
+        }
+        bot.sort_unstable();
+        let number = pull["number"].as_u64().context("pull has no number")?;
+        let mine = changed(pull);
+        for (at, older) in bot.into_iter().filter(|n| *n < number).enumerate() {
+            if at == crate::pass::pressure::OLDER_LIMIT {
+                return Ok(Some(older));
+            }
+            let key = (repo.to_ascii_lowercase(), older);
+            if !self.pressure.files.contains_key(&key) {
+                let files = self.paged(
+                    &format!("repos/{repo}/pulls/{older}/files?per_page=100"),
+                    false,
+                )?;
+                // GitHub silently truncates a PR's REST files at 3000.
+                let paths = if files.len() >= crate::pass::pressure::FILE_LIMIT {
+                    None
+                } else {
+                    files
+                        .iter()
+                        .map(|f| f["filename"].as_str().map(str::to_owned))
+                        .collect()
+                };
+                self.pressure.files.insert(key.clone(), paths);
+            }
+            if match (&mine, &self.pressure.files[&key]) {
+                (Some(mine), Some(theirs)) => !mine.is_disjoint(theirs),
+                _ => true,
+            } {
+                return Ok(Some(older));
+            }
+        }
+        Ok(None)
+    }
+
+    fn pressure_open(&mut self, repo: &str) -> Result<Vec<Value>> {
+        let key = repo.to_ascii_lowercase();
+        if !self.pressure.open.contains_key(&key) {
+            let open = self.paged(
+                &format!("repos/{repo}/pulls?state=open&per_page=100"),
+                false,
+            )?;
+            crate::pass::pressure::census(&open, &self.config.bot)?;
+            self.pressure.open.insert(key.clone(), open);
+        }
+        Ok(self.pressure.open[&key].clone())
     }
 
     fn follow_open(&mut self, repo: &str, open: Vec<Value>, outcome: &mut Outcome) -> Result<()> {
@@ -9157,6 +9257,10 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     }
     let mut cursors = Cursors::new(config, &mut state);
     let mut pass = Pass {
+        pressure: direction
+            .as_mut()
+            .map(|(o, _)| std::mem::take(&mut o.pressure))
+            .unwrap_or_default(),
         updated: direction
             .as_mut()
             .map(|(o, _)| std::mem::take(&mut o.updated))
@@ -23201,6 +23305,7 @@ mod tests {
             merged: 0,
             preview_merges: 0,
             queues: BTreeMap::new(),
+            pressure: Pressure::default(),
             updated: BTreeSet::new(),
             outages: None,
             paces: None,

@@ -48,6 +48,39 @@ This first defaults slice does not change explicit state paths or detailed outpu
 Default cache state, short summaries, `--caller`, SQLite/history and interval runs
 remain separate work.
 
+## Repository PR backpressure
+
+The concrete failure is new independent implementations accumulating faster than
+their PRs land, wasting fix and rebase runs as shared paths repeatedly conflict.
+`openPrCap: 6` opts the GitHub pass into per-destination-repository backpressure;
+omitting the key leaves it off. Values must be 1–100. At or above the cap, a new
+`implement` plan (including a retry) waits with `open-pr-cap`. Triage and landing
+work remain eligible under their existing pools, bounds and dispatch limits.
+The summary shows the cap and observed open bot PR counts by repository.
+
+Counts include drafts and all open PRs authored by the configured bot, not other
+authors or only board-linked PRs. Followed repositories reuse their complete
+stage-2 census; other destinations read at most ten pages of 100 PRs once per
+pass. Failed or incomplete counts hold implementations, never assume zero.
+Counts are a per-pass snapshot, not a cross-pass reservation or a forecast of
+PRs from runs already in flight; a merge does not release new work until the
+next census. No extra credentials or mutation authority are introduced.
+
+The PR walk keeps oldest PR number order (GitHub creation order), retaining its
+resume cursor so parked older work cannot starve disjoint younger work. Fix/rebase,
+automatic fix retries, continuation, update and merge steps wait behind older open bot PRs with overlapping paths;
+disjoint PRs can proceed. The existing merge-queue overlap check also applies.
+The approved-first phase uses the same policy. Repository censuses and older-PR
+paths are read once and shared across these phases. Unread path coverage is
+conservative. The older-PR scan considers at most 100
+older PRs, within the poll's shared request/time budget; further older work holds
+the step. Older PRs parked on a person can therefore hold younger overlapping
+work until landed or closed. This setting does not automatically close PRs or
+grant more fix rounds. Explicit stage-4 `fixPlans` retain their existing policy.
+
+Stacked multi-issue runs remain deferred until the stacked-output dependencies
+in #750 and agentic-job#3438 are usable. This option does not synthesize stacks.
+
 ## Local GitHub credentials
 
 `pass --config FILE` uses the first nonempty token from `GH_TOKEN`, then

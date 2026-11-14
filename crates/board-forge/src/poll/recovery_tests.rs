@@ -4,6 +4,78 @@ fn recovery_policy() -> PollPolicy {
     policy
 }
 
+#[test]
+fn open_pr_cap_keeps_landing_work_and_serializes_oldest_paths() {
+    for cap in [None, Some(1), Some(2), Some(3)] {
+        for shared in [false, true] {
+            for (change, action) in [(json!({}), "merge"), (json!({"contexts":{"ci":{"conclusion":"FAILURE"}}}), "fix"), (json!({"mergeable":CONFLICTING}), "rebase")] {
+                let mut fake = github();
+                fake.page(&format!("repos/{REPO}/pulls?state=open&per_page=100"), None, None,
+                    json!([{"number":471,"user":{"login":BOT}}, {"number":470,"user":{"login":BOT}}]));
+                fake.page(&format!("repos/{REPO}/pulls/470/files?per_page=100"), None, None, json!([{"filename":"src/a.rs"}]));
+                let files = |path: &str| json!({"nodes":[{"path":path}],"pageInfo":{"hasNextPage":false}});
+                let mut later = pull("pull-470", change.clone());
+                later["number"] = 471.into();
+                later["files"] = files(if shared { "src/a.rs" } else { "src/b.rs" });
+                fake.pulls.insert(471, later);
+                fake.page(&format!("repos/{REPO}/issues/471/comments?per_page=100"), None, None, json!([]));
+                let policy = PollPolicy { open_pr_cap:cap, rebase_rounds:2, ..PollPolicy::default() };
+                let mut first = change;
+                first["files"] = files("src/a.rs");
+                let (out, _, _) = applied_policy(fake, policy, first, json!({"rounds":0}));
+                assert_eq!(out.errors, 0, "{cap:?}/{shared}/{action}: {:?}", out.lines);
+                assert_eq!(out.steps[0].number, 470);
+                assert_eq!(out.steps[0].action, action, "{cap:?}/{shared}: {:?}", out.lines);
+                let held = shared && cap.is_some_and(|cap| cap <= 2);
+                assert_eq!(out.steps[1].action, if held { "wait" } else { action }, "{cap:?}/{shared}/{action}: {:?}", out.lines);
+                if held { assert!(out.steps[1].reason.contains("open-pr-cap: land")); }
+            }
+        }
+    }
+}
+
+#[test]
+fn open_pr_cap_preserves_cursor_progress_past_parked_older_work() {
+    let mut fake = github();
+    fake.page(&format!("repos/{REPO}/pulls?state=open&per_page=100"), None, None, json!([{"number":470,"user":{"login":BOT}}, {"number":471,"user":{"login":BOT}}]));
+    fake.pulls.insert(470, pull("pull-470", json!({"labels":{"nodes":[{"name":"Hold"}],"pageInfo":{"hasNextPage":false}}})));
+    let mut later = pull("pull-470", json!({"files":{"nodes":[{"path":"other.rs"}],"pageInfo":{"hasNextPage":false}}}));
+    later["number"] = 471.into();
+    fake.pulls.insert(471, later);
+    fake.page(&format!("repos/{REPO}/issues/471/comments?per_page=100"), None, None, json!([]));
+    fake.page(&format!("repos/{REPO}/pulls/470/files?per_page=100"), None, None, json!([{"filename":"src/a.rs"}]));
+    let mut cfg = config();
+    cfg.policy.open_pr_cap = Some(2);
+    let turn = |state| {
+        let shared = Shared::new(&fake, 2);
+        run(&shared, &fake, &cfg, state, &[], &[REPO.into()], Some(Apply {dispatcher:&shared, workflow:"dispatch.yml".into(), pools:vec!["claude".into()], git_ref:None}), now()).unwrap()
+    };
+    let first = turn(State::default());
+    assert_eq!(first.errors, 0, "{:?}", first.lines);
+    assert_eq!(first.state.share_cursor, Some(format!("{REPO}#471")));
+    let second = turn(State::from_json(&first.state.to_json()).unwrap());
+    assert_eq!(second.errors, 0, "{:?}", second.lines);
+    assert!(second.steps.iter().any(|s| s.number == 471 && s.action == "merge"), "{:?}", second.lines);
+}
+
+#[test]
+fn open_pr_cap_reuses_repository_and_path_reads() {
+    let mut fake = github();
+    fake.page(&format!("repos/{REPO}/pulls?state=open&per_page=100"), None, None, json!((470..=472).map(|number| json!({"number":number,"user":{"login":BOT}})).collect::<Vec<_>>()));
+    for number in [470, 471] {
+        fake.page(&format!("repos/{REPO}/pulls/{number}/files?per_page=100"), None, None, json!([{"filename":format!("{number}.rs")} ]));
+    }
+    let mut cfg = config();
+    cfg.policy.open_pr_cap = Some(2);
+    let mut pass = Pass::new(&fake, &fake, &cfg, now());
+    for number in [472, 471, 472] {
+        let mut p = pull("pull-470", json!({"files":{"nodes":[{"path":"disjoint.rs"}],"pageInfo":{"hasNextPage":false}}}));
+        p["number"] = number.into();
+        assert_eq!(pass.pressure_ahead(REPO, &p).unwrap(), None);
+    }
+    assert_eq!(fake.sent.borrow().len(), 3, "one census and two file lists: {:?}", fake.sent.borrow());
+}
+
 fn assert_no_operator_park(fake: &Fake, dispatcher: &Fake) {
     for (url, body) in fake.writes.borrow().iter().chain(dispatcher.writes.borrow().iter()) {
         assert!(!url.contains("requested_reviewers"), "{url}");
