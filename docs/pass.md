@@ -789,6 +789,13 @@ automatically restore them; investigate and restore ownership before resuming.
 Older journals without `before.assignees` are refused, not interpreted as empty
 assignments. Retain those journals and reconcile their transfers manually using
 the original ownership evidence; do not invent an empty set to bypass the check.
+Priority evidence must distinguish an unset value from an unreadable field entry.
+The bounded field-value read requires typed entries, readable single-select field
+names and a complete Priority option ID/name when set. Missing evidence holds
+before intent; unreadable readback or recovery leaves the receipt pending and
+stops the batch rather than certifying preservation. Other field types are not
+Priority and remain outside this preservation contract. The journal's Priority
+representation is unchanged, so existing pending receipts can still reconcile.
 Parent links are verified by stable issue node ID, not URL: a parent repository
 rename must not strand an otherwise preserved transfer. The journal retains the
 original parent object, and pending entries use the same identity comparison on

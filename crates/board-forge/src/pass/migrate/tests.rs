@@ -26,7 +26,7 @@ fn node(number: u64) -> Value {
         "closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},
         "timelineItems":{"nodes":[],"pageInfo":{"hasNextPage":false}},
         "projectItems":{"nodes":[{"id":format!("item-{number}"),"project":{"id":"board", "number":1,"owner":{"login":"cgwalters-forge"}},
-            "fieldValues":{"nodes":[{"optionId":"priority-1","name":"P1","field":{"name":"Priority"}}],"pageInfo":{"hasNextPage":false}}}],
+            "fieldValues":{"nodes":[{"__typename":"ProjectV2ItemFieldSingleSelectValue","optionId":"priority-1","name":"P1","field":{"name":"Priority"}}],"pageInfo":{"hasNextPage":false}}}],
             "pageInfo":{"hasNextPage":false}}})
 }
 
@@ -66,6 +66,8 @@ struct Forge {
     children_during_preflight: bool,
     assignees: Option<Value>,
     assignees_during_preflight: bool,
+    fields: Option<Value>,
+    fields_during_preflight: bool,
     parent_after_transfer: Option<Value>,
     state_before_transfer: Option<Value>,
     state_after_transfer: Option<Value>,
@@ -314,6 +316,14 @@ impl Transport for Forge {
             node["updatedAt"] = json!("2026-11-13T00:01:00Z");
         }
         let mut board = node["projectItems"]["nodes"][0].clone();
+        if let Some(fields) = &self.fields
+            && (!self.fields_during_preflight || self.snapshots.get() > 1)
+        {
+            board["fieldValues"] = fields.clone();
+        }
+        if moved && self.failure == "priority-unreadable" {
+            board["fieldValues"]["nodes"] = json!([null]);
+        }
         board["__typename"] = json!("ProjectV2Item");
         board["content"] = json!({"id":node["id"]});
         Ok(json!({"node":node, "board":board}))
@@ -353,6 +363,84 @@ fn partial_board_errors_stop_preview_and_apply_before_intent() {
             assert_eq!(forge.snapshots.get(), 0);
             assert_eq!(forge.transfers.get(), 0);
         }
+    }
+}
+
+#[test]
+fn priority_requires_readable_evidence_before_intent() {
+    let valid = node(1)["projectItems"]["nodes"][0]["fieldValues"].clone();
+    let mut cases = vec![
+        ("missing connection", Value::Null),
+        (
+            "null entry",
+            json!({"nodes":[null],"pageInfo":{"hasNextPage":false}}),
+        ),
+        (
+            "untyped entry",
+            json!({"nodes":[{}],"pageInfo":{"hasNextPage":false}}),
+        ),
+    ];
+    for path in [
+        "/nodes/0/__typename",
+        "/nodes/0/field",
+        "/nodes/0/field/name",
+        "/nodes/0/optionId",
+        "/nodes/0/name",
+        "/pageInfo/hasNextPage",
+    ] {
+        let mut fields = valid.clone();
+        *fields.pointer_mut(path).unwrap() = Value::Null;
+        cases.push((path, fields));
+    }
+    let mut duplicate = valid.clone();
+    duplicate["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(valid["nodes"][0].clone());
+    cases.push(("duplicate Priority", duplicate));
+    for (name, fields) in cases {
+        for (apply, preflight) in [(false, false), (true, false), (true, true)] {
+            let forge = Forge {
+                fields: Some(fields.clone()),
+                fields_during_preflight: preflight,
+                ..Default::default()
+            };
+            let mut journal = Journal::default();
+            let (result, lines) = execute(&forge, apply, 1, &mut journal);
+            if preflight {
+                assert!(result.is_err(), "{name}: {lines:?}");
+            } else {
+                result.unwrap();
+                assert!(lines[0].starts_with("hold "), "{name}: {lines:?}");
+            }
+            assert_eq!(forge.transfers.get(), 0, "{name}");
+            assert!(journal.receipts.is_empty(), "{name}");
+        }
+    }
+}
+
+#[test]
+fn priority_snapshot_keeps_journal_shape_and_accepts_unset() {
+    let forge = Forge::default();
+    let mut snapshot = snapshot(&forge, "issue-1", "item-1").unwrap();
+    let config = config();
+    let old_priority = json!([{"optionId":"priority-1","name":"P1","field":{"name":"Priority"}}]);
+    assert_eq!(
+        before(&snapshot, &config).unwrap().board["priority"],
+        old_priority
+    );
+    // Non-single-select fields cannot be Priority; other single-select fields
+    // are distinguished by their readable field name, not their value name.
+    for nodes in [
+        json!([]),
+        json!([{"__typename":"ProjectV2ItemFieldTextValue"}]),
+        json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","field":{"name":"Status"},"name":"Priority"}]),
+    ] {
+        snapshot["board"]["fieldValues"]["nodes"] = nodes;
+        assert_eq!(
+            before(&snapshot, &config).unwrap().board["priority"],
+            json!([])
+        );
     }
 }
 
@@ -648,6 +736,7 @@ fn transfer_failures_reconcile_before_any_retry_and_preservation_failure_stops()
         "timeout",
         "readback",
         "priority",
+        "priority-unreadable",
         "parent",
         "labels",
         "milestone",
@@ -718,6 +807,7 @@ fn batch_recovery_restarts_from_durable_intent_before_advancing() {
         "before",
         "readback",
         "priority",
+        "priority-unreadable",
         "parent",
         "labels",
         "milestone",
