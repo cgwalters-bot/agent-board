@@ -1127,6 +1127,9 @@ pub struct HoldsAt {
     /// ([`holds::needs_you`]) to the snapshot.
     #[serde(default, rename = "needsYou")]
     pub needs_you: bool,
+    /// Off unless set: report the pass credential's expiry and manual rotation.
+    #[serde(rename = "patExpiry")]
+    pub pat_expiry: Option<pat::Rotation>,
     /// Off unless set: the issues whose operator-action proposals the
     /// needs-you list includes; needs `needsYou`.
     pub proposals: Option<needs::ProposalsAt>,
@@ -1390,6 +1393,17 @@ impl Config {
         } else {
             crate::forgejo::Naming::Github
         };
+        if let Some(rotation) = self.holds.as_ref().and_then(|h| h.pat_expiry.as_ref()) {
+            rotation.check()?;
+            ensure!(
+                self.forgejo_board().is_none(),
+                "holds patExpiry supports GitHub only"
+            );
+            ensure!(
+                self.holds.as_ref().is_some_and(|h| h.needs_you),
+                "holds patExpiry needs holds needsYou"
+            );
+        }
         if let Some(cap) = self.open_pr_cap {
             ensure!(
                 (1..=pressure::CAP_LIMIT).contains(&cap),
@@ -3418,6 +3432,10 @@ fn is_mutation(query: &str) -> bool {
 }
 
 impl<C: Rest> Rest for Budget<'_, C> {
+    fn token_expiration(&self) -> Option<OffsetDateTime> {
+        self.inner.token_expiration()
+    }
+
     fn get_fresh(&self, url: &str) -> Result<RestResponse> {
         self.spend(false, &endpoint_class(url))?;
         let response = self.observe(self.inner.get_fresh(url))?;
@@ -3848,6 +3866,10 @@ impl<C> Kept<'_, C> {
 }
 
 impl<C: Rest> Rest for Kept<'_, C> {
+    fn token_expiration(&self) -> Option<OffsetDateTime> {
+        self.inner.token_expiration()
+    }
+
     fn get_fresh(&self, url: &str) -> Result<RestResponse> {
         self.inner.get_fresh(url)
     }
@@ -9598,6 +9620,15 @@ fn fixture_text(head: &Value, entries: &[Value]) -> String {
 }
 
 impl<C: Rest> Rest for Recorder<'_, C> {
+    fn token_expiration(&self) -> Option<OffsetDateTime> {
+        let expiry = self.inner.token_expiration();
+        self.keep(
+            json!({"credential": "expiration"}),
+            json!({"expires_at": expiry.and_then(|e| e.format(&Rfc3339).ok())}),
+        );
+        expiry
+    }
+
     /// Keeps the live client's typed absence ([`crate::github::NotFound`],
     /// 404 or 410) as [`ABSENT`], not as a status it cannot tell. Any other
     /// failure is not kept, so neither its message nor a guess at it is.
@@ -9719,6 +9750,10 @@ pub struct Seeded<'a, C> {
 }
 
 impl<C: Rest> Rest for Seeded<'_, C> {
+    fn token_expiration(&self) -> Option<OffsetDateTime> {
+        self.live.token_expiration()
+    }
+
     fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
         match self.seed.answer(&json!({"get": url})) {
             Ok(_) => self.seed.get(url, None),
@@ -9773,6 +9808,13 @@ impl<C: crate::github::GraphQl> crate::github::GraphQl for Seeded<'_, C> {
 }
 
 impl Rest for Replay {
+    fn token_expiration(&self) -> Option<OffsetDateTime> {
+        self.answer(&json!({"credential": "expiration"}))
+            .ok()
+            .and_then(|v| v["expires_at"].as_str())
+            .and_then(|v| OffsetDateTime::parse(v, &Rfc3339).ok())
+    }
+
     /// A recorded [`ABSENT`] answer is the live client's typed error again;
     /// an older fixture's recorded 404 status stays a response.
     fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
@@ -9867,6 +9909,7 @@ pub mod midstream;
 pub mod mix;
 pub mod needs;
 pub mod next;
+mod pat;
 pub(crate) mod pressure;
 pub mod promote;
 mod pull_links;

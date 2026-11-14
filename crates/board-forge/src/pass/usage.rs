@@ -981,6 +981,18 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 && comment.is_some_and(|c| self.bot_edited(c))
                 && parts.iter().all(|c| self.bot_edited(c));
             let previous = previous.filter(|_| own);
+            if let Some(rotation) = self
+                .config
+                .holds
+                .as_ref()
+                .and_then(|h| h.pat_expiry.as_ref())
+            {
+                snapshot.pat_expiry = Some(super::pat::status(
+                    rotation,
+                    self.client.token_expiration(),
+                    self.now,
+                ));
+            }
             snapshot.needs_you = Some(self.needs_you(&mut snapshot, previous, &on));
         }
         if self.config.follows() {

@@ -4,6 +4,10 @@ use super::*;
 /// State is sufficient to retire a closed target. Labels prove clearance
 /// only for the particular source that actually depends on that label.
 fn retired(source: &str, kind: &str, item: &str, nodes: &BTreeMap<String, Value>) -> bool {
+    // Credential health is not resolved by closing its publication issue.
+    if source == super::super::pat::SOURCE {
+        return false;
+    }
     let Some(node) = nodes.get(&item.to_ascii_lowercase()) else {
         return false;
     };

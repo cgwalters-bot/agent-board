@@ -517,6 +517,13 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             Some(maintain) => self.newest_digest(maintain),
             None => Collected::off(),
         };
+        let mut inbox = self.inbox();
+        if let Some(rotation) = config.holds.as_ref().and_then(|h| h.pat_expiry.as_ref()) {
+            inbox.insert(
+                super::pat::SOURCE.into(),
+                super::pat::asks(rotation, self.client.token_expiration(), self.now, on),
+            );
+        }
         let mut reading = holds::Reading {
             operator: &config.operator,
             epics: config.epics.is_some(),
@@ -527,7 +534,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             reviews,
             proposals,
             digest,
-            inbox: self.inbox(),
+            inbox,
             observed: self.observed(&snapshot.at),
             summaries: (Read::Complete, BTreeMap::new()),
         };

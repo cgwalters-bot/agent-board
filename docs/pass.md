@@ -99,6 +99,80 @@ identity and requires the existing local caps outside Actions. Caller configs
 and reviewed bounds files still come from a trusted checkout; fetching them
 without a checkout is not implemented yet.
 
+## PAT expiry and manual rotation
+
+The concrete failure is a PAT silently expiring and stopping the caller's external
+actions. `holds.patExpiry` opts into a credential-health projection; it is off
+unless configured and requires `holds.needsYou` on GitHub:
+
+```json
+"patExpiry": {
+  "repository": "cgwalters-forge/tracker",
+  "secret": "CGWALTERS_BOT_PAT"
+}
+```
+
+Place this object inside the existing `holds` object. The repository and secret
+name identify the **manual update destination**, not a token to fetch. The pass
+observes its own API credential, never `DISPATCH_TOKEN` or an unrelated stored
+secret. Only enable it where that credential is the PAT being rotated. In
+particular, an Octo STS installation token's expiry is not the bot PAT's expiry;
+a future split read/write client must observe the PAT client's responses.
+
+The shared GitHub client records the `github-authentication-token-expiration`
+header from its first response, including an absent or invalid header. Both REST
+and GraphQL paths use it, including conditional responses. Parsing accepts GitHub's
+`YYYY-MM-DD HH:MM:SS UTC` and RFC 3339 timestamps, with a 64-byte parsing bound.
+No probe or secret read is added. Missing/invalid headers publish an unknown
+expiry, not an assertion that the credential never expires. API authentication
+failures still fail normally: an already expired credential cannot reliably
+publish its own warning.
+
+The holds status payload gains `pat_expiry` with `expires_at` (RFC 3339 or null),
+`threshold_days`, `repository`, `secret` and `settings_url`. At fewer than 30 days,
+then at 7 days and 1 day, needs-you contains one `operator-action` card from source
+`pat-expiry`. Its key and semantic identity include the expiry and threshold:
+repeated passes retain that one card and its age, rather than append reminders.
+Each threshold replaces the previous card. Rotation to a later expiry clears it;
+an expired token stays at the 1-day urgency if it can still report. The usual
+holds publication write/request/size limits apply, including preview's no-write
+behavior and hourly confirmation. There is no unbounded reminder ledger.
+
+The recommendation links to <https://github.com/settings/personal-access-tokens>
+and says to log in as the bot, mint a replacement, then run:
+
+```sh
+gh secret set CGWALTERS_BOT_PAT -R cgwalters-forge/tracker
+```
+
+`gh` reads the replacement from stdin; do not put the token in a command argument,
+issue, pass config or recording. The request descriptor's `rotate-token` action
+is unsupported for automation: this is an operator action, **not** an executable
+operator-action proposal or permission to read/write secrets. Secret names are
+limited to 100 uppercase ASCII letters, digits and underscores (no leading digit)
+to keep the copyable command shell-inert. No credential or mutation authority is
+introduced. Recordings retain only the parsed expiry, never the header or token.
+
+Prefer a **fine-grained PAT with a 60-day lifetime**, restricted to the resource
+owner and selected repositories still needing it, where GitHub supports those
+external operations. Do not assume a fine-grained token can act across unrelated
+owners or on public repositories where the bot is only an outside collaborator;
+verify the remaining upstream operations before replacing the current token.
+The exact post-cutover permission list is not available in this checkout:
+[tracker#1679](https://github.com/cgwalters-forge/tracker/issues/1679) is producing
+that inventory. Do not substitute the pass's current broad in-org permissions
+for the retained external PAT's scopes. Final scope documentation remains blocked
+on that inventory.
+
+Caller activation: `cgwalters-forge/tracker`, `.github/pass.json`, set
+`holds.patExpiry` to the object above, retaining `holds.needsYou: true`, only while
+the pass credential is `CGWALTERS_BOT_PAT`. The external control app in
+`cgwalters-forge/review`, `src/github/holds.ts`, must parse `pat_expiry` and render
+its `expires_at` (null as unknown) in status, and render `pat-expiry` cards as
+manual rotation actions, not proposal application. That consumer is not in this
+repository; its actual rendering and the final permission inventory remain
+acceptance work for agent-board#998.
+
 ## Review setup diagnostic
 
 The concrete failure this check catches is a dispatch target whose review wrapper
