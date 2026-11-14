@@ -59,6 +59,7 @@ struct Forge {
     children_during_preflight: bool,
     assignees: Option<Value>,
     assignees_during_preflight: bool,
+    parent_after_transfer: Option<Value>,
     count: u64,
     body: RefCell<String>,
 }
@@ -232,6 +233,9 @@ impl Transport for Forge {
             other => panic!("unrecorded reference failure {other}"),
         }
         if moved {
+            if let Some(parent) = &self.parent_after_transfer {
+                node["parent"] = parent.clone();
+            }
             node["repository"]["nameWithOwner"] = json!("cgwalters-forge/bootc");
             node["number"] = json!(98 + number);
             node["url"] = json!(format!(
@@ -669,6 +673,49 @@ fn assignee_change_during_preflight_stops_before_transfer_intent() {
     assert!(format!("{:#}", result.unwrap_err()).contains("stale source evidence"));
     assert_eq!(forge.transfers.get(), 0);
     assert!(journal.receipts.is_empty());
+}
+
+#[test]
+fn parent_preservation_uses_stable_identity_and_requires_evidence() {
+    for (parent, succeeds) in [
+        (
+            json!({"id":"epic", "url":"https://github.com/cgwalters-forge/renamed-tracker/issues/1599"}),
+            true,
+        ),
+        (
+            json!({"id":"other-epic", "url":"https://github.com/cgwalters-forge/tracker/issues/1599"}),
+            false,
+        ),
+        (Value::Null, false),
+        (
+            json!({"url":"https://github.com/cgwalters-forge/tracker/issues/1599"}),
+            false,
+        ),
+        (
+            json!({"id":"", "url":"https://github.com/cgwalters-forge/tracker/issues/1599"}),
+            false,
+        ),
+        (json!({"id":"epic"}), false),
+    ] {
+        let forge = Forge {
+            parent_after_transfer: Some(parent.clone()),
+            ..Default::default()
+        };
+        let mut journal = Journal::default();
+        let (result, _) = execute(&forge, true, 1, &mut journal);
+        assert_eq!(result.is_ok(), succeeds, "{parent}: {result:?}");
+        assert_eq!(forge.transfers.get(), 1);
+        assert_eq!(journal.receipts["issue-1"].canonical.is_some(), succeeds);
+
+        // Existing journals retain the full original parent object. Reconcile
+        // that representation after restart without resending the transfer.
+        journal.receipts.get_mut("issue-1").unwrap().canonical = None;
+        let mut restored = serde_json::from_slice(&serde_json::to_vec(&journal).unwrap()).unwrap();
+        let (result, _) = execute(&forge, true, 1, &mut restored);
+        assert_eq!(result.is_ok(), succeeds, "restart {parent}: {result:?}");
+        assert_eq!(restored.receipts["issue-1"].canonical.is_some(), succeeds);
+        assert_eq!(forge.transfers.get(), 1);
+    }
 }
 
 #[test]

@@ -288,10 +288,7 @@ fn before(node: &Value, config: &Config) -> Result<Before> {
         .get("parent")
         .context("missing parent evidence")?
         .clone();
-    if !parent.is_null() {
-        required(&parent, "id")?;
-        required(&parent, "url")?;
-    }
+    parent_id(&parent)?;
     let source = required(&node["repository"], "nameWithOwner")?.to_owned();
     validate_repository(&source)?;
     let number = node["number"]
@@ -315,6 +312,14 @@ fn before(node: &Value, config: &Config) -> Result<Before> {
         assignees,
         milestone: milestone.clone(),
     })
+}
+
+fn parent_id(parent: &Value) -> Result<Option<&str>> {
+    if parent.is_null() {
+        return Ok(None);
+    }
+    required(parent, "url")?;
+    Ok(Some(required(parent, "id")?))
 }
 
 fn validate_milestone(milestone: &Value) -> Result<()> {
@@ -623,7 +628,12 @@ fn preserved(before: &Before, after: &Before, destination: &str) -> Result<Strin
         after.board == before.board,
         "transfer lost board identity or Priority"
     );
-    ensure!(after.parent == before.parent, "transfer lost parent link");
+    // A repository rename can change the parent's URL while an intent is
+    // pending. Retain the original evidence in the journal, but compare identity.
+    ensure!(
+        parent_id(&after.parent)? == parent_id(&before.parent)?,
+        "transfer lost parent link"
+    );
     ensure!(after.labels == before.labels, "transfer lost labels");
     ensure!(
         after.assignees == before.assignees,
