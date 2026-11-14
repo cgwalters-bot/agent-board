@@ -17280,11 +17280,182 @@ fn body_plans_start_a_p0_or_p1_issue() {
 }
 
 #[test]
+fn living_pull_links_create_status_without_a_plan_and_respect_preview_and_caps() {
+    for (mode, cap, expected) in [(false, 10, 0), (true, 0, 0), (true, 10, 1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.json");
+        let mut forge = body_plan_forge("P0", "An unplanned issue.", "cgwalters-bot", None);
+        forge.replay.requests.push(json!({"request":graphql_key(active::LINKS,
+            &json!({"owner":"cgwalters-forge","name":"tracker","number":446,"cursor":null})),
+            "answer":{"data":{"repository":{"issue":{"timelineItems":{
+                "nodes":[{"source":{"repository":{"nameWithOwner":"upstream/work"},"number":408,"state":"OPEN"}},
+                    {"source":{"repository":{"nameWithOwner":"private/work"},"number":99,"state":"OPEN"}}],
+                "pageInfo":{"hasNextPage":false}
+            }}}}}}));
+        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/upstream/work")},
+            "answer":{"status":200,"body":{"full_name":"upstream/work","private":false},"link":null}}));
+        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/private/work")},
+            "answer":{"status":200,"body":{"full_name":"private/work","private":true},"link":null}}));
+        let config = config(json!({"livingStatus":ledger,"triage":false}));
+        let own = own();
+        let report = block(run(
+            &forge,
+            &forge,
+            &config,
+            State::default(),
+            (
+                if mode {
+                    Mode::Actions(&own)
+                } else {
+                    Mode::Preview
+                },
+                Limits {
+                    dispatch: Some(0),
+                    writes: Some(cap),
+                    ..Default::default()
+                },
+            ),
+            forge.replay.now,
+        ))
+        .unwrap();
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        assert_eq!(comments.len(), expected, "{:#?}", report.lines);
+        if expected == 1 {
+            assert!(comments[0].contains("https://github.com/upstream/work/pull/408 (open)"));
+            assert!(!comments[0].contains("private/work"));
+            assert!(
+                !std::fs::read_to_string(&ledger)
+                    .unwrap()
+                    .contains("private/work")
+            );
+            let before = forge.writes.borrow().len();
+            let report = apply(&forge, &config);
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            assert_eq!(
+                forge.writes.borrow().len(),
+                before,
+                "unchanged inventory must not write"
+            );
+            let metadata = format!("{API_ROOT}repos/upstream/work");
+            for entry in &mut forge.replay.requests {
+                if entry["request"]["get"] == metadata {
+                    entry["answer"]["body"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("private");
+                }
+            }
+            let report = apply(&forge, &config);
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("linked repository visibility missing")),
+                "{:#?}",
+                report.lines
+            );
+            assert_eq!(forge.comments_on("cgwalters-forge/tracker", 446), comments);
+            assert_eq!(forge.writes.borrow().len(), before);
+            // Visitor-controlled history overflow must not turn observation
+            // into an authorization to stop work, or erase the last inventory.
+            let first = graphql_key(
+                active::LINKS,
+                &json!({"owner":"cgwalters-forge","name":"tracker","number":446,"cursor":null}),
+            );
+            for entry in &mut forge.replay.requests {
+                if entry["request"] == first {
+                    entry["answer"]["data"]["repository"]["issue"]["timelineItems"]["pageInfo"] =
+                        json!({"hasNextPage":true,"endCursor":"p1"});
+                }
+            }
+            for n in 1..=2 {
+                forge.replay.requests.push(json!({"request":graphql_key(active::LINKS,
+                    &json!({"owner":"cgwalters-forge","name":"tracker","number":446,"cursor":format!("p{n}")})),
+                    "answer":{"data":{"repository":{"issue":{"timelineItems":{
+                        "nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":format!("p{}",n+1)}
+                    }}}}}}));
+            }
+            let report = apply(&forge, &config);
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("cross references exceed page bound")
+                        && l.contains("scheduling unchanged")),
+                "{:#?}",
+                report.lines
+            );
+            assert_eq!(forge.comments_on("cgwalters-forge/tracker", 446), comments);
+            assert_eq!(forge.writes.borrow().len(), before);
+        }
+        if !mode {
+            let saved: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+            assert!(saved["entries"].as_object().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn visitor_reference_overflow_does_not_veto_an_accepted_implementation() {
+    for overflow in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut forge = body_plan_forge("P0", &body_plan_block(), "cgwalters-bot", None);
+        for n in 0..3 {
+            let cursor = if n == 0 {
+                Value::Null
+            } else {
+                json!(format!("p{n}"))
+            };
+            let nodes: Vec<_> = (0..100).map(|i| {
+            let repo = format!("visitor/r{}",n*100+i);
+            forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{repo}")},
+                "answer":{"status":200,"body":{"full_name":repo,"private":false},"link":null}}));
+            json!({"source":{"number":408,"state":"OPEN","repository":{"nameWithOwner":repo}}})
+        }).collect();
+            forge
+                .replay
+                .requests
+                .push(json!({"request":graphql_key(active::LINKS,
+                &json!({"owner":"cgwalters-forge","name":"tracker","number":446,"cursor":cursor})),
+                "answer":{"data":{"repository":{"issue":{"timelineItems":{
+                    "nodes":nodes,
+                    "pageInfo":{"hasNextPage":overflow || n < 2,"endCursor":format!("p{}",n+1)}
+                }}}}}}));
+        }
+        let config =
+            config(json!({"livingStatus":dir.path().join("ledger.json"),"bodyPlans":true}));
+        let report = apply_within(&forge, &config, 247);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert_eq!(forge.dispatches().len(), 1, "{:#?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("warning: pull links")
+                    && (!overflow || l.contains("cross references exceed page bound"))),
+            "{:#?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
 fn living_body_plan_dispatch_uses_logical_time_for_new_and_existing_status() {
     for existing in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
-        let forge = body_plan_forge("P0", &body_plan_block(), "cgwalters-bot", None);
+        let mut forge = body_plan_forge("P0", &body_plan_block(), "cgwalters-bot", None);
+        forge
+            .replay
+            .requests
+            .push(json!({"request":graphql_key(active::LINKS,
+            &json!({"owner":"cgwalters-forge","name":"tracker","number":446,"cursor":null})),
+            "answer":{"data":{"repository":{"issue":{"timelineItems":{
+                "nodes":[],"pageInfo":{"hasNextPage":false}
+            }}}}}}));
         if existing {
             let mut store = living::Store::load(
                 path.to_str().unwrap(),

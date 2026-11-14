@@ -29,6 +29,8 @@ struct Entry {
     // Those comments remain readable after the authoritative status advances.
     #[serde(default)]
     references: BTreeMap<u64, String>,
+    #[serde(default)]
+    pulls: Option<Vec<pull_links::PullLink>>,
 }
 
 #[cfg(test)]
@@ -47,6 +49,40 @@ mod tests {
 
     fn dispatched(id: u64) -> Value {
         json!({"body": format!("<!-- agent-board-dispatch: {id}@time -->\nDispatched [plan](https://github.com/o/r/issues/1#issuecomment-{id}): [run](https://github.com/o/r/actions/runs/8).")})
+    }
+
+    #[test]
+    fn pull_inventory_creates_one_status_and_survives_restart_and_plan_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let path = path.to_str().unwrap();
+        let issue = crate::github::parse_github_issue("o/r#1", None, DEFAULT_HOST).unwrap();
+        let link = |state| {
+            serde_json::from_value(json!({"repository":"up/r","number":8,"state":state})).unwrap()
+        };
+        let mut store = Store::load(path, "bot", at()).unwrap();
+        store.track_pulls(&issue, vec![link("OPEN")]).unwrap();
+        let write = store.pending().pop().unwrap();
+        assert_eq!(write.method, "POST");
+        assert!(text(&write.body, "/body").contains("https://github.com/up/r/pull/8 (open)"));
+        store.finish(&write, &mut (201, json!({"id":30}))).unwrap();
+        let mut store = Store::load(path, "bot", at()).unwrap();
+        store.track_pulls(&issue, vec![link("OPEN")]).unwrap();
+        assert!(store.pending().is_empty());
+        let write = store
+            .prepare("POST", URL, &dispatched(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(write.method, "PATCH");
+        assert!(text(&write.body, "/body").contains("### Pull requests"));
+        store.finish(&write, &mut (200, json!({}))).unwrap();
+        store.track_pulls(&issue, vec![link("MERGED")]).unwrap();
+        let write = store.pending().pop().unwrap();
+        assert_eq!(write.method, "PATCH");
+        assert!(text(&write.body, "/body").contains("/pull/8 (merged)"));
+        store.finish(&write, &mut (200, json!({}))).unwrap();
+        store.track_pulls(&issue, vec![]).unwrap();
+        assert!(text(&store.pending()[0].body, "/body").contains("None observed."));
     }
 
     fn legacy_body(entry: &Entry) -> String {
@@ -568,6 +604,17 @@ fn public_body(entry: &Entry) -> String {
             out.push_str(&format!("\n### {section}\n{prose}\n"));
         }
     }
+    if let Some(pulls) = &entry.pulls {
+        out.push_str("\n### Pull requests\n");
+        if pulls.is_empty() {
+            out.push_str("None observed.\n");
+        }
+        for pull in pulls {
+            out.push_str(&pull.display());
+            out.push('\n');
+        }
+        out.push_str("\nObserved links only; not permission to push.\n");
+    }
     out.push_str(&format!("\n{STATE}{} -->", state_id(entry)));
     out
 }
@@ -606,6 +653,10 @@ impl Store {
             "status ledger schema or bot differs"
         );
         ensure!(
+            ledger.entries.len() <= MAX_RECORDS,
+            "status ledger entry bound exceeded"
+        );
+        ensure!(
             ledger
                 .entries
                 .values()
@@ -624,6 +675,9 @@ impl Store {
             "status ledger reference bound exceeded"
         );
         for (key, entry) in &ledger.entries {
+            if let Some(pulls) = &entry.pulls {
+                pull_links::validate(pulls)?;
+            }
             let (repo, number) = key
                 .rsplit_once('#')
                 .context("invalid status ledger issue key")?;
@@ -664,6 +718,10 @@ impl Store {
 
     fn save(&self) -> Result<()> {
         use std::io::Write;
+        ensure!(
+            self.ledger.entries.len() <= MAX_RECORDS,
+            "status ledger entry bound exceeded"
+        );
         ensure!(
             self.ledger
                 .entries
@@ -870,12 +928,44 @@ impl Store {
         Ok(())
     }
 
+    pub(super) fn track_pulls(
+        &mut self,
+        issue: &ItemRef,
+        pulls: Vec<pull_links::PullLink>,
+    ) -> Result<()> {
+        pull_links::validate(&pulls)?;
+        let key = key(issue);
+        if pulls.is_empty() && !self.ledger.entries.contains_key(&key) {
+            return Ok(());
+        }
+        let before = self.ledger.entries.clone();
+        let entry = self.ledger.entries.entry(key).or_default();
+        entry.pulls = Some(pulls);
+        let size = public_body(entry).len();
+        let result = (|| {
+            ensure!(
+                size <= COMMENT_BYTES,
+                "status comment is full; nothing sent"
+            );
+            self.save()
+        })();
+        if let Err(error) = result {
+            self.ledger.entries = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn pending(&self) -> Vec<Write> {
         self.ledger
             .entries
             .iter()
             .filter_map(|(key, entry)| {
-                let id = entry.id?;
+                // A tracking-only status can be created after a complete comment
+                // scan. Reconciliation scans again before sending this POST.
+                if entry.id.is_none() && entry.pulls.is_none() {
+                    return None;
+                }
                 let body = public_body(entry);
                 if body.len() > COMMENT_BYTES {
                     return None;
@@ -883,13 +973,16 @@ impl Store {
                 if entry.published.as_ref() == Some(&body) {
                     return None;
                 }
-                let (repo, _) = key.rsplit_once('#')?;
+                let (repo, number) = key.rsplit_once('#')?;
                 Some(Write {
                     key: key.clone(),
-                    method: "PATCH",
-                    url: format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
+                    method: if entry.id.is_some() { "PATCH" } else { "POST" },
+                    url: match entry.id {
+                        Some(id) => format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
+                        None => format!("{API_ROOT}repos/{repo}/issues/{number}/comments"),
+                    },
                     body: json!({"body":body}),
-                    created: false,
+                    created: entry.id.is_none(),
                     replaced_post: false,
                     record: None,
                 })

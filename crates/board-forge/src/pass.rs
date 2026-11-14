@@ -2723,6 +2723,7 @@ type ByStage = [usize; Stage::ALL.len()];
 struct Bounds {
     /// Per-item handoff notices, deduplicated across board reads and rechecks.
     handoff_notices: RefCell<BTreeSet<String>>,
+    pull_link_candidates: RefCell<BTreeMap<String, Facts>>,
     /// Successful pass-local reads, reused only by the reporting stage, never
     /// by a start or merge recheck. Unlike decision reads, writes do not evict
     /// these observations: publication reports what the pass saw.
@@ -2793,6 +2794,7 @@ impl Bounds {
     fn new(limit: usize, admit_by: Instant) -> Self {
         Self {
             handoff_notices: RefCell::default(),
+            pull_link_candidates: RefCell::default(),
             publication_reads: RefCell::default(),
             publication_bytes: Cell::new(0),
             publication_runs: RefCell::default(),
@@ -4370,6 +4372,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         scheduler.report.error("schedule", &error);
     }
     scheduler.focus_unjudged();
+    scheduler.refresh_pull_links();
     // Stage 4b: read-only visibility into approved fork PRs, never publication.
     scheduler.promote();
     // Stage 5: board Status from the facts read, this pass's starts included.
@@ -4987,7 +4990,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 break;
             }
             let result = (|| -> Result<()> {
-                // Recheck the author/editor before retrying an idempotent PATCH.
+                // Recheck ownership and discover a previous ambiguous POST.
                 let issue = living::Store::issue(&write)?;
                 plan::issue_comments(&self.client, &issue)?;
                 let refreshed = self
@@ -5005,9 +5008,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     return Ok(());
                 };
                 self.caps.count(Kind::Write);
-                plan::send(&self.client, write.method, &write.url, &write.body, 0)?;
+                let mut response =
+                    plan::send(&self.client, write.method, &write.url, &write.body, 0)?;
                 if let Some(store) = self.client.bounds.living.borrow_mut().as_mut() {
-                    store.acknowledge(write)?;
+                    store.finish(write, &mut response)?;
                 }
                 Ok(())
             })();
@@ -7199,6 +7203,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Err(error) = self.complete_pulls(&mut facts) {
             let why = format!("its pull requests could not all be read: {error:#}");
             return Ok(Step::Hold(Hold::new(HoldKind::Unreadable, why)));
+        }
+        if config.living_status.is_some() {
+            self.client
+                .bounds
+                .pull_link_candidates
+                .borrow_mut()
+                .insert(key(&facts.issue), facts.clone());
         }
         if config.skip_active_work
             && let Some(pull) = active::trusted_pull(&facts, &writers)
@@ -9709,6 +9720,7 @@ pub mod mix;
 pub mod needs;
 pub mod next;
 pub mod promote;
+mod pull_links;
 pub mod revisit;
 mod routing;
 pub mod sessions;
