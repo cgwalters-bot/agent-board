@@ -584,6 +584,45 @@ the option. No deployed caller configuration changes here. Caller activation:
 The supervisor's public epic-health census reports an explicit warning for these
 issues: it cannot infer machine progress from prose without the pass's ledger.
 
+### Observed issue pull requests
+
+With `livingStatus` configured, stage 4 records each considered issue's linked
+PRs in that same durable ledger and shows their URLs and observed open, closed
+or merged state in its status comment. Discovery combines closing references,
+GitHub's cross-reference timeline (including `Part of`, `Fixes` and ordinary
+PR-body mentions) and the open upstream PR from verified promotion handoff
+evidence. Links are sorted and deduplicated. This is an observation, not a
+pushability claim: a visitor's mention must not become authority to stop work or
+write a branch. Existing scheduling and promotion guards remain unchanged.
+
+This uses the existing off-by-default `livingStatus` setting, not another switch.
+Only issues reached by scheduling are refreshed, after all scheduling decisions
+and starts, so optional discovery cannot spend their read capacity. WIP, pacing
+and scan bounds may defer others. Each observation reads at most
+three timeline pages of 100 events within the pass's existing request/time
+budget. Missing, malformed or incomplete reads leave a warning without
+replacing its last complete inventory. Tracking failures are warnings, not new
+scheduling holds: visitor-controlled history cannot veto an authorized start.
+Cross-repository links are published only after a bounded metadata read confirms
+the repository is public; private sources are omitted, and missing visibility
+evidence keeps the prior inventory. These reads share the same pass budget and
+are made once per distinct linked repository in an observation.
+The ledger permits at most 400 PRs per
+issue, 1,000 issue entries and its existing 4 MiB total; the public comment
+keeps its existing 60,000-byte cap. Tracking edits and tracking-only status
+creation use the existing ownership recheck and write caps. Preview reads the
+links but does not update the inventory or public comment.
+
+This is the tracking-first slice of agent-board#961. It does not dispatch onto
+these PRs or grant new write access. Read/write attachments, direct continuation
+of an upstream PR through its fork head, and a checked run-output protocol for
+registering an otherwise undiscoverable PR remain follow-ups to agentic-job#3692.
+The inventory includes a verified open upstream promotion target, but does not
+yet persist the promotion's fork-to-upstream relationship as a separate edge.
+Caller: `cgwalters-forge/tracker`, `.github/pass.json`, `livingStatus` =
+`.state/living-status.json`, with the same durable storage and serialization
+requirements as above.
+
 ## Midstream issue migration
 
 The threat is moving an issue out from under a job or retargeting it from

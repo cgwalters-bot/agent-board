@@ -64,6 +64,7 @@ fn living_planning_dispatch_edits_the_plan_comment() {
     forge.replay = replay();
     unfinished(&mut forge.replay);
     let config = config(json!({"livingStatus": dir.path().join("status.json")}));
+    pull_links::tests::seed_empty(&mut forge.replay);
     let limits = Limits {
         dispatch: Some(1),
         ..Limits::default()
@@ -1749,6 +1750,7 @@ fn living_apply_requires_durable_state_and_replays_nothing_after_restore() {
     let mut replay = replay();
     unfinished(&mut replay);
     unapplied(&mut replay);
+    pull_links::tests::seed_empty(&mut replay);
     let forge = Forge::new(replay);
     let report = local_with(&forge, 10, settings.clone());
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
@@ -1837,6 +1839,7 @@ fn living_failed_receipt_edit_is_reconciled_without_reapplying() {
     let mut replay = replay();
     unfinished(&mut replay);
     unapplied(&mut replay);
+    pull_links::tests::seed_empty(&mut replay);
     let forge = Forge::new(replay);
     forge.receipt_fails.set(true);
     let report = local_with(&forge, 10, settings.clone());

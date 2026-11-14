@@ -8,7 +8,7 @@ pub(super) fn trusted_pull<'f>(facts: &'f Facts, people: &[&str]) -> Option<&'f 
     facts.pulls.iter().find(|p| is(p.author.as_deref(), people))
 }
 
-const LINK_PAGES: usize = 3;
+pub(super) const LINK_PAGES: usize = 3;
 pub(super) const LINKS: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
     lastEditedAt updatedAt
