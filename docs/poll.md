@@ -525,7 +525,7 @@ failure; it does not start fresh CI or weaken the egress policy.
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `maintainerReport`, `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`, and the pass's `pr` keys below. File settings override the
+optional `maintainerReport`, `mergeAuthors`, `queueOnlyRepository`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`, and the pass's `pr` keys below. File settings override the
 corresponding flags. Every reader of the file (poll, supervisor, `ask`,
 `--board-config`, `reconcile plan --config`) refuses a top-level key that is none
 of these and none of the other commands' sections (`board`, `statusReconcile`,
@@ -1005,6 +1005,33 @@ Anyone who can open
 issues as `author` in that repository can give rounds back; one outage can
 cost at most one extra run a round, as a run that fails while it is still open
 waits for it to close.
+
+### Queue-only repository admission
+
+The concrete threat is an absent or removed merge-queue rule turning an approved
+PR's enqueue into a direct merge. `queueOnlyRepository: "OWNER/REPO"` (pass:
+`pr.queueOnlyRepository`) prevents that fallback for exactly one followed
+repository, matched without case. Absent or null is off; globs, lists, malformed
+names and repositories outside `follow` are refused. Other repositories retain
+their existing behavior.
+
+This is the first admission component of #257, inside the existing poll rather
+than a second controller. A ready PR waits if its base has no merge-queue rule;
+the executor checks the rules again before admission and never calls
+`mergePullRequest` for this repository, even if the rule disappeared after the
+decision. With a queue it uses the existing `enqueuePullRequest` mutation pinned
+to the approved head. Existing author eligibility, current-head review, check,
+hold, default-branch and `noMerge` gates still apply. Preview does not write.
+There are no new requests, dispatch authority or retries: the existing 500-request
+poll limit and the pass's stage share and `--max-writes` still bound each run.
+
+This does not establish exclusive authority over other credentials. Configure
+GitHub's default-branch rules to require the queue without bypass, and retire
+other callers' direct-merge/auto-merge paths before deployment as the sole merge
+manager. Existing auto-merge requests are still skipped, not cancelled or repaired;
+all-author discovery, attribution of incompatible auto-merge requests, conflict
+ordering and a dedicated workflow remain follow-up work. `mergeQueue` below is
+the separate existing bounded recovery policy, not enabled by this option.
 
 `mergeQueue` (absent by default, which leaves a removed pull request to be
 enqueued again like any other) has the poll own the merge queue

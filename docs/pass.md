@@ -5359,6 +5359,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
 | `pr.toilFixPool`, `pr.conflictFixPool` | Special fix pools; absent uses ordinary fix choice |
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |
+| `pr.queueOnlyRepository` | One exact followed `OWNER/REPO` whose ready PRs may only be enqueued; missing queue rules hold rather than falling back to direct merge; absent/null off; see [queue-only admission](poll.md#queue-only-repository-admission) |
 | `pr.headOwners` | Logins whose head repositories the bot may push to, making its PRs there its own for fixes, rebases and merges; only the operator's review counts there; the fix bounds must admit those repositories and branches too; `[]`, the bot's fork alone |
 | `pr.noMerge` | Exact `OWNER/REPO` base repositories never directly merged, enqueued or re-enqueued by the pass, while authorized rounds continue; no globs; `[]` |
 | `pr.operatorPaths` | Files, directories ending in `/`, or a JSON file's values other than its `FILE#/json/pointer` exemptions, a pull request changing any of which merges or is enqueued only on the operator's approval of its head, waiting as an approve row naming them, see [the poll](poll.md#configuration); relative, no globs, at most 50; `[]` |

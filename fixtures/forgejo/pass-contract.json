@@ -291,6 +291,7 @@
     "pr.toilFixPool": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.conflictFixPool": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.mergeAuthors": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.queueOnlyRepository": {"verdict": "refused", "reason": "GitHub-only merge queue admission (stage 2)"},
     "pr.headOwners": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.noMerge": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.operatorPaths": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
