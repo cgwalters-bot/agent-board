@@ -1180,6 +1180,16 @@ fn upstream_uses_parent_and_rejects_conflicts_and_qualified_syntax() {
     for (body, expected) in [
         ("Upstream: #42", Some(42)),
         ("https://github.com/bootc-dev/bootc/issues/42", Some(42)),
+        ("https://github.com/Bootc-Dev/Bootc/issues/42", Some(42)),
+        (
+            "Upstream: #42\nhttps://github.com/BOOTC-DEV/BOOTC/issues/42",
+            Some(42),
+        ),
+        ("https://github.com/other/bootc/issues/42", None),
+        (
+            "https://github.com/bootc-dev/bootc/issues/42\nhttps://github.com/Bootc-Dev/Bootc/issues/42",
+            Some(42),
+        ),
         (
             "See https://github.com/bootc-dev/bootc/issues/42. Next.",
             Some(42),
@@ -1209,6 +1219,7 @@ fn upstream_uses_parent_and_rejects_conflicts_and_qualified_syntax() {
         "Upstream: bootc-dev/bootc#42",
         "Upstream: #42\nUpstream: #43",
         "Upstream: #42\nhttps://github.com/bootc-dev/bootc/issues/43",
+        "Upstream: #42\nhttps://github.com/Bootc-Dev/Bootc/issues/43",
     ] {
         assert!(association(body, &fork).is_err());
     }
@@ -1236,13 +1247,55 @@ fn upstream_uses_parent_and_rejects_conflicts_and_qualified_syntax() {
             }
         );
     }
-    let forge = Forge {
-        body: RefCell::new("Upstream: #42\n".into()),
-        ..Default::default()
-    };
-    execute(&forge, true, 1, &mut Journal::default()).0.unwrap();
-    assert_eq!(forge.transfers.get(), 1);
-    assert_eq!(*forge.body.borrow(), "Upstream: #42\n");
+    for body in [
+        "Upstream: #42\n",
+        "Upstream: #42\nhttps://github.com/Bootc-Dev/Bootc/issues/42",
+    ] {
+        let forge = Forge {
+            body: RefCell::new(body.into()),
+            ..Default::default()
+        };
+        let mut journal = Journal::default();
+        execute(&forge, true, 1, &mut journal).0.unwrap();
+        assert_eq!(forge.transfers.get(), 1);
+        assert_eq!(journal.receipts["issue-1"].upstream, Some(42));
+        assert_eq!(*forge.body.borrow(), body);
+    }
+}
+
+#[test]
+fn mixed_case_upstream_references_cannot_bypass_migration_holds() {
+    for (body, reason) in [
+        (
+            "See https://github.com/Bootc-Dev/Bootc/issues/42",
+            "add Upstream: #42 before migration",
+        ),
+        (
+            "Upstream: #42\nhttps://github.com/Bootc-Dev/Bootc/issues/43",
+            "conflicting upstream references",
+        ),
+        (
+            "Upstream: #42\nhttps://github.com/Bootc-Dev/Bootc/issues/42oops",
+            "malformed upstream issue reference",
+        ),
+    ] {
+        for apply in [false, true] {
+            let forge = Forge {
+                body: RefCell::new(body.into()),
+                ..Default::default()
+            };
+            let mut journal = Journal::default();
+            let (result, lines) = execute(&forge, apply, 1, &mut journal);
+            result.unwrap();
+            assert!(
+                lines[0].starts_with("hold ") && lines[0].contains(reason),
+                "{lines:?}"
+            );
+            assert_eq!(forge.transfers.get(), 0);
+            assert!(journal.receipts.is_empty());
+            assert_eq!(*forge.body.borrow(), body);
+        }
+    }
 }
 
 #[test]
@@ -1267,6 +1320,8 @@ fn malformed_upstream_url_suffix_holds_before_transfer_intent() {
         ".?notification_referrer_id=1",
         ".#issuecomment-1",
         ",?query=1",
+        "https://github.com/other/repo/issues/9",
+        "https://github.com/Bootc-Dev/Bootc/issues/42",
     ] {
         let body = format!("Upstream: #42\nhttps://github.com/bootc-dev/bootc/issues/42{suffix}");
         assert!(association(&body, &fork).is_err(), "{body}");
