@@ -66,6 +66,9 @@ pub const SKEW: time::Duration = time::Duration::minutes(5);
 pub const LIST_PAGES: usize = 10;
 /// Items read in detail by one GraphQL request.
 pub const DETAIL_BATCH: usize = 25;
+/// Maximum timeline pages per busy item. Refuse excess rather than silently
+/// acknowledge events that have not been read.
+pub const TIMELINE_PAGES: usize = 10;
 /// The summary's longest form: a header, then a line per changed repository.
 pub const SUMMARY_LINES: usize = 20;
 /// The most pull requests whose checks are followed until they settle; one
@@ -653,19 +656,77 @@ fn details(
             json!({"owner": owner, "name": name, "since": since}),
         )?;
         for (k, number) in batch.iter().enumerate() {
-            let node = &data["repository"][format!("i{k}")];
+            let mut node = data["repository"][format!("i{k}")].clone();
             ensure!(
                 node["number"].as_u64() == Some(*number),
                 "{repository}#{number} was listed but not read"
             );
+            if node["timelineItems"]["pageInfo"]["hasNextPage"] == true {
+                node["timelineItems"] = timeline(client, owner, name, *number, &node, since)
+                    .with_context(|| format!("{repository}#{number} timeline"))?;
+            }
             items.push((
                 *number,
-                classify(node, repository, since, operator)
+                classify(&node, repository, since, operator)
                     .with_context(|| format!("{repository}#{number}"))?,
             ));
         }
     }
     Ok(items)
+}
+
+/// Keep the common batched read unchanged. For an overflowing timeline, read
+/// it afresh with cursors; never combine the initial page with a later snapshot.
+/// The page bound prevents a busy item or a repeating cursor from consuming
+/// unbounded requests. No partial timeline can be committed.
+fn timeline(
+    client: &impl Transport,
+    owner: &str,
+    name: &str,
+    number: u64,
+    initial: &Value,
+    since: &str,
+) -> Result<Value> {
+    let query = detail_query(&[number])
+        .replacen("$since:DateTime!", "$since:DateTime!,$after:String", 1)
+        .replace(
+            "first:100,since:$since",
+            "first:100,after:$after,since:$since",
+        )
+        .replace("pageInfo{hasNextPage}", "pageInfo{hasNextPage endCursor}");
+    let mut cursor = Value::Null;
+    let mut seen = BTreeSet::new();
+    let mut nodes = vec![];
+    for _ in 0..TIMELINE_PAGES {
+        let data = client.graphql(
+            &query,
+            json!({"owner": owner, "name": name, "since": since, "after": cursor}),
+        )?;
+        let node = &data["repository"]["i0"];
+        ensure!(
+            node["number"].as_u64() == Some(number) && node["__typename"] == initial["__typename"],
+            "timeline item identity changed"
+        );
+        let timeline = &node["timelineItems"];
+        let page = timeline["nodes"]
+            .as_array()
+            .context("missing GitHub timelineItems")?;
+        ensure!(page.len() <= PAGE_SIZE, "oversized GitHub timeline page");
+        nodes.extend(page.iter().cloned());
+        match timeline["pageInfo"]["hasNextPage"].as_bool() {
+            Some(false) => return Ok(json!({"nodes": nodes, "pageInfo": {"hasNextPage": false}})),
+            Some(true) => {
+                let next = text(&timeline["pageInfo"], "endCursor")?;
+                ensure!(
+                    !next.is_empty() && seen.insert(next.to_owned()),
+                    "timeline cursor did not advance"
+                );
+                cursor = json!(next);
+            }
+            None => bail!("missing GitHub timeline pageInfo.hasNextPage"),
+        }
+    }
+    bail!("more than {TIMELINE_PAGES} pages of timeline events since {since}")
 }
 
 /// Whether `value`'s login names the operator.

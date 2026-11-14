@@ -74,7 +74,7 @@ review URL and reviewer when GitHub still exposes them. The operator flag
 on a dismissal identifies who dismissed it, not who wrote the review. A
 dismissed approval is not a fresh approval; consumers must re-read current
 approval and check state before acting. This adds no writes or pass dispatch
-and uses the existing one-page timeline bound.
+and uses the bounded timeline reads below.
 
 A pull request whose head checks were absent or still running is read again
 on later runs until they settle, so that their result is a change too (`checked`),
@@ -107,8 +107,14 @@ changed reads one list per repository and nothing else; the recorded
 fixture under `fixtures/changes/` shows both runs.
 
 A repository with more than ten pages, a thousand updated items, or an
-item with more than a page of timeline events in the window, refuses the
-read rather than report part of it.
+item with more than ten pages of timeline events in the window, refuses the
+read rather than report part of it. Most items use only the batched detail
+read. When its timeline exceeds 100 events, the command rereads that item's
+timeline with cursors, at most ten pages of 100 events each (up to ten extra
+requests). This keeps busy issues and PRs readable without an unbounded
+request loop; repeated or missing cursors and incomplete responses refuse
+the read too. No watermark advances on failure. This remains an explicit,
+read-only command, not an enabled pass stage or a new caller option.
 
 ## Limits
 
