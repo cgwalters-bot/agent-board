@@ -56,6 +56,8 @@ struct Forge {
     cross_reference: bool,
     references_after_transfer: bool,
     plan: bool,
+    epic_comment: Option<Value>,
+    epic_during_preflight: bool,
     stale: bool,
     children: Option<Value>,
     children_during_preflight: bool,
@@ -143,6 +145,12 @@ impl Transport for Forge {
             );
         }
         if query == plan::COMMENTS_QUERY {
+            if let Some(comment) = &self.epic_comment
+                && (!self.epic_during_preflight || self.snapshots.get() > 1)
+            {
+                return Ok(json!({"repository":{"issue":{"comments":{"nodes":[comment],
+                    "pageInfo":{"hasNextPage":false}}}}}));
+            }
             if self.plan {
                 let plan = json!({"schema":JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":1,
                     "target_repo":"cgwalters-forge/bootc","kind":"implement","runner":"hosted","brief":"Repair regression"});
@@ -1017,6 +1025,58 @@ fn closed_or_unreadable_source_state_never_transfers() {
             }
             assert_eq!(forge.transfers.get(), 0);
             assert!(journal.receipts.is_empty());
+        }
+    }
+}
+
+#[test]
+fn epic_plan_fences_hold_even_without_labels_or_children() {
+    for (location, author, contents, held) in [
+        ("body", "", "{}", true),
+        ("body", "", "not json", true),
+        ("comment", "cgwalters-bot", "{}", true),
+        ("comment", "cgwalters", "not json", true),
+        ("comment", "visitor", "{}", false),
+        ("preflight", "cgwalters-bot", "{}", true),
+    ] {
+        for apply in [false, true] {
+            let body = format!("```{}\n{contents}\n```", crate::epic::EPIC_PLAN_FENCE);
+            let forge = Forge {
+                body: RefCell::new(if location == "body" {
+                    body.clone()
+                } else {
+                    String::new()
+                }),
+                epic_comment: (location != "body").then(|| {
+                    json!({
+                        "url":"https://github.com/cgwalters-forge/tracker/issues/1#issuecomment-1",
+                        "body":body, "author":{"login":author},
+                        "createdAt":"2026-11-13T00:00:00Z", "updatedAt":"2026-11-13T00:00:00Z",
+                        "lastEditedAt":null, "editor":null
+                    })
+                }),
+                epic_during_preflight: location == "preflight",
+                ..Forge::default()
+            };
+            let mut journal = Journal::default();
+            let (result, lines) = execute(&forge, apply, 1, &mut journal);
+            let expected_hold = held && (location != "preflight" || apply);
+            if location == "preflight" && apply {
+                assert!(format!("{:#}", result.unwrap_err()).contains("excluded issue: epic plan"));
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains("excluded issue: epic plan")),
+                    expected_hold,
+                    "{location}, {author}, {contents}, apply={apply}: {lines:?}"
+                );
+            }
+            assert_eq!(forge.transfers.get(), usize::from(apply && !expected_hold));
+            if expected_hold || !apply {
+                assert!(journal.receipts.is_empty());
+            }
         }
     }
 }
