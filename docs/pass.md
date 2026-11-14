@@ -768,8 +768,14 @@ the original ownership evidence; do not invent an empty set to bypass the check.
 The new URL/number is recorded
 as the canonical identity, not assumed equal to the source number. A pending
 intent is synced before any forge write. A timeout is reconciled by node ID before
-any further transfer; a confirmed transfer is not resent. Failed preservation or
-unresolved results stop the run, leaving its intent for investigation. An unresolved
+any further transfer; a confirmed transfer is not resent. Open or unreadable PR
+references prevent starting a transfer, but do not prevent recognizing one that
+already happened: post-transfer
+verification and pending-intent recovery still require the original identity and
+preservation evidence, not idle work. A PR opened after transfer must not strand
+an otherwise preserved issue in recovery. No transfer is retried by this recovery.
+Failed preservation or unresolved results stop the run, leaving its intent for
+investigation. An unresolved
 intent still at the source is **not** automatically retried: inspect GitHub and
 resolve that entry before authorizing another attempt. Keep the journal for
 retries; do not delete it to work around a hold. An exclusive local journal lock
