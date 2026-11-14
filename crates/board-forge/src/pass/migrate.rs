@@ -247,7 +247,12 @@ fn issues(client: &impl Transport, config: &Config) -> Result<(String, IssueItem
 }
 
 fn before(node: &Value, config: &Config) -> Result<Before> {
-    ensure!(node["state"] == "OPEN", "issue is not open");
+    // Closing a transferred issue must not strand its pending receipt. Admission
+    // checks openness separately; recovery still requires a known issue state.
+    ensure!(
+        matches!(node["state"].as_str(), Some("OPEN" | "CLOSED")),
+        "missing or invalid issue state"
+    );
     let board = config
         .github_board()
         .context("migration needs a GitHub board")?;
@@ -448,6 +453,7 @@ fn classify(
     config: &Config,
     forks: &[Fork],
 ) -> Result<usize> {
+    ensure!(node["state"] == "OPEN", "issue is not open");
     // A project-prefixed parent is still an epic even without an epic label.
     // Read only the count; enumerating children would add no routing evidence.
     let children = node["subIssues"]["totalCount"]
