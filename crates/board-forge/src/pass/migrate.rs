@@ -575,9 +575,19 @@ fn association(body: &str, fork: &Fork) -> Result<Option<u64>> {
     // validated parent. Qualified Upstream: syntax is deliberately refused.
     let explicit = crate::upstream::parse(body)
         .with_context(|| format!("upstream association for {}", fork.parent))?;
-    let prefix = format!("https://github.com/{}/issues/", fork.parent);
     let mut numbers = BTreeSet::new();
-    for tail in body.split(&prefix).skip(1) {
+    for (offset, prefix) in body.match_indices("https://github.com/") {
+        // Keep the original suffix: a second URL is not an issue-number
+        // delimiter and must not make a malformed first URL look valid.
+        let reference = &body[offset + prefix.len()..];
+        let Some((repository, tail)) = reference.split_once("/issues/") else {
+            continue;
+        };
+        // GitHub repository names are case-insensitive. A differently cased
+        // link must not hide an association or bypass conflicting-link holds.
+        if !repository.eq_ignore_ascii_case(&fork.parent) {
+            continue;
+        }
         let digits = tail
             .chars()
             .take_while(char::is_ascii_digit)

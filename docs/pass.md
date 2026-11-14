@@ -707,6 +707,9 @@ Each line identifies the source, destination (or `unresolved`), upstream
 association and refusal cause. Only `Upstream: #N` is accepted, using #949's
 parser and the validated fork parent for its repository. One distinct issue URL
 under that parent can supply a missing association; conflicting references hold.
+Repository names in those URLs are matched case-insensitively, as on GitHub:
+changing an owner's or repository's letter case cannot hide a missing association,
+conflict or malformed issue number. Other repositories do not supply associations.
 When only a URL supplies the association, preview holds with the `Upstream: #N`
 line the maintenance operator must add before retrying. The command never
 rewrites issue bodies: GitHub does not document a conditional issue-body update
