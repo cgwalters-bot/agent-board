@@ -2429,6 +2429,11 @@ pub(super) mod tests {
     }
 
     impl Fake {
+        pub(in crate::poll) fn reset_share(&self) {
+            *self.share_spent_at.borrow_mut() = None;
+            *self.share_spent.borrow_mut() = false;
+        }
+
         pub(in crate::poll) fn page(&self, path: &str, body: Value) {
             self.rest
                 .borrow_mut()

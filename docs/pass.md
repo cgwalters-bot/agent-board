@@ -125,12 +125,26 @@ loaded item's author is the bot: on its own issue or pull request, what the
 operator says within the last two days is to it. Once a thread is retained for
 retry, its saved update time anchors that admission window, so a question does
 not expire while waiting for a fork, a complete read or dispatch capacity.
-A pull request of the bot's
-in a followed repository stays the walk's, whose rounds take the operator's
-reviews, until the poll stops at it; there, as on an item it never followed,
-the unmentioned comment counts. The separate `operatorAnswers` setting still
+A pull request of the bot's in a followed repository leaves reviews to the
+walk until the poll stops at it. Ordinary issue comments go through intake
+even without a stop marker: waiting for review approval does not answer an
+operator's question. The separate `operatorAnswers` setting still
 authorizes the walk to treat comments on a stop as permission to restart;
 this intake does not grant that permission.
+
+In [#970](https://github.com/cgwalters-forge/agent-board/issues/970), the
+operator's unmentioned question on tracker#1619 met the bot-author search but
+the admission predicate excluded followed PRs without a stop marker. The
+[first pass after the comment](https://github.com/cgwalters-forge/tracker/actions/runs/43537485047)
+and [later pass](https://github.com/cgwalters-forge/tracker/actions/runs/43545101905)
+listed the PR waiting for review approval. That exclusion treated ordinary
+questions as though the review walk handled them. The pass does not consume
+notifications, so their later absence does not establish a mark-read bug.
+The regression covers both search and the standalone notification source:
+an exhausted history read leaves direction pending, and the next turn records
+and dispatches it once. This changes admission under the existing off-by-default
+`notifications` option, not search/request bounds or review/fix permissions.
+
 A thread-level search hit
 is insufficient: another author's mention cannot activate an unrelated operator
 comment, including a natural-language ask or a bare `/bot` command, and a
