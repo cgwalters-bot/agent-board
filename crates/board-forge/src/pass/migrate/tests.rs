@@ -59,6 +59,8 @@ struct Forge {
     plan: bool,
     epic_comment: Option<Value>,
     epic_during_preflight: bool,
+    plan_during_preflight: Option<Value>,
+    comment_reads: Cell<usize>,
     stale: bool,
     children: Option<Value>,
     children_during_preflight: bool,
@@ -153,15 +155,20 @@ impl Transport for Forge {
             return Ok(data);
         }
         if query == plan::COMMENTS_QUERY {
+            self.comment_reads.set(self.comment_reads.get() + 1);
             if let Some(comment) = &self.epic_comment
                 && (!self.epic_during_preflight || self.snapshots.get() > 1)
             {
                 return Ok(json!({"repository":{"issue":{"comments":{"nodes":[comment],
                     "pageInfo":{"hasNextPage":false}}}}}));
             }
-            if self.plan {
-                let plan = json!({"schema":JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":1,
-                    "target_repo":"cgwalters-forge/bootc","kind":"implement","runner":"hosted","brief":"Repair regression"});
+            let late_plan = self
+                .plan_during_preflight
+                .as_ref()
+                .filter(|_| self.comment_reads.get() > 1);
+            if self.plan || late_plan.is_some() {
+                let plan = late_plan.cloned().unwrap_or_else(|| json!({"schema":JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":1,
+                    "target_repo":"cgwalters-forge/bootc","kind":"implement","runner":"hosted","brief":"Repair regression"}));
                 return Ok(json!({"repository":{"issue":{"comments":{"nodes":[{
                     "url":"https://github.com/cgwalters-forge/tracker/issues/1#issuecomment-1",
                     "body":format!("```{PLAN_FENCE}\n{plan}\n```"),"author":{"login":"cgwalters-bot"},
@@ -1002,6 +1009,65 @@ fn incomplete_pr_reference_reads_hold_without_writes() {
         assert_eq!(forge.transfers.get(), 0);
         assert!(forge.body.borrow().is_empty());
         assert!(journal.receipts.is_empty());
+    }
+}
+
+#[test]
+fn comment_plan_added_during_preflight_stops_before_transfer_intent() {
+    let plan = json!({"schema":JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":1,
+        "target_repo":"cgwalters-forge/bootc","kind":"implement","runner":"hosted","brief":"Repair regression"});
+    for (key, value, cause) in [
+        (
+            "target_repo",
+            json!("cgwalters-forge/bootc"),
+            "replacement-plan handoff",
+        ),
+        (
+            "target_repo",
+            json!("cgwalters-forge/ostree"),
+            "conflicting target evidence",
+        ),
+        ("item", json!(2), "accepted plan issue number mismatch"),
+    ] {
+        let mut late_plan = plan.clone();
+        late_plan[key] = value;
+        let forge = Forge {
+            plan_during_preflight: Some(late_plan),
+            ..Default::default()
+        };
+        let mut journal = Journal::default();
+        let mut lines = Vec::new();
+        let saves = Cell::new(0);
+        let error = run(
+            &forge,
+            &config(),
+            true,
+            1,
+            &mut journal,
+            |journal| {
+                assert!(
+                    journal.receipts.is_empty(),
+                    "must not persist transfer intent"
+                );
+                saves.set(saves.get() + 1);
+                Ok(())
+            },
+            |line| {
+                lines.push(line);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(cause), "{error:#}");
+        assert_eq!(forge.comment_reads.get(), 2);
+        assert_eq!(
+            saves.get(),
+            1,
+            "only the initial journal reconciliation saves"
+        );
+        assert!(journal.receipts.is_empty());
+        assert_eq!(forge.transfers.get(), 0);
+        assert!(lines.is_empty(), "must not report a transfer: {lines:?}");
     }
 }
 

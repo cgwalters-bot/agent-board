@@ -748,6 +748,9 @@ PRs in any repository also hold; incomplete reference reads fail closed.
 Accepted comment plans and any body plan fence hold: moving them alone would
 leave scheduler identity checks stale. Body fences hold even with `bodyPlans`
 disabled. There is no automatic plan rewrite or exemption for finished plans.
+Regression tests introduce an accepted comment plan between discovery and the
+apply reread: even a plan for the same fork stops before saving transfer intent;
+a conflicting target or wrong issue identity also stops without a mutation.
 Run during a maintenance window with dispatch paused;
 these checks are not a distributed lock against another controller starting work.
 
