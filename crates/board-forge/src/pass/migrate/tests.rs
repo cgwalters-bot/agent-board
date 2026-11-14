@@ -62,6 +62,9 @@ struct Forge {
     assignees: Option<Value>,
     assignees_during_preflight: bool,
     parent_after_transfer: Option<Value>,
+    state_before_transfer: Option<Value>,
+    state_after_transfer: Option<Value>,
+    state_during_preflight: bool,
     count: u64,
     body: RefCell<String>,
 }
@@ -191,6 +194,15 @@ impl Transport for Forge {
             .parse()
             .unwrap();
         let mut node = node(number);
+        if let Some(state) = if moved {
+            self.state_after_transfer.as_ref()
+        } else if !self.state_during_preflight || self.snapshots.get() > 1 {
+            self.state_before_transfer.as_ref()
+        } else {
+            None
+        } {
+            node["state"] = state.clone();
+        }
         node["body"] = json!(*self.body.borrow());
         if let Some(assignees) = &self.assignees {
             node["assignees"] = assignees.clone();
@@ -933,19 +945,21 @@ fn upstream_only_activity_holds_without_writes() {
 }
 
 #[test]
-fn completed_transfers_reconcile_despite_new_pr_references() {
-    for (linked, cross_reference, incomplete_references) in [
-        (true, false, ""),
-        (false, true, ""),
-        (false, false, "closing-page"),
-        (false, false, "timeline-page"),
-        (false, false, "timeline-source"),
+fn completed_transfers_reconcile_despite_new_activity() {
+    for (linked, cross_reference, incomplete_references, state_after_transfer) in [
+        (true, false, "", None),
+        (false, true, "", None),
+        (false, false, "closing-page", None),
+        (false, false, "timeline-page", None),
+        (false, false, "timeline-source", None),
+        (false, false, "", Some(json!("CLOSED"))),
     ] {
         for restart in [false, true] {
             let forge = Forge {
                 linked,
                 cross_reference,
                 incomplete_references,
+                state_after_transfer: state_after_transfer.clone(),
                 references_after_transfer: true,
                 failure: if restart { "readback" } else { "" },
                 ..Default::default()
@@ -981,6 +995,47 @@ fn completed_transfers_reconcile_despite_new_pr_references() {
             );
             assert_eq!(forge.transfers.get(), 1);
         }
+    }
+}
+
+#[test]
+fn closed_or_unreadable_source_state_never_transfers() {
+    for state in [json!("CLOSED"), Value::Null, json!("UNKNOWN"), json!(false)] {
+        for (apply, preflight) in [(false, false), (true, false), (true, true)] {
+            let forge = Forge {
+                state_before_transfer: Some(state.clone()),
+                state_during_preflight: preflight,
+                ..Default::default()
+            };
+            let mut journal = Journal::default();
+            let (result, lines) = execute(&forge, apply, 1, &mut journal);
+            if preflight {
+                assert!(result.is_err(), "{state}: {lines:?}");
+            } else {
+                result.unwrap();
+                assert!(lines[0].starts_with("hold "), "{state}: {lines:?}");
+            }
+            assert_eq!(forge.transfers.get(), 0);
+            assert!(journal.receipts.is_empty());
+        }
+    }
+}
+
+#[test]
+fn unreadable_transferred_state_keeps_receipt_pending() {
+    for state in [Value::Null, json!("UNKNOWN"), json!(false)] {
+        let forge = Forge {
+            state_after_transfer: Some(state),
+            ..Default::default()
+        };
+        let mut journal = Journal::default();
+        assert!(execute(&forge, true, 1, &mut journal).0.is_err());
+        let mut restored = serde_json::from_str(&serde_json::to_string(&journal).unwrap()).unwrap();
+        for apply in [false, true] {
+            assert!(execute(&forge, apply, 1, &mut restored).0.is_err());
+            assert!(restored.receipts["issue-1"].canonical.is_none());
+        }
+        assert_eq!(forge.transfers.get(), 1);
     }
 }
 

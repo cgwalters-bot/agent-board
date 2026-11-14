@@ -776,6 +776,13 @@ original parent object, and pending entries use the same identity comparison on
 restart. A removed or different parent still stops verification, as does malformed
 parent evidence (a non-null parent requires both an ID and URL). Preflight still
 requires the complete source snapshot to be unchanged.
+An issue closed after transfer must not strand a pending receipt and block the
+remaining batch. Immediate readback and restart reconciliation therefore accept
+either `OPEN` or `CLOSED`, while still verifying identity and every preservation
+field above. Missing or unknown state remains an error. Source admission and its
+last preflight recheck still require `OPEN`; closing an issue never authorizes a
+new transfer. Recovery does not reopen issues or retry transfers, and preview
+recognizes a closed destination without marking its journal entry complete.
 The new URL/number is recorded
 as the canonical identity, not assumed equal to the source number. A pending
 intent is synced before any forge write. A timeout is reconciled by node ID before
