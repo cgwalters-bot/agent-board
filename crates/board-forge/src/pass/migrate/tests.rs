@@ -41,6 +41,7 @@ struct Forge {
     disabled: bool,
     incomplete: bool,
     board_incomplete: bool,
+    board_error_page: Option<u64>,
     metadata: &'static str,
     destination_change: Option<(&'static str, Value)>,
     destination_reads: Cell<usize>,
@@ -137,12 +138,19 @@ impl Rest for Forge {
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         if query == BOARD {
-            return Ok(
-                json!({"repositoryOwner":{"projectV2":{"id":"board","number":1,
+            let page = if variables["cursor"].is_null() { 1 } else { 2 };
+            let more = self.board_error_page == Some(2) && page == 1;
+            // The live transport rejects partial GraphQL envelopes before
+            // returning data. Model that Result boundary, not an errors member
+            // inside the already-unwrapped project data.
+            if self.board_error_page == Some(page) {
+                bail!("GitHub GraphQL: UNKNOWN: partial project read; response may be partial");
+            }
+            let data = json!({"repositoryOwner":{"projectV2":{"id":"board","number":1,
                 "field":{"id":"priority","name":"Priority"},
-                "items":{"pageInfo":if self.board_incomplete {Value::Null} else {json!({"hasNextPage":false})},
-                    "nodes":(1..=self.count.max(1)).map(|n| json!({"id":format!("item-{n}"),"content":node(n)})).collect::<Vec<_>>()}}}}),
-            );
+                "items":{"pageInfo":if self.board_incomplete {Value::Null} else {json!({"hasNextPage":more,"endCursor":"next"})},
+                    "nodes":(page..=self.count.max(page)).map(|n| json!({"id":format!("item-{n}"),"content":node(n)})).collect::<Vec<_>>()}}}});
+            return Ok(data);
         }
         if query == plan::COMMENTS_QUERY {
             if let Some(comment) = &self.epic_comment
@@ -302,6 +310,42 @@ impl Transport for Forge {
         board["__typename"] = json!("ProjectV2Item");
         board["content"] = json!({"id":node["id"]});
         Ok(json!({"node":node, "board":board}))
+    }
+}
+
+#[test]
+fn partial_board_errors_stop_preview_and_apply_before_intent() {
+    for page in [1, 2] {
+        for apply in [false, true] {
+            let forge = Forge {
+                board_error_page: Some(page),
+                ..Forge::default()
+            };
+            let mut journal = Journal::default();
+            let mut lines = Vec::new();
+            let result = run(
+                &forge,
+                &config(),
+                apply,
+                2,
+                &mut journal,
+                |_| panic!("incomplete board must not save journal"),
+                |line| {
+                    lines.push(line);
+                    Ok(())
+                },
+            );
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("project issue listing; migration preview incomplete"),
+                "page={page}, apply={apply}: {error}"
+            );
+            assert!(error.contains("partial project read; response may be partial"));
+            assert!(lines.is_empty());
+            assert!(journal.receipts.is_empty());
+            assert_eq!(forge.snapshots.get(), 0);
+            assert_eq!(forge.transfers.get(), 0);
+        }
     }
 }
 

@@ -183,11 +183,13 @@ fn issues(client: &impl Transport, config: &Config) -> Result<(String, IssueItem
     let mut identity = None;
     let mut found = BTreeMap::new();
     for _ in 0..ISSUE_PAGES {
-        let data = client.graphql(
-            BOARD,
-            json!({"owner":board.owner, "number":board.project,
-            "field":board.priority_field, "cursor":cursor}),
-        )?;
+        let data = client
+            .graphql(
+                BOARD,
+                json!({"owner":board.owner, "number":board.project,
+                "field":board.priority_field, "cursor":cursor}),
+            )
+            .context("read project issue listing; migration preview incomplete")?;
         let project = &data["repositoryOwner"]["projectV2"];
         let id = required(project, "id")
             .context("configured project inaccessible; migration preview incomplete")?;
