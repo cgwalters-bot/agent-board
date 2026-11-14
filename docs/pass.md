@@ -783,9 +783,16 @@ work. The existing snapshot reads at most 100 assignee IDs and requires a comple
 connection; missing or incomplete evidence holds. Stable user IDs are compared as
 a set before transfer and afterward, so ordering and login renames do not matter.
 Changed assignments during preflight stop before intent; changed or unreadable
-assignments afterward leave the intent pending and stop further transfers. This
-detects loss but does not prevent GitHub from dropping an ineligible assignee or
-automatically restore them; investigate and restore ownership before resuming.
+assignments afterward leave the intent pending and stop further transfers.
+To avoid transferring an issue that would lose its owners, the existing destination
+metadata query also reads up to 100 assignable user IDs for assigned issues.
+Every source assignee must be eligible; missing, malformed or truncated eligibility
+evidence holds. This is checked in preview and again before apply records intent,
+without an extra request or pagination. Unassigned issues skip this read. A fork
+with more than 100 assignable users conservatively holds assigned issues until a
+future bounded lookup supports it. Eligibility can still change after preflight;
+readback detects loss but does not automatically restore ownership. Investigate
+and restore ownership before resuming after a failed preservation check.
 Older journals without `before.assignees` are refused, not interpreted as empty
 assignments. Retain those journals and reconcile their transfers manually using
 the original ownership evidence; do not invent an empty set to bypass the check.
