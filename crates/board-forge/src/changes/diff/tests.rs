@@ -211,7 +211,11 @@ impl Rest for Fake {
 
 impl Transport for Fake {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        assert!(query.starts_with("query($owner:String!,$name:String!,$since:DateTime!)"));
+        assert!(query.starts_with("query($owner:String!,$name:String!,$since:DateTime!"));
+        if variables.get("after").is_some() {
+            assert!(query.contains("first:100,after:$after,since:$since"));
+            assert!(query.contains("pageInfo{hasNextPage endCursor}"));
+        }
         assert!(query.contains("PULL_REQUEST_REVIEW,REVIEW_DISMISSED_EVENT,"));
         assert!(query.contains("... on ReviewDismissedEvent{"));
         self.variables.borrow_mut().push(variables);
@@ -277,6 +281,144 @@ fn state_since(since: &str) -> State {
 
 /// What a classified item is checked for, beyond its changes.
 type Check = Box<dyn Fn(&Item)>;
+
+fn timeline_page(kind: &str, timeline: Value) -> Value {
+    json!({"repository": {"i0": node(kind, 1, json!({"timelineItems": timeline}))}})
+}
+
+#[test]
+fn busy_timelines_include_later_events_without_duplicating_the_first_page() {
+    for kind in ["Issue", "PullRequest"] {
+        let comment = json!({"__typename": "IssueComment", "createdAt": IN,
+            "author": {"login": OPERATOR}, "url": "https://github.com/example/project/issues/1#issuecomment-1"});
+        let first = json!({"nodes": vec![comment.clone(); PAGE_SIZE],
+            "pageInfo": {"hasNextPage": true, "endCursor": "page-1"}});
+        let fake = Fake {
+            gets: BTreeMap::from([(list_url(SINCE), json!({"body": listing(&[1])}))]),
+            graphql: RefCell::new(vec![
+                timeline_page(kind, first.clone()),
+                timeline_page(kind, first),
+                timeline_page(kind, events(vec![comment])),
+            ]),
+            ..Fake::default()
+        };
+        let mut state = state_since("2026-11-11T14:05:00Z");
+        let diff = read(&fake, &scope(), &mut state, parse_time(IN).unwrap()).unwrap();
+        assert_eq!(diff.requests, 4);
+        assert_eq!(diff.repositories[0].items[0].comments.len(), PAGE_SIZE + 1);
+        assert!(
+            diff.repositories[0].items[0]
+                .comments
+                .iter()
+                .all(|c| c.operator)
+        );
+        let variables = fake.variables.borrow();
+        assert_eq!(variables[1]["after"], Value::Null);
+        assert_eq!(variables[2]["after"], "page-1");
+        assert!(variables.iter().all(|v| v["since"] == SINCE));
+        diff.commit(&mut state);
+        assert_eq!(state.repositories[REPO].since.as_deref(), Some(IN));
+    }
+}
+
+#[test]
+fn incomplete_busy_timelines_refuse_without_advancing_the_watermark() {
+    for failure in [
+        "limit",
+        "cursor",
+        "missing cursor",
+        "missing page info",
+        "identity",
+        "missing nodes",
+        "oversized",
+        "transport",
+    ] {
+        let first = json!({"nodes": [], "pageInfo": {"hasNextPage": true, "endCursor": "first"}});
+        let mut pages = vec![timeline_page("Issue", first.clone())];
+        let (expected, reads) = match failure {
+            "limit" => {
+                for page in 0..TIMELINE_PAGES {
+                    pages.push(timeline_page(
+                        "Issue",
+                        json!({"nodes": [], "pageInfo": {
+                        "hasNextPage": true, "endCursor": format!("page-{page}")}}),
+                    ));
+                }
+                ("more than 10 pages", TIMELINE_PAGES + 1)
+            }
+            "cursor" => {
+                pages.extend(vec![timeline_page("Issue", first); 2]);
+                ("cursor did not advance", 3)
+            }
+            "missing cursor" => {
+                pages.push(timeline_page(
+                    "Issue",
+                    json!({"nodes": [], "pageInfo": {"hasNextPage": true}}),
+                ));
+                ("endCursor", 2)
+            }
+            "missing page info" => {
+                pages.push(timeline_page("Issue", json!({"nodes": []})));
+                ("pageInfo.hasNextPage", 2)
+            }
+            "identity" => {
+                pages.push(timeline_page("PullRequest", events(vec![])));
+                ("identity changed", 2)
+            }
+            "missing nodes" => {
+                pages.push(timeline_page(
+                    "Issue",
+                    json!({"pageInfo": {"hasNextPage": false}}),
+                ));
+                ("missing GitHub timelineItems", 2)
+            }
+            "oversized" => {
+                pages.push(timeline_page(
+                    "Issue",
+                    events(vec![Value::Null; PAGE_SIZE + 1]),
+                ));
+                ("oversized GitHub timeline page", 2)
+            }
+            _ => ("unexpected GraphQL request", 2),
+        };
+        let fake = Fake {
+            gets: BTreeMap::from([(list_url(SINCE), json!({"body": listing(&[1])}))]),
+            graphql: RefCell::new(pages),
+            ..Fake::default()
+        };
+        let mut state = state_since("2026-11-11T14:05:00Z");
+        let error = read(&fake, &scope(), &mut state, parse_time(IN).unwrap()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{failure}: {error:#}"
+        );
+        assert_eq!(fake.variables.borrow().len(), reads, "{failure}");
+        assert_eq!(
+            state.repositories[REPO].since.as_deref(),
+            Some("2026-11-11T14:05:00Z")
+        );
+    }
+}
+
+#[test]
+fn busy_timeline_can_finish_on_the_last_allowed_page() {
+    let mut pages = vec![];
+    for page in 0..TIMELINE_PAGES {
+        pages.push(timeline_page(
+            "Issue",
+            json!({"nodes": [], "pageInfo": {
+            "hasNextPage": page + 1 < TIMELINE_PAGES, "endCursor": format!("page-{page}")}}),
+        ));
+    }
+    let fake = Fake {
+        graphql: RefCell::new(pages),
+        ..Fake::default()
+    };
+    let initial = node("Issue", 1, json!({}));
+    let result = timeline(&fake, "example", "project", 1, &initial, SINCE).unwrap();
+    assert_eq!(result, events(vec![]));
+    assert_eq!(fake.variables.borrow().len(), TIMELINE_PAGES);
+}
 
 #[test]
 fn review_dismissals_are_changes_not_new_approvals() {
