@@ -798,6 +798,14 @@ credentials. Both conflict with apply. Recordings contain issue/comment bodies:
 review them before publishing. Synthetic failure tests cover timeouts, refusal,
 stale sources, incomplete reads, cap exhaustion and changed destination numbers;
 they do not prove GitHub preserves board state in a live transfer.
+Upstream URL evidence must not silently truncate a malformed issue path to a
+different issue number: `/issues/42oops`, `/issues/42/43` and encoded suffixes
+hold even when `Upstream: #42` is present. Query strings and fragments directly
+after the number, trailing prose punctuation, Markdown link destinations and
+angle-bracket autolinks remain accepted. Bare URLs wrapped in emphasis are
+conservatively held; use a Markdown link or autolink instead. Correct malformed links before
+retrying; preview and apply both hold without editing the body or recording
+transfer intent.
 Batch recovery tests restart from the bytes accepted by the journal save callback,
 including a failed completion save after GitHub has already moved the issue. A
 pending first transfer blocks the second candidate until preservation is verified;

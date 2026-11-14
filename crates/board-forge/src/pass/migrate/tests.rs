@@ -1065,6 +1065,27 @@ fn upstream_uses_parent_and_rejects_conflicts_and_qualified_syntax() {
     for (body, expected) in [
         ("Upstream: #42", Some(42)),
         ("https://github.com/bootc-dev/bootc/issues/42", Some(42)),
+        (
+            "See https://github.com/bootc-dev/bootc/issues/42. Next.",
+            Some(42),
+        ),
+        (
+            "See https://github.com/bootc-dev/bootc/issues/42 next",
+            Some(42),
+        ),
+        (
+            "[issue](https://github.com/bootc-dev/bootc/issues/42)",
+            Some(42),
+        ),
+        ("<https://github.com/bootc-dev/bootc/issues/42>", Some(42)),
+        (
+            "https://github.com/bootc-dev/bootc/issues/42#issuecomment-1",
+            Some(42),
+        ),
+        (
+            "https://github.com/bootc-dev/bootc/issues/42?notification_referrer_id=1",
+            Some(42),
+        ),
         ("", None),
     ] {
         assert_eq!(association(body, &fork).unwrap(), expected);
@@ -1107,4 +1128,49 @@ fn upstream_uses_parent_and_rejects_conflicts_and_qualified_syntax() {
     execute(&forge, true, 1, &mut Journal::default()).0.unwrap();
     assert_eq!(forge.transfers.get(), 1);
     assert_eq!(*forge.body.borrow(), "Upstream: #42\n");
+}
+
+#[test]
+fn malformed_upstream_url_suffix_holds_before_transfer_intent() {
+    let config = config();
+    let fork = discover_forks(&Forge::default(), &config)
+        .unwrap()
+        .remove(0);
+    for suffix in [
+        "oops",
+        "-43",
+        "_43",
+        "/43",
+        "%30",
+        "é",
+        "+1",
+        ".json",
+        ",43",
+        ":43",
+        ";43",
+        "!43",
+        ".?notification_referrer_id=1",
+        ".#issuecomment-1",
+        ",?query=1",
+    ] {
+        let body = format!("Upstream: #42\nhttps://github.com/bootc-dev/bootc/issues/42{suffix}");
+        assert!(association(&body, &fork).is_err(), "{body}");
+        for apply in [false, true] {
+            let forge = Forge {
+                body: RefCell::new(body.clone()),
+                ..Default::default()
+            };
+            let mut journal = Journal::default();
+            let (result, lines) = execute(&forge, apply, 1, &mut journal);
+            result.unwrap();
+            assert!(
+                lines[0].starts_with("hold ")
+                    && lines[0].contains("malformed upstream issue reference"),
+                "{lines:?}"
+            );
+            assert_eq!(forge.transfers.get(), 0);
+            assert!(journal.receipts.is_empty());
+            assert_eq!(*forge.body.borrow(), body);
+        }
+    }
 }
