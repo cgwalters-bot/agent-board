@@ -316,7 +316,13 @@ fn before(node: &Value, config: &Config) -> Result<Before> {
         .filter(|n| *n > 0)
         .context("missing issue number")?;
     ensure!(
-        node["url"] == format!("https://github.com/{source}/issues/{number}"),
+        node["url"]
+            .as_str()
+            .and_then(|url| url.strip_prefix("https://github.com/"))
+            .and_then(|path| path.split_once("/issues/"))
+            .is_some_and(|(repository, issue)| {
+                repository.eq_ignore_ascii_case(&source) && issue == number.to_string()
+            }),
         "issue URL mismatch"
     );
     Ok(Before {

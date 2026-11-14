@@ -75,6 +75,7 @@ struct Forge {
     state_before_transfer: Option<Value>,
     state_after_transfer: Option<Value>,
     state_during_preflight: bool,
+    case_variant_url: bool,
     count: u64,
     body: RefCell<String>,
 }
@@ -321,6 +322,14 @@ impl Transport for Forge {
                 _ => node["assignees"]["nodes"].as_array_mut().unwrap().reverse(),
             }
         }
+        if self.case_variant_url {
+            let repository = node["repository"]["nameWithOwner"].as_str().unwrap();
+            node["url"] = json!(format!(
+                "https://github.com/{}/issues/{}",
+                repository.to_ascii_uppercase(),
+                node["number"]
+            ));
+        }
         if self.incomplete {
             node["labels"]["pageInfo"] = Value::Null;
         }
@@ -339,6 +348,85 @@ impl Transport for Forge {
         board["__typename"] = json!("ProjectV2Item");
         board["content"] = json!({"id":node["id"]});
         Ok(json!({"node":node, "board":board}))
+    }
+}
+
+#[test]
+fn snapshot_url_matches_repository_case_insensitively_but_not_other_components() {
+    let config = config();
+    for (url, accepted) in [
+        ("https://github.com/cgwalters-forge/tracker/issues/1", true),
+        ("https://github.com/CGWALTERS-FORGE/Tracker/issues/1", true),
+        ("https://github.com/other/tracker/issues/1", false),
+        ("https://github.com/cgwalters-forge/other/issues/1", false),
+        ("https://github.com/cgwalters-forge/tracker/issues/2", false),
+        ("https://github.com/cgwalters-forge/tracker/pull/1", false),
+        ("https://github.com/cgwalters-forge/tracker/ISSUES/1", false),
+        ("http://github.com/cgwalters-forge/tracker/issues/1", false),
+        (
+            "https://example.com/cgwalters-forge/tracker/issues/1",
+            false,
+        ),
+        (
+            "https://github.com/cgwalters-forge/tracker/issues/01",
+            false,
+        ),
+        (
+            "https://github.com/cgwalters-forge/tracker/issues/1/2",
+            false,
+        ),
+        (
+            "https://github.com/cgwalters-forge/tracker/issues/1?x=1",
+            false,
+        ),
+        (
+            "https://github.com/cgwalters-forge/tracker/issues/1#comment",
+            false,
+        ),
+        (
+            "https://github.com/cgwalters-forge/tracker/issues/1oops",
+            false,
+        ),
+    ] {
+        let mut node = node(1);
+        node["board"] = node["projectItems"]["nodes"][0].clone();
+        node["url"] = json!(url);
+        let result = before(&node, &config);
+        assert_eq!(result.is_ok(), accepted, "{url}: {result:?}");
+    }
+}
+
+#[test]
+fn case_variant_urls_allow_preview_and_transfer_readback() {
+    for apply in [false, true] {
+        let forge = Forge {
+            case_variant_url: true,
+            ..Forge::default()
+        };
+        let mut journal = Journal::default();
+        let mut lines = Vec::new();
+        run(
+            &forge,
+            &config(),
+            apply,
+            1,
+            &mut journal,
+            |_| Ok(()),
+            |line| {
+                lines.push(line);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            lines.iter().any(|line| line.starts_with(if apply {
+                "transferred "
+            } else {
+                "preview "
+            })),
+            "{lines:?}"
+        );
+        assert_eq!(forge.transfers.get(), usize::from(apply));
     }
 }
 

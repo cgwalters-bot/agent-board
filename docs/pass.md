@@ -817,7 +817,13 @@ last preflight recheck still require `OPEN`; closing an issue never authorizes a
 new transfer. Recovery does not reopen issues or retry transfers, and preview
 recognizes a closed destination without marking its journal entry complete.
 The new URL/number is recorded
-as the canonical identity, not assumed equal to the source number. A pending
+as the canonical identity, not assumed equal to the source number. Each
+source or destination snapshot accepts owner/repository letter-case differences
+between its GitHub issue URL and repository metadata. The HTTPS GitHub host,
+`/issues/` path and exact issue number must still match; a different repository,
+PR URL or suffixed number remains a hold. This avoids refusing an otherwise
+preserved transfer solely because the URL spells the repository differently.
+A pending
 intent is synced before any forge write. A timeout is reconciled by node ID before
 any further transfer; a confirmed transfer is not resent. Open or unreadable PR
 references prevent starting a transfer, but do not prevent recognizing one that
