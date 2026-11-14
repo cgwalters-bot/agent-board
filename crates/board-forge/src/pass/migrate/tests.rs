@@ -19,6 +19,7 @@ fn node(number: u64) -> Value {
         "repository":{"nameWithOwner":"cgwalters-forge/tracker"},
         "title":"bootc: repair regression", "body":"", "updatedAt":"2026-11-13T00:00:00Z", "state":"OPEN",
         "parent":{"id":"epic", "url":"https://github.com/cgwalters-forge/tracker/issues/1599"},
+        "milestone":null,
         "labels":{"nodes":[],"pageInfo":{"hasNextPage":false}},
         "closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},
         "timelineItems":{"nodes":[],"pageInfo":{"hasNextPage":false}},
@@ -39,6 +40,13 @@ struct Forge {
     board_incomplete: bool,
     metadata: &'static str,
     active: bool,
+    active_repo: &'static str,
+    open_pr_repo: &'static str,
+    incomplete_references: &'static str,
+    labeled: bool,
+    milestoned: bool,
+    missing_metadata: &'static str,
+    edit_during_preflight: bool,
     linked: bool,
     cross_reference: bool,
     plan: bool,
@@ -53,9 +61,18 @@ impl Rest for Forge {
         let body = if path == "user" {
             json!({"login":"cgwalters-bot"})
         } else if path.contains("/actions/runs?") {
-            json!({"total_count":u64::from(self.active),"workflow_runs":if self.active {vec![json!({"id":1})]} else {vec![]}})
+            let active = self.active
+                && (self.active_repo.is_empty()
+                    || path.starts_with(&format!("repos/{}/", self.active_repo)));
+            json!({"total_count":u64::from(active),"workflow_runs":if active {vec![json!({"id":1})]} else {vec![]}})
         } else if path.ends_with("/pulls?state=open&per_page=1") {
-            json!([])
+            if !self.open_pr_repo.is_empty()
+                && path.starts_with(&format!("repos/{}/", self.open_pr_repo))
+            {
+                json!([{"number":7}])
+            } else {
+                json!([])
+            }
         } else if path == "repos/cgwalters-forge/bootc" || path == "repos/cgwalters-forge/ostree" {
             if self.metadata == "inaccessible" {
                 bail!("HTTP 404");
@@ -69,6 +86,11 @@ impl Rest for Forge {
             }
             metadata
         } else if path == "repos/bootc-dev/bootc/issues/42" {
+            if self.edit_during_preflight {
+                self.body
+                    .borrow_mut()
+                    .push_str("\nHuman edit during preflight");
+            }
             json!({"number":42,"repository_url":format!("{API_ROOT}repos/bootc-dev/bootc")})
         } else {
             bail!("unrecorded GET {path}")
@@ -83,9 +105,7 @@ impl Rest for Forge {
     }
 
     fn send(&self, method: &str, _: &str, body: &Value) -> Result<(u16, Value)> {
-        assert_eq!(method, "PATCH");
-        *self.body.borrow_mut() = body["body"].as_str().unwrap().into();
-        Ok((200, json!({})))
+        panic!("migration must not edit issue bodies: {method} {body}")
     }
 }
 
@@ -114,6 +134,13 @@ impl Transport for Forge {
                 json!({"repository":{"issue":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}),
             );
         }
+        if query == DESTINATION {
+            return Ok(json!({"repository":{
+                "nameWithOwner":format!("{}/{}", variables["owner"].as_str().unwrap(), variables["name"].as_str().unwrap()),
+                "labels":{"nodes":if self.missing_metadata == "labels" {vec![]} else {vec![json!({"name":"migration: retained"})]},"pageInfo":{"hasNextPage":false}},
+                "milestones":{"nodes":if self.missing_metadata == "milestone" {vec![]} else {vec![json!({"title":"Next","dueOn":null})]},"pageInfo":{"hasNextPage":false}}
+            }}));
+        }
         if query == TRANSFER {
             self.transfers.set(self.transfers.get() + 1);
             if self.failure == "before" {
@@ -139,6 +166,12 @@ impl Transport for Forge {
             .unwrap();
         let mut node = node(number);
         node["body"] = json!(*self.body.borrow());
+        if self.labeled {
+            node["labels"]["nodes"] = json!([{"name":"migration: retained"}]);
+        }
+        if self.milestoned {
+            node["milestone"] = json!({"title":"Next","dueOn":null});
+        }
         if self.linked {
             node["closedByPullRequestsReferences"]["nodes"] =
                 json!([{"state":"OPEN","number":7,"repository":{"nameWithOwner":"external/work"}}]);
@@ -146,6 +179,27 @@ impl Transport for Forge {
         }
         if self.cross_reference {
             node["timelineItems"]["nodes"] = json!([{"__typename":"CrossReferencedEvent","source":{"__typename":"PullRequest","state":"OPEN"}}]);
+        }
+        match self.incomplete_references {
+            "closing-page" => node["closedByPullRequestsReferences"]["pageInfo"] = Value::Null,
+            "closing-count" => node["closedByPullRequestsReferences"]["totalCount"] = json!(1),
+            "closing-state" => {
+                node["closedByPullRequestsReferences"]["nodes"] = json!([{"number":7}]);
+                node["closedByPullRequestsReferences"]["totalCount"] = json!(1);
+            }
+            "timeline-page" => node["timelineItems"]["pageInfo"] = Value::Null,
+            "timeline-source" => {
+                node["timelineItems"]["nodes"] =
+                    json!([{"__typename":"CrossReferencedEvent","source":null}]);
+            }
+            "timeline-state" => {
+                node["timelineItems"]["nodes"] = json!([{"__typename":"CrossReferencedEvent","source":{"__typename":"PullRequest"}}]);
+            }
+            "timeline-kind" => {
+                node["timelineItems"]["nodes"] = json!([{"__typename":"CrossReferencedEvent","source":{"__typename":"Unknown"}}]);
+            }
+            "" => {}
+            other => panic!("unrecorded reference failure {other}"),
         }
         if self.moved.get() && number == 1 {
             node["repository"]["nameWithOwner"] = json!("cgwalters-forge/bootc");
@@ -156,6 +210,12 @@ impl Transport for Forge {
             }
             if self.failure == "parent" {
                 node["parent"] = Value::Null;
+            }
+            if self.failure == "labels" {
+                node["labels"]["nodes"] = json!([]);
+            }
+            if self.failure == "milestone" {
+                node["milestone"] = Value::Null;
             }
         }
         if self.incomplete {
@@ -330,9 +390,20 @@ fn disabled_incomplete_active_and_exhausted_caps_hold_without_writes() {
 
 #[test]
 fn transfer_failures_reconcile_before_any_retry_and_preservation_failure_stops() {
-    for failure in ["", "before", "timeout", "readback", "priority", "parent"] {
+    for failure in [
+        "",
+        "before",
+        "timeout",
+        "readback",
+        "priority",
+        "parent",
+        "labels",
+        "milestone",
+    ] {
         let forge = Forge {
             failure,
+            labeled: true,
+            milestoned: true,
             ..Default::default()
         };
         let mut journal = Journal::default();
@@ -349,6 +420,121 @@ fn transfer_failures_reconcile_before_any_retry_and_preservation_failure_stops()
         let (retry, _) = execute(&forge, true, 1, &mut journal);
         assert_eq!(retry.is_ok(), success || failure == "readback");
         assert_eq!(forge.transfers.get(), 1, "{failure} retried a mutation");
+    }
+}
+
+#[test]
+fn incompatible_destination_metadata_holds_without_transfer() {
+    for (missing_metadata, reason) in [
+        ("labels", "destination missing source labels"),
+        ("milestone", "destination missing matching milestone"),
+    ] {
+        let forge = Forge {
+            labeled: true,
+            milestoned: true,
+            missing_metadata,
+            ..Default::default()
+        };
+        let mut journal = Journal::default();
+        let (result, lines) = execute(&forge, true, 1, &mut journal);
+        result.unwrap();
+        assert!(
+            lines[0].starts_with("hold ") && lines[0].contains(reason),
+            "{lines:?}"
+        );
+        assert_eq!(forge.transfers.get(), 0);
+        assert!(journal.receipts.is_empty());
+    }
+}
+
+#[test]
+fn incomplete_pr_reference_reads_hold_without_writes() {
+    for (incomplete_references, reason) in [
+        ("closing-page", "incomplete closedByPullRequestsReferences"),
+        ("closing-count", "in-flight or unreadable linked PRs"),
+        ("closing-state", "in-flight or unreadable linked PRs"),
+        ("timeline-page", "incomplete timelineItems"),
+        ("timeline-source", "missing __typename"),
+        ("timeline-state", "missing state"),
+        ("timeline-kind", "unknown cross-reference source type"),
+    ] {
+        let forge = Forge {
+            incomplete_references,
+            ..Default::default()
+        };
+        let mut journal = Journal::default();
+        let (result, lines) = execute(&forge, true, 1, &mut journal);
+        result.unwrap();
+        assert!(
+            lines[0].starts_with("hold ") && lines[0].contains(reason),
+            "{lines:?}"
+        );
+        assert_eq!(forge.transfers.get(), 0);
+        assert!(forge.body.borrow().is_empty());
+        assert!(journal.receipts.is_empty());
+    }
+}
+
+#[test]
+fn body_plan_requires_handoff_even_when_body_plans_are_disabled() {
+    let plan = json!({"schema":JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":1,
+        "target_repo":"cgwalters-forge/bootc","kind":"implement","runner":"hosted","brief":"Repair regression"});
+    let forge = Forge {
+        body: RefCell::new(format!("```{PLAN_FENCE}\n{plan}\n```")),
+        ..Default::default()
+    };
+    for body_plans in [false, true] {
+        let mut config = config();
+        config.body_plans = body_plans;
+        let mut journal = Journal::default();
+        let mut lines = Vec::new();
+        run(
+            &forge,
+            &config,
+            true,
+            1,
+            &mut journal,
+            |_| Ok(()),
+            |line| {
+                lines.push(line);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            lines[0].starts_with("hold ") && lines[0].contains("replacement-plan handoff"),
+            "{lines:?}"
+        );
+        assert_eq!(forge.transfers.get(), 0);
+        assert!(journal.receipts.is_empty());
+    }
+}
+
+#[test]
+fn upstream_only_activity_holds_without_writes() {
+    for forge in [
+        Forge {
+            active: true,
+            active_repo: "bootc-dev/bootc",
+            ..Default::default()
+        },
+        Forge {
+            open_pr_repo: "bootc-dev/bootc",
+            ..Default::default()
+        },
+    ] {
+        let mut journal = Journal::default();
+        let (result, lines) = execute(&forge, true, 1, &mut journal);
+        result.unwrap();
+        assert!(
+            lines[0].starts_with("hold ")
+                && lines[0].contains("in-flight")
+                && lines[0].contains("bootc-dev/bootc"),
+            "{lines:?}"
+        );
+        assert_eq!(forge.transfers.get(), 0);
+        assert!(forge.body.borrow().is_empty());
+        assert!(journal.receipts.is_empty());
     }
 }
 
@@ -395,7 +581,9 @@ fn stale_source_and_failed_intent_save_never_transfer() {
     assert!(execute(&forge, true, 1, &mut Journal::default()).0.is_err());
     assert_eq!(forge.transfers.get(), 0);
     let forge = Forge {
-        body: RefCell::new("See https://github.com/bootc-dev/bootc/issues/42".into()),
+        body: RefCell::new(
+            "See https://github.com/bootc-dev/bootc/issues/42\n\nUpstream: #42\n".into(),
+        ),
         ..Default::default()
     };
     let initial_body = forge.body.borrow().clone();
@@ -442,10 +630,35 @@ fn upstream_uses_parent_and_rejects_conflicts_and_qualified_syntax() {
     ] {
         assert!(association(body, &fork).is_err());
     }
+    for edit_during_preflight in [false, true] {
+        let body = "See https://github.com/bootc-dev/bootc/issues/42";
+        let forge = Forge {
+            body: RefCell::new(body.into()),
+            edit_during_preflight,
+            ..Default::default()
+        };
+        let (result, lines) = execute(&forge, true, 1, &mut Journal::default());
+        result.unwrap();
+        assert!(
+            lines[0].starts_with("hold ")
+                && lines[0].contains("add Upstream: #42 before migration"),
+            "{lines:?}"
+        );
+        assert_eq!(forge.transfers.get(), 0);
+        assert_eq!(
+            *forge.body.borrow(),
+            if edit_during_preflight {
+                format!("{body}\nHuman edit during preflight")
+            } else {
+                body.into()
+            }
+        );
+    }
     let forge = Forge {
-        body: RefCell::new("See https://github.com/bootc-dev/bootc/issues/42".into()),
+        body: RefCell::new("Upstream: #42\n".into()),
         ..Default::default()
     };
     execute(&forge, true, 1, &mut Journal::default()).0.unwrap();
-    assert!(forge.body.borrow().ends_with("Upstream: #42\n"));
+    assert_eq!(forge.transfers.get(), 1);
+    assert_eq!(*forge.body.borrow(), "Upstream: #42\n");
 }

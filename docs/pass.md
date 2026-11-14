@@ -568,7 +568,11 @@ Each line identifies the source, destination (or `unresolved`), upstream
 association and refusal cause. Only `Upstream: #N` is accepted, using #949's
 parser and the validated fork parent for its repository. One distinct issue URL
 under that parent can supply a missing association; conflicting references hold.
-The migration never emits the old qualified `Upstream: OWNER/REPO#N` syntax.
+When only a URL supplies the association, preview holds with the `Upstream: #N`
+line the maintenance operator must add before retrying. The command never
+rewrites issue bodies: GitHub does not document a conditional issue-body update
+that protects concurrent human edits. It never emits the old qualified
+`Upstream: OWNER/REPO#N` syntax.
 Disabled issues, archived destinations, inaccessible repositories and incomplete
 metadata hold; this command never enables issues or changes repository settings.
 
@@ -579,21 +583,39 @@ identity and a durable journal outside version control:
 agent-board migrate midstream-issues --config .github/pass.json --apply --max 1 --state /path/to/migration.json
 ```
 
-`--max` must be positive; preview defaults to one. Each transfer, including its
-optional source association edit, is one existing write-cap step. The entire
+`--max` must be positive; preview defaults to one. Each transfer is one existing
+write-cap step. The entire
 command shares the pass's 650-request/15-minute envelope. Source content,
 accepted plan, admission and destination metadata are rechecked before writing.
 Any open PR or active Actions run in the source, destination or upstream parent
 holds all work for that repository. Open closing-reference or cross-referenced
 PRs in any repository also hold; incomplete reference reads fail closed.
-Accepted plans still naming the source identity hold until a reviewed replacement-plan
-handoff exists: moving their comments alone would leave scheduler identity checks stale.
+Accepted comment plans and any body plan fence hold: moving them alone would
+leave scheduler identity checks stale. Body fences hold even with `bodyPlans`
+disabled. There is no automatic plan rewrite or exemption for finished plans.
 Run during a maintenance window with dispatch paused;
 these checks are not a distributed lock against another controller starting work.
 
+For a planned issue, the maintenance operator must first retain the old plan and
+its dispatch history for reference outside executable plan fences, then retire
+all accepted source comment plan fences and any body plan fence using their
+authors' normal editing process. Preserve a structured target on the issue before removing its only
+routing evidence. Preview again; do not clear a hold by changing admission or
+discarding the journal. After a verified transfer, use the journal's canonical
+repository and new issue number to review and post a replacement plan under the
+[job-plan contract](job-plans.md), omitting a now-redundant `target_repo`. Keep
+dispatch paused until that plan and the retained board/Priority/parent state have
+been checked. This handoff is manual; the migration neither edits plan comments
+nor posts new ones.
+
 GitHub issue transfer preserves comments and redirects; no copy-and-close path
 exists. The stable issue node, exact board item/project identity, Priority value,
-parent and issue content are verified afterward. The new URL/number is recorded
+parent, labels, milestone and issue content are verified afterward. Destination
+labels must contain every source label by name, and a source milestone must
+match a destination milestone's title and due date; missing or incomplete
+metadata holds before transfer. This follows GitHub's
+[transfer retention rules](https://docs.github.com/en/issues/tracking-your-work-with-issues/administering-issues/transferring-an-issue-to-another-repository).
+The new URL/number is recorded
 as the canonical identity, not assumed equal to the source number. A pending
 intent is synced before any forge write. A timeout is reconciled by node ID before
 any further transfer; a confirmed transfer is not resent. Failed preservation or
@@ -612,8 +634,8 @@ they do not prove GitHub preserves board state in a live transfer.
 
 Rollout remains blocked on operator-enabled fork issues where disabled,
 admission of any missing work targets through the existing configuration process,
-a replacement-plan handoff for planned issues, a maintenance window, and a controlled transfer verifying real project/Priority/
-parent preservation. This change neither transfers live issues nor retires tracker
+the manual plan handoff for planned issues, a maintenance window, and a controlled
+transfer verifying real project/Priority/parent preservation. This change neither transfers live issues nor retires tracker
 staging. The `target_repo` staging contract remains necessary for issues-off forks.
 Part of [tracker#1599](https://github.com/cgwalters-forge/tracker/issues/1599).
 
