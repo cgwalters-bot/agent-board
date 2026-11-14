@@ -76,14 +76,19 @@ dismissed approval is not a fresh approval; consumers must re-read current
 approval and check state before acting. This adds no writes or pass dispatch
 and uses the existing one-page timeline bound.
 
-A pull request whose head checks were still running is read again on later
-runs until they settle, so that their result is a change too (`checked`),
+A pull request whose head checks were absent or still running is read again
+on later runs until they settle, so that their result is a change too (`checked`),
 although it updates nothing GitHub lists; at most a hundred are followed at a
 time, including settled results not yet acknowledged with `--commit`. A
 settled result remains replayable until commit, even after the pull request
 ages out of the update window. Pending entries outside the current repository
 scope do not consume its cap, but are kept for other caller checkouts sharing
-the state directory. An item whose update the timeline does not explain is listed as
+the state directory. An absent check rollup is not success: CI can register
+after the first read without updating the pull request. Such a PR stays in
+the same bounded pending set until checks settle or the PR closes, including
+across `--commit`. If CI never registers, it continues to occupy a slot and
+cost a batched detail read; the existing hundred-PR cap also bounds this case.
+An item whose update the timeline does not explain is listed as
 `updated`.
 
 ## Reads
