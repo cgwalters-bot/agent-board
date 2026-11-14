@@ -325,8 +325,10 @@ approved work visible without granting the pass upstream write authority.
 * **Candidate read gates.** Only after command/head evidence passes, read in
   order: all upstream PRs for the head repository owner's branch (same open
   head is already promoted; different, closed or merged holds); upstream-base
-  comparison (zero ahead holds; preview reports behind heads as needing a
-  publication rebase); the issue's accepted plan's `stacks_on`; DCO facts from required
+  comparison (zero ahead holds; a behind head whose commits form a linear
+  bot- or operator-authored chain is reported ready after a publication rebase,
+  whose conflict only `--apply` finds and holds; the awaiting queue still holds
+  it); the issue's accepted plan's `stacks_on`; DCO facts from required
   base-branch checks or base-head check runs; and unchanged title/body text.
   This prevents duplicate publication, stale bases, unmerged dependencies,
    unsafe sign-off rewrites and references changing meaning upstream. Only a

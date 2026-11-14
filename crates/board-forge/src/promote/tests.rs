@@ -1366,7 +1366,18 @@ fn candidate_read_gates() {
         (
             "behind",
             |r| body(r, "/compare/")["behind_by"] = json!(1),
-            gate_hold("needs publication rebase (behind_by=1)"),
+            candidate(false).replace(
+                "dco=required;",
+                "dco=required; publication rebase onto main (behind_by=1), held by --apply on conflict;",
+            ),
+        ),
+        (
+            "behind, another author",
+            |r| {
+                body(r, "/compare/")["behind_by"] = json!(1);
+                body(r, "/compare/")["commits"][0]["author"]["login"] = json!("visitor");
+            },
+            gate_hold("promotion refuses another author's commit"),
         ),
         (
             "zero ahead",

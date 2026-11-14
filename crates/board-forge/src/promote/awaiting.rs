@@ -182,7 +182,10 @@ impl<'a> Awaiting<'a> {
         permission.map_err(GateFailure::into_error)?;
         match gate {
             Gates::Promoted(line) => Ok(line),
-            Gates::Ready { signoffs, .. } => {
+            Gates::Ready {
+                signoffs, behind, ..
+            } => {
+                hold!(behind == 0, "needs publication rebase (behind_by={behind})");
                 hold!(signoffs == 0, "DCO sign-off rewrite required");
                 hold!(
                     !pull["head"]["repo"]["owner"]["login"]

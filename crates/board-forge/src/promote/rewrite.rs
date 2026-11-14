@@ -19,6 +19,42 @@ pub(super) fn branch(head: &str) -> String {
     format!("bot/promote/{head}")
 }
 
+/// What a replay needs before any Git run: a linear chain from the merge base
+/// of commits by the bot or operator. A preview reads this; only a conflict is
+/// left to the replay itself.
+pub(super) fn replayable(config: &Config, compare: &Value) -> Result<()> {
+    config
+        .promote
+        .as_ref()
+        .and_then(|p| p.signoff.as_ref())
+        .context("missing sign-off identity")?;
+    let mut parent = compare["merge_base_commit"]["sha"]
+        .as_str()
+        .filter(|s| oid(s))
+        .context("invalid merge base")?;
+    for c in compare["commits"].as_array().context("missing commits")? {
+        let sha = c["sha"]
+            .as_str()
+            .filter(|s| oid(s))
+            .context("invalid commit")?;
+        hold!(
+            c["parents"]
+                .as_array()
+                .is_some_and(|p| p.len() == 1 && p[0]["sha"] == parent),
+            "promotion requires a linear commit chain"
+        );
+        hold!(
+            c["author"]["login"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&config.bot)
+                    || a.eq_ignore_ascii_case(&config.operator)),
+            "promotion refuses another author's commit"
+        );
+        parent = sha;
+    }
+    Ok(())
+}
+
 pub(super) trait Rewrite {
     fn prepare(
         &mut self,
@@ -221,6 +257,7 @@ impl Git {
             .as_ref()
             .and_then(|p| p.signoff.as_ref())
             .context("missing sign-off identity")?;
+        replayable(config, compare)?;
         let commits = compare["commits"].as_array().context("missing commits")?;
         let mut parent = ancestor.to_owned();
         let mut rebased = base.to_owned();
@@ -232,19 +269,6 @@ impl Git {
                 .as_str()
                 .filter(|s| oid(s))
                 .context("invalid commit")?;
-            ensure!(
-                c["parents"]
-                    .as_array()
-                    .is_some_and(|p| p.len() == 1 && p[0]["sha"] == parent),
-                "promotion requires a linear commit chain"
-            );
-            ensure!(
-                c["author"]["login"]
-                    .as_str()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(&config.bot)
-                        || a.eq_ignore_ascii_case(&config.operator)),
-                "promotion refuses another author's commit"
-            );
             let tree = self.run(&["rev-parse", &format!("{rebased}^{{tree}}")], &[])?;
             let date = self.run(&["show", "-s", "--format=%cI", sha], &[])?;
             let identity = [
