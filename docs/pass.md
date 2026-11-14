@@ -702,6 +702,11 @@ reads only `subIssues(first:1).totalCount`, not child bodies or extra pages;
 missing, null or invalid counts hold rather than implying a leaf. Apply rechecks
 this evidence before recording transfer intent. A leaf with its own parent
 remains eligible, subject to the other checks and parent-link preservation.
+An epic awaiting its first child can also lack labels: an `agent-board-epic-plan`
+fence in the body or a comment weighed by the accepted-writer rules holds it in
+tracker, even if the fenced JSON is malformed. Untrusted comment authors do not
+gain a migration veto. This uses the existing body/comment reads and is rechecked
+during apply preflight, before transfer intent is saved.
 
 Each line identifies the source, destination (or `unresolved`), upstream
 association and refusal cause. Only `Upstream: #N` is accepted, using #949's

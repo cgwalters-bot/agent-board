@@ -454,6 +454,17 @@ fn classify(
     forks: &[Fork],
 ) -> Result<usize> {
     ensure!(node["state"] == "OPEN", "issue is not open");
+    // An epic can have a plan before its first child exists. Moving that
+    // coordinator would strand the plan's tracker identity even without labels.
+    ensure!(
+        !plan::has_fence(required_body(node)?, crate::epic::EPIC_PLAN_FENCE)
+            && plan::no_fenced(
+                comments,
+                &[&config.operator, &config.bot],
+                crate::epic::EPIC_PLAN_FENCE,
+            ),
+        "excluded issue: epic plan"
+    );
     // A project-prefixed parent is still an epic even without an epic label.
     // Read only the count; enumerating children would add no routing evidence.
     let children = node["subIssues"]["totalCount"]
