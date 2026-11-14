@@ -725,6 +725,11 @@ that protects concurrent human edits. It never emits the old qualified
 `Upstream: OWNER/REPO#N` syntax.
 Disabled issues, archived destinations, inaccessible repositories and incomplete
 metadata hold; this command never enables issues or changes repository settings.
+Partial GraphQL errors in the project issue listing stop the whole command, even
+when other items on that page are readable. Otherwise an incomplete inventory
+could look like a complete preview or permit transfers from a partial apply list.
+Every page must succeed before candidate previews, journal saves or transfers;
+the existing 20-page and shared request limits still bound discovery.
 
 Apply is an explicit operator maintenance operation, using the configured bot
 identity and a durable journal outside version control:
