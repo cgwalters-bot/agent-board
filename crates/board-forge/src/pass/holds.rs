@@ -584,6 +584,9 @@ const START_KINDS: &[&str] = &[
 /// The hold snapshot ([`HOLDS_SCHEMA`]).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Snapshot {
+    /// First-response credential expiry; null expiry means unknown, not unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pat_expiry: Option<Value>,
     /// Known operator requests and reply receipts; never an authorization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator_direction: Option<Value>,
@@ -754,6 +757,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, mut pass): (Wip, PassSummar
         .collect();
     Snapshot {
         operator_direction: None,
+        pat_expiry: None,
         dispatchable_work: None,
         pass_view: None,
         epic_focus: None,
@@ -2332,7 +2336,17 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         }
         approvals.insert(pull, joined);
     }
-    let published = published_asks(previous, &[REVIEWS, PROPOSALS, DIGEST, DECISIONS, DRAFTS]);
+    let published = published_asks(
+        previous,
+        &[
+            REVIEWS,
+            PROPOSALS,
+            DIGEST,
+            DECISIONS,
+            DRAFTS,
+            super::pat::SOURCE,
+        ],
+    );
     let own: Vec<_> = [
         (REVIEWS, &reading.reviews),
         (PROPOSALS, &reading.proposals),
@@ -2402,7 +2416,10 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         .into_iter()
         .flatten()
         .filter_map(|i| serde_json::from_value::<Identity>(i.clone()).ok())
-        .filter(|i| i.source == REVIEWS && !published.iter().any(|p| p.key == i.detail_key))
+        .filter(|i| {
+            matches!(i.source.as_str(), REVIEWS | super::pat::SOURCE)
+                && !published.iter().any(|p| p.key == i.detail_key)
+        })
         .collect();
     // A carried ask is joined with its hold as a live one is.
     for mut ask in asks {
@@ -2436,7 +2453,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             .map(|p| p.waiting_since.as_str())
             .or_else(|| {
                 let source = |i: &&Identity| i.key == ask.key && i.kind == ask.kind;
-                (ask.source == REVIEWS && ask.group.is_none())
+                (matches!(ask.source.as_str(), REVIEWS | super::pat::SOURCE) && ask.group.is_none())
                     .then(|| evicted.iter().find(source))
                     .flatten()
                     .map(|i| i.waiting_since.as_str())
@@ -2916,8 +2933,12 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         ),
         None => String::new(),
     };
+    let pat = match &snapshot.pat_expiry {
+        Some(pat) => format!(",\"pat_expiry\":{}", serde_json::to_string(pat)?),
+        None => String::new(),
+    };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{direction}{leases}{needs_you}{work}{view}{today}{focus},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{direction}{leases}{needs_you}{work}{view}{today}{focus}{pat},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -3051,6 +3072,7 @@ pub fn fit_to(mut snapshot: Snapshot, bound: Bound) -> Result<(Snapshot, String)
     let without = |dropped: &BTreeSet<usize>,
                    needs_you: &Option<NeedsYou>,
                    pass_view: &Option<Value>| Snapshot {
+        pat_expiry: snapshot.pat_expiry.clone(),
         operator_direction: snapshot.operator_direction.clone(),
         dispatchable_work: snapshot.dispatchable_work.clone(),
         pass_view: pass_view.clone(),

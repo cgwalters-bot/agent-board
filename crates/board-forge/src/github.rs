@@ -6,7 +6,23 @@ use board_core::{Capability, Coverage, Evidence, Item, ItemRef, Snapshot};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
+
+const TOKEN_EXPIRATION_HEADER: &str = "github-authentication-token-expiration";
+
+/// GitHub uses a UTC timestamp with a space rather than RFC 3339's `T`.
+/// Never publish unparsed header text as operator instructions.
+fn token_expiration(value: &str) -> Option<OffsetDateTime> {
+    if value.len() > 64 {
+        return None;
+    }
+    OffsetDateTime::parse(value, &Rfc3339).ok().or_else(|| {
+        let value = value.strip_suffix(" UTC")?;
+        let (date, time) = value.split_once(' ')?;
+        OffsetDateTime::parse(&format!("{date}T{time}Z"), &Rfc3339).ok()
+    })
+}
 
 pub const DEFAULT_HOST: &str = "github.com";
 /// The only origin a REST request carries the token to.
@@ -640,6 +656,7 @@ impl Client {
             .build()
             .call()
             .map_err(transport_error)?;
+        self.api.observe_headers(response.headers());
         let status = response.status().as_u16();
         if (300..400).contains(&status) {
             let location = response
@@ -734,6 +751,7 @@ pub(crate) struct Reply {
 /// A response's rate-limit headers.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Limits {
+    expiration: Option<OffsetDateTime>,
     retry_after: Option<String>,
     /// `x-ratelimit-remaining` and `x-ratelimit-reset`.
     remaining: Option<String>,
@@ -744,6 +762,9 @@ impl Limits {
     /// The headers `header` looks up by their lower-case names.
     fn read(header: impl Fn(&str) -> Option<String>) -> Self {
         Self {
+            expiration: header(TOKEN_EXPIRATION_HEADER)
+                .as_deref()
+                .and_then(token_expiration),
             retry_after: header("retry-after"),
             remaining: header("x-ratelimit-remaining"),
             reset: header("x-ratelimit-reset"),
@@ -769,6 +790,7 @@ pub(crate) trait Http {
 /// reqwest with the token, its TLS client built at the first request.
 pub(crate) struct Https {
     token: String,
+    expiration: std::sync::Arc<std::sync::OnceLock<Option<OffsetDateTime>>>,
     client: tokio::sync::OnceCell<reqwest::Client>,
 }
 
@@ -798,7 +820,7 @@ impl Http for Https {
             .get_or_try_init(|| async { https_client() })
             .await?;
         let failed = |_| anyhow::anyhow!("GitHub transport failed");
-        let mut response = client
+        let response = client
             .post(url)
             .bearer_auth(&self.token)
             .header("Content-Type", "application/json")
@@ -806,6 +828,12 @@ impl Http for Https {
             .send()
             .await
             .map_err(failed)?;
+        self.reply(response).await
+    }
+}
+
+impl Https {
+    async fn reply(&self, mut response: reqwest::Response) -> Result<Reply> {
         let limits = Limits::read(|name| {
             response
                 .headers()
@@ -813,9 +841,16 @@ impl Http for Https {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned)
         });
+        // Observe the headers before reading a fallible body, not in body
+        // completion order when snapshot reads are concurrent.
+        self.expiration.get_or_init(|| limits.expiration);
         let status = response.status().as_u16();
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(failed)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow::anyhow!("GitHub transport failed"))?
+        {
             ensure!(
                 body.len() + chunk.len() <= RESPONSE_BYTES,
                 "GitHub response over {RESPONSE_BYTES} bytes"
@@ -836,6 +871,8 @@ impl Http for Https {
 /// [`RATE_LIMIT_WAIT`] ([`Backoff`]). An operation's request budget
 /// is its own ([`GitHub::snapshot_with_policy`]).
 pub(crate) struct Api<H = Https> {
+    /// Includes an absent/invalid first header: later responses cannot replace it.
+    expiration: std::sync::Arc<std::sync::OnceLock<Option<OffsetDateTime>>>,
     requests: std::sync::atomic::AtomicUsize,
     http: H,
     in_flight: tokio::sync::Semaphore,
@@ -845,16 +882,30 @@ pub(crate) struct Api<H = Https> {
 
 impl Api {
     fn new(token: String) -> Self {
-        Self::with_http(Https {
+        let expiration = std::sync::Arc::new(std::sync::OnceLock::new());
+        let mut api = Self::with_http(Https {
             token,
+            expiration: expiration.clone(),
             client: tokio::sync::OnceCell::new(),
-        })
+        });
+        api.expiration = expiration;
+        api
     }
 }
 
 impl<H: Http> Api<H> {
+    fn observe_headers(&self, headers: &ureq::http::HeaderMap) {
+        self.expiration.get_or_init(|| {
+            headers
+                .get(TOKEN_EXPIRATION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(token_expiration)
+        });
+    }
+
     fn with_http(http: H) -> Self {
         Self {
+            expiration: std::sync::Arc::new(std::sync::OnceLock::new()),
             requests: std::sync::atomic::AtomicUsize::new(0),
             http,
             in_flight: tokio::sync::Semaphore::new(MAX_IN_FLIGHT),
@@ -874,6 +925,7 @@ impl<H: Http> Api<H> {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.http.post(url, body).await?
             };
+            self.expiration.get_or_init(|| reply.limits.expiration);
             let decoded = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
             let Some(wait) = rate_limited(reply.status, &reply.limits, &decoded, SystemTime::now())
             else {
@@ -1152,6 +1204,7 @@ impl Transport for Client {
                 .header("User-Agent", "agent-board")
                 .send_json(&request)
                 .map_err(transport_error)?;
+            self.api.observe_headers(response.headers());
             let status = response.status().as_u16();
             let limits = Limits::of(response.headers());
             let body: Value = match response.body_mut().read_json() {
@@ -1184,6 +1237,10 @@ impl crate::pass::Broker for Client {
 }
 
 impl crate::poll::Rest for Client {
+    fn token_expiration(&self) -> Option<OffsetDateTime> {
+        self.api.expiration.get().copied().flatten()
+    }
+
     fn network_requests(&self) -> Option<usize> {
         use std::sync::atomic::Ordering;
         Some(self.requests.load(Ordering::Relaxed) + self.api.requests.load(Ordering::Relaxed))
@@ -1238,6 +1295,7 @@ impl crate::poll::Rest for Client {
                 _ => anyhow::bail!("unsupported method {method}"),
             }
             .map_err(transport_error)?;
+            self.api.observe_headers(response.headers());
             let status = response.status().as_u16();
             if status == 401 {
                 return Err(anyhow::Error::from(AuthenticationRequired)
@@ -1287,6 +1345,7 @@ impl crate::poll::Rest for Client {
                 request = request.header(name, value);
             }
             let mut response = request.call().map_err(transport_error)?;
+            self.api.observe_headers(response.headers());
             let status = response.status().as_u16();
             // Only a refusal's body says whether it is a rate limit's.
             let wait = matches!(status, 403 | 429).then(|| {
@@ -2415,6 +2474,104 @@ mod tests {
     }
 
     #[test]
+    fn token_expiration_header_is_parsed_and_first_response_wins() {
+        use crate::poll::Rest;
+        let expected = token_expiration("2026-12-31T00:00:00Z").unwrap();
+        for (value, valid) in [
+            (Some("2026-12-31 00:00:00 UTC"), true),
+            (Some("2026-12-31T00:00:00Z"), true),
+            (Some("2026-12-30T19:00:00-05:00"), true),
+            (None, false),
+            (Some(""), false),
+            (Some("not a date; run this"), false),
+            (Some("2026-02-30 00:00:00 UTC"), false),
+        ] {
+            for method in ["GET", "POST", "GRAPHQL"] {
+                let mut client = Client::with_token("test-key-not-secret".into());
+                client.agent = ureq::Agent::config_builder()
+                    .http_status_as_error(false)
+                    .middleware(
+                        move |_request: ureq::http::Request<ureq::SendBody<'_>>,
+                              _next: ureq::middleware::MiddlewareNext<'_>| {
+                            let mut response = ureq::http::Response::builder().status(200);
+                            if let Some(value) = value {
+                                response = response.header(TOKEN_EXPIRATION_HEADER, value);
+                            }
+                            Ok(response
+                                .body(ureq::Body::builder().data(r#"{"data":{"ok":true}}"#))
+                                .unwrap())
+                        },
+                    )
+                    .build()
+                    .into();
+                assert_eq!(client.token_expiration(), None);
+                match method {
+                    "GET" => {
+                        client.get(API_ROOT, None).unwrap();
+                    }
+                    "POST" => {
+                        client.send("POST", API_ROOT, &json!({})).unwrap();
+                    }
+                    _ => {
+                        Transport::graphql(&client, "query { viewer { login } }", json!({}))
+                            .unwrap();
+                    }
+                }
+                let observed = valid.then_some(expected);
+                assert_eq!(client.token_expiration(), observed, "{method} {value:?}");
+                let mut later = ureq::http::HeaderMap::new();
+                later.insert(
+                    TOKEN_EXPIRATION_HEADER,
+                    "2027-01-01T00:00:00Z".parse().unwrap(),
+                );
+                client.api.observe_headers(&later);
+                assert_eq!(client.token_expiration(), observed);
+            }
+        }
+        assert!(token_expiration(&"x".repeat(65)).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_first_response_records_token_expiration() {
+        for first in [None, token_expiration("2026-12-31T00:00:00Z")] {
+            let mut response = reply(200, None, None, r#"{"data":{"ok":true}}"#);
+            response.limits.expiration = first;
+            let api = Api::with_http(Scripted::default());
+            api.http.replies.borrow_mut().push_back(response);
+            api.graphql("query { viewer { login } }", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(api.expiration.get(), Some(&first));
+            api.graphql("query { viewer { login } }", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(api.expiration.get(), Some(&first));
+        }
+    }
+
+    #[tokio::test]
+    async fn async_expiration_survives_a_refused_response_body() {
+        let api = Api::new("test-key-not-secret".into());
+        let response = ureq::http::Response::builder()
+            .header(TOKEN_EXPIRATION_HEADER, "2026-12-31 00:00:00 UTC")
+            .body(vec![b' '; RESPONSE_BYTES + 1])
+            .unwrap();
+        assert!(api.http.reply(response.into()).await.is_err());
+        assert_eq!(
+            api.expiration.get().copied().flatten(),
+            token_expiration("2026-12-31T00:00:00Z")
+        );
+        let later = ureq::http::Response::builder()
+            .body(Vec::<u8>::new())
+            .unwrap();
+        api.http.reply(later.into()).await.unwrap();
+        assert_eq!(
+            api.expiration.get().copied().flatten(),
+            token_expiration("2026-12-31T00:00:00Z")
+        );
+    }
+
+    #[test]
     fn client_uses_platform_trust_with_verification_enabled() {
         let client = Client::with_token("test-key-not-secret".into());
         let tls = client.agent.config().tls_config();
@@ -2464,6 +2621,7 @@ mod tests {
         Reply {
             status,
             limits: Limits {
+                expiration: None,
                 retry_after: retry_after.map(str::to_owned),
                 remaining: remaining.map(str::to_owned),
                 reset: Some("1000090".into()),

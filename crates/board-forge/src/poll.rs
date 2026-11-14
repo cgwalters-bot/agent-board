@@ -1551,6 +1551,11 @@ pub struct RestResponse {
 
 /// Conditional GETs against the REST API. `validator` is a header name and value.
 pub trait Rest {
+    /// Parsed expiry from this credential's first API response, never a token.
+    fn token_expiration(&self) -> Option<OffsetDateTime> {
+        None
+    }
+
     /// Transport sends, including retries; none when the transport cannot count.
     fn network_requests(&self) -> Option<usize> {
         None

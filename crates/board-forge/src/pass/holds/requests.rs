@@ -135,6 +135,7 @@ pub(crate) fn identity(ask: &Ask, host: &str) -> String {
         RefKind::ReplyPullRequest => "reply".to_owned(),
         RefKind::ClosePullRequest => "close".to_owned(),
         RefKind::OperatorAction => format!("proposal/{}", action.comment.unwrap_or_default()),
+        _ if ask.source == super::super::pat::SOURCE => ask.key.clone(),
         _ if ask.source == DECISIONS || ask.source == DRAFTS => ask.key.clone(),
         // Preserve the existing pass-alarm grouping. Other issue questions
         // must not collapse merely because they share an issue number.
@@ -178,7 +179,12 @@ pub(super) fn describe(
         | RefKind::ReviewPullRequest
         | RefKind::ReplyPullRequest
         | RefKind::ClosePullRequest => true,
-        _ if ask.kind == "review-promote" || matches!(ask.source.as_str(), DECISIONS | DRAFTS) => {
+        _ if ask.kind == "review-promote"
+            || matches!(
+                ask.source.as_str(),
+                DECISIONS | DRAFTS | super::super::pat::SOURCE
+            ) =>
+        {
             true
         }
         _ => hold.is_some_and(|h| h.question.is_some() || h.reason != ask.ask),
@@ -186,7 +192,7 @@ pub(super) fn describe(
     let known = hold.is_some_and(|h| h.kind != HoldKind::Other)
         || matches!(
             ask.source.as_str(),
-            REVIEWS | PROPOSALS | DIGEST | DECISIONS | DRAFTS
+            REVIEWS | PROPOSALS | DIGEST | DECISIONS | DRAFTS | super::super::pat::SOURCE
         );
     let source_read = match ask.source.as_str() {
         "epics" => {
@@ -283,6 +289,13 @@ pub(super) fn describe(
             reason: "Re-read the exact source comment and run action check with caller scope before independently authorized action apply; a listed proposal is not approval.".into(),
         });
     }
+    if ask.source == super::super::pat::SOURCE {
+        actions.push(Action {
+            kind: "rotate-token".into(),
+            supported: false,
+            reason: "Operator action: log in as the bot, mint a PAT and update the named secret manually. This publication cannot read or write secrets.".into(),
+        });
+    }
     Request {
         key: ask.key.clone(),
         identity,
@@ -313,6 +326,7 @@ pub(super) fn describe(
             DIGEST => "Newest digest written and last edited by the configured bot requests operator attention; freshness must be rechecked.",
             DECISIONS => "Outstanding entry in the configured decisions document, written and last edited by the operator or bot; checked answers are not resolution.",
             DRAFTS => "Newest review draft written and last edited by the operator or bot on an open labelled issue; source inspection is not authorization to send.",
+            super::super::pat::SOURCE => "First GitHub API response reports the configured pass credential's expiry; trusted caller configuration names the manual secret-update destination.",
             _ => "Pass hold has operator=true; a done verdict alone does not release the hold.",
         }.into(),
         sources,
