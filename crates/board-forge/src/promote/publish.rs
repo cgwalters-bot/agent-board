@@ -100,7 +100,7 @@ pub(super) fn apply_with<C: Rest + Transport>(
         !config.bot.eq_ignore_ascii_case(&config.operator),
         "promote operator and bot must differ"
     );
-    pass::preview_reads(client, |client| {
+    pass::promotion_reads(client, config, |client, lines| {
         // Status comments must remain recoverable with the same authenticated
         // writer, not merely an assumed author from trusted configuration.
         let identity = get(client, "user")?;
@@ -110,22 +110,51 @@ pub(super) fn apply_with<C: Rest + Transport>(
                 .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot)),
             "publication credential must authenticate as configured bot"
         );
-        let mut lines = Vec::new();
         for (repo, target) in &targets(client, config)? {
+            // Reuse the pass's bounded hint query: ordinary waiting drafts
+            // spend no per-PR reads. Hints never replace fresh authorization.
+            let candidates = awaiting::candidates(client, config, repo).with_context(|| {
+                format!("discover promotion candidates in {repo}; later forks not evaluated")
+            })?;
+            if candidates.is_empty() {
+                continue;
+            }
             let mut pulls = pages(
                 client,
                 &format!("repos/{repo}/pulls?state=open&sort=created&direction=asc"),
-            )?;
+            )
+            .with_context(|| {
+                format!("list promotion candidates in {repo}; later forks not evaluated")
+            })?;
             pulls.sort_by_key(|p| p["number"].as_u64());
-            for pull in pulls {
+            let mut seen = BTreeSet::new();
+            for pull in &pulls {
                 let number = pull["number"]
                     .as_u64()
                     .filter(|n| *n > 0)
                     .context("invalid pull number")?;
+                ensure!(seen.insert(number), "duplicate pull {repo}#{number}");
+            }
+            let pulls: Vec<_> = pulls
+                .into_iter()
+                .filter(|p| {
+                    p["number"]
+                        .as_u64()
+                        .is_some_and(|n| candidates.contains(&n))
+                })
+                .collect();
+            for (index, pull) in pulls.iter().enumerate() {
+                let number = pull["number"].as_u64().context("invalid pull number")?;
+                let pending = || {
+                    format!(
+                        "{repo}#{number}; {} candidate(s) in this fork and later forks not evaluated",
+                        candidates.len() - index
+                    )
+                };
                 // A candidate that cannot be published holds alone, before any
                 // write; the candidates after it are still read this invocation.
                 let prepared =
-                    match prepare(client, config, (repo, target), &pull, now, max_writes, git) {
+                    match prepare(client, config, (repo, target), pull, now, max_writes, git) {
                         Ok(Step::Publish(prepared)) => prepared,
                         Ok(Step::Line(line)) => {
                             lines.push(line);
@@ -133,7 +162,10 @@ pub(super) fn apply_with<C: Rest + Transport>(
                         }
                         Ok(Step::Held(line)) => {
                             lines.push(line);
-                            return Ok(lines);
+                            return Ok(());
+                        }
+                        Err(error) if pass::budget_spent(&error) => {
+                            return Err(error.context(pending()));
                         }
                         Err(error) => {
                             if error.is::<ScopeFailure>() {
@@ -143,11 +175,11 @@ pub(super) fn apply_with<C: Rest + Transport>(
                             continue;
                         }
                     };
-                lines.push(publish(client, (repo, target), git, *prepared)?);
-                return Ok(lines);
+                lines.push(publish(client, (repo, target), git, *prepared).with_context(pending)?);
+                return Ok(());
             }
         }
-        Ok(lines)
+        Ok(())
     })
 }
 

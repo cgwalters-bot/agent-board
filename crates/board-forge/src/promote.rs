@@ -162,19 +162,29 @@ fn assess(
         return Ok((gate, Ok("")));
     }
     authorized_promotion_body(client, config, repo, pull, &target.upstream, command)?;
-    let policy = policies
-        .entry(target.upstream.to_ascii_lowercase())
-        .or_insert_with(|| {
-            policy::gate(client, config, &target.upstream).map_err(GateFailure::policy)
-        });
+    let key = target.upstream.to_ascii_lowercase();
+    if !policies.contains_key(&key) {
+        let permission = match policy::gate(client, config, &target.upstream) {
+            Err(error) if pass::budget_spent(&error) => return Err(error),
+            result => result,
+        };
+        policies.insert(key.clone(), permission.map_err(GateFailure::policy));
+    }
+    let policy = policies.get(&key).context("promotion policy observation")?;
     let verdict = match policy {
         Ok(policy::Permitted::BotOk) => Ok("bot-ok"),
-        Ok(policy::Permitted::HumanText) => provenance::verify(client, config, repo, pull, command)
-            .map(|()| "human-text; provenance verified")
-            .map_err(|e| GateFailure {
-                operational: !e.is::<Held>(),
-                why: format!("needs-text: {e:#}"),
-            }),
+        Ok(policy::Permitted::HumanText) => {
+            let verified = match provenance::verify(client, config, repo, pull, command) {
+                Err(error) if pass::budget_spent(&error) => return Err(error),
+                result => result,
+            };
+            verified
+                .map(|()| "human-text; provenance verified")
+                .map_err(|e| GateFailure {
+                    operational: !e.is::<Held>(),
+                    why: format!("needs-text: {e:#}"),
+                })
+        }
         Err(why) => Err(why.clone()),
     };
     Ok((gate, verdict))
@@ -183,6 +193,12 @@ fn assess(
 /// The REST response fields a recorded preview keeps: those this evaluator
 /// reads, not avatars, descriptions or other fields it never reads.
 const RECORDED_FIELDS: &[&str] = &[
+    // requestShare sizes standalone previews from this free read too.
+    "resources",
+    "core",
+    "graphql",
+    "remaining",
+    "reset",
     "full_name",
     "fork",
     "archived",
@@ -416,8 +432,7 @@ pub fn preview<C: Rest + Transport>(
         !config.bot.eq_ignore_ascii_case(&config.operator),
         "promote operator and bot must differ"
     );
-    pass::preview_reads(client, |client| {
-        let mut lines = Vec::new();
+    pass::promotion_reads(client, config, |client, lines| {
         // Each upstream's policy is read at most once per run.
         let mut policies = BTreeMap::new();
         for (repo, target) in &targets(client, config)? {
@@ -472,11 +487,13 @@ pub fn preview<C: Rest + Transport>(
                                     Err(why) => format!("hold promote {repo}#{number} head={head}: {why}"),
                                 });
                             }
+                            Err(error) if pass::budget_spent(&error) => return Err(error.context(format!("evaluating {repo}#{number}; remaining candidates and forks not evaluated"))),
                             Err(error) => lines.push(format!(
                                 "hold promote {repo}#{number} head={head} {command}: {error:#}"
                             )),
                         }
                     }
+                    Err(error) if pass::budget_spent(&error) => return Err(error.context(format!("evaluating {repo}#{number}; remaining candidates and forks not evaluated"))),
                     Err(error) => lines.push(format!(
                         "hold promote {repo}#{number} head={head} command=unverified: {error:#}"
                     )),
@@ -484,7 +501,7 @@ pub fn preview<C: Rest + Transport>(
             }
         }
         lines.push(REMAINING.into());
-        Ok(lines)
+        Ok(())
     })
 }
 
@@ -903,8 +920,14 @@ fn source_issue(repo: &str, pull: &Value) -> Result<board_core::ItemRef> {
 /// A qualified body link cannot redirect publication or close another repo's issue.
 fn promotion_body(client: &impl Rest, repo: &str, pull: &Value, upstream: &str) -> Result<String> {
     let source = source_issue(repo, pull)?;
-    let target = crate::upstream::target(client, &source)
-        .map_err(|e| Held(format!("upstream link held: {e:#}")))?;
+    let held = |error: anyhow::Error| {
+        if pass::budget_spent(&error) {
+            error
+        } else {
+            Held(format!("upstream link held: {error:#}")).into()
+        }
+    };
+    let target = crate::upstream::target(client, &source).map_err(held)?;
     let mut body = pull["body"]
         .as_str()
         .context("missing pull body")?
@@ -915,8 +938,7 @@ fn promotion_body(client: &impl Rest, repo: &str, pull: &Value, upstream: &str) 
             "upstream link held: fork parent {} differs from configured target {upstream}",
             target.repository
         );
-        crate::upstream::issue(client, &target.repository, target.number)
-            .map_err(|e| Held(format!("upstream link held: {e:#}")))?;
+        crate::upstream::issue(client, &target.repository, target.number).map_err(held)?;
         body.push_str(&format!("\n\nFixes {}", target.display()));
     }
     Ok(body)

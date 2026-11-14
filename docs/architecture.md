@@ -284,6 +284,25 @@ candidates and their first held gate through the same read-only evaluator; it
 never publishes, even with `pass --apply` and `promote.publish` set. This makes
 approved work visible without granting the pass upstream write authority.
 
+Publication first uses the pass's cheap discovery query, one per fork: only
+drafts with an operator current-head approval (when `promote.onApproval` is on)
+or PRs with an operator command reach the expensive per-PR gates. Ordinary
+waiting drafts have no per-PR reads. Discovery is a hint, not authorization;
+publication still independently re-reads every gate and approval. The query
+admits at most 100 open PRs per fork and 100 reviews/comments per PR; truncation
+is an error, never permission. Preview retains its exhaustive hold diagnostics.
+
+Standalone preview and publication honor the existing optional `requestShare`
+setting, using the same remaining-token sizing and GraphQL point stop as the
+pass. Absent it, or when the free rate-limit read fails, the fixed 650-request
+budget remains. The 15-minute admission bound and publication/write caps are
+unchanged. Request, point or time exhaustion reports `promote deferred:` with
+unfinished work and exits successfully for retry next run, preserving completed
+diagnostics. Other operational errors are not classified as budget deferral.
+No new control or publication authority is added; publication remains off by
+default. This prevents unapproved drafts consuming the budget before approved
+work, without weakening the current-head authorization boundary.
+
 * **Permission.** An exact operator-authored `/promote` or
   `/promote --human-text` conversation command after the observed push
   establishing the current head is a trigger. This preview accepts only a
