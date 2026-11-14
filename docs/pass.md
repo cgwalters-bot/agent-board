@@ -752,7 +752,12 @@ exists. The stable issue node, exact board item/project identity, Priority value
 parent, labels, assignees, milestone and issue content are verified afterward. Destination
 labels must contain every source label by name, and a source milestone must
 match a destination milestone's title and due date; missing or incomplete
-metadata holds before transfer. This follows GitHub's
+metadata holds before transfer. Apply rereads destination identity, parent,
+topic admission, archive state and issue availability before recording intent:
+an initially eligible fork is not sufficient if its metadata changes during
+preflight. Regression tests change those facts between discovery and revalidation
+and require no transfer or pending receipt. These reads are not an atomic GitHub
+transaction; a change after the final read remains a race. This follows GitHub's
 [transfer retention rules](https://docs.github.com/en/issues/tracking-your-work-with-issues/administering-issues/transferring-an-issue-to-another-repository).
 Losing assignment during transfer must not silently turn owned work into unowned
 work. The existing snapshot reads at most 100 assignee IDs and requires a complete

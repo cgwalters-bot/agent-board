@@ -42,6 +42,8 @@ struct Forge {
     incomplete: bool,
     board_incomplete: bool,
     metadata: &'static str,
+    destination_change: Option<(&'static str, Value)>,
+    destination_reads: Cell<usize>,
     active: bool,
     active_repo: &'static str,
     open_pr_repo: &'static str,
@@ -87,11 +89,20 @@ impl Rest for Forge {
                 bail!("HTTP 404");
             }
             let repository = path.strip_prefix("repos/").unwrap();
+            if repository == "cgwalters-forge/bootc" {
+                self.destination_reads.set(self.destination_reads.get() + 1);
+            }
             let mut metadata = json!({"full_name":repository,"fork":true,"node_id":repository,
                 "has_issues":!self.disabled,"archived":false,"topics":["bot-midstream"],
                 "parent":{"full_name":if repository.ends_with("bootc") {"bootc-dev/bootc"} else {"ostreedev/ostree"}}});
             if self.metadata == "incomplete" {
                 metadata["parent"] = Value::Null;
+            }
+            if repository == "cgwalters-forge/bootc"
+                && self.destination_reads.get() > 1
+                && let Some((key, value)) = &self.destination_change
+            {
+                metadata[*key] = value.clone();
             }
             metadata
         } else if path == "repos/bootc-dev/bootc/issues/42" {
@@ -755,6 +766,55 @@ fn journal_without_assignee_evidence_is_not_treated_as_unassigned() {
             .to_string()
             .contains("missing field `assignees`")
     );
+}
+
+#[test]
+fn destination_changes_during_preflight_stop_before_transfer_intent() {
+    for (key, value) in [
+        ("full_name", json!("cgwalters-forge/replacement")),
+        ("node_id", json!("replacement-node")),
+        ("parent", json!({"full_name":"other/bootc"})),
+        ("fork", json!(false)),
+        ("topics", json!([])),
+        ("archived", json!(true)),
+        ("has_issues", json!(false)),
+        ("has_issues", Value::Null),
+    ] {
+        let forge = Forge {
+            destination_change: Some((key, value.clone())),
+            ..Default::default()
+        };
+        let mut journal = Journal::default();
+        let mut durable = String::new();
+        let result = run(
+            &forge,
+            &config(),
+            true,
+            1,
+            &mut journal,
+            |state| {
+                durable = serde_json::to_string(state)?;
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("destination admission changed"),
+            "{key}={value}: {error:#}"
+        );
+        assert_eq!(forge.destination_reads.get(), 2, "{key}={value}");
+        assert_eq!(forge.transfers.get(), 0, "{key}={value}");
+        assert!(journal.receipts.is_empty(), "{key}={value}");
+        let saved: Journal = serde_json::from_str(&durable).unwrap();
+        assert!(saved.receipts.is_empty(), "{key}={value}");
+    }
+
+    // Revalidation must also permit an unchanged destination.
+    let forge = Forge::default();
+    execute(&forge, true, 1, &mut Journal::default()).0.unwrap();
+    assert_eq!(forge.destination_reads.get(), 2);
+    assert_eq!(forge.transfers.get(), 1);
 }
 
 #[test]
