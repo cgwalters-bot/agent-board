@@ -833,6 +833,14 @@ retries; do not delete it to work around a hold. An exclusive local journal lock
 prevents concurrent applies using the same state; a crashed run can leave a lock
 which also requires inspection before removal.
 
+The lock path replaces the journal's extension with `.migration-lock` (for example,
+`migration.json` uses `migration.migration-lock`). A refused second apply leaves
+the existing lock and journal untouched. Ordinary command errors release only
+the lock that command acquired; preview does not acquire or remove an apply lock.
+CLI regression tests cover these local failure paths and reject missing apply
+bounds, zero caps and apply combined with recording/replay before configuration
+or credential lookup. They do not establish live transfer readiness.
+
 `--record FILE` captures a read-only preview; `--replay FILE` repeats it without
 credentials. Both conflict with apply. Recordings contain issue/comment bodies:
 review them before publishing. Synthetic failure tests cover timeouts, refusal,

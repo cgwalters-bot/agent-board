@@ -9,6 +9,149 @@ fn fixture() -> String {
     format!("{}/../../fixtures/board.json", env!("CARGO_MANIFEST_DIR"))
 }
 
+#[test]
+fn migration_apply_requires_explicit_bounds_and_live_mode() {
+    let dir =
+        std::env::temp_dir().join(format!("agent-board-migration-args-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (args, diagnostic) in [
+        (vec!["--apply"], "--max"),
+        (vec!["--apply", "--max", "1"], "--state"),
+        (vec!["--apply", "--state", "journal.json"], "--max"),
+        (vec!["--max", "0"], "--max must be positive"),
+        (
+            vec!["--apply", "--max", "0", "--state", "journal.json"],
+            "--max must be positive",
+        ),
+        (
+            vec![
+                "--apply",
+                "--max",
+                "1",
+                "--state",
+                "journal.json",
+                "--replay",
+                "reads.json",
+            ],
+            "cannot be used with",
+        ),
+        (
+            vec![
+                "--apply",
+                "--max",
+                "1",
+                "--state",
+                "journal.json",
+                "--record",
+                "reads.json",
+            ],
+            "cannot be used with",
+        ),
+        (
+            vec!["--record", "reads.json", "--replay", "reads.json"],
+            "cannot be used with",
+        ),
+    ] {
+        let output = command()
+            .current_dir(&dir)
+            .args([
+                "migrate",
+                "midstream-issues",
+                "--config",
+                "missing-config.json",
+            ])
+            .args(&args)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{args:?}");
+    }
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[test]
+fn migration_cli_preserves_existing_lock_and_releases_its_own_on_error() {
+    let dir =
+        std::env::temp_dir().join(format!("agent-board-migration-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = dir.join("journal.json");
+    let lock = state.with_extension("migration-lock");
+    let journal = b"{\"receipts\":{}}\n";
+    let existing_lock = b"inspect the prior run before removing this lock\n";
+    std::fs::write(&state, journal).unwrap();
+    std::fs::write(&lock, existing_lock).unwrap();
+    // No credentials or readable configuration: these checks must happen locally.
+    // A preview does not acquire/remove the apply lock; an apply cannot steal it.
+    for (apply, diagnostic) in [
+        (false, "read missing-config.json"),
+        (true, "migration journal is locked"),
+    ] {
+        let mut cmd = command();
+        cmd.current_dir(&dir)
+            .args([
+                "migrate",
+                "midstream-issues",
+                "--config",
+                "missing-config.json",
+                "--state",
+                "journal.json",
+                "--max",
+                "1",
+            ])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN");
+        if apply {
+            cmd.arg("--apply");
+        }
+        let output = cmd.assert().code(1).get_output().clone();
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&lock).unwrap(), existing_lock);
+        assert_eq!(std::fs::read(&state).unwrap(), journal);
+    }
+    std::fs::remove_file(&lock).unwrap();
+    let output = command()
+        .current_dir(&dir)
+        .args([
+            "migrate",
+            "midstream-issues",
+            "--config",
+            "missing-config.json",
+            "--apply",
+            "--state",
+            "journal.json",
+            "--max",
+            "1",
+        ])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("read missing-config.json"));
+    assert!(
+        !lock.exists(),
+        "ordinary errors must release the acquired lock"
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), journal);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// What a preview of the recorded pass spends: its stages, then every
 /// endpoint class and the ten causes with the most requests.
 const REPLAY_SPENT: &str = r#"requests 57 (epics 17, schedule 37, status 3), endpoints {"graphql repository.issue":31,"actions workflows runs":12,"graphql repositoryOwner.projectV2":6,"graphql repository.defaultBranchRef":2,"actions runs jobs":1,"graphql node.fields":1,"graphql node.items":1,"graphql repository.issues":1,"graphql repository.pullRequests":1,"issues comments":1}, causes {"epics":11,"schedule":10,"cgwalters-forge/tracker#527":5,"status":3,"cgwalters-forge/agentic-job#188":2,"cgwalters-forge/tracker#468":2,"epic cgwalters-forge/tracker#596":2,"epic cgwalters-forge/tracker#766":2,"epic cgwalters-forge/tracker#890":2,"cgwalters-forge/agent-board#40":1,"... 17 more":17}, points ~43"#;
