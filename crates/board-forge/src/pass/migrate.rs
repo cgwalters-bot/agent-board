@@ -21,6 +21,7 @@ const SNAPSHOT: &str = r#"query MigrationIssue($id:ID!, $item:ID!) {
   node(id:$id) { __typename ... on Issue {
     id number url title body updatedAt state repository { nameWithOwner }
     parent { id url }
+    subIssues(first:1) { totalCount }
     milestone { title dueOn }
     labels(first:100) { nodes { name } pageInfo { hasNextPage } }
     closedByPullRequestsReferences(first:100, includeClosedPrs:false) {
@@ -427,6 +428,12 @@ fn classify(
     config: &Config,
     forks: &[Fork],
 ) -> Result<usize> {
+    // A project-prefixed parent is still an epic even without an epic label.
+    // Read only the count; enumerating children would add no routing evidence.
+    let children = node["subIssues"]["totalCount"]
+        .as_u64()
+        .context("missing or invalid sub-issue count")?;
+    ensure!(children == 0, "excluded issue: parent with sub-issues");
     for label in connection(node, "labels")? {
         let label = required(label, "name")?;
         ensure!(
