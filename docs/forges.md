@@ -923,7 +923,8 @@ agentic-job now has a Forgejo Actions caller example at
 It declares the six inputs and matching `run-name`, uses caller-provided
 runner labels and bounds, refuses an unsuitable sandbox host, and then
 **unconditionally stops** before the unwired session. Session, check and apply
-integration remains unresolved (agentic-job#2399); this is not an activated
+integration remains unresolved (#271; agentic-job#2399 delivered the skeleton
+and is closed); this is not an activated
 caller or proof of an agent sandbox. Its separate `apply --forge forgejo`
 and disposable-service CI do not supply that integration either.
 
@@ -937,15 +938,95 @@ repository:
    group every run but one would sit `waiting`, holding a slot without running.
    A group keyed by item,
    with `cancel-in-progress: false`, is allowed.
-2. Its collect, check and apply jobs, with apply's token in a protected step the
-   agent cannot reach, and fork pushes separate from upstream writes
+2. Its collect, check and apply jobs, with apply's token on a separate machine
+   the agent cannot reach, and fork pushes separate from upstream writes
    (agentic-job#2130, tracker#766).
-3. The agent sandbox on a Forgejo runner (agentic-job#1347), and a registered,
+3. The agent sandbox on a Forgejo host runner (see below), and a registered,
    disposable runner for CI.
 4. A bot user and its scoped token, the `recorders` ids, the exclusive labels
    and the private lease and publication repositories, provisioned by the
    operator, with admin and owner rights on the board's repositories kept to
    the operator and the bot. A run does not provision them.
+
+#### Remaining integration contract
+
+The proposed engineering choice for #271, pending the operator's acceptance of
+its caller forge and transport, is to retain agentic-job's existing
+policy → agent → collect/check → apply boundary, not add another output
+publisher to agent-board. This is an implementation handoff, **not a claim
+that the caller works or permission to provision credentials**. The evidence
+below was read at agentic-job commit
+[`cfd9512`](https://github.com/cgwalters-forge/agentic-job/tree/cfd9512712386acf11166766ee37c7972cde1881)
+on 14 November 2026. Caller integration belongs in that repository's
+`workflow/forgejo/dispatch.yml`; no open Forgejo caller PR was found there.
+
+The concrete threat is a prompt-injected agent substituting its own policy,
+checked output or credentials for the trusted caller's. Keep one checked
+handoff, with these requirements:
+
+* Policy, bounds, binary and configuration come from one pinned trusted caller
+  revision, never from the target checkout or a proposal artifact. Task text and
+  all six dispatch inputs remain data. Check runs on a fresh machine, executes
+  no target code, and applies the existing profile, path, size and output-count
+  limits. Agent-board's own `output check` and `output apply` stay unsupported.
+* Carry proposal bytes by an exact upload id and SHA-256 digest, associated with
+  the configured instance, caller repository, run and job attempt. Check owns
+  the checked upload's id and digest; apply accepts only that release from its
+  own successful check. A name such as `latest`, a digest supplied inside the
+  proposal, or a green run title proves neither provenance nor acceptance.
+  Missing attempt association, ambiguous uploads, digest mismatch and stale
+  reruns refuse. Port the existing
+  [GitHub handoff](https://github.com/cgwalters-forge/agentic-job/blob/cfd9512712386acf11166766ee37c7972cde1881/.github/workflows/check.yml),
+  but prove Forgejo's artifact API and runner transport separately; GitHub's
+  artifact actions and digest/attempt semantics are not Forgejo evidence.
+* Apply runs on another fresh machine with the protected bot credential, never
+  merely a later step on the agent's machine. It executes only pinned trusted
+  code, revalidates the checked bytes and target head under the caller's bounds,
+  and retains apply idempotency. A target is allowed only if pinned policy and
+  the dispatched item permit it; the proposal cannot widen that set. Its token
+  reaches only this instance; fork pushes and upstream publication retain their
+  existing separate permissions.
+  No new token scope, cross-instance publication or upstream write is authorized.
+
+Use a disposable, managed **host** runner for the first integration, with
+agentic-job's existing setup and `sandbox check`; do not weaken the skeleton's
+container refusal or implement a new sandbox here. Labels alone are not proof
+of isolation. The current
+[runner model](https://github.com/cgwalters-forge/agentic-job/blob/cfd9512712386acf11166766ee37c7972cde1881/docs/sandbox.md)
+puts the agent and `run` under the same uid. An environment filter, another
+process or a later cleanup step cannot hide a credential from that agent.
+That includes the job's own Forgejo token and the runner's registration: prove
+on the pinned Forgejo version that the agent job's token cannot write
+`dispatchRepo` (the caller workflow, its pin and the lease branch), or use a
+token-less or separate-repository structure, and give each agent job a
+registration destroyed after that job, with labels and registrations disjoint
+from check's and apply's runners. A refusal test covers each.
+
+Inference endpoints come only from runtime deployment configuration. Forgejo
+must not impersonate a GitHub OIDC caller, use `plain` registration to skip
+identity, or put a provider key or broker lifecycle token on the agent host.
+Use the credentialless endpoint and off-agent lifecycle work already owned by
+[agentic-job#2999](https://github.com/cgwalters-forge/agentic-job/issues/2999),
+and retain the fail-closed readiness gate owned by
+[agentic-job#3000](https://github.com/cgwalters-forge/agentic-job/issues/3000).
+Both were open at the revision above. Neither a Forgejo registration identity
+nor its broker admission is delivered by this contract; an unadmitted identity
+must refuse, not fall back. Credential provisioning remains tracker#766.
+
+Once that acceptance is recorded on #271, deliver the caller work in order:
+first prove the bounded artifact handoff offline and against a disposable
+Forgejo service; then wire policy, the session and independent check without
+an apply credential; finally wire protected apply, still disabled in deployed
+callers. Each slice must include positive controls and refusals for
+substituted policy, another instance/run/attempt, missing or duplicate uploads,
+changed bytes, a target outside that set, failed check, unavailable readiness
+and changed target head. Use the caller's existing artifact and checker limits;
+do not introduce an unbounded download or retry loop. A missing Forgejo API
+guarantee blocks that slice rather than weakening the handoff.
+
+This leaves the separately approved [caller smoke](#live-ci) and activation
+outstanding. Disposable API CI is not that smoke. No production pass config,
+runner registration, broker admission, secret or deployment changes here.
 
 ### Live CI
 
