@@ -1075,6 +1075,7 @@ struct Forge {
     link_fails: Cell<bool>,
     receipt_fails: Cell<bool>,
     minimized: RefCell<BTreeSet<String>>,
+    minimize_fails: Cell<bool>,
 }
 
 impl Forge {
@@ -1092,6 +1093,7 @@ impl Forge {
             link_fails: Cell::new(false),
             receipt_fails: Cell::new(false),
             minimized: RefCell::new(BTreeSet::new()),
+            minimize_fails: Cell::new(false),
         }
     }
 
@@ -1185,12 +1187,35 @@ impl crate::github::GraphQl for Forge {
 
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if query == living::HISTORY_STATE {
+            let added = self.added.borrow();
+            let mut node = added
+                .iter()
+                .find(|n| {
+                    plan::comment_id(text(n, "/url"))
+                        .map(|id| id.to_string())
+                        .as_deref()
+                        == variables["id"].as_str()
+                })
+                .unwrap()
+                .clone();
+            node["isMinimized"] = self
+                .minimized
+                .borrow()
+                .contains(text(&variables, "/id"))
+                .into();
+            return Ok(json!({"node":node}));
+        }
         if query == living::MINIMIZED {
             return Ok(
                 json!({"node":{"isMinimized":self.minimized.borrow().contains(text(&variables,"/id"))}}),
             );
         }
         if query == living::MINIMIZE {
+            if self.minimize_fails.get() {
+                self.kept("graphql minimizeComment".into(), variables);
+                bail!("interrupted minimization");
+            }
             self.minimized
                 .borrow_mut()
                 .insert(text(&variables, "/id").into());
@@ -1856,6 +1881,197 @@ fn living_failed_receipt_edit_is_reconciled_without_reapplying() {
     let before = forge.written().len();
     let report = local_with(&forge, 1, settings);
     assert_eq!(forge.written().len(), before, "{:#?}", report.lines);
+}
+
+#[test]
+fn living_historical_cleanup_is_opt_in_bounded_and_retryable() {
+    for (name, enabled, preview_mode, cap, fail) in [
+        ("off", false, false, 10, false),
+        ("preview", true, true, 10, false),
+        ("apply", true, false, 10, false),
+        ("publication cap", true, false, 1, false),
+        ("zero cap", true, false, 0, false),
+        ("minimization interrupted", true, false, 10, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let mut replay = replay();
+        unfinished(&mut replay);
+        unapplied(&mut replay);
+        let forge = Forge::new(replay);
+        let mut settings = json!({"livingStatus":path});
+        let report = local_with(&forge, 10, settings.clone());
+        assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+        let body = "<!-- agent-board-dispatch: 10@2026-10-23T20:03:00Z -->\nDispatched.";
+        for (id, author, editor) in [
+            (600, "cgwalters-bot", None),
+            (601, "human", None),
+            (602, "cgwalters-bot", Some("foreign")),
+            (603, "cgwalters-bot", Some("")),
+            (604, "cgwalters-bot", Some("cgwalters-bot")),
+        ] {
+            let mut node = posted(&forge.replay, 890, id, author, 1, body);
+            if let Some(editor) = editor {
+                node["lastEditedAt"] = node["createdAt"].clone();
+                node["editor"] = if editor.is_empty() {
+                    Value::Null
+                } else {
+                    json!({"login":editor})
+                };
+            }
+            forge.added.borrow_mut().push(node);
+        }
+        let plan = json!({"schema":plan::JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":890,"kind":"implement","runner":"hosted","brief":"Implement the bounded plan."});
+        for (id, minutes) in [(610, 3), (611, 2)] {
+            forge.added.borrow_mut().push(posted(
+                &forge.replay,
+                890,
+                id,
+                "cgwalters-bot",
+                minutes,
+                &format!("Plan.\n```{}\n{plan}\n```", plan::PLAN_FENCE),
+            ));
+        }
+        let ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let receipt = ledger["entries"]["cgwalters-forge/tracker#890"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| text(r, "/body").contains(epic_apply::APPLY_MARKER))
+            .unwrap();
+        forge.added.borrow_mut().push(posted(
+            &forge.replay,
+            890,
+            620,
+            "cgwalters-bot",
+            1,
+            text(receipt, "/body"),
+        ));
+        settings["cleanupHistory"] = enabled.into();
+        let before = forge.written().len();
+        let saved = std::fs::read(&path).unwrap();
+        forge.minimize_fails.set(fail);
+        let report = if preview_mode {
+            let config = config(settings.clone());
+            block(run(
+                &forge,
+                &forge,
+                &config,
+                State::default(),
+                (Mode::Preview, Limits::default()),
+                forge.replay.now,
+            ))
+            .unwrap()
+        } else {
+            local_with(&forge, cap, settings.clone())
+        };
+        if preview_mode {
+            assert_eq!(forge.written().len(), before, "{:?}", report.lines);
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("would minimize OUTDATED") && l.ends_with("-600")),
+                "{:?}",
+                report.lines
+            );
+        } else {
+            assert!(
+                forge.written().len() - before <= cap,
+                "{name}: {:?}",
+                report.lines
+            );
+        }
+        assert!(
+            !forge
+                .minimized
+                .borrow()
+                .iter()
+                .any(|id| ["601", "602", "603"].contains(&id.as_str()))
+        );
+        assert!(!forge.minimized.borrow().contains("611"), "current plan");
+        if enabled && !preview_mode {
+            assert_eq!(
+                forge.minimized.borrow().contains("600"),
+                cap > 1 && !fail,
+                "{name}: {:?}",
+                report.lines
+            );
+            forge.minimize_fails.set(false);
+            let report = local_with(&forge, 10, settings.clone());
+            assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+            assert!(
+                forge.minimized.borrow().contains("600"),
+                "{name}: {:?}",
+                report.lines
+            );
+            assert!(forge.minimized.borrow().contains("604"));
+            assert!(forge.minimized.borrow().contains("610"), "superseded plan");
+            assert!(forge.minimized.borrow().contains("620"), "fenced receipt");
+            let before = forge.written().len();
+            let report = local_with(&forge, 10, settings);
+            assert_eq!(forge.written().len(), before, "{name}: {:?}", report.lines);
+        } else if !enabled {
+            assert!(!forge.minimized.borrow().contains("600"));
+        }
+    }
+}
+
+#[test]
+fn living_historical_recovery_never_reimports_the_stopped_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut replay = replay();
+    unfinished(&mut replay);
+    let original = comments(&mut replay, COMMENTS_890).clone();
+    let parsed: Vec<_> = original.iter().map(|n| plan::comment(n).unwrap()).collect();
+    let (receipts, unread) = epic_apply::receipts(&parsed, &["cgwalters-bot"]);
+    assert!(unread.is_empty());
+    let receipt = receipts.iter().find(|r| r.detail.plan == PLAN_890).unwrap();
+    let mut detail = receipt.detail.clone();
+    detail.outcome = epic_apply::Outcome::Stopped;
+    detail.fingerprint = None;
+    let mut source = original
+        .iter()
+        .find(|n| text(n, "/url") == receipt.url)
+        .unwrap()
+        .clone();
+    source["body"] = format!(
+        "Stopped.\n```{}\n{}\n```",
+        epic_apply::APPLY_MARKER,
+        serde_json::to_string(&detail).unwrap()
+    )
+    .into();
+    comments(&mut replay, COMMENTS_890).retain(|n| text(n, "/url") != receipt.url);
+    let forge = Forge::new(replay);
+    forge.added.borrow_mut().extend([
+        posted(
+            &forge.replay,
+            890,
+            900,
+            "cgwalters-bot",
+            0,
+            "<!-- agent-board-status -->",
+        ),
+        source,
+    ]);
+    let settings = json!({"livingStatus":dir.path().join("status.json"),"cleanupHistory":true});
+    // Import first, with no room to recover or publish yet.
+    local_with(&forge, 0, settings.clone());
+    let report = local_with(&forge, 10, settings.clone());
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("recover epic cgwalters-forge/tracker#890")),
+        "{:?}",
+        report.lines
+    );
+    let before = forge.written().len();
+    let report = local_with(&forge, 10, settings);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert_eq!(forge.written().len(), before, "{:?}", report.lines);
 }
 
 /// A retry that waits behind `epics.focus` is still asked as a retry, which

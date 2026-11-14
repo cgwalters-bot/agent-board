@@ -12,6 +12,7 @@ const COMMENT_BYTES: usize = 60_000;
 pub(super) const MINIMIZE: &str = "mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }";
 pub(super) const MINIMIZED: &str =
     "query($id: ID!) { node(id: $id) { ... on IssueComment { isMinimized } } }";
+pub(super) const HISTORY_STATE: &str = "query($id: ID!) { node(id: $id) { ... on IssueComment { url body createdAt lastEditedAt author { login } editor { login } isMinimized } } }";
 const SCHEMA: &str = "agent-board/status/v1";
 const MAX_RECORDS: usize = 1000;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -31,6 +32,9 @@ struct Entry {
     references: BTreeMap<u64, String>,
     #[serde(default)]
     pulls: Option<Vec<pull_links::PullLink>>,
+    // A confirmed minimization stays done even if a person later restores it.
+    #[serde(default)]
+    minimized: BTreeSet<u64>,
 }
 
 #[cfg(test)]
@@ -466,6 +470,321 @@ mod tests {
         assert!(Store::load(path, "bot", at()).unwrap().pending().is_empty());
         assert_eq!(store.ledger.entries["o/r#1"].records.len(), 2);
     }
+
+    #[test]
+    fn historical_plans_require_complete_trusted_coverage_and_publication() {
+        for (name, edit, expected) in [
+            ("superseded", None, 1),
+            ("foreign newer plan", Some("foreign"), 0),
+            ("unknown newer editor", Some(""), 0),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.json");
+            let mut store = Store::load(path.to_str().unwrap(), "bot", at()).unwrap();
+            store.cleanup = true;
+            let plan = json!({"schema":plan::JOB_PLAN_SCHEMA,"repo":"o/r","item":1,"kind":"implement","runner":"hosted","brief":"Do it."});
+            let node = |id, time, body| json!({"url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"), "body":body,"createdAt":time,"lastEditedAt":null,"author":{"login":"bot"},"editor":null});
+            let old = node(
+                10,
+                "2026-10-01T00:00:00Z",
+                format!("Old.\n```{}\n{plan}\n```", plan::PLAN_FENCE),
+            );
+            let mut current = node(
+                20,
+                "2026-10-02T00:00:00Z",
+                format!("Current.\n```{}\n{plan}\n```", plan::PLAN_FENCE),
+            );
+            if let Some(editor) = edit {
+                current["lastEditedAt"] = current["createdAt"].clone();
+                current["editor"] = if editor.is_empty() {
+                    Value::Null
+                } else {
+                    json!({"login":editor})
+                };
+            }
+            let page = |nodes, more| json!({"repository":{"issue":{"comments":{"nodes":nodes,"pageInfo":{"hasNextPage":more,"endCursor":"next"}}}}});
+            let vars = json!({"owner":"o","name":"r","number":1,"after":null});
+            store
+                .expand(
+                    &vars,
+                    &mut page(
+                        json!([node(30, "2026-10-03T00:00:00Z", MARKER.into()), old.clone()]),
+                        true,
+                    ),
+                )
+                .unwrap();
+            assert!(store.historical(false).is_empty(), "incomplete history");
+            let later = json!({"owner":"o","name":"r","number":1,"after":"next"});
+            store
+                .expand(&later, &mut page(json!([current]), false))
+                .unwrap();
+            assert!(
+                store.historical(true).is_empty(),
+                "must confirm publication"
+            );
+            let pending = store.pending().pop().unwrap();
+            store.acknowledge(&pending).unwrap();
+            assert_eq!(store.historical(true).len(), expected, "{name}");
+            if expected > 0 {
+                assert_eq!(
+                    text(&store.historical(true)[0].1, "/url"),
+                    text(&old, "/url")
+                );
+                let restored = Store::load(path.to_str().unwrap(), "bot", at()).unwrap();
+                let records = &restored.ledger.entries["o/r#1"].records;
+                assert_eq!(
+                    plan::plan_id(&plan::comment(&records[0]).unwrap()).unwrap(),
+                    "10@2026-10-01T00:00:00Z"
+                );
+                assert!(text(&pending.body, "/body").contains("Current."));
+                // A later complete read no longer sees the newer source.
+                // Its archived replay identity cannot supersede a live plan.
+                store
+                    .expand(
+                        &vars,
+                        &mut page(
+                            json!([node(30, "2026-10-03T00:00:00Z", MARKER.into()), old.clone()]),
+                            false,
+                        ),
+                    )
+                    .unwrap();
+                assert!(
+                    store.historical(false).is_empty(),
+                    "deleted superseding source"
+                );
+                let mut removed_fence =
+                    node(20, "2026-10-02T00:00:00Z", "Replaced by a person.".into());
+                removed_fence["lastEditedAt"] = "2026-10-04T00:00:00Z".into();
+                removed_fence["editor"] = json!({"login":"foreign"});
+                store
+                    .expand(
+                        &vars,
+                        &mut page(
+                            json!([
+                                node(30, "2026-10-03T00:00:00Z", MARKER.into()),
+                                old,
+                                removed_fence
+                            ]),
+                            false,
+                        ),
+                    )
+                    .unwrap();
+                assert!(store.historical(false).is_empty(), "foreign fence removal");
+            }
+        }
+    }
+
+    #[test]
+    fn historical_protocol_coverage_preserves_receipts_and_refuses_bounds() {
+        for (name, body, admitted) in [
+            (
+                "dispatch",
+                "<!-- agent-board-dispatch: 10@2026-10-01T00:00:00Z -->\nDispatched.".to_owned(),
+                true,
+            ),
+            (
+                "receipt",
+                format!(
+                    "Applied.\n```{}\n{}\n```",
+                    epic_apply::APPLY_MARKER,
+                    serde_json::to_string(&epic_apply::Detail::new(
+                        "10@2026-10-01T00:00:00Z",
+                        epic_apply::Outcome::Applied
+                    ))
+                    .unwrap()
+                ),
+                true,
+            ),
+            (
+                "legacy receipt",
+                "<!-- agent-board-epic-apply: 10@2026-10-01T00:00:00Z -->".into(),
+                false,
+            ),
+            (
+                "malformed",
+                "```agent-board-epic-apply\n{}\n```".into(),
+                false,
+            ),
+            ("unrelated", "A human-readable reply.".into(), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = Store::load(
+                dir.path().join("ledger.json").to_str().unwrap(),
+                "bot",
+                at(),
+            )
+            .unwrap();
+            store.cleanup = true;
+            let vars = json!({"owner":"o","name":"r","number":1});
+            let node = |id, body| json!({"url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),"body":body,"createdAt":"2026-10-01T00:00:00Z","lastEditedAt":null,"author":{"login":"bot"},"editor":null});
+            let record = node(10, body);
+            let mut data = json!({"repository":{"issue":{"comments":{"nodes":[node(30, MARKER.into()),record.clone()],"pageInfo":{"hasNextPage":false}}}}});
+            store.expand(&vars, &mut data).unwrap();
+            assert_eq!(
+                store.historical(false).len(),
+                usize::from(admitted),
+                "{name}"
+            );
+            if admitted {
+                assert!(same_record(
+                    &store.ledger.entries["o/r#1"].records[0],
+                    &record
+                ));
+                let write = store.pending().pop().unwrap();
+                store.acknowledge(&write).unwrap();
+                assert_eq!(store.historical(true).len(), 1);
+                store.minimized("o/r#1", 10).unwrap();
+                assert!(store.historical(true).is_empty());
+                let restored = Store::load(store.path.to_str().unwrap(), "bot", at()).unwrap();
+                assert!(restored.ledger.entries["o/r#1"].minimized.contains(&10));
+                // Ledger exhaustion must hold cleanup rather than drop guards.
+                store
+                    .history
+                    .get_mut("o/r#1")
+                    .unwrap()
+                    .resize(MAX_RECORDS, record.clone());
+                let vars = json!({"owner":"o","name":"r","number":1,"after":"more"});
+                assert!(store.expand(&vars, &mut data).is_err());
+                assert!(store.historical(false).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn historical_later_page_replaces_cached_receipt_before_emission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            "bot",
+            at(),
+        )
+        .unwrap();
+        store.cleanup = true;
+        let body = |outcome| {
+            format!(
+                "Receipt.\n```{}\n{}\n```",
+                epic_apply::APPLY_MARKER,
+                serde_json::to_string(&epic_apply::Detail::new("10@2026-10-01T00:00:00Z", outcome))
+                    .unwrap()
+            )
+        };
+        let node = |id, body| json!({"url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),"body":body,"createdAt":"2026-10-01T00:00:00Z","lastEditedAt":null,"author":{"login":"bot"},"editor":null});
+        let source = node(10, body(epic_apply::Outcome::Stopped));
+        let page = |nodes, more| json!({"repository":{"issue":{"comments":{"nodes":nodes,"pageInfo":{"hasNextPage":more,"endCursor":"next"}}}}});
+        let vars = json!({"owner":"o","name":"r","number":1,"after":null});
+        store
+            .expand(
+                &vars,
+                &mut page(json!([node(30, MARKER.into()), source.clone()]), false),
+            )
+            .unwrap();
+        let mut first = page(json!([node(30, MARKER.into())]), true);
+        store.expand(&vars, &mut first).unwrap();
+        assert_eq!(
+            first.pointer("/repository/issue/comments/nodes").unwrap(),
+            &json!([])
+        );
+        let mut completed = source;
+        completed["body"] = body(epic_apply::Outcome::Applied).into();
+        completed["lastEditedAt"] = "2026-10-02T00:00:00Z".into();
+        completed["editor"] = json!({"login":"bot"});
+        let mut last = page(json!([completed]), false);
+        store
+            .expand(
+                &json!({"owner":"o","name":"r","number":1,"after":"next"}),
+                &mut last,
+            )
+            .unwrap();
+        let records: Vec<_> = last
+            .pointer("/repository/issue/comments/nodes")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| plan::comment(n).unwrap())
+            .collect();
+        let (receipts, unread) = epic_apply::receipts(&records, &["bot"]);
+        assert!(unread.is_empty());
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].detail.outcome, epic_apply::Outcome::Applied);
+    }
+
+    #[test]
+    fn historical_plan_withdrawn_at_its_source_is_not_rescheduled() {
+        let plan = json!({"schema":plan::JOB_PLAN_SCHEMA,"repo":"o/r","item":1,"kind":"implement","runner":"hosted","brief":"Implement it."});
+        let fenced = format!("Plan.\n```{}\n{plan}\n```", plan::PLAN_FENCE);
+        let node = |id, body: &str| json!({"url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),"body":body,"createdAt":"2026-10-01T00:00:00Z","lastEditedAt":null,"author":{"login":"bot"},"editor":null});
+        let page = |nodes: Vec<Value>| json!({"repository":{"issue":{"comments":{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}}});
+        let vars = json!({"owner":"o","name":"r","number":1});
+        let mut unfenced = node(10, "Plan withdrawn.");
+        unfenced["lastEditedAt"] = "2026-10-02T00:00:00Z".into();
+        unfenced["editor"] = json!({"login":"bot"});
+        for ((name, source, kept), later) in [
+            ("unchanged", Some(node(10, &fenced)), true),
+            ("deleted", None, false),
+            ("fence removed by trusted edit", Some(unfenced), false),
+        ]
+        .into_iter()
+        .flat_map(|case| [(case.clone(), true), (case, false)])
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = Store::load(
+                dir.path().join("ledger.json").to_str().unwrap(),
+                "bot",
+                at(),
+            )
+            .unwrap();
+            store.cleanup = true;
+            // A held, undispatched plan is imported but stays current.
+            store
+                .expand(&vars, &mut page(vec![node(30, MARKER), node(10, &fenced)]))
+                .unwrap();
+            assert!(store.historical(false).is_empty(), "{name}");
+            let write = store.pending().pop().unwrap();
+            store.acknowledge(&write).unwrap();
+            // Turning cleanup off later must not revive archived plans either.
+            store.cleanup = later;
+            let name = format!("{name}, cleanup {later}");
+            // Plan selection and dispatch's re-read both see the issue as it is.
+            for read in ["selection", "dispatch"] {
+                let mut data = page(
+                    [node(30, MARKER)]
+                        .into_iter()
+                        .chain(source.clone())
+                        .collect(),
+                );
+                store.expand(&vars, &mut data).unwrap();
+                let comments: Vec<_> = data
+                    .pointer("/repository/issue/comments/nodes")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| plan::comment(n).unwrap())
+                    .collect();
+                assert_eq!(
+                    plan::newest_plan(&comments, &["bot"]).is_ok(),
+                    kept,
+                    "{name} {read}: {comments:#?}"
+                );
+                assert_eq!(
+                    comments
+                        .iter()
+                        .filter(|c| plan::has_fence(&c.body, plan::PLAN_FENCE))
+                        .count(),
+                    usize::from(kept),
+                    "{name} {read}: no archived duplicate"
+                );
+            }
+            assert!(
+                store.ledger.entries["o/r#1"]
+                    .records
+                    .iter()
+                    .any(|r| text(r, "/url").ends_with("-10")),
+                "{name}: archived record kept for replay protection"
+            );
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -484,6 +803,10 @@ pub(super) struct Store {
     duplicates: BTreeMap<String, BTreeSet<u64>>,
     discovered: BTreeMap<String, u64>,
     written: BTreeSet<String>,
+    pub cleanup: bool,
+    pub read_only: bool,
+    history: BTreeMap<String, Vec<Value>>,
+    complete: BTreeSet<String>,
 }
 
 /// A prepared public write. The full machine record is already durable.
@@ -674,6 +997,15 @@ impl Store {
                 <= MAX_RECORDS,
             "status ledger reference bound exceeded"
         );
+        ensure!(
+            ledger
+                .entries
+                .values()
+                .map(|e| e.minimized.len())
+                .sum::<usize>()
+                <= MAX_RECORDS,
+            "status ledger minimization bound exceeded"
+        );
         for (key, entry) in &ledger.entries {
             if let Some(pulls) = &entry.pulls {
                 pull_links::validate(pulls)?;
@@ -713,6 +1045,10 @@ impl Store {
             duplicates: BTreeMap::new(),
             discovered: BTreeMap::new(),
             written: BTreeSet::new(),
+            cleanup: false,
+            read_only: false,
+            history: BTreeMap::new(),
+            complete: BTreeSet::new(),
         })
     }
 
@@ -721,6 +1057,15 @@ impl Store {
         ensure!(
             self.ledger.entries.len() <= MAX_RECORDS,
             "status ledger entry bound exceeded"
+        );
+        ensure!(
+            self.ledger
+                .entries
+                .values()
+                .map(|e| e.minimized.len())
+                .sum::<usize>()
+                <= MAX_RECORDS,
+            "status ledger minimization bound exceeded"
         );
         ensure!(
             self.ledger
@@ -745,6 +1090,9 @@ impl Store {
             bytes.len() as u64 <= MAX_BYTES,
             "status ledger is full; nothing sent"
         );
+        if self.read_only {
+            return Ok(());
+        }
         let parent = self
             .path
             .parent()
@@ -1009,10 +1357,25 @@ impl Store {
             self.ledger.entries.clone(),
             self.duplicates.clone(),
             self.discovered.clone(),
+            self.history.clone(),
+            self.complete.clone(),
         );
         let result = self.expand_inner(variables, data);
         if result.is_err() {
-            (self.ledger.entries, self.duplicates, self.discovered) = before;
+            (
+                self.ledger.entries,
+                self.duplicates,
+                self.discovered,
+                self.history,
+                self.complete,
+            ) = before;
+            let key = format!(
+                "{}/{}#{}",
+                text(variables, "/owner"),
+                text(variables, "/name"),
+                variables["number"]
+            );
+            self.complete.remove(&key);
         }
         result
     }
@@ -1033,10 +1396,28 @@ impl Store {
             variables["number"]
         );
         let mut expanded = Vec::new();
-        let previous_records = self.ledger.entries.get(&key).map_or(0, |e| e.records.len());
+        let previous_records = self
+            .ledger
+            .entries
+            .get(&key)
+            .map(|e| e.records.clone())
+            .unwrap_or_default();
         if variables["after"].is_null() {
             self.discovered.remove(&key);
             self.duplicates.remove(&key);
+            self.history.remove(&key);
+            self.complete.remove(&key);
+        }
+        if self.cleanup {
+            let history = self.history.entry(key.clone()).or_default();
+            ensure!(
+                history.len() + nodes.len() <= MAX_RECORDS,
+                "cleanup history bound exceeded"
+            );
+            history.extend(nodes.iter().cloned());
+            if complete {
+                self.complete.insert(key.clone());
+            }
         }
         for node in nodes.iter() {
             let body = text(node, "/body");
@@ -1159,15 +1540,80 @@ impl Store {
             entry.id = None;
             entry.published = None;
         }
+        if self.cleanup && complete && self.discovered.contains_key(&key) {
+            let entry = self
+                .ledger
+                .entries
+                .get_mut(&key)
+                .context("missing discovered status")?;
+            // Import only self-contained protocols. Keep the original URL and
+            // timestamps: relocation would change logical plan/replay identity.
+            for node in &self.history[&key] {
+                if let Some(source) = trusted_history(node, &key, &self.ledger.bot) {
+                    if let Some(saved) = entry.records.iter_mut().find(|r| same_origin(r, node)) {
+                        // Recovery edits target the living status, leaving the
+                        // historical source untouched. Never resurrect that
+                        // older claim beside its confirmed durable revision.
+                        if plan::comment(saved).is_ok_and(|c| source.changed > c.changed) {
+                            *saved = node.clone();
+                        }
+                    } else {
+                        entry.records.push(node.clone());
+                    }
+                }
+            }
+            entry.records.sort_by_key(|r| {
+                plan::comment(r)
+                    .ok()
+                    .map(|c| (c.changed, plan::comment_id(&c.url)))
+            });
+        }
         // A read immediately after our write may not show the status yet.
         // Keep local claims authoritative even during that visibility window.
         if let Some(entry) = self.ledger.entries.get(&key) {
-            let skip = if variables["after"].is_null() {
-                0
+            // Archived records outlive turning cleanup off; without its
+            // complete history, judge them by this page alone.
+            let sources = if self.cleanup {
+                self.history.get(&key).map_or(&[][..], Vec::as_slice)
             } else {
-                previous_records
+                nodes.as_slice()
             };
-            expanded.extend(entry.records.iter().skip(skip).cloned());
+            // An archived plan keeps replay identity, not scheduling authority:
+            // once its source is deleted or no longer a trusted plan, the
+            // issue has withdrawn it.
+            let withdrawn = |r: &Value| {
+                plan::comment_id(text(r, "/url")) != entry.id
+                    && plan::has_fence(text(r, "/body"), plan::PLAN_FENCE)
+                    && !sources.iter().any(|n| {
+                        same_origin(r, n)
+                            && trusted_history(n, &key, &self.ledger.bot)
+                                .is_some_and(|c| plan::has_fence(&c.body, plan::PLAN_FENCE))
+                    })
+            };
+            expanded.retain(|node| {
+                !trusted_history(node, &key, &self.ledger.bot).is_some_and(|source| {
+                    entry.records.iter().any(|r| {
+                        same_origin(r, node)
+                            && plan::comment(r).is_ok_and(|saved| saved.changed > source.changed)
+                    })
+                })
+            });
+            expanded.extend(
+                entry
+                    .records
+                    .iter()
+                    .filter(|r| {
+                        (if self.cleanup {
+                            // Do not emit a cached revision before a later
+                            // page can supply its newer historical source.
+                            complete
+                        } else {
+                            variables["after"].is_null() || !previous_records.contains(r)
+                        }) && !sources.contains(r)
+                            && !withdrawn(r)
+                    })
+                    .cloned(),
+            );
         }
         *nodes = expanded;
         self.save()?;
@@ -1186,4 +1632,166 @@ impl Store {
             .flat_map(|(key, ids)| ids.iter().map(move |id| (key.clone(), *id)))
             .collect()
     }
+
+    /// Only exact, authenticated records covered by the authoritative
+    /// ledger are eligible. Uncovered history is evidence, not garbage: leave it
+    /// visible rather than guessing at legacy multi-comment replay protocols.
+    pub fn historical(&self, published: bool) -> Vec<(String, Value)> {
+        if !self.cleanup {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for key in &self.complete {
+            let Some(entry) = self.ledger.entries.get(key) else {
+                continue;
+            };
+            if !self.discovered.contains_key(key)
+                || (published && entry.published.as_deref() != Some(public_body(entry).as_str()))
+            {
+                continue;
+            }
+            let history = &self.history[key];
+            for node in history {
+                let Some(comment) = trusted_history(node, key, &self.ledger.bot) else {
+                    continue;
+                };
+                if entry.id == plan::comment_id(&comment.url) || kind(&comment.body).is_none() {
+                    continue;
+                }
+                if plan::comment_id(&comment.url).is_some_and(|id| entry.minimized.contains(&id)) {
+                    continue;
+                }
+                // Body equality alone is not enough: changing the URL or edit
+                // time changes a plan's logical identity and can replay work.
+                let covered = entry.records.iter().any(|r| {
+                    trusted_history(r, key, &self.ledger.bot).is_some() && same_record(r, node)
+                });
+                if !covered {
+                    continue;
+                }
+                if kind(&comment.body) == Some("Current plan") {
+                    // Any ambiguous/untrusted newer plan holds cleanup. Keep
+                    // the current logical plan, even if its prose is identical.
+                    let plans: Vec<_> = history
+                        .iter()
+                        // Only living-status records are independently
+                        // authoritative. Archived source plans that vanished
+                        // or changed cannot prove live supersession.
+                        .chain(
+                            entry
+                                .records
+                                .iter()
+                                .filter(|r| plan::comment_id(text(r, "/url")) == entry.id),
+                        )
+                        .filter(|n| plan::has_fence(text(n, "/body"), plan::PLAN_FENCE))
+                        .collect();
+                    let changed_source = entry
+                        .records
+                        .iter()
+                        .filter(|r| {
+                            plan::comment_id(text(r, "/url")) != entry.id
+                                && plan::has_fence(text(r, "/body"), plan::PLAN_FENCE)
+                        })
+                        .any(|r| {
+                            history
+                                .iter()
+                                .any(|n| same_origin(r, n) && !same_record(r, n))
+                        });
+                    if changed_source
+                        || plans
+                            .iter()
+                            .any(|n| trusted_history(n, key, &self.ledger.bot).is_none())
+                        || !plans
+                            .iter()
+                            .filter_map(|n| trusted_history(n, key, &self.ledger.bot))
+                            .any(|c| c.changed > comment.changed)
+                    {
+                        continue;
+                    }
+                }
+                out.push((key.clone(), node.clone()));
+            }
+        }
+        out
+    }
+
+    pub fn minimized(&mut self, key: &str, id: u64) -> Result<()> {
+        self.ledger
+            .entries
+            .get_mut(key)
+            .context("missing cleanup entry")?
+            .minimized
+            .insert(id);
+        self.save()
+    }
+}
+
+fn trusted_history(node: &Value, key: &str, bot: &str) -> Option<plan::Comment> {
+    // Absent facts are not evidence of an unedited comment.
+    node.get("lastEditedAt")?;
+    node.get("editor")?;
+    let comment = plan::comment(node).ok()?;
+    let protocols = [
+        comment.body.starts_with("<!-- agent-board-dispatch: "),
+        plan::has_fence(&comment.body, epic_apply::APPLY_MARKER),
+        plan::has_fence(&comment.body, plan::PLAN_FENCE),
+        plan::has_fence(&comment.body, crate::epic::EPIC_PLAN_FENCE),
+    ];
+    if protocols.into_iter().filter(|p| *p).count() != 1 {
+        return None;
+    }
+    let (repo, number) = key.rsplit_once('#')?;
+    if !plan::written_by(&comment, bot)
+        || !comment.url.starts_with(&format!(
+            "https://github.com/{repo}/issues/{number}#issuecomment-"
+        ))
+        || plan::comment_id(&comment.url).is_none()
+    {
+        return None;
+    }
+    match kind(&comment.body)? {
+        "Last dispatch" => {
+            let identity = comment
+                .body
+                .lines()
+                .next()?
+                .strip_prefix("<!-- agent-board-dispatch: ")?
+                .strip_suffix(" -->")?;
+            let (id, at) = identity.split_once('@')?;
+            id.parse::<u64>().ok()?;
+            OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()?;
+        }
+        "Last apply" => {
+            let (receipts, unread) = epic_apply::receipts(std::slice::from_ref(&comment), &[bot]);
+            if receipts.len() != 1 || !unread.is_empty() {
+                return None;
+            }
+        }
+        "Current plan" => {
+            let value = plan::fenced_json(&comment.body, plan::PLAN_FENCE).ok()??;
+            let plan = plan::JobPlan::from_json(&value).ok()?;
+            if plan.repo != repo || plan.item.to_string() != number {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(comment)
+}
+
+fn same_record(a: &Value, b: &Value) -> bool {
+    [
+        "url",
+        "body",
+        "createdAt",
+        "lastEditedAt",
+        "author",
+        "editor",
+    ]
+    .iter()
+    .all(|field| a.get(field) == b.get(field))
+}
+
+fn same_origin(a: &Value, b: &Value) -> bool {
+    a.get("url") == b.get("url") && a.get("createdAt") == b.get("createdAt")
 }

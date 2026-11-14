@@ -758,6 +758,9 @@ pub struct Config {
     /// Opt-in durable ledger path for one living status comment per issue.
     /// Retain it across runs; applying passes must still be serialized.
     pub living_status: Option<String>,
+    /// Off by default: reversibly hide covered historical protocol comments.
+    #[serde(default)]
+    pub cleanup_history: bool,
     /// Off by default: rank epic groups before reading their admission facts.
     #[serde(default)]
     pub top_down: bool,
@@ -1310,6 +1313,10 @@ impl Config {
             config.pools = source_pools(text)?;
             config
         };
+        ensure!(
+            !config.cleanup_history || config.living_status.is_some(),
+            "cleanupHistory requires livingStatus"
+        );
         if sources.is_empty() {
             config.check()?;
         } else {
@@ -4076,9 +4083,16 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds: &Bounds,
 ) -> Result<Report> {
     config.check_pace(now)?;
+    ensure!(
+        !config.cleanup_history || config.living_status.is_some(),
+        "cleanupHistory requires livingStatus"
+    );
     if let Some(path) = &config.living_status {
         living::check_paths(path, config.state.as_deref())?;
-        *bounds.living.borrow_mut() = Some(living::Store::load(path, &config.bot, now)?);
+        let mut store = living::Store::load(path, &config.bot, now)?;
+        store.cleanup = config.cleanup_history;
+        store.read_only = matches!(mode, Mode::Preview);
+        *bounds.living.borrow_mut() = Some(store);
     }
     bounds.cache_enabled.set(config.state.is_some());
     *bounds.publication_pending.borrow_mut() = state.holds_pending.clone();
@@ -4388,6 +4402,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // Stages 3 and 4's holds, unless either failed outright: they would be
     // partial.
     scheduler.reconcile_living();
+    scheduler.cleanup_history();
     bounds.enter(Stage::Holds);
     if scheduler.holds_whole {
         scheduler.publish_holds();
@@ -5066,6 +5081,102 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             })();
             if let Err(error) = result {
                 self.report.error("living status duplicate", &error);
+            }
+        }
+    }
+
+    fn cleanup_history(&mut self) {
+        let candidates = self
+            .client
+            .bounds
+            .living
+            .borrow()
+            .as_ref()
+            .map(|store| store.historical(self.apply))
+            .unwrap_or_default();
+        for (key, candidate) in candidates {
+            let id = plan::comment_id(text(&candidate, "/url")).unwrap_or_default();
+            if !self.apply {
+                self.line(format!(
+                    "living status: would minimize OUTDATED {}",
+                    text(&candidate, "/url")
+                ));
+                continue;
+            }
+            if let Some(why) = self.other_holds().or_else(|| self.caps.check(Kind::Write)) {
+                self.line(format!("living status: cleanup deferred; {why}"));
+                break;
+            }
+            let result = (|| -> Result<()> {
+                // Supersession depends on the other plans too, not just the
+                // candidate. A changed/incomplete history must hold cleanup.
+                let issue = crate::github::parse_github_issue(&key, None, DEFAULT_HOST)?;
+                plan::issue_comments(&self.client, &issue)?;
+                if !self
+                    .client
+                    .bounds
+                    .living
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|store| {
+                        store
+                            .historical(true)
+                            .iter()
+                            .any(|(k, n)| k == &key && n == &candidate)
+                    })
+                {
+                    return Ok(());
+                }
+                let (repo, _) = key.rsplit_once('#').context("cleanup issue key")?;
+                let response = self.client.get(
+                    &format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
+                    None,
+                )?;
+                ensure!(
+                    response.status == 200,
+                    "cleanup lookup: HTTP {}",
+                    response.status
+                );
+                let node = response.body["node_id"]
+                    .as_str()
+                    .context("cleanup node id missing")?;
+                let fresh = self
+                    .client
+                    .graphql(living::HISTORY_STATE, json!({"id":node}))?;
+                let fresh = &fresh["node"];
+                // Revalidate all admission facts, not just author or body. A
+                // foreign edit after discovery must not hide changed evidence.
+                for field in [
+                    "url",
+                    "body",
+                    "createdAt",
+                    "lastEditedAt",
+                    "author",
+                    "editor",
+                ] {
+                    ensure!(
+                        fresh.get(field) == candidate.get(field),
+                        "cleanup comment changed: {field}"
+                    );
+                }
+                let minimized = fresh["isMinimized"]
+                    .as_bool()
+                    .context("cleanup minimized state missing")?;
+                if !minimized {
+                    self.caps.count(Kind::Write);
+                    self.client.graphql(living::MINIMIZE, json!({"id":node}))?;
+                    self.line(format!(
+                        "living status: minimized OUTDATED {}",
+                        text(&candidate, "/url")
+                    ));
+                }
+                if let Some(store) = self.client.bounds.living.borrow_mut().as_mut() {
+                    store.minimized(&key, id)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.report.error("living status cleanup", &error);
             }
         }
     }
