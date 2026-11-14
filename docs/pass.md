@@ -730,6 +730,10 @@ when other items on that page are readable. Otherwise an incomplete inventory
 could look like a complete preview or permit transfers from a partial apply list.
 Every page must succeed before candidate previews, journal saves or transfers;
 the existing 20-page and shared request limits still bound discovery.
+Null, redacted or unknown item content and unreadable issue states also stop
+discovery: they cannot prove that an entry is unrelated to the migration.
+Readable pull requests, draft issues, closed issues and issues outside tracker
+remain non-candidates. This uses the same listing, without additional requests.
 
 Apply is an explicit operator maintenance operation, using the configured bot
 identity and a durable journal outside version control:

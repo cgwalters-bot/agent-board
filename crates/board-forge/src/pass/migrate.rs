@@ -209,7 +209,18 @@ fn issues(client: &impl Transport, config: &Config) -> Result<(String, IssueItem
             .context("missing project items")?
         {
             let issue = &item["content"];
-            if issue["__typename"] != "Issue" || issue["state"] != "OPEN" {
+            // Null/redacted content is not evidence that this is unrelated work.
+            // Refuse a partial inventory before previewing or transferring any item.
+            match issue["__typename"].as_str() {
+                Some("PullRequest" | "DraftIssue") => continue,
+                Some("Issue") => {}
+                _ => bail!("unreadable project item content; migration preview incomplete"),
+            }
+            ensure!(
+                matches!(issue["state"].as_str(), Some("OPEN" | "CLOSED")),
+                "unreadable project issue state; migration preview incomplete"
+            );
+            if issue["state"] == "CLOSED" {
                 continue;
             }
             let repository = required(&issue["repository"], "nameWithOwner")?;

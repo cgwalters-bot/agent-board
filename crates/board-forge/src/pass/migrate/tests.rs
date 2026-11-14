@@ -42,6 +42,7 @@ struct Forge {
     incomplete: bool,
     board_incomplete: bool,
     board_error_page: Option<u64>,
+    board_content: Option<(u64, Value)>,
     metadata: &'static str,
     destination_change: Option<(&'static str, Value)>,
     destination_reads: Cell<usize>,
@@ -146,17 +147,30 @@ impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         if query == BOARD {
             let page = if variables["cursor"].is_null() { 1 } else { 2 };
-            let more = self.board_error_page == Some(2) && page == 1;
+            let more = (self.board_error_page == Some(2)
+                || self
+                    .board_content
+                    .as_ref()
+                    .is_some_and(|(page, _)| *page == 2))
+                && page == 1;
             // The live transport rejects partial GraphQL envelopes before
             // returning data. Model that Result boundary, not an errors member
             // inside the already-unwrapped project data.
             if self.board_error_page == Some(page) {
                 bail!("GitHub GraphQL: UNKNOWN: partial project read; response may be partial");
             }
-            let data = json!({"repositoryOwner":{"projectV2":{"id":"board","number":1,
+            let mut data = json!({"repositoryOwner":{"projectV2":{"id":"board","number":1,
                 "field":{"id":"priority","name":"Priority"},
                 "items":{"pageInfo":if self.board_incomplete {Value::Null} else {json!({"hasNextPage":more,"endCursor":"next"})},
                     "nodes":(page..=self.count.max(page)).map(|n| json!({"id":format!("item-{n}"),"content":node(n)})).collect::<Vec<_>>()}}}});
+            if let Some((target, content)) = &self.board_content
+                && *target == page
+            {
+                data["repositoryOwner"]["projectV2"]["items"]["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":"extra-item", "content":content}));
+            }
             return Ok(data);
         }
         if query == plan::COMMENTS_QUERY {
@@ -396,6 +410,45 @@ fn destination_assignee_eligibility_is_required_before_intent() {
 }
 
 #[test]
+fn unreadable_board_content_stops_before_preview_or_intent() {
+    for content in [
+        Value::Null,
+        json!({}),
+        json!({"__typename":"RedactedIssue"}),
+        json!({"__typename":"Unknown"}),
+        json!({"__typename":"Issue"}),
+        json!({"__typename":"Issue","state":"UNKNOWN"}),
+    ] {
+        for page in [1, 2] {
+            for apply in [false, true] {
+                let forge = Forge {
+                    board_content: Some((page, content.clone())),
+                    ..Default::default()
+                };
+                let mut journal = Journal::default();
+                let error = run(
+                    &forge,
+                    &config(),
+                    apply,
+                    2,
+                    &mut journal,
+                    |_| panic!("incomplete inventory must not save journal"),
+                    |_| panic!("incomplete inventory must not emit candidates"),
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("migration preview incomplete"),
+                    "{content}, page={page}, apply={apply}: {error:#}"
+                );
+                assert!(journal.receipts.is_empty());
+                assert_eq!(forge.snapshots.get(), 0);
+                assert_eq!(forge.transfers.get(), 0);
+            }
+        }
+    }
+}
+
+#[test]
 fn unassigned_issues_need_no_destination_assignee_evidence() {
     for apply in [false, true] {
         let forge = Forge {
@@ -424,6 +477,23 @@ fn unassigned_issues_need_no_destination_assignee_evidence() {
             "preview "
         })));
         assert_eq!(forge.transfers.get(), usize::from(apply));
+    }
+}
+
+#[test]
+fn readable_non_candidates_do_not_block_board_inventory() {
+    for content in [
+        json!({"__typename":"PullRequest"}),
+        json!({"__typename":"DraftIssue"}),
+        json!({"__typename":"Issue","state":"CLOSED"}),
+        json!({"__typename":"Issue","state":"OPEN","repository":{"nameWithOwner":"other/repo"}}),
+    ] {
+        let forge = Forge {
+            board_content: Some((2, content)),
+            ..Default::default()
+        };
+        let (_, items) = issues(&forge, &config()).unwrap();
+        assert_eq!(items.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
     }
 }
 
