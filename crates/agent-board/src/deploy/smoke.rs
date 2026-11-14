@@ -1,5 +1,5 @@
 //! The applied stage deployment smoke path: a fresh scratch repository and
-//! project, one harmless task through an in-process fake engine, and the
+//! project, one harmless task through a fake or model-free Actions engine, and the
 //! pass's derived Status. Only identities that creation returned, matching
 //! what was requested, authorize cleanup; everything else is reported.
 use super::Config;
@@ -17,10 +17,15 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use tokio::runtime::Runtime;
 
+mod actions;
+
 /// The smoke steps' writes: repository, project, issue, item add, Todo,
 /// result comment, close and Done. Cleanup's deletions, one per receipt,
-/// come on top so that a capped run can still clean up.
+/// come on top so that a capped run can still clean up. Actions reserves two
+/// additional writes for installing and dispatching the fixed workflow.
 pub(crate) const SMOKE_WRITES: usize = 8;
+
+const ACTIONS_EXTRA_WRITES: usize = 2;
 
 /// Where the fake engine is told the job would run; it sends nothing.
 const DISPATCH_REF: &str = "main";
@@ -68,14 +73,16 @@ impl std::error::Error for Cancelled {}
 struct Counting<'a, T> {
     inner: &'a T,
     writes: Cell<usize>,
+    limit: usize,
 }
 
 impl<T: Transport> Transport for Counting<'_, T> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         if query.trim_start().starts_with("mutation") {
             ensure!(
-                self.writes.get() < SMOKE_WRITES,
-                "smoke write cap of {SMOKE_WRITES} reached"
+                self.writes.get() < self.limit,
+                "smoke write cap of {} reached",
+                self.limit
             );
             self.writes.set(self.writes.get() + 1);
         }
@@ -225,7 +232,7 @@ impl<T: Transport + board_forge::github::GraphQl> Run<'_, T> {
             .collect())
     }
 
-    fn steps(&mut self, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
+    fn steps(&mut self, rest: &impl Rest, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
         let owner = self.step(cancelled, "scope", |run| {
             let data = run
                 .counting
@@ -330,6 +337,24 @@ impl<T: Transport + board_forge::github::GraphQl> Run<'_, T> {
             Ok(())
         })?;
         let handle = self.step(cancelled, "dispatch", |run| {
+            if run.config.actions {
+                let (id, name) = run.repository.as_ref().context("missing receipt")?;
+                // Reserve the install, dispatch and the workflow's two issue writes.
+                // Ambiguous sends are never retried by the smoke runner.
+                run.counting.writes.set(run.counting.writes.get() + 4);
+                ensure!(
+                    run.counting.writes.get() <= run.counting.limit,
+                    "smoke write cap reached"
+                );
+                let (handle, sha) = actions::start(rest, id, name, run.identity()?.number, || {
+                    std::thread::sleep(actions::POLL_INTERVAL);
+                })?;
+                run.receipts.insert(
+                    "dispatch".into(),
+                    json!({"id":handle.id,"engine":"actions","sha":sha}),
+                );
+                return Ok(handle);
+            }
             let target = Target {
                 caller: run.config.repository.clone(),
                 workflow: run.config.workflow.clone(),
@@ -382,8 +407,34 @@ impl<T: Transport + board_forge::github::GraphQl> Run<'_, T> {
                 .insert("dispatch".into(), json!({"id":handle.id,"engine":"fake"}));
             Ok(handle)
         })?;
+        if self.config.actions {
+            let (_, name) = self.repository.as_ref().context("missing receipt")?;
+            let sha = self.receipts["dispatch"]["sha"]
+                .as_str()
+                .context("missing workflow commit")?;
+            let result = actions::wait(rest, name, &handle.id, sha, cancelled, || {
+                std::thread::sleep(actions::POLL_INTERVAL);
+            });
+            self.step(cancelled, "actions-run", |_| result)?;
+        }
         self.step(cancelled, "result", |run| {
             let (issue, _) = run.issue.clone().context("missing issue receipt")?;
+            if run.config.actions {
+                let data = run.counting.graphql(RESULT, json!({"id":issue}))?;
+                let node = &data["node"];
+                let body = actions::result_body(&handle.id);
+                ensure!(
+                    node["id"] == issue
+                        && node["state"] == "CLOSED"
+                        && node["stateReason"] == "COMPLETED"
+                        && node["comments"]["totalCount"] == 1
+                        && node["comments"]["nodes"][0]["body"] == body,
+                    "Actions result readback mismatch"
+                );
+                let id = string(node, "/comments/nodes/0/id").context("missing result comment")?;
+                run.receipts.insert("comment".into(), json!({"id":id}));
+                return Ok(());
+            }
             let body = format!(
                 "agent-board fake-engine result: run {}, task {}",
                 handle.id, run.nonce
@@ -513,6 +564,12 @@ pub(crate) fn run(
         counting: Counting {
             inner: t,
             writes: Cell::new(0),
+            limit: SMOKE_WRITES
+                + if config.actions {
+                    ACTIONS_EXTRA_WRITES
+                } else {
+                    0
+                },
         },
         nonce,
         steps: Vec::new(),
@@ -522,7 +579,7 @@ pub(crate) fn run(
         receipts: serde_json::Map::new(),
         leftovers: Vec::new(),
     };
-    let result = run.steps(cancelled);
+    let result = run.steps(rest, cancelled);
     let (cleanup, deletions) = run.cleanup(rest);
     let writes = run.counting.writes.get() + deletions;
     let result = match result {
@@ -534,6 +591,11 @@ pub(crate) fn run(
     };
     let report = json!({
         "nonce": nonce,
+        "engine": if config.actions { "actions" } else { "fake" },
+        "limitations": [
+            "Reconciliation is called directly; no installed scheduler or agentic-job round trip is exercised.",
+            "README setup still requires copying dispatch and review caller workflows; this fixed task is not either caller."
+        ],
         "steps": run.steps,
         "receipts": run.receipts,
         "cleanup": cleanup,
