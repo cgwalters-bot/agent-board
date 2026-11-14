@@ -693,6 +693,9 @@ Open issues in `dispatchRepo` must have exactly one item on the configured
 project. Whole `Target:`/`repo:` lines, `target:` labels, the accepted plan's
 `repo`/`target_repo`, and a known fork's title prefix contribute evidence.
 Unknown or conflicting evidence holds, rather than giving one source precedence.
+The `target:` label key is ASCII case-insensitive, like the body-line keys:
+`TARGET:ostree` must not be ignored in favor of a conflicting `bootc:` title.
+Unknown or empty targets still hold, including with a case-variant label key.
 Epics, infrastructure/harness labels, operator decisions and the configured
 operator-ask exclusions hold. No prose/model classification is used.
 An unlabeled parent can otherwise look like ordinary single-project work and
