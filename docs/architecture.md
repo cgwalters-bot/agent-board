@@ -470,6 +470,17 @@ approved work visible without granting the pass upstream write authority.
   rewriting holds for manual migration, rather than creating a duplicate PR.
   The upstream base and approved head are checked again before pushing the new
   branch.
+  Before any upstream PR write, read the fork PR base's required checks from
+  rules and classic protection, and the exact publication oid's check rollup
+  from its head repository. App-bound requirements cannot be satisfied by
+  another app or a plain status. Paginate the full rollup; missing, pending or
+  failed required checks hold publication, and malformed or incomplete evidence
+  is an error. A null rollup holds even on an unprotected base. A retained
+  pending receipt lets later invocations wait for checks without replaying the
+  approved head again. Success records approval carryover from the approved oid
+  to the checked publication oid; the original approval is still revalidated
+  on each retry. This gate does not itself arrange CI for a new publication ref;
+  a fork whose workflows do not check that ref remains held.
   Draft creation is deliberate:
   GitHub's branch-based POST can race a push, so it must not mark an unapproved
   head ready. Verify the branch immediately before publication and verify the
