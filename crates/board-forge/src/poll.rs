@@ -545,6 +545,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "generatedBy",
     "maintainerReport",
     // The pass's `pr` keys of [`PrOptions`].
+    "queueOnlyRepository",
     "checkReruns",
     "unstall",
     "directionFirst",
@@ -633,6 +634,9 @@ pub struct PollPolicy {
     /// Optional issue for the edited maintainer report; absent publishes nothing.
     pub maintainer_report: Option<report::Destination>,
     pub merge_authors: Vec<String>,
+    /// One repository whose admission must use the merge queue, never a direct
+    /// merge fallback when the branch rules change. Absent by default.
+    pub queue_only_repository: Option<String>,
     /// The pass's `pr.headOwners`: the owners of the head repositories the bot may push
     /// to, besides its own fork, where a pull request it opened is its own
     /// ([`is_harness`]): such as an organization whose forks hold its
@@ -1059,6 +1063,8 @@ pub const OPERATOR_PATHS_LIMIT: usize = 50;
 #[serde(rename_all = "camelCase")]
 pub struct PrOptions {
     #[serde(default)]
+    pub queue_only_repository: Option<String>,
+    #[serde(default)]
     pub hold_missing_data: bool,
     #[serde(default)]
     pub hold_dependencies: bool,
@@ -1122,6 +1128,14 @@ impl PrOptions {
     /// `at` starts each error, as `pr ` for the pass.
     pub fn check(&self, at: &str, follow: &[String], review_workflow: bool) -> Result<()> {
         let names = |list: &[String], repo: &str| list.iter().any(|r| r.eq_ignore_ascii_case(repo));
+        if let Some(repo) = &self.queue_only_repository {
+            validate_repository(repo)
+                .with_context(|| format!("{at}queueOnlyRepository repository"))?;
+            ensure!(
+                names(follow, repo),
+                "{at}queueOnlyRepository repository {repo} is not followed"
+            );
+        }
         ensure!(
             self.review_dispatch_repositories.len() <= POLL_REPOSITORY_LIMIT,
             "{at}reviewDispatchRepositories exceeds {POLL_REPOSITORY_LIMIT} repositories"
@@ -1195,6 +1209,7 @@ impl PrOptions {
     /// Sets these in `policy`.
     pub fn apply(&self, policy: &mut PollPolicy) {
         let Self {
+            queue_only_repository,
             hold_missing_data,
             hold_dependencies,
             action_first,
@@ -1213,6 +1228,7 @@ impl PrOptions {
             operator_paths,
             stale_days,
         } = self.clone();
+        policy.queue_only_repository = queue_only_repository;
         policy.hold_dependencies = hold_dependencies;
         policy.hold_missing_data = hold_missing_data;
         policy.action_first = action_first;
@@ -1275,6 +1291,7 @@ impl PollPolicy {
         .context("mergeQueue fixedFlakes")?;
         check_flake_fixes(&fixed_flakes)?;
         let mut policy = Self {
+            queue_only_repository: None,
             maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
             merge_queue,
             fixed_flakes,
@@ -4824,6 +4841,13 @@ fn no_merge(config: &Config, pull: &Value) -> bool {
         .any(|r| r.eq_ignore_ascii_case(repository))
 }
 
+fn queue_only(policy: &PollPolicy, repository: &str) -> bool {
+    policy
+        .queue_only_repository
+        .as_deref()
+        .is_some_and(|r| r.eq_ignore_ascii_case(repository))
+}
+
 /// Which of `pr.operatorPaths` `pull` changes, named for its wait: none
 /// where it changes none of them. Changed files past those read may be any,
 /// so they count as one. GraphQL gives no previous filename for a rename;
@@ -5974,6 +5998,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     }
                     self.merged += 1;
                     Ok(Some("added to the merge queue".into()))
+                } else if queue_only(&self.config.policy, repo) {
+                    Ok(Some(
+                        "not merged: queueOnlyRepository requires a merge queue on the base".into(),
+                    ))
                 } else if !checks.every {
                     // The queue was removed since the checks were judged on
                     // the required ones alone; the next pass judges them all.
@@ -8278,6 +8306,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             (Some(tries), Some((removal, state))) => queue_step(decision, removal, state, tries),
             _ => decision,
         };
+        if decision.action == "merge" && queue_only(&self.config.policy, repo) && !queued {
+            decision = step(
+                "wait",
+                "queueOnlyRepository requires a merge queue on the base",
+            );
+        }
         // A conflict can wait for an earlier change to land. An approved,
         // clean head must be enqueued now: GitHub owns queue ordering and
         // merge-group revalidation, not a file-overlap guess by this pass.
@@ -14240,6 +14274,138 @@ mod tests {
     }
 
     #[test]
+    fn queue_only_repository_config_is_single_followed_repository() {
+        for value in [json!({}), json!({"queueOnlyRepository": null})] {
+            assert!(
+                PollPolicy::from_json(&value)
+                    .unwrap()
+                    .queue_only_repository
+                    .is_none()
+            );
+        }
+        for setting in [
+            json!(false),
+            json!([]),
+            json!([REPO]),
+            json!(""),
+            json!("owner/*"),
+            json!("other/repo"),
+        ] {
+            let value = json!({"follow": [REPO], "queueOnlyRepository": setting});
+            assert!(PollPolicy::from_json(&value).is_err(), "{value}");
+        }
+        let policy = PollPolicy::from_json(&json!({
+            "follow": [REPO], "queueOnlyRepository": REPO.to_uppercase()
+        }))
+        .unwrap();
+        assert!(queue_only(&policy, REPO));
+        assert!(!queue_only(&policy, "other/repo"));
+    }
+
+    #[test]
+    fn queue_only_repository_never_falls_back_to_direct_merge() {
+        for queued in [false, true] {
+            for apply in [false, true] {
+                for repository in [None, Some("other/repo"), Some(REPO)] {
+                    let mut fake = github();
+                    if queued {
+                        fake.rest
+                            .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
+                            .unwrap()
+                            .3
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"type": "merge_queue"}));
+                    }
+                    let mut cfg = config();
+                    cfg.policy.queue_only_repository = repository.map(str::to_owned);
+                    let dispatcher = Fake::default();
+                    let outcome = run(
+                        &fake,
+                        &fake,
+                        &cfg,
+                        State::default(),
+                        &[],
+                        &[REPO.into()],
+                        if apply { applying(&dispatcher) } else { None },
+                        now(),
+                    )
+                    .unwrap();
+                    assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                    let blocked = !queued && repository == Some(REPO);
+                    let writes = fake.writes.borrow();
+                    assert_eq!(
+                        writes.len(),
+                        usize::from(apply && !blocked),
+                        "{:?}",
+                        outcome.lines
+                    );
+                    if apply && !blocked {
+                        assert_eq!(writes[0].0.contains("enqueuePullRequest"), queued);
+                        assert_eq!(
+                            writes[0].1,
+                            json!({"id": fake.pulls[&470]["id"], "head": HEAD})
+                        );
+                    }
+                    if blocked {
+                        assert!(
+                            outcome
+                                .lines
+                                .iter()
+                                .any(|l| l.contains("wait: queueOnlyRepository")),
+                            "{:?}",
+                            outcome.lines
+                        );
+                    }
+                    assert!(dispatcher.writes.borrow().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queue_only_repository_rechecks_rules_before_admission() {
+        // A previously admitted merge decision must not turn into a direct
+        // merge if the queue rule disappears before execution.
+        for rules in [json!([]), json!({"unreadable": true})] {
+            let mut fake = github();
+            fake.page(
+                &format!("repos/{REPO}/rules/branches/main"),
+                None,
+                None,
+                rules.clone(),
+            );
+            let mut cfg = config();
+            cfg.policy.queue_only_repository = Some(REPO.into());
+            let dispatcher = Fake::default();
+            let mut pass = Pass::new(&fake, &fake, &cfg, now());
+            pass.apply = applying(&dispatcher);
+            let got = pass.take(
+                REPO,
+                &fake.pulls[&470],
+                &Checks {
+                    every: true,
+                    ..Checks::default()
+                },
+                (&Marker::default(), &[]),
+                &step("merge", "approved"),
+                None,
+            );
+            if rules.is_array() {
+                assert!(
+                    got.unwrap()
+                        .unwrap()
+                        .contains("not merged: queueOnlyRepository")
+                );
+            } else {
+                assert!(got.is_err());
+            }
+            assert_eq!(pass.merged, 0);
+            assert!(fake.writes.borrow().is_empty());
+        }
+    }
+
+    #[test]
     fn queued_merges_and_allowed_direct_methods_are_head_pinned() {
         for (queue, settings, method, moved, refused, expected_errors) in [
             (true, json!({}), "queue", false, false, 0),
@@ -14293,7 +14459,19 @@ mod tests {
                 fake.refused = vec![ENQUEUE];
             }
             let dispatcher = Fake::default();
-            let outcome = applied(&fake, &dispatcher);
+            let mut cfg = config();
+            cfg.policy.queue_only_repository = queue.then(|| REPO.to_owned());
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
             assert_eq!(
                 outcome.errors, expected_errors,
                 "{method}: {:?}",
@@ -14348,7 +14526,19 @@ mod tests {
                     ),
                 );
                 let dispatcher = Fake::default();
-                let outcome = applied(&fake, &dispatcher);
+                let mut cfg = config();
+                cfg.policy.queue_only_repository = queue.then(|| REPO.to_owned());
+                let outcome = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &[REPO.into()],
+                    applying(&dispatcher),
+                    now(),
+                )
+                .unwrap();
                 assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
                 assert!(dispatcher.writes.borrow().is_empty());
                 let writes = fake.writes.borrow();
