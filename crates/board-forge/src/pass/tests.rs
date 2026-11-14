@@ -17392,8 +17392,7 @@ fn living_pull_links_create_status_without_a_plan_and_respect_preview_and_caps()
             assert_eq!(forge.writes.borrow().len(), before);
         }
         if !mode {
-            let saved: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
-            assert!(saved["entries"].as_object().unwrap().is_empty());
+            assert!(!ledger.exists(), "preview must not write the ledger");
         }
     }
 }

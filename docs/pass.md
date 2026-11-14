@@ -574,10 +574,49 @@ their canonical destinations must differ. Standalone dispatch
 and epic apply refuse a living-status issue without its configured pass. Do not
 turn the option off on an issue that has adopted it.
 
-This is the first slice of agent-board#880. It does not migrate old comments,
-change agentic-job run hand-backs, publish findings or triage verdicts into the
-status, or minimize unrelated historical comments; those remain follow-ups. Forgejo refuses
-the option. No deployed caller configuration changes here. Caller activation:
+### Historical comment cleanup
+
+The concrete threat is hiding the only dispatch/apply replay evidence, or hiding
+a human's or foreign editor's words as though they were obsolete bot protocol.
+`cleanupHistory: true` is a separate, default-off GitHub option and requires
+`livingStatus`. It only cleans issues whose authoritative status was discovered
+in the pass's existing bounded comment reads; it does not launch a history sweep.
+Preview lists `would minimize OUTDATED` candidates without changing the forge or
+the ledger.
+
+After a complete history read, authenticated bot-owned, self-contained dispatch
+records, fenced epic-apply receipts and valid job plans are copied verbatim into
+the ledger, with their original URLs and timestamps. This preserves logical plan
+identities and full replay guards, not just the last displayed prose. Missing edit
+facts, unknown/foreign editors, mixed protocols and unrecognized or malformed
+records are not admitted. Historical job plans need a strictly newer trusted plan;
+ambiguous plan evidence holds plan cleanup. The current plan and authoritative
+status are never minimized. Legacy split apply/fingerprint protocols and epic-plan
+comments remain visible: this slice does not establish their complete coverage.
+
+Cleanup waits until the ledger is synced and its authoritative public status edit
+is confirmed. Each candidate is re-read with its ownership, editor, body and
+identity facts before reversible **OUTDATED** minimization. Nothing is deleted.
+The existing request/time limits and write caps include publication, failed writes
+and minimizations. Ledger limits refuse growth rather than evicting replay guards;
+incomplete pagination holds cleanup. Interrupted publication or minimization can
+be retried; already-minimized comments consume no further writes. Keep the ledger
+backed up and applying passes serialized, as for living status itself.
+Confirmed minimizations are retained within the ledger's 1,000-ID bound so a
+completed prefix cannot spend every later pass's read budget; a comment manually
+restored afterward stays restored. A recovered receipt's newer durable revision
+takes precedence over its unchanged historical source, which then stays visible
+unless exact coverage can be confirmed again.
+
+Caller follow-up in `cgwalters-forge/tracker`, `.github/pass.json`: retain the
+durable `livingStatus` path and set `cleanupHistory` to `true` only after adopting
+this revision and reviewing preview candidates. No caller configuration,
+credentials, permissions or agent-output mutation authority is changed here.
+
+Agent-board#880 remains open for caller activation, the conservative exclusions
+above, and agentic-job/agenthome run-findings and verdict integration. This does
+not change agentic-job run hand-backs or publish findings/triage verdicts into the
+status. Forgejo refuses both options. Caller activation for living status:
 `cgwalters-forge/tracker`, `.github/pass.json`, set `livingStatus` to
 `.state/living-status.json`; applying passes must still be serialized.
 

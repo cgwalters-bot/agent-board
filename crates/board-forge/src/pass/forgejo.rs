@@ -58,6 +58,10 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
         "unsupported_capability: livingStatus: GitHub comments only"
     );
     ensure!(
+        value.get("cleanupHistory").is_none(),
+        "unsupported_capability: cleanupHistory: GitHub comments only"
+    );
+    ensure!(
         value.get("topDown").is_none(),
         "unsupported_capability: topDown: GitHub scheduling only"
     );
