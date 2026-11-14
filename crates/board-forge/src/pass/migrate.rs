@@ -24,6 +24,7 @@ const SNAPSHOT: &str = r#"query MigrationIssue($id:ID!, $item:ID!) {
     subIssues(first:1) { totalCount }
     milestone { title dueOn }
     labels(first:100) { nodes { name } pageInfo { hasNextPage } }
+    assignees(first:100) { nodes { id } pageInfo { hasNextPage } }
     closedByPullRequestsReferences(first:100, includeClosedPrs:false) {
       totalCount pageInfo { hasNextPage } nodes { state number updatedAt repository { nameWithOwner } author { login } }
     }
@@ -64,6 +65,7 @@ pub struct Before {
     board: Value,
     parent: Value,
     labels: BTreeSet<String>,
+    assignees: BTreeSet<String>,
     milestone: Value,
 }
 
@@ -250,6 +252,12 @@ fn before(node: &Value, config: &Config) -> Result<Before> {
     let milestone = node
         .get("milestone")
         .context("missing milestone evidence")?;
+    // Stable user IDs avoid treating a login rename or connection reordering as
+    // ownership loss. Missing evidence must never mean an unassigned issue.
+    let assignees = connection(node, "assignees")?
+        .iter()
+        .map(|assignee| required(assignee, "id").map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()?;
     if !milestone.is_null() {
         validate_milestone(milestone)?;
     }
@@ -298,6 +306,7 @@ fn before(node: &Value, config: &Config) -> Result<Before> {
         board,
         parent,
         labels,
+        assignees,
         milestone: milestone.clone(),
     })
 }
@@ -610,6 +619,10 @@ fn preserved(before: &Before, after: &Before, destination: &str) -> Result<Strin
     );
     ensure!(after.parent == before.parent, "transfer lost parent link");
     ensure!(after.labels == before.labels, "transfer lost labels");
+    ensure!(
+        after.assignees == before.assignees,
+        "transfer changed assignees"
+    );
     ensure!(
         after.milestone == before.milestone,
         "transfer lost milestone"
