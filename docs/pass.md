@@ -781,6 +781,12 @@ credentials. Both conflict with apply. Recordings contain issue/comment bodies:
 review them before publishing. Synthetic failure tests cover timeouts, refusal,
 stale sources, incomplete reads, cap exhaustion and changed destination numbers;
 they do not prove GitHub preserves board state in a live transfer.
+Batch recovery tests restart from the bytes accepted by the journal save callback,
+including a failed completion save after GitHub has already moved the issue. A
+pending first transfer blocks the second candidate until preservation is verified;
+reconciliation never resends the first transfer. Preview can report reconciliation
+without saving it or transferring the next candidate. Apply saves the reconciled
+canonical identity before advancing, and only new transfers consume `--max`.
 
 Rollout remains blocked on operator-enabled fork issues where disabled,
 admission of any missing work targets through the existing configuration process,

@@ -32,7 +32,8 @@ fn node(number: u64) -> Value {
 
 #[derive(Default)]
 struct Forge {
-    moved: Cell<bool>,
+    moved: RefCell<BTreeSet<String>>,
+    transfer_ids: RefCell<Vec<String>>,
     transfers: Cell<usize>,
     snapshots: Cell<usize>,
     readback_failed: Cell<bool>,
@@ -149,17 +150,23 @@ impl Transport for Forge {
         }
         if query == TRANSFER {
             self.transfers.set(self.transfers.get() + 1);
+            let id = variables["issue"].as_str().unwrap().to_owned();
+            self.transfer_ids.borrow_mut().push(id.clone());
             if self.failure == "before" {
                 bail!("transport failed before response");
             }
-            self.moved.set(true);
+            self.moved.borrow_mut().insert(id);
             if self.failure == "timeout" {
                 bail!("timeout after GitHub applied");
             }
             return Ok(json!({"transferIssue":{"issue":{"id":variables["issue"],"number":99}}}));
         }
         assert_eq!(query, SNAPSHOT);
-        if self.moved.get() && self.failure == "readback" && !self.readback_failed.replace(true) {
+        let moved = self
+            .moved
+            .borrow()
+            .contains(variables["id"].as_str().unwrap());
+        if moved && self.failure == "readback" && !self.readback_failed.replace(true) {
             bail!("readback unavailable after transfer");
         }
         self.snapshots.set(self.snapshots.get() + 1);
@@ -219,10 +226,13 @@ impl Transport for Forge {
             "" => {}
             other => panic!("unrecorded reference failure {other}"),
         }
-        if self.moved.get() && number == 1 {
+        if moved {
             node["repository"]["nameWithOwner"] = json!("cgwalters-forge/bootc");
-            node["number"] = json!(99);
-            node["url"] = json!("https://github.com/cgwalters-forge/bootc/issues/99");
+            node["number"] = json!(98 + number);
+            node["url"] = json!(format!(
+                "https://github.com/cgwalters-forge/bootc/issues/{}",
+                98 + number
+            ));
             if self.failure == "priority" {
                 node["projectItems"]["nodes"][0]["fieldValues"]["nodes"] = json!([]);
             }
@@ -502,6 +512,112 @@ fn transfer_failures_reconcile_before_any_retry_and_preservation_failure_stops()
         let (retry, _) = execute(&forge, true, 1, &mut journal);
         assert_eq!(retry.is_ok(), success || failure == "readback");
         assert_eq!(forge.transfers.get(), 1, "{failure} retried a mutation");
+    }
+}
+
+#[test]
+fn batch_recovery_restarts_from_durable_intent_before_advancing() {
+    // Only successful save callbacks survive a process restart. In particular,
+    // the in-memory canonical receipt must not hide a failed completion save.
+    fn restart(
+        forge: &Forge,
+        apply: bool,
+        max: usize,
+        durable: &mut Vec<u8>,
+        fail_completion: bool,
+    ) -> (Result<()>, Vec<String>) {
+        let mut journal = serde_json::from_slice(durable).unwrap();
+        let mut lines = Vec::new();
+        let result = run(
+            forge,
+            &config(),
+            apply,
+            max,
+            &mut journal,
+            |journal| {
+                assert!(apply, "preview must not save reconciliation");
+                ensure!(
+                    !fail_completion || journal.receipts.values().all(|r| r.canonical.is_none()),
+                    "disk full saving completion"
+                );
+                *durable = serde_json::to_vec(journal)?;
+                Ok(())
+            },
+            |line| {
+                lines.push(line);
+                Ok(())
+            },
+        );
+        (result, lines)
+    }
+
+    for failure in [
+        "before",
+        "readback",
+        "priority",
+        "parent",
+        "labels",
+        "milestone",
+        "assignees",
+        "assignees-replaced",
+        "assignees-unreadable",
+        "save-completion",
+    ] {
+        let mut forge = Forge {
+            failure,
+            count: 2,
+            labeled: true,
+            milestoned: true,
+            ..Default::default()
+        };
+        let mut durable = serde_json::to_vec(&Journal::default()).unwrap();
+        let (result, lines) = restart(&forge, true, 2, &mut durable, failure == "save-completion");
+        assert!(result.is_err(), "{failure}: {lines:?}");
+        assert!(lines.iter().all(|line| !line.starts_with("transferred ")));
+        assert_eq!(*forge.transfer_ids.borrow(), ["issue-1"], "{failure}");
+        let pending = durable.clone();
+        let journal: Journal = serde_json::from_slice(&pending).unwrap();
+        assert_eq!(journal.receipts.len(), 1, "{failure}");
+        assert!(journal.receipts["issue-1"].canonical.is_none(), "{failure}");
+
+        // Persistent loss (or an intent still at the source) blocks the next
+        // candidate on restart too, without resending the first mutation.
+        if !["readback", "save-completion"].contains(&failure) {
+            let (result, _) = restart(&forge, true, 2, &mut durable, false);
+            assert!(result.is_err(), "{failure}");
+            assert_eq!(durable, pending, "{failure}");
+            assert_eq!(*forge.transfer_ids.borrow(), ["issue-1"], "{failure}");
+        }
+        if failure == "before" {
+            continue; // An unresolved source intent requires manual investigation.
+        }
+
+        // Model restored metadata/read availability, not an automatic repair.
+        forge.failure = "";
+        let (result, lines) = restart(&forge, false, 1, &mut durable, false);
+        result.unwrap();
+        assert!(lines[0].starts_with("reconciled "), "{failure}: {lines:?}");
+        assert!(lines[1].starts_with("preview cgwalters-forge/tracker#2 "));
+        assert_eq!(durable, pending, "preview persisted recovery: {failure}");
+        assert_eq!(*forge.transfer_ids.borrow(), ["issue-1"]);
+
+        // Reconciliation consumes no transfer allowance: the one permitted
+        // new write belongs to issue-2, never a duplicate issue-1 transfer.
+        let (result, lines) = restart(&forge, true, 1, &mut durable, false);
+        result.unwrap();
+        assert!(lines[0].starts_with("reconciled "), "{failure}: {lines:?}");
+        assert!(lines[1].starts_with("transferred cgwalters-forge/tracker#2 "));
+        assert_eq!(*forge.transfer_ids.borrow(), ["issue-1", "issue-2"]);
+        let journal: Journal = serde_json::from_slice(&durable).unwrap();
+        assert_eq!(journal.receipts.len(), 2);
+        for (id, number) in [("issue-1", 99), ("issue-2", 100)] {
+            assert_eq!(
+                journal.receipts[id].canonical.as_deref(),
+                Some(format!("https://github.com/cgwalters-forge/bootc/issues/{number}").as_str())
+            );
+        }
+        restart(&forge, true, 2, &mut durable, false).0.unwrap();
+        assert_eq!(*forge.transfer_ids.borrow(), ["issue-1", "issue-2"]);
     }
 }
 
