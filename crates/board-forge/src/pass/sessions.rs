@@ -26,6 +26,8 @@ use crate::session_apply::{self, Outcome};
 
 mod activity;
 
+const REPAIR: &str = "The board pass asks a triage run to repair this session anchor.";
+
 #[cfg(test)]
 pub(super) fn activity_query() -> String {
     activity::query()
@@ -662,6 +664,18 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             let (plan, from) = match plan::newest_plan(&weighed, &writers) {
                 Ok(newest) => newest,
                 Err(error) => {
+                    if config.operator_questions_only
+                        && plan::repairable(&weighed, &writers, &config.bot, PLAN_FENCE).is_some()
+                    {
+                        if !self.session_admitted(sessions, repo, eligible, (free, remaining)) {
+                            return Ok(None);
+                        }
+                        let intro = format!("{}: {error:#}", plan::INVALID_REPLAN);
+                        let step =
+                            self.triage((facts, comments), &intro, (snapshot, target, slots));
+                        self.client.bounds.end_start();
+                        return Ok(self.session_repair_step(facts, step?));
+                    }
                     let why = format!(
                         "its newest plan cannot be used: {error:#}; a person replaces it, or the next day's session supersedes it"
                     );
@@ -670,7 +684,25 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 }
             };
             let id = plan::plan_id(from)?;
-            if plan.kind != SESSION_KIND {
+            if plan.kind != SESSION_KIND
+                && !(config.operator_questions_only
+                    && self.session_repaired(comments, from, due)?)
+            {
+                if config.operator_questions_only {
+                    if !self.session_admitted(sessions, repo, eligible, (free, remaining)) {
+                        return Ok(None);
+                    }
+                    let step = if plan.kind == "triage" {
+                        // Recorded repairs keep their normal verdict/cooldown
+                        // lifecycle, rather than becoming another repair per pass.
+                        self.consider(facts, board, slots, snapshot, target)
+                    } else {
+                        self.triage((facts, comments), REPAIR, (snapshot, target, slots))
+                    };
+                    // A repair start is over, like a session start below.
+                    self.client.bounds.end_start();
+                    return Ok(self.session_repair_step(facts, step?));
+                }
                 let why = format!(
                     "its newest plan {id} is for {}, not a session; a person moves it, and its session waits",
                     plan.kind
@@ -678,63 +710,44 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
                 return Ok(None);
             }
-            let held = batch::held(&self.client, comments, &writers, &id, anchor)?;
-            let Some(&(record_id, record)) = held.first() else {
-                let why = format!(
-                    "its session plan {id} has no dispatch record; a person dispatches it by hand or removes it, and its session waits"
-                );
-                self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
-                return Ok(None);
-            };
-            if !eligible {
-                self.line(format!(
-                    "session {repo}: last started at {}, {}; no new session due",
-                    sweep::stamp(record.created),
-                    record.url,
-                ));
+            if plan.kind == SESSION_KIND {
+                let held = batch::held(&self.client, comments, &writers, &id, anchor)?;
+                let Some(&(record_id, record)) = held.first() else {
+                    let why = format!(
+                        "its session plan {id} has no dispatch record; a person dispatches it by hand or removes it, and its session waits"
+                    );
+                    self.held(facts, Hold::new(HoldKind::NeedsOperator, why));
+                    return Ok(None);
+                };
+                if !eligible {
+                    self.line(format!(
+                        "session {repo}: last started at {}, {}; no new session due",
+                        sweep::stamp(record.created),
+                        record.url,
+                    ));
+                }
+                // Apply the existing answer independently of replacement admission:
+                // a due session deferred by maxStarts or pace must not lose its batch.
+                // Preserve the existing once-per-day batch mutation boundary,
+                // even when minHours permits multiple session starts in a day.
+                // An expired foreign-edit hold still gives way to a due
+                // replacement, as before; it cannot authorize an old batch.
+                if !eligible || session_apply::answer(comments, &writers, record_id).is_ok() {
+                    self.batch(
+                        sessions,
+                        anchor,
+                        facts,
+                        comments,
+                        (record_id, sessions.due(record.created)?),
+                        board,
+                    )?;
+                }
+                if !eligible {
+                    return Ok(None);
+                }
             }
-            // Apply the existing answer independently of replacement admission:
-            // a due session deferred by maxStarts or pace must not lose its batch.
-            // Preserve the existing once-per-day batch mutation boundary,
-            // even when minHours permits multiple session starts in a day.
-            // An expired foreign-edit hold still gives way to a due
-            // replacement, as before; it cannot authorize an old batch.
-            if !eligible || session_apply::answer(comments, &writers, record_id).is_ok() {
-                self.batch(
-                    sessions,
-                    anchor,
-                    facts,
-                    comments,
-                    (record_id, sessions.due(record.created)?),
-                    board,
-                )?;
-            }
-            if !eligible {
-                return Ok(None);
-            }
         }
-        if !eligible {
-            return Ok(None);
-        }
-        if remaining == 0 {
-            self.line(format!(
-                "session {repo}: sessions.maxStarts={} reached; it waits for the next pass",
-                sessions.max_starts
-            ));
-            return Ok(None);
-        }
-        if free == 0 {
-            self.line(format!("session {repo}: no slot free; it waits"));
-            return Ok(None);
-        }
-        // Not a failure of its own, as for the sweep.
-        if Instant::now() > self.client.bounds.admit_by {
-            let limit = PASS_SECONDS_LIMIT;
-            self.line(format!("session {repo}: the pass ran past {limit} seconds"));
-            return Ok(None);
-        }
-        if let Some(why) = self.budget_hold(1.0) {
-            self.line(format!("session {repo}: budget: {why}"));
+        if !self.session_admitted(sessions, repo, eligible, (free, remaining)) {
             return Ok(None);
         }
         let pool = match self.pool(snapshot, config.triage_pools(), slots) {
@@ -767,6 +780,97 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
             step => Some(step),
         })
+    }
+
+    /// The newest recorded controller repair whose run has ended (the
+    /// caller checks busy slots) and produced a verdict or the bot's
+    /// replacement plan, with no architectural question outstanding since,
+    /// is complete. On a later session day, supersede its ordinary
+    /// triage/implement plan with our own session plan, never dispatch the
+    /// agent's plan as a session. An older repair authorizes nothing.
+    fn session_repaired(
+        &self,
+        comments: &[plan::Comment],
+        newest: &plan::Comment,
+        due: OffsetDateTime,
+    ) -> Result<bool> {
+        let bot = self.config.bot.as_str();
+        let unedited = |c: &plan::Comment| {
+            plan::written_by(c, bot) && !c.edited && c.editor.is_none() && !run_output(&c.body)
+        };
+        let Some(repair) = comments.iter().rev().find(|c| {
+            unedited(c) && (c.body.starts_with(REPAIR) || c.body.starts_with(plan::INVALID_REPLAN))
+        }) else {
+            return Ok(false);
+        };
+        let Ok((plan, _)) = plan::newest_plan(std::slice::from_ref(repair), &[bot]) else {
+            return Ok(false);
+        };
+        if plan.kind != "triage" {
+            return Ok(false);
+        }
+        let records = plan::records(comments, &[bot], &plan::plan_id(repair)?);
+        let Some(record) = (records.into_iter().map(|(_, r)| r)).rfind(|record| {
+            !run_output(&record.body) && record.created >= repair.changed && record.created < due
+        }) else {
+            return Ok(false);
+        };
+        let later: Vec<_> = (comments.iter())
+            .filter(|c| c.created > record.created)
+            .cloned()
+            .collect();
+        Ok(match self.newest_verdict(&later) {
+            Some((_, c, _)) => !operator_question(&c.body, false),
+            None => newest.changed > record.created && plan::written_by(newest, bot),
+        })
+    }
+
+    fn session_repair_step(&mut self, facts: &Facts, step: Step) -> Option<Step> {
+        match step {
+            Step::Hold(held) => {
+                self.held(facts, held);
+                None
+            }
+            Step::Stop(why, _) => {
+                self.line(format!("session {}: {why}", facts.issue.repository));
+                None
+            }
+            step => Some(step),
+        }
+    }
+
+    /// All session-owned starts, including plan repair, share this admission.
+    fn session_admitted(
+        &mut self,
+        sessions: &Sessions,
+        repo: &str,
+        eligible: bool,
+        (free, remaining): (usize, usize),
+    ) -> bool {
+        if !eligible {
+            return false;
+        }
+        if remaining == 0 {
+            self.line(format!(
+                "session {repo}: sessions.maxStarts={} reached; it waits for the next pass",
+                sessions.max_starts
+            ));
+            return false;
+        }
+        if free == 0 {
+            self.line(format!("session {repo}: no slot free; it waits"));
+            return false;
+        }
+        if Instant::now() > self.client.bounds.admit_by {
+            let limit = PASS_SECONDS_LIMIT;
+            self.line(format!("session {repo}: the pass ran past {limit} seconds"));
+            return false;
+        }
+        if let Some(why) = self.budget_hold(1.0) {
+            self.line(format!("session {repo}: budget: {why}"));
+            return false;
+        }
+        true
     }
 
     /// What a session's batch may touch, from the caller's configuration

@@ -1829,7 +1829,7 @@ impl NeedsYou {
     /// hold's card on such an approval, unjoined, is left out too. `holds`
     /// are the snapshot's, whose [`Published::releases`] a hold's card
     /// unblocks.
-    pub(super) fn rank_act_now(&mut self, holds: &[Published]) {
+    pub(super) fn rank_act_now(&mut self, holds: &[Published], priority_order: bool) {
         let ready = |key: &str| {
             (self.approval_evidence.as_ref())
                 .and_then(|e| e.items.get(key))
@@ -1873,9 +1873,35 @@ impl NeedsYou {
             })
             .collect();
         // Stable: equal counts keep the list's Priority, then age, order.
-        rows.sort_by_key(|r| std::cmp::Reverse(r.unblocks));
+        if !priority_order {
+            rows.sort_by_key(|r| std::cmp::Reverse(r.unblocks));
+        }
         rows.truncate(MAX_ACT_NOW);
         self.act_now = Some(rows);
+    }
+
+    /// The operator's focus and board priority outrank estimated unblock counts.
+    pub(super) fn focus_priority_order(&mut self, focused: &BTreeSet<String>, options: &[String]) {
+        self.items.sort_by_key(|ask| {
+            let priority = ask
+                .priority
+                .as_ref()
+                .and_then(|p| options.iter().position(|o| o == p));
+            (!focused.contains(&ask.key), priority.unwrap_or(usize::MAX))
+        });
+        let order: BTreeMap<_, _> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(n, a)| (a.key.clone(), n))
+            .collect();
+        self.identities
+            .sort_by_key(|i| order.get(&i.detail_key).copied().unwrap_or(usize::MAX));
+        self.requests
+            .sort_by_key(|r| order.get(&r.key).copied().unwrap_or(usize::MAX));
+        if let Some(rows) = &mut self.act_now {
+            rows.sort_by_key(|r| order.get(&r.key).copied().unwrap_or(usize::MAX));
+        }
     }
 }
 
@@ -1981,7 +2007,7 @@ pub fn one_line(text: &str, limit: usize) -> Option<String> {
 
 /// The pull request `OWNER/REPO#N` whose approval a hold's `reason` waits
 /// on ([`APPROVE_PREFIX`]).
-fn approval_of(reason: &str) -> Option<&str> {
+pub(super) fn approval_of(reason: &str) -> Option<&str> {
     reason
         .strip_prefix(APPROVE_PREFIX)?
         .strip_suffix(APPROVE_SUFFIX)
@@ -5915,7 +5941,7 @@ mod tests {
             ..reading(&on, &options)
         };
         let mut list = needs_you(&board, None, &reading);
-        list.rank_act_now(&board.holds);
+        list.rank_act_now(&board.holds, false);
         list
     }
 
@@ -5923,6 +5949,27 @@ mod tests {
     /// first and then in the list's order, at most [`MAX_ACT_NOW`], each
     /// joined to its card; the shared fixture is its publication. Off, the
     /// field is absent; a card [`fit`] leaves out takes its record along.
+    #[test]
+    fn operator_questions_order_focus_then_board_priority_before_shortlisting() {
+        let mut list = act_now_list(15);
+        let focused = list.items.iter_mut().find(|a| a.key == "o/t#54").unwrap();
+        focused.chain.top_epic = "o/epics#1".into();
+        list.focus_priority_order(
+            &BTreeSet::from(["o/t#54".into()]),
+            &options(&["P0", "P1", "P2", "P3"]),
+        );
+        assert_eq!(list.items[0].key, "o/t#54");
+        let priorities: Vec<_> = list.items[1..]
+            .iter()
+            .filter_map(|a| a.priority.as_deref())
+            .collect();
+        assert!(priorities.windows(2).all(|p| p[0] <= p[1]));
+        list.rank_act_now(&[], true);
+        let rows = list.act_now.unwrap();
+        assert_eq!(rows.len(), MAX_ACT_NOW);
+        assert_eq!(rows[0].key, "o/t#54");
+    }
+
     #[test]
     fn act_now_ranks_decisions_by_what_they_unblock() {
         let list = act_now_list(0);

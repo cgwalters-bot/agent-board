@@ -5560,6 +5560,7 @@ fn invalid_bot_plan_replans_once() {
     for case in [
         "off",
         "bot",
+        "operator-questions-only",
         "operator",
         "foreign-edit",
         "twice",
@@ -5586,8 +5587,11 @@ fn invalid_bot_plan_replans_once() {
             "editor": if case == "foreign-edit" {json!({"login":"visitor"})} else {Value::Null}}));
         let mut forge = Forge::new(None, false);
         forge.replay = without_epics(replay);
-        let settings =
-            config(json!({"replanInvalid": case != "off", "triage": case != "triage-off"}));
+        assignments(&mut forge.replay, 446, &[], &[]);
+        let settings = config(
+            json!({"replanInvalid": !["off", "operator-questions-only"].contains(&case),
+            "operatorQuestionsOnly": case == "operator-questions-only", "triage": case != "triage-off"}),
+        );
         let limits = Limits {
             dispatch: if case == "cap" { Some(0) } else { None },
             ..Limits::default()
@@ -5596,11 +5600,11 @@ fn invalid_bot_plan_replans_once() {
         assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
         assert_eq!(
             forge.dispatches().len(),
-            usize::from(case == "bot"),
+            usize::from(["bot", "operator-questions-only"].contains(&case)),
             "{case}: {:?}",
             report.lines
         );
-        if case == "bot" {
+        if ["bot", "operator-questions-only"].contains(&case) {
             let writes = forge.writes.borrow();
             let body = writes
                 .iter()
@@ -10284,6 +10288,271 @@ fn board_labelled(replay: &mut Replay, label: &str) {
 /// the bot's assignment (or before it), whether the issue is labelled, the
 /// write limit, what tracker#446's line contains, the hold writes and
 /// whether it was triaged again.
+#[test]
+fn operator_questions_only_routes_engineering_to_triage() {
+    for (name, body, assignment, cap, triaged, released) in [
+        (
+            "generic verdict",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            None,
+            None,
+            true,
+            false,
+        ),
+        (
+            "technical decision",
+            "**Decision needed:** Which parser should we use?\n```schedule-triage\n{\"verdict\":\"needs-design\"}\n```",
+            None,
+            None,
+            true,
+            false,
+        ),
+        (
+            "architectural question",
+            "**Decision needed:** Should deployments share one trust domain?\n```schedule-triage\n{\"verdict\":\"needs-operator\",\"operator\":\"architecture\"}\n```",
+            None,
+            None,
+            false,
+            false,
+        ),
+        (
+            "architecture without question",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\",\"operator\":\"architecture\"}\n```",
+            None,
+            None,
+            true,
+            false,
+        ),
+        (
+            "bot assignment",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            Some("cgwalters-bot"),
+            None,
+            true,
+            true,
+        ),
+        (
+            "operator assignment",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            Some("cgwalters"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "same bot without pass receipt",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            Some("cgwalters-bot"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "run output receipt",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            Some("cgwalters-bot"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "receipt naming no verdict",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            Some("cgwalters-bot"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "authentic label receipt",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            Some("cgwalters-bot"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "label receipt after verdict and assignment",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            Some("cgwalters-bot"),
+            None,
+            true,
+            false,
+        ),
+        (
+            "cleanup capped",
+            "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```",
+            Some("cgwalters-bot"),
+            Some(0),
+            false,
+            false,
+        ),
+    ] {
+        let settings = outside_harness(config(
+            json!({"operatorQuestionsOnly": true, "assignHolds": true, "triageFollowUpDays": 3}),
+        ));
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        answered(
+            &forge,
+            ("cgwalters-bot", None),
+            body,
+            if name == "authentic label receipt" {
+                0
+            } else {
+                -1
+            },
+        );
+        let verdict = forge.ids.get();
+        let url =
+            format!("https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-{verdict}");
+        let receipt = format!(
+            "{}\n\n[This triage verdict]({url}) waits on cgwalters: assigned to cgwalters; any response of theirs releases it.",
+            hold_marker(verdict)
+        );
+        let receipt = match name {
+            "bot assignment" | "cleanup capped" => Some(receipt),
+            "authentic label receipt" | "label receipt after verdict and assignment" => {
+                Some(format!(
+                    "{}\n\n[This triage verdict]({url}) waits on cgwalters: labelled needs-human; a comment, then the label taken off, releases it.",
+                    hold_marker(verdict)
+                ))
+            }
+            // An agent's safe output, posted as the bot, can carry the marker.
+            "run output receipt" => Some(format!(
+                "{receipt}\n\n{}dispatch, id: 1 -->",
+                crate::poll::RUN_MARKER
+            )),
+            "receipt naming no verdict" => {
+                Some(format!("{}\nThe operator was assigned.", hold_marker(42)))
+            }
+            _ => None,
+        };
+        if let Some(receipt) = receipt {
+            answered(&forge, ("cgwalters-bot", None), &receipt, 0);
+        }
+        let events: Vec<_> = assignment
+            .map(|actor| ("AssignedEvent", actor, 0))
+            .into_iter()
+            .collect();
+        assignments(
+            &mut forge.replay,
+            446,
+            &events,
+            if assignment.is_some() {
+                &["cgwalters"]
+            } else {
+                &[]
+            },
+        );
+        let report = apply_limited(
+            &forge,
+            &settings,
+            Limits {
+                writes: cap,
+                ..Limits::default()
+            },
+        );
+        assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+        assert_eq!(
+            !forge.dispatches().is_empty(),
+            triaged,
+            "{name}: {:?}",
+            report.lines
+        );
+        let writes = forge.writes.borrow();
+        assert!(
+            !writes
+                .iter()
+                .any(|(method, url, _)| method == "POST" && url.ends_with("/assignees")),
+            "{name}"
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .any(|(method, url, _)| method == "DELETE" && url.ends_with("/assignees")),
+            released,
+            "{name}"
+        );
+        if released {
+            assert!(
+                writes.iter().any(|(_, _, body)| body["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("Engineering work belongs to agent triage"))),
+                "{name}"
+            );
+        }
+    }
+    assert!(!config(json!({})).operator_questions_only);
+}
+
+/// With `readFreeHolds` and no `assignHolds`, an unanswered needs-human label
+/// still reaches the release, and an explicit approval label stays the
+/// operator's ask without a Decision needed summary or a review source.
+#[test]
+fn operator_questions_only_label_release_and_approval_holds() {
+    let verdict = "```schedule-triage\n{\"verdict\":\"needs-operator\"}\n```";
+    for read_free in [false, true] {
+        let settings = outside_harness(config(json!({"operatorQuestionsOnly": true,
+            "readFreeHolds": read_free, "triageFollowUpDays": 3})));
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        board_labelled(&mut forge.replay, NEEDS_HUMAN);
+        answered(&forge, ("cgwalters-bot", None), verdict, 0);
+        assignments(&mut forge.replay, 446, &[], &[]);
+        let report = apply(&forge, &settings);
+        assert_eq!(report.failures, 0, "{read_free}: {:?}", report.lines);
+        let writes = forge.writes.borrow();
+        assert!(
+            writes.iter().any(|(method, url, _)| method == "DELETE"
+                && url.ends_with(&format!("/labels/{NEEDS_HUMAN}"))),
+            "{read_free}: {:?}",
+            report.lines
+        );
+        assert!(!forge.dispatches().is_empty(), "{read_free}");
+    }
+
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    board_labelled(&mut forge.replay, OPERATOR_APPROVAL_LABEL);
+    for entry in &mut forge.replay.requests {
+        let nodes = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+        for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+            node["content"]["closedByPullRequestsReferences"] = json!({"nodes": [{"number": 999,
+                "state": "OPEN", "repository": {"nameWithOwner": "cgwalters-forge/tracker"},
+                "author": {"login": "cgwalters-bot"}}], "totalCount": 1});
+        }
+    }
+    assignments(&mut forge.replay, 446, &[], &[]);
+    for (path, body) in [
+        ("user", json!({"login": "cgwalters-bot"})),
+        ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
+    ] {
+        forge
+            .replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+            "answer": {"status": 200, "link": null, "body": body}}));
+    }
+    let settings = config(json!({"operatorQuestionsOnly": true,
+        "holds": {"repository": "cgwalters-forge/bot-ops", "issue": 1, "needsYou": true}}));
+    let report = apply(&forge, &settings);
+    let body = forge
+        .holds_publication()
+        .unwrap_or_else(|| panic!("{:?}", report.lines));
+    let published = holds::parse(&body).unwrap();
+    let items = published["needs_you"]["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|row| row["item"] == "cgwalters-forge/tracker#446"
+                && row["ask"] == "approve pull request cgwalters-forge/tracker#999 to merge"),
+        "{:#?}\n{:?}",
+        published["needs_you"],
+        report.lines
+    );
+}
+
 #[test]
 fn assign_holds_wait_on_the_operator() {
     let assigned = ("AssignedEvent", "cgwalters-bot", 1);
@@ -24642,6 +24911,169 @@ fn sessions_wait_on_the_anchors_plan_or_a_person() {
         [format!("held by --max-dispatch: {SESSION_START}")]
     );
     assert!(forge.dispatches().is_empty());
+}
+
+#[test]
+fn operator_questions_current_evidence_supersedes_old_questions() {
+    let comment = |body: &str, author: &str, day| {
+        plan::comment(
+            &json!({"url":"https://github.com/o/r/issues/1#issuecomment-1",
+            "body":body, "author":{"login":author}, "editor":null,
+            "createdAt":format!("2026-10-{day:02}T00:00:00Z"), "lastEditedAt":null}),
+        )
+        .unwrap()
+    };
+    let body = comment(
+        "Q: Which compatibility policy should we promise?",
+        "operator",
+        20,
+    );
+    assert!(
+        current_question(Some(&body), &[], "operator", "bot")
+            .question
+            .is_some()
+    );
+    for (text, author, expected) in [
+        ("Use the existing compatibility policy.", "operator", false),
+        (
+            "```schedule-triage\n{\"verdict\":\"ready\"}\n```",
+            "bot",
+            false,
+        ),
+        (
+            "<!-- agent-board-hold: verdict 1 -->\nAssigned to the operator.",
+            "bot",
+            true,
+        ),
+        ("Please pick a design.", "stranger", true),
+    ] {
+        let newer = comment(text, author, 21);
+        assert_eq!(
+            current_question(Some(&body), &[newer], "operator", "bot")
+                .question
+                .is_some(),
+            expected,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn operator_questions_only_triages_wrong_kind_session_plan() {
+    let mut forge = session_forge(None);
+    anchor_plan(&mut forge.replay, "implement", "cgwalters", None);
+    let mut settings = session_settings();
+    settings["operatorQuestionsOnly"] = json!(true);
+    let report = preview(&config(settings), &forge.replay);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.contains("start triage cgwalters-forge/agent-board#40")),
+        "{:?}",
+        report.lines
+    );
+    assert!(!report.holds.iter().any(|h| h.hold.operator));
+
+    for (wip, expected) in [
+        (12, "sessions.maxStarts=1 reached"),
+        (1, "2 of 1 runs active"),
+    ] {
+        let mut settings = session_settings();
+        settings["operatorQuestionsOnly"] = json!(true);
+        settings["wip"] = json!(wip);
+        settings["sessions"]["issues"] = json!([
+            "cgwalters-forge/agent-board#40",
+            "cgwalters-forge/tracker#446"
+        ]);
+        settings["sessions"]["activity"] = json!({"threshold":1});
+        let report = preview(&config(settings), &forge.replay);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert!(
+            report.lines.iter().any(|line| line.contains(expected)),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|line| line.contains("start triage cgwalters-forge/agent-board#40")),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn operator_questions_session_repair_resumes_next_day() {
+    let plan = |kind: &str| {
+        format!(
+            "```{PLAN_FENCE}\n{}\n```",
+            json!({
+                "schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/agent-board", "item": 40,
+                "kind": kind, "runner": "hosted", "brief": "Repair is complete."
+            })
+        )
+    };
+    let question = "**Decision needed:** Which compatibility policy should we promise?\n```schedule-triage\n{\"verdict\":\"needs-operator\",\"operator\":\"architecture\"}\n```";
+    for output in ["plan", "verdict", "question", "replan-question", "none"] {
+        let mut forge = session_forge(None);
+        anchor_plan(&mut forge.replay, "implement", "cgwalters", None);
+        let mut settings = session_settings();
+        settings["operatorQuestionsOnly"] = json!(true);
+        settings["triageFollowUpDays"] = json!(3);
+        let settings = config(settings);
+        let report = apply(&forge, &settings);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        let comments = forge.comments_on("cgwalters-forge/agent-board", 40);
+        assert!(
+            comments.iter().any(|c| c.contains("\"kind\": \"triage\"")),
+            "{comments:?}"
+        );
+        // A replacement triage plan's own architectural question still
+        // waits on the operator after the repair it follows.
+        let bodies = match output {
+            "plan" => vec![plan("implement")],
+            "verdict" => vec!["```schedule-triage\n{\"verdict\":\"not-done\"}\n```".into()],
+            "question" => vec![question.into()],
+            "replan-question" => vec![plan("triage"), question.into()],
+            _ => vec![],
+        };
+        for ((id, at), body) in [(99, "2026-10-23T18:00:00Z"), (100, "2026-10-23T19:00:00Z")]
+            .into_iter()
+            .zip(&bodies)
+        {
+            anchor_comment(
+                &mut forge.replay,
+                id,
+                ("cgwalters-bot", None),
+                (at, at),
+                body,
+            );
+        }
+        forge.replay.now += time::Duration::hours(25);
+        let mut snapshot = usage(&mut forge.replay);
+        snapshot["updated_at"] = forge.replay.now.format(&Rfc3339).unwrap().into();
+        set_usage(&mut forge.replay, &snapshot);
+        let report = apply(&forge, &settings);
+        assert_eq!(report.failures, 0, "{output}: {:?}", report.lines);
+        assert_eq!(
+            report.lines.iter().any(|l| l.starts_with(SESSION_START)),
+            matches!(output, "plan" | "verdict"),
+            "{output}: {:?}",
+            report.lines
+        );
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("start implement cgwalters-forge/agent-board#40")),
+            "{:?}",
+            report.lines
+        );
+    }
 }
 
 #[test]

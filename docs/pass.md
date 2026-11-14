@@ -10,6 +10,53 @@ layer. Existing [PR follow-up](poll.md),
 [job-plan](job-plans.md) and [epic-plan](epic-plans.md) protocols remain the
 authority for their operations. The differences below are intentional.
 
+## Operator questions, not engineering parking
+
+The concrete failure is a bot parking engineering work on the operator with an
+assignment or a fallback “decide what this verdict asks” card. On GitHub,
+`operatorQuestionsOnly: true` opts into agent-owned engineering decisions; it is
+off by default. It never assigns the operator. Generic `needs-operator` and
+`needs-design` verdicts return to triage; malformed bot plans use the existing
+one-repair path even without `replanInvalid`, and a session anchor carrying a
+different kind of plan goes to triage rather than asking a person to move it.
+Once that recorded repair run ends with a replacement plan or a verdict without
+an operator question, the next eligible session day supersedes it with a
+controller-generated session. The agent's implement plan is not dispatched on
+the session anchor; a repair without output retains normal triage follow-up.
+
+An issue hold enters needs-you only with a trusted, explicit question: a summary
+written and last edited by the operator, or a bot summary whose `schedule-triage`
+fence has `"operator":"architecture"`. Use the existing **Decision needed:**
+line for the concrete question. Known generic fallback wording is not a question.
+The pass does not classify arbitrary issue prose as architectural. Generated hold
+receipts cannot replace that source evidence. Review approvals and configured
+decision/proposal inboxes retain their existing explicit decision protocols.
+
+Existing pass-owned assignments without such a question are unassigned, with a
+comment recording why; operator-made and other controllers' assignments are
+untouched. Ownership requires an unedited bot receipt explicitly recording the
+assignment of this operator, linked to an unedited bot verdict no newer than the
+assignment. Label receipts and agent run output cannot prove ownership, and a
+newer assignment invalidates an older receipt. Unquestioned
+`needs-human` labels return to planning instead of becoming assignments. Cleanup
+uses the existing per-pass release and write caps, authenticated assignment
+timeline and complete comment reads; unknown ownership never authorizes cleanup.
+No new credentials, permissions or agent mutation path are introduced. Starts,
+including repair and triage, keep the existing WIP, pool and dispatch bounds.
+
+Needs-you and Act now rank the configured focus epic (including its descendants)
+first, then board Priority, with existing stable tie-breaks. This ordering happens
+before the ten-card Act now limit. Summary reads use the existing publication
+share; unread question evidence is omitted, and the list is incomplete, rather
+than falling back to an engineering reason. This does not make the bounded
+inventory a complete inbox.
+
+Caller: `cgwalters-forge/tracker`, `.github/pass.json`, set
+`operatorQuestionsOnly` to `true`. Keep `triage` enabled, configure `triagePools`
+or `planPools`, and include `architecture` in the existing `operatorAsk.domains`
+when using that brief policy. No deployed caller or live assignments are changed
+by this patch.
+
 ## Local configuration defaults
 
 From the root of a trusted caller checkout, `agent-board pass` reads
