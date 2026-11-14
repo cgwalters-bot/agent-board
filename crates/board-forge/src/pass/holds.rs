@@ -132,6 +132,8 @@ pub enum HoldKind {
     WaitingOn,
     /// The bot's or the operator's pull request that closes it is open.
     PrOpen,
+    /// Repository has reached its opt-in open bot PR cap.
+    OpenPrCap,
     /// A run is in flight on it.
     InFlight,
     /// Its plan's run has ended, or an epic's planning request waits for
@@ -190,6 +192,7 @@ impl HoldKind {
             Self::Blocked => "blocked",
             Self::WaitingOn => "waiting-on",
             Self::PrOpen => "pr-open",
+            Self::OpenPrCap => "open-pr-cap",
             Self::InFlight => "in-flight",
             Self::Dispatched => "dispatched",
             Self::TriageCooldown => "triage-cooldown",

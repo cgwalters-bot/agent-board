@@ -602,6 +602,9 @@ pub struct Config {
     /// epics name, which it follows first, and never merges in those it
     /// adds ([`authored`]).
     pub authored: Option<usize>,
+    /// Off unless set: hold new implements at this many open bot PRs in
+    /// their destination repository, and land overlapping PRs oldest first.
+    pub open_pr_cap: Option<usize>,
     /// Off by default: keep a larger scheduling share before the maintain
     /// and PR sweeps and epic discovery can consume it.
     #[serde(default)]
@@ -1387,6 +1390,17 @@ impl Config {
         } else {
             crate::forgejo::Naming::Github
         };
+        if let Some(cap) = self.open_pr_cap {
+            ensure!(
+                (1..=pressure::CAP_LIMIT).contains(&cap),
+                "openPrCap must be 1 to {}",
+                pressure::CAP_LIMIT
+            );
+            ensure!(
+                self.forgejo_board().is_none(),
+                "openPrCap supports GitHub only"
+            );
+        }
         if self.issue_intake {
             ensure!(
                 self.github_board().is_some(),
@@ -1958,6 +1972,7 @@ impl Config {
     /// or without one by the published snapshot.
     pub fn poll(&self, snapshot: Option<&Value>) -> poll::Config {
         let mut policy = PollPolicy {
+            open_pr_cap: self.open_pr_cap,
             fix_caller_workflow: Some(self.dispatch_workflow.clone()),
             assign_holds: self.assign_holds,
             merge_authors: self.pr.merge_authors.clone(),
@@ -3891,6 +3906,9 @@ impl<C: Broker> Broker for Budget<'_, C> {
 /// stages 3 and 4's holds as data, whose lines are among `lines`.
 #[derive(Default)]
 pub struct Report {
+    /// Complete repository PR counts, or a failed read; absent when disabled.
+    pub open_pr_counts: RefCell<BTreeMap<String, Option<usize>>>,
+    pub open_pr_cap: Option<usize>,
     /// This pass's bounded upstream issue reads, keyed by the fork issue.
     pub upstreams: RefCell<crate::upstream::Observations>,
     pub issue_intake: BTreeMap<String, String>,
@@ -3983,8 +4001,17 @@ impl Report {
         } else {
             format!(", triages skipped {}", json!(*self.triage_skipped.borrow()))
         };
+        let pressure = self
+            .open_pr_cap
+            .map(|cap| {
+                format!(
+                    ", open bot PRs {}/cap {cap}",
+                    json!(*self.open_pr_counts.borrow())
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "{}, {}, starts {}, comments created {}, edited {}{not_ready}{planned}{skipped}",
+            "{}, {}, starts {}, comments created {}, edited {}{not_ready}{planned}{skipped}{pressure}",
             self.summary,
             self.spent,
             json!(self.effects.starts),
@@ -5312,6 +5339,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// it started.
     fn follow(&mut self, mut state: State, git_ref: &str, earlier: usize) -> usize {
         let config = self.config;
+        self.report.open_pr_cap = config.open_pr_cap;
         let bounds = self.client.bounds;
         let later_share = bounds.kept.get();
         if config.notifications {
@@ -5673,6 +5701,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     fn finish_follow(&mut self, outcome: poll::Outcome) -> usize {
+        self.report.open_pr_counts.borrow_mut().extend(
+            outcome
+                .open_pr_counts
+                .iter()
+                .map(|(r, n)| (r.clone(), Some(*n))),
+        );
         if !self.apply {
             for step in &outcome.steps {
                 if step.ran
@@ -7619,6 +7653,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .accepted_plans
             .borrow_mut()
             .insert(issue.display(), plan.kind.clone());
+        if let Some(held) = self.pr_pressure(&dest.repository, &plan.kind) {
+            return Ok(Step::Hold(held));
+        }
         if let Some(run) = failed {
             return self.rerun(
                 (issue, &dest),
@@ -9830,6 +9867,7 @@ pub mod midstream;
 pub mod mix;
 pub mod needs;
 pub mod next;
+pub(crate) mod pressure;
 pub mod promote;
 mod pull_links;
 pub mod revisit;
