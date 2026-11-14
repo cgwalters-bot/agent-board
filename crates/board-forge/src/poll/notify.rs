@@ -86,9 +86,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// request, one that does not, within the lookback: what the operator
     /// says there is to it (agent-board#840). Except on a pull request the
     /// walk reads, in a followed repository, whose rounds take the operator's
-    /// reviews, unless the poll's marker on it is a stop, as on the draft it
-    /// stopped following that the operator asked about. Intake routes those
-    /// questions to tracking-issue triage, not authorization to restart it.
+    /// reviews. Ordinary issue comments still belong to intake: waiting for
+    /// review approval does not handle an operator's question (#970). A stop
+    /// also admits reviews. Intake routes questions to tracking-issue triage,
+    /// not authorization to restart the pull request.
     pub(super) fn directs(
         &self,
         repo: &str,
@@ -106,6 +107,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
         !(pull && self.followed.contains(&repo.to_ascii_lowercase()))
+            || said.key.starts_with("issuecomment-")
             || find_marker(comments, bot).stopped
     }
 }
@@ -2914,11 +2916,100 @@ mod tests {
     /// (agent-board#840): a question on its pull request starts tracking-issue
     /// triage, on the draft the poll stopped following as on one it never
     /// followed, and one on its issue the plan, in our space or staged in
-    /// the midstream fork. The walk keeps the bot's followed pull requests
-    /// until it stops at them, as it did before; only a mention reaches those,
-    /// or someone else's item, and only the operator's. Nothing starts on a
+    /// the midstream fork. The walk keeps reviews on followed pull requests
+    /// until it stops at them; ordinary questions still reach intake.
+    /// Someone else's item needs the operator's own mention. Nothing starts on a
     /// comment older than the lookback, one the bot answered by hand, or one
     /// a pass before claimed.
+    #[test]
+    fn followed_pr_question_survives_an_exhausted_intake_turn() {
+        let repo = "upstream/app";
+        for search in [false, true] {
+            let fake = intake_github(repo, true, "comment", OPERATOR);
+            fake.rest
+                .borrow_mut()
+                .get_mut(&format!("{API_ROOT}repos/{repo}/issues/2"))
+                .unwrap()["user"]["login"] = BOT.into();
+            reword(&fake, repo, "Is there another mechanism? Research this");
+            let config = if search {
+                search_intake(&fake, repo)
+            } else {
+                intake_config()
+            };
+            let followed = vec![repo.to_owned()];
+            fake.page(&format!("repos/{repo}/events?per_page=100"), json!([]));
+            fake.page(
+                &format!("repos/{repo}/pulls?state=open&per_page=100"),
+                json!([]),
+            );
+            // Reproduce a PR waiting on somebody else's changes-requested review,
+            // without a poll stop marker. That review is not operator direction.
+            fake.page(
+                &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
+                json!([
+                    {"id": 20, "user": {"login": "reviewer"}, "state": "CHANGES_REQUESTED",
+                     "submitted_at": UPDATED, "body": "A blocker"}
+                ]),
+            );
+            let run = |state: State, phase| {
+                if !search {
+                    fake.page(
+                        &listing(state.notify_since.as_deref().unwrap_or(INTAKE_FIRST)),
+                        json!([thread("9001", repo, 2, true, "comment")]),
+                    );
+                }
+                run_capped(
+                    &fake,
+                    &fake,
+                    &config,
+                    state,
+                    (&[], &followed),
+                    Some(Apply {
+                        dispatcher: &fake,
+                        workflow: "dispatch.yml".into(),
+                        pools: vec![],
+                        git_ref: None,
+                    }),
+                    None,
+                    now(),
+                )
+                .unwrap_or_else(|error| panic!("search={search} {phase}: {error:#}"))
+            };
+            *fake.share_spent_at.borrow_mut() = Some(format!("repos/{repo}/issues/2/comments"));
+            let first = run(State::default(), "exhausted");
+            assert!(
+                first
+                    .lines
+                    .iter()
+                    .any(|line| line.contains("the share is spent")),
+                "{:?}",
+                first.lines
+            );
+            assert!(dispatches(&fake).is_empty());
+            assert!(marked(&fake).is_empty());
+            if search {
+                assert!(
+                    first
+                        .state
+                        .intake_waiting
+                        .contains_key(&format!("{repo}#2"))
+                );
+                // Search need not return it again: the saved retry owns it.
+                fake.page("search", json!({"items": [], "incomplete_results": false}));
+            }
+            fake.reset_share();
+            let second = run(first.state, "retry");
+            assert_eq!(second.errors, 0, "{:?}", second.lines);
+            assert_eq!(dispatches(&fake).len(), 1, "{:?}", second.lines);
+            assert_eq!(second.state.operator_direction.requests.len(), 1);
+            assert_eq!(marked(&fake).len(), usize::from(!search));
+            assert!(second.state.intake_waiting.is_empty());
+            let third = run(second.state, "settled");
+            assert_eq!(third.errors, 0, "{:?}", third.lines);
+            assert_eq!(dispatches(&fake).len(), 1);
+        }
+    }
+
     #[test]
     fn search_intake_admits_the_operators_unmentioned_comments_on_the_bots_items() {
         const ASKED: &str = "Why did this commit lose its authorship?";
@@ -2972,6 +3063,15 @@ mod tests {
                 OPERATOR,
                 ASKED,
                 &["followed"],
+                Some(("triage", DISPATCH)),
+            ),
+            (
+                "upstream/app",
+                true,
+                BOT,
+                OPERATOR,
+                ASKED,
+                &["followed", "review"],
                 None,
             ),
             (
@@ -3096,6 +3196,19 @@ mod tests {
                 if flags.contains(&"answered") {
                     comments.push(said(13, BOT, UPDATED, "The author was kept; see the log."));
                 }
+            }
+            if flags.contains(&"review") {
+                fake.page(
+                    &format!("repos/{repo}/issues/2/comments?per_page=100"),
+                    json!([]),
+                );
+                fake.page(
+                    &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
+                    json!([
+                        {"id": 11, "user": {"login": sender}, "submitted_at": UPDATED,
+                         "state": "CHANGES_REQUESTED", "body": body}
+                    ]),
+                );
             }
             fake.page(
                 &format!("repos/{repo}/pulls/2"),
