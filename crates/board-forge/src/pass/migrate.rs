@@ -572,6 +572,21 @@ fn association(body: &str, fork: &Fork) -> Result<Option<u64>> {
             .take_while(char::is_ascii_digit)
             .collect::<String>();
         ensure!(!digits.is_empty(), "malformed upstream issue reference");
+        // Do not turn a malformed path (42oops, 42/43, 42%30) into an
+        // association with issue 42. Allow query/fragment and prose/Markdown
+        // boundaries, but never silently truncate the issue path component.
+        let suffix = &tail[digits.len()..];
+        ensure!(
+            suffix.starts_with(['?', '#'])
+                || suffix
+                    .trim_start_matches(['.', ',', ';', ':', '!'])
+                    .chars()
+                    .next()
+                    .is_none_or(|c| {
+                        c.is_whitespace() || matches!(c, ')' | ']' | '>' | '\"' | '\'' | '`')
+                    }),
+            "malformed upstream issue reference: invalid suffix after issue number"
+        );
         let number = digits
             .parse::<u64>()
             .context("upstream reference overflow")?;
