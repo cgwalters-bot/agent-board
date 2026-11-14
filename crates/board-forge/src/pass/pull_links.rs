@@ -125,6 +125,11 @@ fn read(client: &(impl Rest + Transport), facts: &Facts) -> Result<Vec<PullLink>
         Some(Promotion::Open(pull)) => Some(pull),
         _ => None,
     }) {
+        // These facts were read before scheduling. A later timeline read may
+        // already show the PR closed or merged; do not reopen it in the ledger.
+        if links.contains_key(&(pull.repository.to_ascii_lowercase(), pull.number)) {
+            continue;
+        }
         insert(
             &mut links,
             &json!({"repository":{"nameWithOwner":pull.repository},
@@ -305,6 +310,33 @@ pub(super) mod tests {
                 ("up/r", 9, "MERGED"),
                 ("up/r", 10, "OPEN")
             ]
+        );
+    }
+
+    #[test]
+    fn timeline_state_wins_over_earlier_open_closing_and_promotion_facts() {
+        let replay = fixture(vec![page(
+            vec![pull("o/r", 2, "CLOSED"), pull("up/r", 10, "MERGED")],
+            false,
+            Value::Null,
+        )]);
+        let mut facts = super::super::tests::facts("o/r", 1, "2026-01-01T00:00:00Z");
+        facts.pulls.push(ClosingPull {
+            repository: "O/R".into(),
+            number: 2,
+            author: None,
+            updated: None,
+        });
+        facts.promotion = Some(Promotion::Open(ClosingPull {
+            repository: "up/r".into(),
+            number: 10,
+            author: None,
+            updated: None,
+        }));
+        let links = read(&replay, &facts).unwrap();
+        assert_eq!(
+            links.iter().map(|p| p.state.as_str()).collect::<Vec<_>>(),
+            ["CLOSED", "MERGED"]
         );
     }
 
