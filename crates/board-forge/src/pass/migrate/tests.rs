@@ -606,6 +606,26 @@ fn batch_recovery_restarts_from_durable_intent_before_advancing() {
         assert_eq!(durable, pending, "preview persisted recovery: {failure}");
         assert_eq!(*forge.transfer_ids.borrow(), ["issue-1"]);
 
+        // A successful readback is not a durable completion. Repeated process
+        // restarts with a broken journal must not advance to the next issue.
+        for _ in 0..2 {
+            let (result, lines) = restart(&forge, true, 1, &mut durable, true);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("disk full saving completion"),
+                "{failure}: {lines:?}"
+            );
+            assert_eq!(lines.len(), 1, "{failure}: {lines:?}");
+            assert!(lines[0].starts_with("reconciled "), "{failure}: {lines:?}");
+            assert_eq!(
+                durable, pending,
+                "failed recovery save persisted: {failure}"
+            );
+            assert_eq!(*forge.transfer_ids.borrow(), ["issue-1"], "{failure}");
+        }
+
         // Reconciliation consumes no transfer allowance: the one permitted
         // new write belongs to issue-2, never a duplicate issue-1 transfer.
         let (result, lines) = restart(&forge, true, 1, &mut durable, false);
