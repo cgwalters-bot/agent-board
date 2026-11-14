@@ -172,7 +172,7 @@ mod tests {
         std::fs::create_dir(&directory)?;
         let path = directory.join("journal.json");
         let mut value = serde_json::json!({"receipts":{"issue-1":{
-            "before":{"id":"issue-1","source":"owner/tracker","number":1,"body":"","title":"repair","updated":"now","board":{},"parent":null,"labels":[],"milestone":null},
+            "before":{"id":"issue-1","source":"owner/tracker","number":1,"body":"","title":"repair","updated":"now","board":{},"parent":null,"labels":[],"assignees":["user-1"],"milestone":null},
             "destination":"owner/fork","upstream":null,"canonical":null
         }}});
         for canonical in [

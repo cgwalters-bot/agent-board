@@ -22,6 +22,7 @@ fn node(number: u64) -> Value {
         "subIssues":{"totalCount":0},
         "milestone":null,
         "labels":{"nodes":[],"pageInfo":{"hasNextPage":false}},
+        "assignees":{"nodes":[{"id":"user-1"},{"id":"user-2"}],"pageInfo":{"hasNextPage":false}},
         "closedByPullRequestsReferences":{"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}},
         "timelineItems":{"nodes":[],"pageInfo":{"hasNextPage":false}},
         "projectItems":{"nodes":[{"id":format!("item-{number}"),"project":{"id":"board", "number":1,"owner":{"login":"cgwalters-forge"}},
@@ -54,6 +55,8 @@ struct Forge {
     stale: bool,
     children: Option<Value>,
     children_during_preflight: bool,
+    assignees: Option<Value>,
+    assignees_during_preflight: bool,
     count: u64,
     body: RefCell<String>,
 }
@@ -169,6 +172,12 @@ impl Transport for Forge {
             .unwrap();
         let mut node = node(number);
         node["body"] = json!(*self.body.borrow());
+        if let Some(assignees) = &self.assignees {
+            node["assignees"] = assignees.clone();
+        }
+        if self.assignees_during_preflight && self.snapshots.get() > 1 {
+            node["assignees"]["nodes"] = json!([]);
+        }
         if let Some(children) = &self.children {
             node["subIssues"] = children.clone();
         }
@@ -225,6 +234,12 @@ impl Transport for Forge {
             }
             if self.failure == "milestone" {
                 node["milestone"] = Value::Null;
+            }
+            match self.failure {
+                "assignees" => node["assignees"]["nodes"] = json!([]),
+                "assignees-replaced" => node["assignees"]["nodes"] = json!([{"id":"user-3"}]),
+                "assignees-unreadable" => node["assignees"] = Value::Null,
+                _ => node["assignees"]["nodes"].as_array_mut().unwrap().reverse(),
             }
         }
         if self.incomplete {
@@ -463,6 +478,9 @@ fn transfer_failures_reconcile_before_any_retry_and_preservation_failure_stops()
         "parent",
         "labels",
         "milestone",
+        "assignees",
+        "assignees-replaced",
+        "assignees-unreadable",
     ] {
         let forge = Forge {
             failure,
@@ -485,6 +503,70 @@ fn transfer_failures_reconcile_before_any_retry_and_preservation_failure_stops()
         assert_eq!(retry.is_ok(), success || failure == "readback");
         assert_eq!(forge.transfers.get(), 1, "{failure} retried a mutation");
     }
+}
+
+#[test]
+fn incomplete_assignees_hold_without_transfer() {
+    for assignees in [
+        Value::Null,
+        json!({"nodes":[]}),
+        json!({"nodes":[],"pageInfo":{"hasNextPage":true}}),
+        json!({"nodes":null,"pageInfo":{"hasNextPage":false}}),
+        json!({"nodes":[null],"pageInfo":{"hasNextPage":false}}),
+        json!({"nodes":[{"id":""}],"pageInfo":{"hasNextPage":false}}),
+    ] {
+        for apply in [false, true] {
+            let forge = Forge {
+                assignees: Some(assignees.clone()),
+                ..Default::default()
+            };
+            let mut journal = Journal::default();
+            let (result, lines) = execute(&forge, apply, 1, &mut journal);
+            result.unwrap();
+            assert!(lines[0].starts_with("hold "), "{lines:?}");
+            assert_eq!(forge.transfers.get(), 0);
+            assert!(journal.receipts.is_empty());
+        }
+    }
+    // An explicitly empty connection, unlike missing evidence, is valid.
+    let forge = Forge {
+        assignees: Some(json!({"nodes":[],"pageInfo":{"hasNextPage":false}})),
+        ..Default::default()
+    };
+    execute(&forge, true, 1, &mut Journal::default()).0.unwrap();
+    assert_eq!(forge.transfers.get(), 1);
+}
+
+#[test]
+fn assignee_change_during_preflight_stops_before_transfer_intent() {
+    let forge = Forge {
+        assignees_during_preflight: true,
+        ..Default::default()
+    };
+    let mut journal = Journal::default();
+    let (result, _) = execute(&forge, true, 1, &mut journal);
+    assert!(format!("{:#}", result.unwrap_err()).contains("stale source evidence"));
+    assert_eq!(forge.transfers.get(), 0);
+    assert!(journal.receipts.is_empty());
+}
+
+#[test]
+fn journal_without_assignee_evidence_is_not_treated_as_unassigned() {
+    let forge = Forge::default();
+    let mut journal = Journal::default();
+    execute(&forge, true, 1, &mut journal).0.unwrap();
+    let mut value = serde_json::to_value(journal).unwrap();
+    value["receipts"]["issue-1"]["before"]
+        .as_object_mut()
+        .unwrap()
+        .remove("assignees");
+    assert!(
+        serde_json::from_value::<Journal>(value)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("missing field `assignees`")
+    );
 }
 
 #[test]
