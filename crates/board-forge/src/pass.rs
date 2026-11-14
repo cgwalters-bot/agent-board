@@ -3264,6 +3264,38 @@ pub(crate) fn preview_reads<C, R>(
     })
 }
 
+/// Standalone promotion uses the configured pass share and keeps completed
+/// diagnostics when admission stops. Only typed budget exhaustion is deferred;
+/// transport, decoding and publication failures remain errors.
+pub(crate) fn promotion_reads<C: Rest + Transport>(
+    client: &C,
+    config: &Config,
+    read: impl FnOnce(&Budget<'_, C>, &mut Vec<String>) -> Result<()>,
+) -> Result<Vec<String>> {
+    let bounds = Bounds::new(
+        PASS_REQUEST_LIMIT,
+        Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
+    );
+    let mut lines = Vec::new();
+    size_request_share(client, config, &bounds, &mut lines);
+    match read(
+        &Budget {
+            inner: client,
+            bounds: &bounds,
+        },
+        &mut lines,
+    ) {
+        Ok(()) => {}
+        Err(error) if budget_spent(&error) => {
+            lines.push(format!(
+                "promote deferred: remaining work will be retried next run: {error:#}"
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(lines)
+}
+
 impl<C> Budget<'_, C> {
     fn publication_read(&self, key: &str) -> Option<KeptRead> {
         (self.bounds.stage.get() == Stage::Holds)
@@ -4170,23 +4202,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     let mut lines = Vec::new();
     // The budget first, before any request is spent of it: the read of the
     // headroom is free, so it goes around the bounds.
-    if let Some(share) = config.request_share {
-        let sized = Headroom::read(client).and_then(|headroom| {
-            let limit = headroom.share(share);
-            bounds.size(limit)?;
-            bounds
-                .graphql_limit
-                .set(Some(headroom.graphql.saturating_mul(share as u64) / 100));
-            Ok(headroom.line(share, limit))
-        });
-        lines.push(match sized {
-            Ok(line) => format!("budget: {line}"),
-            Err(error) => format!(
-                "warning: requestShare: the budget was not sized from the token's rate limit, so the fixed {} holds: {error:#}",
-                bounds.limit.get()
-            ),
-        });
-    }
+    size_request_share(client, config, bounds, &mut lines);
     let resolved = config.resolve(
         &Budget {
             inner: client,
@@ -4470,6 +4486,31 @@ fn kept_shares(config: &Config, bounds: &Bounds) -> (usize, usize) {
         (AFTER_PULL_REQUESTS, AFTER_EPICS)
     };
     (bounds.share(pulls), bounds.share(epics))
+}
+
+fn size_request_share(
+    client: &impl Rest,
+    config: &Config,
+    bounds: &Bounds,
+    lines: &mut Vec<String>,
+) {
+    if let Some(share) = config.request_share {
+        let sized = Headroom::read(client).and_then(|headroom| {
+            let limit = headroom.share(share);
+            bounds.size(limit)?;
+            bounds
+                .graphql_limit
+                .set(Some(headroom.graphql.saturating_mul(share as u64) / 100));
+            Ok(headroom.line(share, limit))
+        });
+        lines.push(match sized {
+            Ok(line) => format!("budget: {line}"),
+            Err(error) => format!(
+                "warning: requestShare: the budget was not sized from the token's rate limit, so the fixed {} holds: {error:#}",
+                bounds.limit.get()
+            ),
+        });
+    }
 }
 
 /// What the token has left of GitHub's primary rate limits until they reset

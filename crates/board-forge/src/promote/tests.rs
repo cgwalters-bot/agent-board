@@ -1621,6 +1621,7 @@ fn run(replay: Replay, config: &Config) -> (Result<Vec<String>>, Forge) {
 // staging evidence. The fake records every attempted mutation in order.
 struct PublishingForge {
     replay: Replay,
+    reads: RefCell<Vec<String>>,
     writes: RefCell<Vec<(String, String, Value)>>,
     fresh: Value,
     moved: bool,
@@ -1691,6 +1692,7 @@ impl rewrite::Rewrite for FakeRewrite {
 
 impl Rest for PublishingForge {
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        self.reads.borrow_mut().push(url.into());
         let value = if url == format!("{API}user") {
             Some(json!({"login":self.writer}))
         } else if url == format!("{API}repos/{REPO}/pulls/34") {
@@ -1771,6 +1773,7 @@ impl Rest for PublishingForge {
 
 impl Transport for PublishingForge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.reads.borrow_mut().push(format!("{API}graphql"));
         if query.contains("object(expression:$head)") {
             let head = variables["head"].as_str().unwrap();
             self.checked_heads.borrow_mut().push(head.to_owned());
@@ -1779,6 +1782,42 @@ impl Transport for PublishingForge {
                 .get(head)
                 .unwrap_or(&self.publication_checks);
             return Ok(json!({"repository":{"object":{"oid":head,"statusCheckRollup":checks}}}));
+        }
+        if query == awaiting::QUERY {
+            let url = format!(
+                "{API}repos/{REPO}/pulls?state=open&sort=created&direction=asc&per_page=100&page=1"
+            );
+            let pulls = self.replay.get(&url, None)?.body;
+            let mut nodes = Vec::new();
+            for pull in pulls.as_array().unwrap() {
+                let number = pull["number"].as_u64().unwrap();
+                let evidence = |path: &str| -> Result<Vec<Value>> {
+                    Ok(self
+                        .replay
+                        .get(
+                            &format!("{API}repos/{REPO}/{path}?per_page=100&page=1"),
+                            None,
+                        )?
+                        .body
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| {
+                            json!({
+                                "author": {"login":row["user"]["login"]}, "state":row["state"],
+                                "commit":{"oid":row["commit_id"]}, "body":row["body"]
+                            })
+                        })
+                        .collect())
+                };
+                nodes.push(json!({"number":number, "headRefOid":pull["head"]["sha"], "isDraft":pull["draft"],
+                    "author":{"login":pull["user"]["login"]},
+                    "reviews":{"pageInfo":{"hasPreviousPage":false},"nodes":evidence(&format!("pulls/{number}/reviews"))?},
+                    "comments":{"pageInfo":{"hasPreviousPage":false},"nodes":evidence(&format!("issues/{number}/comments"))?}}));
+            }
+            return Ok(
+                json!({"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":nodes}}}),
+            );
         }
         self.replay.graphql(query, variables)
     }
@@ -1792,6 +1831,7 @@ fn publication() -> (PublishingForge, Config) {
     let fresh = pull(&mut replay).clone();
     let forge = PublishingForge {
         replay,
+        reads: RefCell::new(vec![]),
         fresh,
         writes: RefCell::new(vec![]),
         moved: false,
@@ -1861,6 +1901,124 @@ fn with_second(forge: &mut PublishingForge) {
         .as_array_mut()
         .unwrap()
         .push(next);
+}
+
+fn request_share(replay: &mut Replay, config: &mut Config, limit: usize) {
+    config.request_share = Some(50);
+    replay
+        .requests
+        .push(json!({"request":{"get":format!("{API}rate_limit")},
+        "answer":{"status":200,"body":{"resources":{
+            "core":{"remaining":limit * 2,"reset":1800000000},
+            "graphql":{"remaining":limit * 2,"reset":1800000000}
+        }}}}));
+}
+
+#[test]
+fn approved_draft_is_published_without_spending_reads_on_waiting_drafts() {
+    let (mut forge, mut config) = publication();
+    config.promote.as_mut().unwrap().on_approval = true;
+    forge.fresh["draft"] = json!(true);
+    *pull(&mut forge.replay) = forge.fresh.clone();
+    *comments(&mut forge.replay) = json!([]);
+    sync_metadata(&mut forge.replay);
+    timeline(&mut forge.replay, json!([]));
+    let approved = forge.fresh.clone();
+    for number in 1..34 {
+        let mut waiting = approved.clone();
+        waiting["number"] = json!(number);
+        body(&mut forge.replay, "pulls?state=open")
+            .as_array_mut()
+            .unwrap()
+            .push(waiting);
+        for path in [
+            format!("pulls/{number}/reviews"),
+            format!("issues/{number}/comments"),
+        ] {
+            forge.replay.requests.push(
+                json!({"request":{"get":format!("{API}repos/{REPO}/{path}?per_page=100&page=1")},
+                "answer":{"status":200,"body":[]}}),
+            );
+        }
+    }
+    // Enough for the approved candidate, not 33 candidates' full gates.
+    request_share(&mut forge.replay, &mut config, 120);
+    let lines = apply(&forge, &config, forge.replay.now, 3).unwrap();
+    assert!(lines[0].starts_with("budget: requestShare"), "{lines:?}");
+    assert!(
+        lines[1].starts_with(&format!("promoted {REPO}#34")),
+        "{lines:?}"
+    );
+    assert_eq!(forge.writes.borrow().len(), 3);
+    assert!(forge.reads.borrow().len() < 120);
+    for number in 1..34 {
+        assert!(
+            !forge
+                .reads
+                .borrow()
+                .iter()
+                .any(|url| url.contains(&format!("/issues/{number}/"))
+                    || url.contains(&format!("/pulls/{number}/")))
+        );
+    }
+}
+
+#[test]
+fn publication_budget_defers_discovery_and_candidate_gates_without_failure() {
+    for limit in [0, 1, 2, 20, 40, 120] {
+        let (mut forge, mut config) = publication();
+        request_share(&mut forge.replay, &mut config, limit);
+        let lines = apply(&forge, &config, forge.replay.now, 3).unwrap();
+        let deferred = lines
+            .iter()
+            .any(|line| line.starts_with("promote deferred:"));
+        if limit < 40 {
+            assert!(deferred, "{limit}: {lines:?}");
+            assert!(forge.writes.borrow().is_empty());
+        }
+        if limit == 120 {
+            assert!(!deferred, "{lines:?}");
+            assert_eq!(forge.writes.borrow().len(), 3);
+        }
+        // The free rate-limit read is outside the pass envelope.
+        assert!(
+            forge.reads.borrow().len() - 1 + forge.writes.borrow().len() <= limit,
+            "{limit}: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn preview_budget_defers_at_each_read_boundary_and_records_its_share() {
+    let (forge, _) = publication();
+    let mut config = Config::parse(CONFIG).unwrap();
+    for limit in 0..100 {
+        let mut replay = Replay {
+            now: forge.replay.now,
+            requests: forge.replay.requests.clone(),
+        };
+        request_share(&mut replay, &mut config, limit);
+        let recorder = pass::Recorder::new(&replay);
+        let lines = preview(&recorder, &config, replay.now).unwrap();
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("hold promote") && line.contains("budget")),
+            "{limit}: {lines:?}"
+        );
+        if limit == 0 {
+            assert!(
+                lines.last().unwrap().starts_with("promote deferred:"),
+                "{lines:?}"
+            );
+        }
+        let recorded = Replay::from_json(
+            &serde_json::from_str(&recording(&recorder.fixture(replay.now).unwrap()).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(preview(&recorded, &config, recorded.now).unwrap(), lines);
+    }
 }
 
 /// The fork receipt and upstream PR the fake forge accepted from a rewritten
@@ -2249,12 +2407,7 @@ fn publication_caps_and_existing_receipt_are_bounded() {
         comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":"Previous attempt: outcome unknown. <!-- agent-board-promote-status -->"}));
         sync_metadata(&mut forge.replay);
         // The second candidate is never evaluated or published this invocation.
-        let mut second = forge.fresh.clone();
-        second["number"] = json!(35);
-        body(&mut forge.replay, "pulls?state=open")
-            .as_array_mut()
-            .unwrap()
-            .push(second);
+        with_second(&mut forge);
         let lines = apply(&forge, &config, forge.replay.now, cap).unwrap();
         assert_eq!(lines.len(), 1);
         if cap < 3 {
