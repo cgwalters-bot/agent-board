@@ -335,6 +335,78 @@ fn recorded_classification_table() {
     }
 }
 
+#[test]
+fn target_label_classification() {
+    let config = config();
+    let forks = discover_forks(&Forge::default(), &config).unwrap();
+    for (title, labels, expected) in [
+        (
+            "Repair regression",
+            vec!["target:bootc"],
+            Ok("cgwalters-forge/bootc"),
+        ),
+        (
+            "Repair regression",
+            vec!["TARGET:BOOTC"],
+            Ok("cgwalters-forge/bootc"),
+        ),
+        (
+            "Repair regression",
+            vec!["Target: bootc"],
+            Ok("cgwalters-forge/bootc"),
+        ),
+        (
+            "bootc: repair",
+            vec!["TARGET:ostree"],
+            Err("conflicting target evidence"),
+        ),
+        (
+            "bootc: repair",
+            vec!["TARGET:unknown"],
+            Err("ambiguous or unadmitted target"),
+        ),
+        (
+            "bootc: repair",
+            vec!["TARGET:"],
+            Err("ambiguous or unadmitted target"),
+        ),
+        (
+            "Repair regression",
+            vec!["target:bootc", "TARGET:ostree"],
+            Err("conflicting target evidence"),
+        ),
+        (
+            "Repair regression",
+            vec!["retarget:bootc"],
+            Err("no structured target evidence"),
+        ),
+        (
+            "Repair regression",
+            vec!["targét:bootc"],
+            Err("no structured target evidence"),
+        ),
+    ] {
+        let mut issue = node(1);
+        issue["title"] = json!(title);
+        issue["labels"]["nodes"] = json!(
+            labels
+                .iter()
+                .map(|name| json!({"name":name}))
+                .collect::<Vec<_>>()
+        );
+        let result = classify(&issue, &[], &config, &forks);
+        match expected {
+            Ok(destination) => {
+                assert_eq!(forks[result.unwrap()].repository, destination, "{labels:?}")
+            }
+            Err(message) => assert!(
+                result.unwrap_err().to_string().contains(message),
+                "{labels:?}"
+            ),
+        }
+    }
+}
+
 fn execute(
     forge: &Forge,
     apply: bool,

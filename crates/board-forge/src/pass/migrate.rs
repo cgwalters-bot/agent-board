@@ -504,7 +504,9 @@ fn classify(
     }
     let mut targets = Vec::new();
     for label in connection(node, "labels")? {
-        if let Some(target) = required(label, "name")?.strip_prefix("target:") {
+        if let Some((key, target)) = required(label, "name")?.split_once(':')
+            && key.eq_ignore_ascii_case("target")
+        {
             targets.push(target.trim().to_owned());
         }
     }
