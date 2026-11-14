@@ -52,6 +52,7 @@ struct Forge {
     edit_during_preflight: bool,
     linked: bool,
     cross_reference: bool,
+    references_after_transfer: bool,
     plan: bool,
     stale: bool,
     children: Option<Value>,
@@ -197,15 +198,19 @@ impl Transport for Forge {
         if self.milestoned {
             node["milestone"] = json!({"title":"Next","dueOn":null});
         }
-        if self.linked {
+        if self.linked && (!self.references_after_transfer || moved) {
             node["closedByPullRequestsReferences"]["nodes"] =
                 json!([{"state":"OPEN","number":7,"repository":{"nameWithOwner":"external/work"}}]);
             node["closedByPullRequestsReferences"]["totalCount"] = json!(1);
         }
-        if self.cross_reference {
+        if self.cross_reference && (!self.references_after_transfer || moved) {
             node["timelineItems"]["nodes"] = json!([{"__typename":"CrossReferencedEvent","source":{"__typename":"PullRequest","state":"OPEN"}}]);
         }
-        match self.incomplete_references {
+        match if self.references_after_transfer && !moved {
+            ""
+        } else {
+            self.incomplete_references
+        } {
             "closing-page" => node["closedByPullRequestsReferences"]["pageInfo"] = Value::Null,
             "closing-count" => node["closedByPullRequestsReferences"]["totalCount"] = json!(1),
             "closing-state" => {
@@ -797,6 +802,58 @@ fn upstream_only_activity_holds_without_writes() {
         assert_eq!(forge.transfers.get(), 0);
         assert!(forge.body.borrow().is_empty());
         assert!(journal.receipts.is_empty());
+    }
+}
+
+#[test]
+fn completed_transfers_reconcile_despite_new_pr_references() {
+    for (linked, cross_reference, incomplete_references) in [
+        (true, false, ""),
+        (false, true, ""),
+        (false, false, "closing-page"),
+        (false, false, "timeline-page"),
+        (false, false, "timeline-source"),
+    ] {
+        for restart in [false, true] {
+            let forge = Forge {
+                linked,
+                cross_reference,
+                incomplete_references,
+                references_after_transfer: true,
+                failure: if restart { "readback" } else { "" },
+                ..Default::default()
+            };
+            let mut journal = Journal::default();
+            let mut durable = String::new();
+            let result = run(
+                &forge,
+                &config(),
+                true,
+                1,
+                &mut journal,
+                |state| {
+                    durable = serde_json::to_string(state)?;
+                    Ok(())
+                },
+                |_| Ok(()),
+            );
+            assert_eq!(result.is_err(), restart, "{result:?}");
+            if restart {
+                journal = serde_json::from_str(&durable).unwrap();
+                assert!(journal.receipts["issue-1"].canonical.is_none());
+                // Preview can recognize the transfer without completing the journal.
+                let (result, lines) = execute(&forge, false, 1, &mut journal);
+                result.unwrap();
+                assert!(lines[0].starts_with("reconciled "), "{lines:?}");
+                assert!(journal.receipts["issue-1"].canonical.is_none());
+                execute(&forge, true, 1, &mut journal).0.unwrap();
+            }
+            assert_eq!(
+                journal.receipts["issue-1"].canonical.as_deref(),
+                Some("https://github.com/cgwalters-forge/bootc/issues/99")
+            );
+            assert_eq!(forge.transfers.get(), 1);
+        }
     }
 }
 

@@ -126,6 +126,21 @@ fn snapshot(client: &impl Transport, id: &str, item: &str) -> Result<Value> {
         node["__typename"] == "Issue" && node["id"] == id,
         "issue node identity mismatch"
     );
+    let board = &data["board"];
+    ensure!(
+        board["__typename"] == "ProjectV2Item"
+            && board["id"] == item
+            && board["content"]["id"] == id,
+        "board item identity or content changed"
+    );
+    let mut node = node.clone();
+    node["board"] = board.clone();
+    Ok(node)
+}
+
+/// Activity prevents starting a transfer, not recognizing a completed one.
+/// Recovery only reads identity and preservation evidence; it never retries.
+fn idle_references(node: &Value) -> Result<()> {
     let references = &node["closedByPullRequestsReferences"];
     let closing = connection(node, "closedByPullRequestsReferences")?;
     ensure!(
@@ -155,16 +170,7 @@ fn snapshot(client: &impl Transport, id: &str, item: &str) -> Result<Value> {
             ensure!(kind == "Issue", "unknown cross-reference source type");
         }
     }
-    let board = &data["board"];
-    ensure!(
-        board["__typename"] == "ProjectV2Item"
-            && board["id"] == item
-            && board["content"]["id"] == id,
-        "board item identity or content changed"
-    );
-    let mut node = node.clone();
-    node["board"] = board.clone();
-    Ok(node)
+    Ok(())
 }
 
 type IssueItems = BTreeMap<u64, (String, String)>;
@@ -714,6 +720,7 @@ pub fn run<C: Rest + Transport>(
             let mut route_hint = format!("{source} -> unresolved upstream=unresolved");
             let candidate = (|| -> Result<(Before, Fork, Option<u64>)> {
                 let node = snapshot(client, &id, &item_id)?;
+                idle_references(&node)?;
                 let evidence = before(&node, config)?;
                 ensure!(
                     evidence.board["project"] == project_id,
@@ -783,6 +790,7 @@ pub fn run<C: Rest + Transport>(
             // Reread content/board/parent and accepted plan immediately before
             // recording intent. New comments can replace routing evidence.
             let node = snapshot(client, &id, &item_id)?;
+            idle_references(&node)?;
             ensure!(
                 before(&node, config)? == evidence,
                 "stale source evidence: {source}"
