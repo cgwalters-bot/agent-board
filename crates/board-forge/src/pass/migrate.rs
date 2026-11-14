@@ -21,6 +21,7 @@ const SNAPSHOT: &str = r#"query MigrationIssue($id:ID!, $item:ID!) {
   node(id:$id) { __typename ... on Issue {
     id number url title body updatedAt state repository { nameWithOwner }
     parent { id url }
+    milestone { title dueOn }
     labels(first:100) { nodes { name } pageInfo { hasNextPage } }
     closedByPullRequestsReferences(first:100, includeClosedPrs:false) {
       totalCount pageInfo { hasNextPage } nodes { state number updatedAt repository { nameWithOwner } author { login } }
@@ -42,6 +43,13 @@ const SNAPSHOT: &str = r#"query MigrationIssue($id:ID!, $item:ID!) {
 const TRANSFER: &str = r#"mutation MigrationTransfer($issue:ID!, $repository:ID!) {
   transferIssue(input:{issueId:$issue,repositoryId:$repository}) { issue { id number url } }
 }"#;
+const DESTINATION: &str = r#"query MigrationMetadata($owner:String!, $name:String!) {
+  repository(owner:$owner, name:$name) {
+    nameWithOwner
+    labels(first:100) { nodes { name } pageInfo { hasNextPage } }
+    milestones(first:100) { nodes { title dueOn } pageInfo { hasNextPage } }
+  }
+}"#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +62,8 @@ pub struct Before {
     updated: String,
     board: Value,
     parent: Value,
+    labels: BTreeSet<String>,
+    milestone: Value,
 }
 
 /// A pending entry is saved *before* the first forge write. Its stable node ID
@@ -114,7 +124,13 @@ fn snapshot(client: &impl Transport, id: &str, item: &str) -> Result<Value> {
         "issue node identity mismatch"
     );
     let references = &node["closedByPullRequestsReferences"];
-    connection(node, "closedByPullRequestsReferences")?;
+    let closing = connection(node, "closedByPullRequestsReferences")?;
+    ensure!(
+        closing.iter().all(|reference| reference["state"]
+            .as_str()
+            .is_some_and(|state| ["OPEN", "CLOSED", "MERGED"].contains(&state))),
+        "in-flight or unreadable linked PRs"
+    );
     let (open, read, total) = pulls(references)?;
     ensure!(
         read == total && open.is_empty(),
@@ -132,6 +148,8 @@ fn snapshot(client: &impl Transport, id: &str, item: &str) -> Result<Value> {
                 ["CLOSED", "MERGED"].contains(&required(source, "state")?),
                 "in-flight cross-referenced PR"
             );
+        } else {
+            ensure!(kind == "Issue", "unknown cross-reference source type");
         }
     }
     let board = &data["board"];
@@ -224,7 +242,16 @@ fn before(node: &Value, config: &Config) -> Result<Before> {
     let board = config
         .github_board()
         .context("migration needs a GitHub board")?;
-    connection(node, "labels")?;
+    let labels = connection(node, "labels")?
+        .iter()
+        .map(|label| required(label, "name").map(str::to_owned))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let milestone = node
+        .get("milestone")
+        .context("missing milestone evidence")?;
+    if !milestone.is_null() {
+        validate_milestone(milestone)?;
+    }
     let item = node.get("board").context("missing board item")?;
     ensure!(
         item.pointer("/project/number").and_then(Value::as_u64) == Some(board.project)
@@ -269,7 +296,60 @@ fn before(node: &Value, config: &Config) -> Result<Before> {
         updated: required(node, "updatedAt")?.into(),
         board,
         parent,
+        labels,
+        milestone: milestone.clone(),
     })
+}
+
+fn validate_milestone(milestone: &Value) -> Result<()> {
+    required(milestone, "title")?;
+    let due = milestone
+        .get("dueOn")
+        .context("missing milestone due date")?;
+    ensure!(
+        due.is_null() || due.is_string(),
+        "invalid milestone due date"
+    );
+    Ok(())
+}
+
+fn compatible_metadata(client: &impl Transport, before: &Before, fork: &Fork) -> Result<()> {
+    let (owner, name) = fork
+        .repository
+        .split_once('/')
+        .context("invalid fork name")?;
+    let data = client.graphql(DESTINATION, json!({"owner":owner,"name":name}))?;
+    ensure!(
+        data.get("errors").is_none(),
+        "destination metadata GraphQL errors"
+    );
+    let repository = &data["repository"];
+    ensure!(
+        repository["nameWithOwner"] == fork.repository,
+        "destination metadata identity mismatch"
+    );
+    let labels = connection(repository, "labels")?
+        .iter()
+        .map(|label| required(label, "name"))
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        before
+            .labels
+            .iter()
+            .all(|label| labels.contains(label.as_str())),
+        "destination missing source labels"
+    );
+    if !before.milestone.is_null() {
+        let milestones = connection(repository, "milestones")?;
+        for milestone in milestones {
+            validate_milestone(milestone)?;
+        }
+        ensure!(
+            milestones.contains(&before.milestone),
+            "destination missing matching milestone title and due date"
+        );
+    }
+    Ok(())
 }
 
 fn required_body(node: &Value) -> Result<&str> {
@@ -446,6 +526,17 @@ fn short(repository: &str) -> &str {
     repository.split_once('/').map_or(repository, |(_, r)| r)
 }
 
+fn unplanned(node: &Value, comments: &[plan::Comment], config: &Config) -> Result<()> {
+    // Body plans can become executable too. Hold even when bodyPlans is off:
+    // preserving a stale plan would break a later enablement of that setting.
+    ensure!(
+        !plan::has_fence(required_body(node)?, PLAN_FENCE)
+            && plan::no_plan(comments, &[&config.operator, &config.bot]),
+        "source plan requires replacement-plan handoff before migration"
+    );
+    Ok(())
+}
+
 fn association(body: &str, fork: &Fork) -> Result<Option<u64>> {
     // Reuse #949's grammar. An existing number refers only to this fork's
     // validated parent. Qualified Upstream: syntax is deliberately refused.
@@ -511,6 +602,11 @@ fn preserved(before: &Before, after: &Before, destination: &str) -> Result<Strin
         "transfer lost board identity or Priority"
     );
     ensure!(after.parent == before.parent, "transfer lost parent link");
+    ensure!(after.labels == before.labels, "transfer lost labels");
+    ensure!(
+        after.milestone == before.milestone,
+        "transfer lost milestone"
+    );
     ensure!(
         after.body == before.body && after.title == before.title,
         "transfer changed issue content"
@@ -616,10 +712,7 @@ pub fn run<C: Rest + Transport>(
                 let comments = plan::issue_comments(client, &item)?;
                 let fork = forks[classify(&node, &comments, config, &forks)?].clone();
                 route_hint = format!("{source} -> {} upstream=unresolved", fork.repository);
-                ensure!(
-                    plan::no_plan(&comments, &[&config.operator, &config.bot]),
-                    "accepted plan still names the source identity; replacement-plan handoff required before migration"
-                );
+                unplanned(&node, &comments, config)?;
                 if fork.parent.is_empty() {
                     bail!(
                         "{}",
@@ -637,7 +730,12 @@ pub fn run<C: Rest + Transport>(
                 }
                 if let Some(number) = upstream {
                     crate::upstream::issue(client, &fork.parent, number)?;
+                    ensure!(
+                        crate::upstream::parse(&evidence.body)?.is_some(),
+                        "add Upstream: #{number} before migration; automatic body edits cannot protect concurrent changes"
+                    );
                 }
+                compatible_metadata(client, &evidence, &fork)?;
                 idle(client, config, &fork)?;
                 Ok((evidence, fork, upstream))
             })();
@@ -690,21 +788,16 @@ pub fn run<C: Rest + Transport>(
                     && f.refusal.is_none()),
                 "destination admission changed"
             );
-            ensure!(
-                plan::no_plan(&comments, &[&config.operator, &config.bot]),
-                "accepted plan added before transfer"
-            );
+            unplanned(&node, &comments, config)?;
             idle(client, config, &fork)?;
+            compatible_metadata(client, &evidence, &fork)?;
             ensure!(
                 client.bounds.left.get() >= 8,
                 "insufficient requests to transfer and verify"
             );
-            let mut expected = evidence.clone();
-            if let Some(number) = upstream
-                && crate::upstream::parse(&expected.body)?.is_none()
-            {
-                expected.body = format!("{}\n\nUpstream: #{number}\n", expected.body.trim_end());
-            }
+            // Never PATCH an issue body: GitHub offers no documented conditional
+            // issue edit that would protect a human edit during preflight.
+            let expected = evidence.clone();
             journal.receipts.insert(
                 id.clone(),
                 Receipt {
@@ -716,27 +809,6 @@ pub fn run<C: Rest + Transport>(
             );
             save(journal)?;
             caps.count(Kind::Write);
-            if expected.body != evidence.body {
-                let (status, _) = client.send(
-                    "PATCH",
-                    &format!("{API_ROOT}repos/{}/issues/{number}", config.dispatch_repo),
-                    &json!({"body":expected.body}),
-                )?;
-                ensure!(
-                    status == 200,
-                    "cannot add upstream association; retain journal"
-                );
-                let updated = before(&snapshot(client, &id, &item_id)?, config)?;
-                ensure!(
-                    updated.body == expected.body
-                        && updated.board == evidence.board
-                        && updated.parent == evidence.parent
-                        && updated.title == evidence.title
-                        && updated.source == evidence.source
-                        && updated.number == evidence.number,
-                    "association update changed source evidence; retain journal"
-                );
-            }
             // Whether the mutation returned success, an API error or a timeout,
             // read the stable node. Never resend based on the old issue number.
             let result = client.graphql(TRANSFER, json!({"issue":id,"repository":fork.id}));
