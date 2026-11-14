@@ -765,6 +765,12 @@ automatically restore them; investigate and restore ownership before resuming.
 Older journals without `before.assignees` are refused, not interpreted as empty
 assignments. Retain those journals and reconcile their transfers manually using
 the original ownership evidence; do not invent an empty set to bypass the check.
+Parent links are verified by stable issue node ID, not URL: a parent repository
+rename must not strand an otherwise preserved transfer. The journal retains the
+original parent object, and pending entries use the same identity comparison on
+restart. A removed or different parent still stops verification, as does malformed
+parent evidence (a non-null parent requires both an ID and URL). Preflight still
+requires the complete source snapshot to be unchanged.
 The new URL/number is recorded
 as the canonical identity, not assumed equal to the source number. A pending
 intent is synced before any forge write. A timeout is reconciled by node ID before
