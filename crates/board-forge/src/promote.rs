@@ -142,6 +142,8 @@ enum Gates {
         summary: String,
         detail: String,
         signoffs: usize,
+        /// Commits the base has that the head lacks: a publication rebase.
+        behind: u64,
     },
 }
 
@@ -610,10 +612,11 @@ fn gates_impl(
     let ahead = compare["ahead_by"].as_u64().context("missing ahead_by")?;
     let behind = compare["behind_by"].as_u64().context("missing behind_by")?;
     hold!(ahead > 0, "already upstream (zero ahead)");
-    hold!(
-        !observe_existing || behind == 0,
-        "needs publication rebase (behind_by={behind})"
-    );
+    // Publication replays a behind head onto the current base; only a
+    // conflict, found by that replay, is left for --apply to hold.
+    if behind > 0 {
+        rewrite::replayable(config, &compare)?;
+    }
     let stack = stack_gate(client, config, repo, pull, upstream, base)?;
     let dco = dco_gate(client, config, upstream, base, &compare, head)?;
     let text = pull["body"].as_str().context("missing pull body")?;
@@ -643,10 +646,18 @@ fn gates_impl(
             );
         }
     }
+    let rebase = if behind > 0 {
+        format!(
+            "; publication rebase onto {base} (behind_by={behind}), held by --apply on conflict"
+        )
+    } else {
+        String::new()
+    };
     Ok(Gates::Ready {
         summary: dco.1,
-        detail: format!("{stack}; {}", dco.0),
+        detail: format!("{stack}; {}{rebase}", dco.0),
         signoffs: dco.2,
+        behind,
     })
 }
 
