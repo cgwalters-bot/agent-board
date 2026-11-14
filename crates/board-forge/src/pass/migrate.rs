@@ -37,7 +37,7 @@ const SNAPSHOT: &str = r#"query MigrationIssue($id:ID!, $item:ID!) {
   board: node(id:$item) { __typename ... on ProjectV2Item {
       id project { id number owner { ... on Organization { login } ... on User { login } } }
       content { ... on Issue { id } }
-      fieldValues(first:100) { pageInfo { hasNextPage } nodes {
+       fieldValues(first:100) { pageInfo { hasNextPage } nodes { __typename
         ... on ProjectV2ItemFieldSingleSelectValue { optionId name field { ... on ProjectV2SingleSelectField { name } } }
       } }
   } }
@@ -285,10 +285,22 @@ fn before(node: &Value, config: &Config) -> Result<Before> {
     );
     required(item, "id")?;
     required(&item["project"], "id")?;
-    let priority = connection(item, "fieldValues")?
-        .iter()
-        .filter(|f| f.pointer("/field/name").and_then(Value::as_str) == Some(&board.priority_field))
-        .collect::<Vec<_>>();
+    let mut priority = Vec::new();
+    for value in connection(item, "fieldValues")? {
+        // An unreadable entry could be Priority, not proof that it is unset.
+        let kind = required(value, "__typename").context("unreadable project field value")?;
+        if kind != "ProjectV2ItemFieldSingleSelectValue" {
+            continue;
+        }
+        let name = required(&value["field"], "name").context("unreadable single-select field")?;
+        if name == board.priority_field {
+            let option = required(value, "optionId").context("unreadable Priority")?;
+            let value_name = required(value, "name").context("unreadable Priority")?;
+            // Keep the existing journal representation: the query's new type
+            // discriminator must not strand pending receipts from older runs.
+            priority.push(json!({"optionId":option, "name":value_name, "field":{"name":name}}));
+        }
+    }
     ensure!(priority.len() <= 1, "ambiguous Priority");
     let board = json!({"item":item["id"], "project":item["project"]["id"], "priority":priority});
     let parent = node
