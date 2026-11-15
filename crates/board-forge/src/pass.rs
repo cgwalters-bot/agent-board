@@ -5500,6 +5500,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let mut poll = config.poll(fresh.as_ref());
         poll.policy.notification_intake = routes.as_ref().map(|r| r.staging.clone());
+        poll.policy.midstreams = midstreams.clone();
         poll.policy.no_merge.extend(midstreams);
         let mut direction = None;
         let mut intake_starts = 0;
@@ -7835,6 +7836,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             waiver,
             // A plan written by hand carries no direction.
             direction: None,
+            midstreams: self.midstreams.as_deref(),
         };
         // Without the bot, dispatch checks no overlap; it batches implement
         // plans only, and the pass asks for no batch either way.
@@ -9343,6 +9345,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             ended: None,
             waiver: Default::default(),
             direction: self.direction_hash(),
+            midstreams: None,
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);

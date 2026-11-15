@@ -38,11 +38,11 @@ pub const STACK_PULL_READS: u64 = 50;
 /// Characters of a base branch name.
 const BRANCH_LIMIT: usize = 200;
 /// The words by which a pull request's description closes an issue on merge.
-const CLOSING: &[&str] = &[
+pub(crate) const CLOSING: &[&str] = &[
     "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
 ];
 /// GitHub's web root, under which its issue URLs lie.
-const GITHUB_WEB: &str = "https://github.com/";
+pub(crate) const GITHUB_WEB: &str = "https://github.com/";
 
 pub(crate) const LOWER_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $pulls: Int!) {
   repository(owner: $owner, name: $name) {

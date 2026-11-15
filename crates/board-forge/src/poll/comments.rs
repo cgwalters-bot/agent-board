@@ -1236,6 +1236,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             &format!("{of}: starting."),
             (stop, read),
         )?;
+        let brief = &midstream_task(&self.config.policy, repo, brief.to_owned());
         let start = Start {
             issue_repository: None,
             repository: repo,
@@ -1785,6 +1786,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         )?;
         let url = format!("https://github.com/{repo}/pull/{number}");
         let brief = fix_brief(repo, number, &head, round, &url, said, &operator);
+        let brief = midstream_task(&self.config.policy, repo, brief);
         let start = Start {
             issue_repository: None,
             repository: repo,

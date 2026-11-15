@@ -636,33 +636,7 @@ fn gates_impl(
     }
     let stack = stack_gate(client, config, repo, pull, upstream, base)?;
     let dco = dco_gate(client, config, upstream, base, &compare, head)?;
-    let text = pull["body"].as_str().context("missing pull body")?;
-    hold!(!text.trim().is_empty(), "empty body");
-    let title = pull["title"].as_str().context("missing pull title")?;
-    for text in [title, text] {
-        // A qualified reference keeps its meaning; any bare reference changes
-        // repository. Be conservative even in Markdown examples: never rewrite.
-        for (i, _) in text.match_indices('#') {
-            if text.as_bytes().get(i + 1).is_some_and(u8::is_ascii_digit) {
-                let prefix = &text[..i];
-                let qualifier = prefix
-                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || "-._/".contains(c)))
-                    .next()
-                    .unwrap_or_default();
-                let qualified = validate_repository(qualifier).is_ok();
-                hold!(
-                    qualified,
-                    "text has a bare #N reference that changes repository upstream"
-                );
-            }
-        }
-        for n in referenced_numbers(text) {
-            hold!(
-                !crate::stack::closes(text, repo, n),
-                "text has a closing reference to {repo}#{n}"
-            );
-        }
-    }
+    publication_text(repo, upstream, pull)?;
     let rebase = if behind > 0 {
         format!(
             "; publication rebase onto {base} (behind_by={behind}), held by --apply on conflict"
@@ -680,9 +654,13 @@ fn gates_impl(
 
 pub(crate) mod handoff;
 mod publish;
+mod repair;
 mod rewrite;
+mod text;
 
 pub use publish::apply;
+pub use repair::repair;
+pub(crate) use text::midstream_brief;
 
 fn comparison(client: &impl Rest, path: &str, head: &str) -> Result<Value> {
     let mut first: Option<Value> = None;
@@ -916,8 +894,31 @@ fn source_issue(repo: &str, pull: &Value) -> Result<board_core::ItemRef> {
     )
 }
 
-/// Only this mechanically derived closing line supplements the approved text.
-/// A qualified body link cannot redirect publication or close another repo's issue.
+/// The approved title and body as upstream would read them: the body less its
+/// standalone source line ([`text::strip`]), and both held unless publishable.
+fn publication_text(repo: &str, upstream: &str, pull: &Value) -> Result<String> {
+    let source = source_issue(repo, pull)?;
+    let body = pull["body"].as_str().context("missing pull body")?;
+    let published = text::strip(repo, body, source.number)?;
+    hold!(
+        !published.trim().is_empty(),
+        "empty body{}",
+        if published == body {
+            ""
+        } else {
+            " without its source line"
+        }
+    );
+    let title = pull["title"].as_str().context("missing pull title")?;
+    for text in [title, &published] {
+        text::check(repo, upstream, text)?;
+    }
+    Ok(published)
+}
+
+/// Only this mechanically derived closing line supplements the approved text,
+/// and the source line is the only one removed from it. A qualified body link
+/// cannot redirect publication or close another repo's issue.
 fn promotion_body(client: &impl Rest, repo: &str, pull: &Value, upstream: &str) -> Result<String> {
     let source = source_issue(repo, pull)?;
     let held = |error: anyhow::Error| {
@@ -928,10 +929,8 @@ fn promotion_body(client: &impl Rest, repo: &str, pull: &Value, upstream: &str) 
         }
     };
     let target = crate::upstream::target(client, &source).map_err(held)?;
-    let mut body = pull["body"]
-        .as_str()
-        .context("missing pull body")?
-        .to_owned();
+    let body = pull["body"].as_str().context("missing pull body")?;
+    let mut body = text::strip(repo, body, source.number)?;
     if let Some(target) = target {
         hold!(
             target.repository.eq_ignore_ascii_case(upstream),
@@ -958,7 +957,8 @@ fn authorized_promotion_body(
     command: &Command,
 ) -> Result<String> {
     let body = promotion_body(client, repo, pull, upstream)?;
-    if body == pull["body"] {
+    let published = publication_text(repo, upstream, pull)?;
+    if body == published {
         return Ok(body);
     }
     let source = source_issue(repo, pull)?;
@@ -978,10 +978,7 @@ fn authorized_promotion_body(
     let number = crate::upstream::parse(issue["body"].as_str().context("missing source text")?)?
         .context("upstream link changed during publication")?;
     hold!(
-        body == format!(
-            "{}\n\nFixes {upstream}#{number}",
-            pull["body"].as_str().context("missing pull body")?
-        ),
+        body == format!("{published}\n\nFixes {upstream}#{number}"),
         "upstream link changed during publication"
     );
     let edited = issue

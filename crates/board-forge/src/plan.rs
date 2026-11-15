@@ -971,6 +971,9 @@ pub struct Scheduled<'a> {
     /// The hash of the operator's direction the pass put in the plan's
     /// brief, which its record carries ([`recorded_direction`]).
     pub direction: Option<&'a str>,
+    /// The topic-admitted midstream forks stage 2 read: an implement or fix
+    /// plan that works in one gets [`crate::promote::midstream_brief`].
+    pub midstreams: Option<&'a [String]>,
 }
 
 /// A dispatcher's refusal before it sent anything, as a lease admission
@@ -1108,6 +1111,24 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             overlap,
         });
     }
+    // Upstream readers see only what a midstream run writes once promoted.
+    let midstream = scheduled.midstreams.is_some_and(|forks| {
+        matches!(plan.kind.as_str(), "implement" | "fix")
+            && forks
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(plan.work_repository()))
+    });
+    let plan = match midstream {
+        true => {
+            let source = (plan.kind == "implement").then_some((plan.repo.as_str(), plan.item));
+            JobPlan {
+                brief: plan.brief.clone()
+                    + &crate::promote::midstream_brief(plan.work_repository(), source),
+                ..plan
+            }
+        }
+        false => plan,
+    };
     let note = overlap
         .as_ref()
         .map(|d| format!(" {}", d.sentence()))
@@ -2469,6 +2490,48 @@ mod tests {
                 "{again:#}"
             );
             assert_eq!(forge.dispatches.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn midstream_plans_get_the_promotion_brief() {
+        let fenced = format!("Plan:\n\n```{PLAN_FENCE}\n{}\n```\n", plan());
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        let brief = plan()["brief"].as_str().unwrap().to_owned();
+        let midstream = format!(
+            "{brief}{}",
+            crate::promote::midstream_brief("ostreedev/ostree", Some(("ostreedev/ostree", 3665)))
+        );
+        let forks = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (listed, other) = (forks(&["OSTREEDEV/ostree"]), forks(&["other/ostree"]));
+        for (midstreams, expected) in [
+            (None, &brief),
+            (Some(&other[..]), &brief),
+            (Some(&listed[..]), &midstream),
+        ] {
+            let forge = Forge::new(
+                vec![node(7, PLANNER, "2026-10-13T10:00:00Z", &fenced)],
+                vec![],
+            );
+            let dispatcher = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
+            let scheduled = Scheduled {
+                midstreams,
+                ..Default::default()
+            };
+            dispatch_with(
+                &forge,
+                &dispatcher,
+                &issue,
+                &[OPERATOR, PLANNER],
+                &target(),
+                (0, None, None, scheduled),
+            )
+            .unwrap();
+            let dispatches = dispatcher.dispatches.borrow();
+            assert_eq!(
+                dispatches[0]["inputs"]["task"], **expected,
+                "{midstreams:?}"
+            );
         }
     }
 

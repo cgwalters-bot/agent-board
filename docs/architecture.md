@@ -358,7 +358,9 @@ work, without weakening the current-head authorization boundary.
   passes. Accepted-plan comments require complete edit metadata. DCO never comes from CONTRIBUTING.
   When required, report missing operator sign-offs; commits needing a sign-off
   that are merges or by neither bot nor operator hold. Empty bodies, bare
-  `#N` references and closing references to the fork hold, never get rewritten.
+  `#N` references, closing references to the fork and any other reference
+  into the midstream owner (the fork, its tracker) hold, in the title or the
+  body as it would be published (see the source line below); they never get rewritten.
    All reads use the existing budget and complete bounded pagination (ten
    100-row pages); unreadable/incomplete evidence holds.
    The source issue may carry one whole `Upstream: #N` line. Only the number
@@ -366,12 +368,61 @@ work, without weakening the current-head authorization boundary.
    agree with the configured promotion target. A malformed or duplicate line,
    missing parent evidence, or an issue read that returns a PR holds with an
    `upstream link` cause, never a guessed destination. Publication preserves
-   the approved title/body and appends only `Fixes OWNER/REPO#N` for that link;
-   no link preserves the body byte-for-byte. GraphQL must identify the source
+   the approved title/body, less its source line, and appends only
+   `Fixes OWNER/REPO#N` for that link; no link preserves the rest of the body
+   byte-for-byte. GraphQL must identify the source
    text's author or last editor as the bot/operator and its creation/edit must
    strictly predate the selected operator command or approval. A later edit
    requires fresh authorization, including after confirmed publication. The
    extra reads use the same budget.
+* **The source line** (agent-board#1002). A midstream PR names its source
+  issue on one line of its own, canonically
+  `Part of https://github.com/FORK/issues/N` (`Fixes` for a slice that
+  completes it), which upstream readers could not follow. Publication removes
+  exactly that line: the whole line, less surrounding whitespace, is `Part of`
+  or `Fixes`, one space and the fork issue's full URL, and it names the issue
+  the source tie above found. One blank line is left where its paragraph was
+  and the result is trimmed; nothing else changes. Two such lines, or one
+  naming another issue, hold; a punctuated, quoted or listed one is prose and
+  holds as a midstream reference. The fork PR keeps the line, so stacking,
+  the `Upstream: #N` derivation, the handoff and retries still read the same
+  source. The removal is the one permitted deterministic edit, like the
+  derived closing line: it is not a rewrite of prose, grants no approval and
+  leaves every gate, provenance proof and write bound as above. A source
+  staged outside the fork (an issues-off fork's tracker item) has no fork
+  issue to name and holds for a person.
+* **Writing it.** The pass appends the same instruction to the brief of an
+  implement or fix plan whose work repository is a midstream fork stage 2
+  read by topic, and to the poll's fix, rebase, continuation and
+  operator-comment fix briefs in those forks: keep the PR a draft; name the
+  source only as the line above (for an implement run, the exact line for its
+  issue; for a staged one, the tracker issue as it is, never an invented fork
+  issue); no bare `#N` and no tracker or forge-internal reference in the
+  title, body or commit messages. Elsewhere briefs are unchanged. The
+  standalone `agent-board dispatch` has no topic read and adds nothing.
+* **Repairing older drafts.** `agent-board promote --config FILE
+  --repair-bodies` previews a one-time repair of drafts written before this
+  line existed, logging each one's before/after body or why it is left for
+  manual repair. Candidates are the bot's own open drafts whose base is a
+  verified promotion fork (the same metadata discovery as above). Standalone
+  lines of `Part of` or a closing keyword and one reference (`#N`,
+  `OWNER/REPO#N` or an issue URL, one trailing mark allowed) to fork issues
+  become the one canonical line (`Fixes` where they close it), and such lines
+  naming another repository of the midstream owner, such as the tracker, are
+  dropped. Two fork issues, mixed kinds, no such line, a source only in
+  prose, or a result that still fails the title/body checks above leave the
+  draft unchanged for a person; prose, titles and commits are never
+  rewritten. A repaired body is unchanged by a second run. `--apply
+  --max-writes N` needs a credential authenticating as the configured bot,
+  re-reads each draft's number, state, draft flag, author, title and body
+  just before editing only its body, and edits at most N; it never writes
+  upstream and needs no `promote.publish`. A bot-ok approval binds the head,
+  not the body, so a repaired draft that only its text held becomes
+  publishable under an existing current-head approval; and the bot becomes the
+  body's last editor, so a human-text draft holds on provenance until the
+  operator edits it again. The controller runs the preview
+  first, reviews the logged changes, then applies with the same token and
+  bounds as its promote job; the worker that built this never ran it live.
 * **Policy gate.** Only a candidate that passed every read gate above reads
   its upstream's record, once per run, from
   `policyRepository/policyPath/OWNER/REPO.md` on that repository's default
@@ -430,7 +481,8 @@ work, without weakening the current-head authorization boundary.
   every PR's provenance is independently evaluated. Passing reports `(policy
   human-text; provenance verified)`, not live publication. No labels or notices
    are written. The only body supplement is the mechanically derived upstream
-   closing reference above; it is not a claim of operator-authored prose.
+   closing reference above, and the only removal the source line; neither is
+   a claim of operator-authored prose.
 * **Kept.** The upstream contribution-policy gate; the operator's sign-off
   added to every promoted commit, whether or not upstream checks DCO; the stacked wait (a pull
   request whose dependency is not yet upstream waits); one notice per reason
@@ -473,8 +525,8 @@ work, without weakening the current-head authorization boundary.
   `/user` must identify the configured bot before any publication reads/writes.
 * **Publication effects.** Create a **draft** upstream PR from `OWNER:BRANCH`,
   or update the title/body of the unique open same-head upstream PR. Send the
-  fork title/body bytes unchanged, including for human-text; add no attribution
-  or sign-off paragraph. Existing readiness is unchanged. There is no ready,
+  fork title/body bytes unchanged but for the source line, including for
+  human-text; add no attribution or sign-off paragraph. Existing readiness is unchanged. There is no ready,
   merge, reopen or approved-ref update operation. If any commit lacks the
   configured operator trailer, or the head is behind, Git replays every commit
   onto the observed upstream base and adds the trailer wherever missing,
@@ -554,7 +606,10 @@ The answers to the brief's open questions:
    before selecting or counting receipts.
    REST comment identity/times must agree with complete GraphQL bot authorship
    and bot last-edit evidence. Network/base mapping, unique source linkage,
-   fork head and the live upstream PR/head must all match. A verified open
+   fork head and the live upstream PR/head must all match. An upstream body
+   without the removed source line links no fork issue and rests on the
+   record's source; one that links any fork issue must link that source, the
+   recorded way. A verified open
    upstream supplies In Progress and the existing scheduler open-PR hold even
    if the fork is closed or stale. A matching verified closing merge supplies Done
    under normal Status precedence; person holds remain until Done. Missing,
