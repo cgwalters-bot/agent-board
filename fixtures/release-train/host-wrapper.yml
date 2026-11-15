@@ -1,26 +1,23 @@
-# Relevant steps from actions/.github/workflows/cgwalters-agentic-job.yml
-# (2026-11-03); release pins substituted by the recorded repository fixture.
+# Relevant steps from actions/.github/workflows/cgwalters-agent.yml
+# (2026-11-15): the agent job took the secure-host step from
+# cgwalters-agentic-job.yml, and has no release pin of its own.
 jobs:
-  policy:
-    uses: cgwalters-forge/agentic-job/.github/workflows/policy.yml@RELEASE_PIN # agentic-job vVERSION
   agent:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: ${{ needs.policy.outputs.source-repository }}
-          ref: ${{ needs.policy.outputs.source-sha }}
+          repository: ${{ inputs.source-repository }}
+          ref: ${{ inputs.source-sha }}
           path: .agentic-job-source
           persist-credentials: false
-      - uses: ./.agentic-job-source/prepare
+      - uses: ./.agentic-job-source/prepare # zizmor: ignore[self-repository] Policy-selected pinned source, never head code.
         with:
           job-dir: /var/tmp/agentic-job
-          binary-artifact-id: ${{ needs.policy.outputs.binary-artifact-id }}
-          policy-artifact-id: ${{ needs.policy.outputs.policy-artifact-id }}
-      - uses: ./.agentic-job-source/secure-host
+      - uses: ./.agentic-job-source/secure-host # zizmor: ignore[self-repository] Policy-selected pinned source, never head code.
         with:
           config: ${{ runner.temp }}/agentic-job-host.toml
       - id: run
-        uses: ./.agentic-job-source/run
+        uses: ./.agentic-job-source/run # zizmor: ignore[self-repository] Policy-selected pinned source, never head code.
         with:
           job-dir: /var/tmp/agentic-job
           agent-user: sandbox

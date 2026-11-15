@@ -144,7 +144,9 @@ fn host_fixture() -> Value {
     let old = image_pin("0.6.3", &format!("sha256:{}", "b".repeat(64))).unwrap();
     r["/repos/cgwalters-forge/actions/contents/secure-host/Containerfile.pin?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"] =
         json!({"encoding": "base64", "content": base64(&format!("{old}\n"))});
-    let wrapper = &mut r["/repos/cgwalters-forge/actions/contents/.github/workflows/cgwalters-agentic-job.yml?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"];
+    // As deployed: the recorded cgwalters-agentic-job.yml keeps only release
+    // pins, and the secure-host forwarder is in a file with no release pin.
+    let wrapper = &r["/repos/cgwalters-forge/actions/contents/.github/workflows/cgwalters-agentic-job.yml?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"];
     let text = decode(&wrapper["content"]).unwrap();
     let pin = pin_of(
         &[("wrapper".into(), text)],
@@ -152,21 +154,21 @@ fn host_fixture() -> Value {
         "agentic-job",
     )
     .unwrap();
-    let wrapper_text = include_str!("../../../../fixtures/release-train/host-wrapper.yml")
-        .replace("RELEASE_PIN", &pin.pin)
-        .replace("VERSION", &pin.version);
-    wrapper["content"] = json!(base64(&wrapper_text));
+    r[format!(
+        "/repos/cgwalters-forge/actions/contents/{HOST_WRAPPER}?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"
+    )] = json!({"encoding": "base64", "content": base64(include_str!("../../../../fixtures/release-train/host-wrapper.yml"))});
     let smoke = include_str!("../../../../fixtures/release-train/host-smoke.yml")
         .replace("RELEASE_PIN", &pin.pin)
         .replace("VERSION", &pin.version);
     r["/repos/cgwalters-forge/actions/contents/.github/workflows/smoke.yml?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"] =
         json!({"encoding": "base64", "content": base64(&smoke)});
-    f["config"]["wrappers"]["files"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!(".github/workflows/smoke.yml"));
+    let files = f["config"]["wrappers"]["files"].as_array_mut().unwrap();
+    files.push(json!(HOST_WRAPPER));
+    files.push(json!(".github/workflows/smoke.yml"));
     f
 }
+
+const HOST_WRAPPER: &str = ".github/workflows/cgwalters-agent.yml";
 
 fn host_merged(f: &mut Value) {
     let mut pr = f["responses"]["/repos/cgwalters-forge/agentic-job/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100"][0].clone();
@@ -231,17 +233,34 @@ fn wrappers_select_the_actions_commit_containing_the_matching_release_image() {
     let mut f = host_fixture();
     host_merged(&mut f);
     f["responses"]["expectedTreeContent"] = json!([
-        format!("cgwalters-forge/actions/secure-host@{}", "c".repeat(40)),
+        format!(
+            "cgwalters-forge/actions/secure-host@{} # zizmor: ignore[self-repository]",
+            "c".repeat(40)
+        ),
         "run: python3 workflow/sandbox-binary-check.py",
         "cgwalters-forge/agentic-job/.github/workflows/policy.yml@732db8c24295ee8d4a79de19f588e6f871d35fe0",
         "uses: ./.agentic-job-source/prepare",
         "uses: ./.agentic-job-source/run",
+        "uses: ./.agentic-job-source/secure-host/internal\n",
         "config: ${{ runner.temp }}/agentic-job-host.toml",
-        "ref: ${{ needs.policy.outputs.source-sha }}"
+        "ref: ${{ inputs.source-sha }}"
     ]);
     let output = replay(&f, true).unwrap();
     assert!(output.contains("v0.6.4: wrappers\n"), "{output}");
     assert!(output.contains("Opened the wrappers' pin bump"), "{output}");
+    // Each listed file must move through one of the two edits.
+    let mut neither = f.clone();
+    neither["responses"][format!(
+        "/repos/cgwalters-forge/actions/contents/{HOST_WRAPPER}?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"
+    )]["content"] = json!(base64("jobs: {}\n"));
+    let output = replay(&neither, true).unwrap();
+    assert!(
+        output.contains(&format!(
+            "{HOST_WRAPPER} has no release or secure-host pin to move"
+        )),
+        "{output}"
+    );
+    assert!(!output.contains("/git/trees"), "{output}");
     let path = format!(
         "/repos/cgwalters-forge/actions/contents/secure-host/Containerfile.pin?ref={}",
         "c".repeat(40)
