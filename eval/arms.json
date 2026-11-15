@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "source": {
+    "repository": "cgwalters-forge/agenthome",
+    "base": "opencode/opencode.json",
+    "runner": "opencode/opencode-runner.json",
+    "tiers": "prompt-tiers.json",
+    "pool": "praxis"
+  },
+  "arms": {
+    "single-strong": {
+      "tier": "sol",
+      "assembly": "Keep the base and runner prompts and permissions; set model, small_model and every configured and built-in agent (build, plan, general, explore, compaction, title, summary and the embedded diff-reviewer) to the tier's resolved model."
+    },
+    "single-cheap": {
+      "tier": "luna",
+      "assembly": "Keep the base and runner prompts and permissions; set model, small_model and every configured and built-in agent (build, plan, general, explore, compaction, title, summary and the embedded diff-reviewer) to the tier's resolved model."
+    },
+    "tiered": {
+      "roles": "roles/opencode/eval-tiered.json",
+      "assembly": "Resolve the base's model, small_model and agent models from the tiers file's roles; add the role agents and default_agent from roles to the runner, with the models that file sets, and set the embedded diff-reviewer to the sol tier's resolved model."
+    }
+  }
+}

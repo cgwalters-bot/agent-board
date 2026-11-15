@@ -68,6 +68,7 @@ runs agent-board; the records stay on the forge.
 - [v1 release readiness](../docs/release.md): the gates v1.0 waits on, their evidence, and the interfaces it would support.
 - [Broker probe](../docs/broker-probe.md): one outage issue, open while the inference broker is unreachable.
 - [Per-role GitHub Apps](../docs/apps.md): one app per automation role; so far only `apps create` exists.
+- [Role evaluation](../docs/eval.md): the offline three-arm evaluation protocol and its summarizer.
 - [Design](../docs/design.md): the original design and research, with its [current implementation limits](../docs/design.md#current-implementation-limits).
 - [GitHub work queue comparison](../docs/github-workqueue-comparison.md): how this differs from gh-aw's native work queue.
 
