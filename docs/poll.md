@@ -336,8 +336,16 @@ repository merge method (rebase, squash, then merge in preference order).
 Queue admission also uses `expectedHeadOid`; GitHub owns revalidation after
 admission. Already queued and auto-merge-enabled requests are skipped, never
 enabled as a fallback. Label `needs-human` with the marker comment, and start a fix run
-through the caller's `--dispatch-workflow` with `DISPATCH_TOKEN`, at most three
-a pass. A pass claims each fix round with a
+through the caller's `--dispatch-workflow` with `DISPATCH_TOKEN`, within the
+pass's `--max-dispatch`, pool pacing and `wip`, counting the runs in flight
+and every run the pass started, as stage 4's starts are (agent-board#1025).
+With `reviewPools` the review job's runs in every followed repository are
+counted before the first start, the approved and intake turns' included,
+with the starts reserved in the last ten minutes whose run is not listed yet
+(one more read of the repository's recent comments), and before those turns
+the runs in every repository with the bot's open pull requests that `authored`
+may add. Without a `wip`, as a standalone poll or a pass with no work to schedule, it
+starts at most three a pass. A pass claims each fix round with a
 comment naming the marker comment it decided from, and only the earliest claim on
 that comment, while that marker is still the newest, starts a run. The winner
 writes the round's marker over its claim, so a round is one comment. A claim
@@ -627,8 +635,8 @@ policy either way: `checkReruns`, `unstall`, `directionFirst` (`operatorComments
 and `notifications` read before the followed repositories rather than after
 them), `ownerBranches`, `ownSpaceOnly`,
 `foldRounds`, `reviewPools`, `reviewDispatchRepositories`,
-`draftReviewRepositories`, `headOwners`, `noMerge`, `operatorPaths` and
-`staleDays`, besides `mergeAuthors`, `toilFixPool`, `conflictFixPool`,
+`draftReviewRepositories`, `headOwners`, `noMerge`, `operatorPaths`,
+`staleDays` and `fixRounds`, besides `mergeAuthors`, `toilFixPool`, `conflictFixPool`,
 `mergeQueue` and `rebaseRounds` above. As in the pass, `reviewPools` needs
 `reviewWorkflow`, and `reviewDispatchRepositories` names only followed
 repositories. Under the pass, `unstall` also refuses a configuration that
@@ -986,11 +994,21 @@ start on the same pull request: the plan needs exactly one such midstream
 pull request, and stage 2 starts nothing where there is one. Where they could
 not be read, stage 2 starts nothing either.
 
+`fixRounds` (1 to 5, default 2) is the fix rounds a pull request gets before
+its budget is exhausted (agent-board#1025); each round stays one bounded agent
+run. The default is the two the tracker's polling job may start without
+per-run approval ([AGENTS.md](../AGENTS.md), [design](design.md)); more needs
+that bound changed first. Exhausted, the pull request goes
+to [agent recovery](#agent-recovery-instead-of-operator-parking-992) where
+`agentRecovery` is on, else to `needs-human`. In pass it is `pr.fixRounds`.
+
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
-once its 2 fix rounds are used) gives a pull request that still fails one more
+once its fix rounds are used) gives a pull request that still fails one more
 round, the diagnostic round, on that pool, before `needs-human`
-(tracker#649). It is counted as fix round 3 in the marker, claimed and recorded
-like any round, and given once. Its task also carries the first failed check
+(tracker#649). It is counted as the fix round after the last in the marker, claimed and recorded
+like any round, and given once: the marker records it (`diagnosed`), so it ends
+the rounds even if `fixRounds` is raised later, and a marker from before
+`fixRounds` with more than two rounds reads as having had it. Its task also carries the first failed check
 that is an Actions job of the repository, the step it failed at, and the last
 2000 characters of the first 50 failure annotations of its check run, besides
 the review's text as every fix task does; the merge queue's failure, where that
@@ -999,7 +1017,7 @@ API serves only from a redirect off the API, so for a plain test failure they
 may say little more than the exit code. A failure after it goes to
 `needs-human`, and the stop comment quotes the same excerpt in a fenced block,
 its backticks and `<!--` defused.
-Setting it lets the poll start three runs for a pull request instead of two.
+Setting it lets the poll start one run more than `fixRounds` for a pull request.
 
 `rebaseRounds` (0 to 3; absent or 0 by default, which charges a conflict to the
 fix rounds as any failure) gives a pull request of the bot's whose
@@ -1148,7 +1166,7 @@ comments, reviews and review comments of each thread found. The operator's
 comments from the last two days that no round's marker or triage claim of
 the bot's names start at most one run a thread: on an open pull request the bot
 opened (upstream or in its fork), a fix round counted in its marker like any other (within
-the 2 fix rounds, not while one runs for the head, not once labelled
+the `fixRounds`, not while one runs for the head, not once labelled
 `needs-human`), whose task quotes them; on any other issue or pull request,
 a `triage` run whose task quotes them, says the operator wrote them, and says
 whether a `/bot` or `@BOT` line asks for action (a `research` run where such a
@@ -1192,7 +1210,8 @@ counts as a refusal, so a refusal whose record could not be written, or a
 started run whose record could not, is tried again too, within those tries
 and the fix rounds (agent-board#185). A
 fix round's claim that no marker followed within the run timeout is
-superseded by a marker restating the state. The runs count against the three a pass and go through
+superseded by a marker restating the state. The runs count against the pass's `wip` (the three a pass without one) and
+go through
 `--dispatch-workflow` and its bounds. Followed repositories are left to the
 steps above. Each thread acted on gets a decision line; a preview does not
 advance the cursor.
@@ -1265,7 +1284,7 @@ unread, and the cursor stays before it, as it does before one that could not
 be marked read (from the budget or an error); so does any other subject (an alert,
 an invitation, a release), for a person reading the bot's inbox. The
 three-run cap is per thread: a peer opening many issues is bounded only by
-the three runs a pass.
+the pass's `wip`, or three runs a pass without one.
 The token is the poll's `GH_TOKEN`: listing notifications needs the bot's
 classic token with the `notifications` (or `repo`) scope, as fine-grained
 tokens and App tokens cannot read them. A preview neither marks a thread read

@@ -1415,7 +1415,7 @@ fn settled(api: &dyn Api, p: &Policy, repo: &str, item: u64, comment: Option<u64
         return Ok(());
     };
     // Taking the poll's hold off a pull request starts its fix rounds again
-    // (`MAX_FIX_ROUNDS`); the poll's own `operatorAnswers` reads an answer there.
+    // (`fixRounds`); the poll's own `operatorAnswers` reads an answer there.
     ensure!(
         issue.get("pull_request").is_none_or(Value::is_null),
         "An operator comment settles an issue's hold, not a pull request's"

@@ -59,9 +59,10 @@ pub const MIN_INTERVAL_SECONDS: i64 = 5 * 60;
 pub const MAX_INTERVAL_SECONDS: i64 = 6 * 60 * 60;
 /// The events API serves at most this many a page; the pass reads one page.
 const EVENTS_PAGE: usize = 100;
-/// Fix runs one pass may start, as the design bounds its dispatcher: a pass
-/// that finds (or misreads) many pull requests failing at once cannot start
-/// an agent run for each. The rest stay `fix` and get theirs in later passes.
+/// Runs one pass may start where it has no `wip` to share ([`Pass::admits`]),
+/// as a standalone poll has none: a pass that finds (or misreads) many pull
+/// requests failing at once cannot start an agent run for each. The rest
+/// stay `fix` and get theirs in later passes.
 pub const POLL_DISPATCH_LIMIT: usize = 3;
 
 // The protocol poll.cjs shares with dispatch.yml and fix.toml in the tracker.
@@ -76,7 +77,16 @@ pub(crate) const OPERATOR_APPROVAL_LABEL: &str = "needs-operator-approval";
 /// The start of the wait of a pull request that changes one of the pass's
 /// `pr.operatorPaths` without the operator's approval of its head.
 const OPERATOR_PATHS_WAIT: &str = "pr.operatorPaths: ";
-const MAX_FIX_ROUNDS: u64 = 2;
+/// Fix rounds of one pull request before its budget is exhausted, unless
+/// `fixRounds` says otherwise: the two the tracker's polling job may start
+/// without approval (AGENTS.md).
+pub const FIX_ROUNDS: u64 = 2;
+/// The fixed budget markers were written under before `fixRounds`
+/// ([`Marker::diagnosed`]).
+const LEGACY_FIX_ROUNDS: u64 = 2;
+/// The most `fixRounds` may ask for: each round is an agent run, and a
+/// change that keeps failing cannot start runs without end.
+pub const FIX_ROUNDS_LIMIT: u64 = 5;
 /// The ref fix runs are started at, as poll.cjs starts dispatch.yml.
 const DISPATCH_REF: &str = "main";
 /// fix.toml's replacement_max_commits: the series a fix may hand back.
@@ -242,6 +252,9 @@ const REVIEW_DISPATCH_READS: u64 = 100;
 /// How long a review start reserved for a head may go unlisted before a
 /// person is asked: the start is never sent twice ([`Pass::review_unlisted`]).
 const REVIEW_START_SECONDS: i64 = 10 * 60;
+/// A repository's comments read for the review starts reserved within
+/// [`REVIEW_START_SECONDS`], one page ([`Pass::review_reservations`]).
+const REVIEW_RESERVATION_READS: u64 = 100;
 /// What a review start's claim is a claim of, as its comment says.
 const REVIEW_START: &str = "Review start";
 const REVIEW_RESERVED: &str =
@@ -576,6 +589,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "holdDependencies",
     "agentRecovery",
     "holdMissingData",
+    "fixRounds",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -703,8 +717,12 @@ pub struct PollPolicy {
     /// of its failure annotations, before `needs-human`. The controller did
     /// this by hand (tracker#649), and that round is what fixed them. Empty
     /// (the default) labels it after the fix rounds as before; set, a pull
-    /// request gets one run more than `MAX_FIX_ROUNDS`.
+    /// request gets one run more than [`Self::fix_rounds`].
     pub diagnostic_pool: String,
+    /// `fixRounds`: the fix rounds of one pull request, 1 to
+    /// [`FIX_ROUNDS_LIMIT`]; none is [`FIX_ROUNDS`]. Read with
+    /// [`Self::fix_rounds`].
+    pub fix_rounds: Option<u64>,
     /// `operatorComments.repositories`: where the operator's comments start
     /// runs ([`comments`]), as `OWNER/*` or `OWNER/REPO`. Empty (the default)
     /// reads none.
@@ -829,10 +847,11 @@ pub struct PollPolicy {
     pub draft_review_repositories: Vec<String>,
     /// Caller workflow already inventoried by pass, to avoid counting its reviews twice.
     pub review_caller_workflow: Option<String>,
-    /// The pass's `wip` as the review starts and reruns of
-    /// [`Self::review_pools`] see it ([`Pass::review_admits`]); none, as for
-    /// a pass that starts no work, bounds them by the dispatch caps alone.
-    pub review_wip: Option<ReviewWip>,
+    /// The pass's `wip` as its fix, rebase, continuation, answer, triage and
+    /// review starts and reruns see it ([`Pass::admits`]); none, as for a
+    /// standalone poll or a pass that starts no work, bounds them by
+    /// [`POLL_DISPATCH_LIMIT`] instead.
+    pub wip: Option<Wip>,
     /// The board's Priority rank, its option's index, of each issue on it by
     /// lower-case `OWNER/REPO#N`: a pull request's review starts in the
     /// best rank of the issues it closes, unranked last
@@ -845,17 +864,21 @@ pub struct PollPolicy {
     /// space nothing is written in them ([`Config::writes_in`]). Empty (the
     /// default) follows `mergeAuthors` everywhere.
     pub bot_only: Vec<String>,
+    /// With `wip`, the repositories besides the followed whose review runs
+    /// [`Pass::review_census`] counts before any start: those the pass's
+    /// `authored` sweep may add after its approved and intake turns.
+    pub review_census: Vec<String>,
 }
 
-/// The pass's `wip` for stage 2's review starts and reruns, read before it.
+/// The pass's `wip` for stage 2's starts and reruns, read before it.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ReviewWip {
+pub struct Wip {
     pub wip: usize,
     /// The runs active besides the review job's: the caller's listed and
     /// leased runs, and those earlier stages of the pass started.
     pub active: usize,
-    /// Why no review starts this pass, such as another pass in progress or
-    /// a listing that could not be read.
+    /// Why no run starts this pass, such as another pass in progress or a
+    /// listing that could not be read.
     pub held: Option<String>,
 }
 
@@ -1135,6 +1158,8 @@ pub struct PrOptions {
     pub operator_paths: Vec<String>,
     #[serde(default)]
     pub stale_days: u64,
+    #[serde(default)]
+    pub fix_rounds: Option<u64>,
 }
 
 impl PrOptions {
@@ -1240,6 +1265,11 @@ impl PrOptions {
             "{at}staleDays is not 0 to {}",
             stale::STALE_DAYS_LIMIT
         );
+        ensure!(
+            self.fix_rounds
+                .is_none_or(|r| (1..=FIX_ROUNDS_LIMIT).contains(&r)),
+            "{at}fixRounds is not 1 to {FIX_ROUNDS_LIMIT}"
+        );
         Ok(())
     }
 
@@ -1266,6 +1296,7 @@ impl PrOptions {
             no_merge,
             operator_paths,
             stale_days,
+            fix_rounds,
         } = self.clone();
         policy.queue_only_repository = queue_only_repository;
         policy.agent_recovery = agent_recovery;
@@ -1287,10 +1318,16 @@ impl PrOptions {
         policy.no_merge = no_merge;
         policy.operator_paths = operator_paths;
         policy.stale_days = stale_days;
+        policy.fix_rounds = fix_rounds;
     }
 }
 
 impl PollPolicy {
+    /// The fix rounds of one pull request: `fixRounds`, or [`FIX_ROUNDS`].
+    pub fn fix_rounds(&self) -> u64 {
+        self.fix_rounds.unwrap_or(FIX_ROUNDS)
+    }
+
     pub fn from_json(value: &Value) -> Result<Self> {
         check_config(value)?;
         let get = |key: &str| option(value, key);
@@ -1408,6 +1445,7 @@ impl PollPolicy {
             midstreams: Vec::new(),
             operator_paths: Vec::new(),
             stale_days: 0,
+            fix_rounds: None,
             check_reruns: false,
             unstall: false,
             hold_missing_data: false,
@@ -1428,9 +1466,10 @@ impl PollPolicy {
             assign_holds: false,
             reruns: false,
             review_caller_workflow: None,
-            review_wip: None,
+            wip: None,
             review_ranks: BTreeMap::new(),
             bot_only: Vec::new(),
+            review_census: Vec::new(),
         };
         pr.apply(&mut policy);
         Ok(policy)
@@ -2752,6 +2791,11 @@ pub struct Marker {
     pub recovery: Option<recovery::Recovery>,
     pub id: Option<u64>,
     pub rounds: u64,
+    /// Whether the last of `rounds` was the diagnostic round, which ends
+    /// them whatever [`PollPolicy::fix_rounds`] says now. Written where set
+    /// or `rounds` is past [`LEGACY_FIX_ROUNDS`]; a marker without it from
+    /// before `fixRounds` ran its diagnostic round if its rounds are past.
+    pub diagnosed: bool,
     pub sha: Option<String>,
     pub run: Option<u64>,
     pub at: Option<String>,
@@ -2908,6 +2952,9 @@ impl Marker {
     /// The state the marker comment carries, as poll.cjs writes it.
     fn state(&self) -> Value {
         let mut state = json!({"rounds": self.rounds});
+        if self.diagnosed || self.rounds > LEGACY_FIX_ROUNDS {
+            state["diagnosed"] = self.diagnosed.into();
+        }
         if let Some(recovery) = &self.recovery {
             state["recovery"] = json!(recovery);
         }
@@ -2996,6 +3043,8 @@ impl Marker {
             marker.rebased = marker.rebased.saturating_sub(1);
         } else {
             marker.rounds = marker.rounds.saturating_sub(1);
+            // The diagnostic round is the last, so it is the one given back.
+            marker.diagnosed = false;
         }
         marker
     }
@@ -3006,7 +3055,7 @@ impl Marker {
             format!("continuation round {}", self.continued)
         } else if self.rebasing {
             format!("rebase round {}", self.rebased)
-        } else if self.rounds > MAX_FIX_ROUNDS {
+        } else if self.diagnosed {
             "the diagnostic round".into()
         } else {
             format!("fix round {}", self.rounds)
@@ -3076,6 +3125,9 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
             recovery: state.get("recovery").map(recovery::read),
             id: comment["id"].as_u64(),
             rounds,
+            diagnosed: state["diagnosed"]
+                .as_bool()
+                .unwrap_or(rounds > LEGACY_FIX_ROUNDS),
             sha: state["sha"].as_str().map(str::to_owned),
             run: state["run"].as_u64().filter(|r| *r > 0),
             at: state["at"].as_str().map(str::to_owned),
@@ -3735,23 +3787,24 @@ pub fn rebase_task(repo: &str, pull: &Value, approved: bool, round: u64, rounds:
 
 /// The task a fix run is started with, as poll.cjs's `fixTask`. `review` is
 /// the text of the change request of the head (the operator's, or else the
-/// review job's), when that is what failed.
+/// review job's), when that is what failed. `round` is of `rounds`
+/// ([`PollPolicy::fix_rounds`]); one past them is the diagnostic round.
 pub fn fix_task(
     repo: &str,
     pull: &Value,
     checks: &Checks,
     review: Option<&str>,
-    round: u64,
+    (round, rounds): (u64, u64),
 ) -> String {
     let head = text(pull, "/headRefOid");
     let base = text(pull, "/baseRefName");
     let number = pull["number"].as_u64().unwrap_or_default();
-    let which = if round > MAX_FIX_ROUNDS {
+    let which = if round > rounds {
         format!(
-            "This is its diagnostic round: {MAX_FIX_ROUNDS} fix rounds did not make it pass. Read the failure quoted below, find its cause before changing anything, and fix that cause."
+            "This is its diagnostic round: {rounds} fix rounds did not make it pass. Read the failure quoted below, find its cause before changing anything, and fix that cause."
         )
     } else {
-        format!("This is fix round {round} of {MAX_FIX_ROUNDS}.")
+        format!("This is fix round {round} of {rounds}.")
     };
     let mut lines = vec![format!(
         "Pull request {repo}#{number} at head {head} cannot merge as it is. Make the smallest change to its branch that addresses what follows, and nothing else. {which}"
@@ -4333,22 +4386,28 @@ pub fn decide(
             };
         }
         // The diagnostic round is one more, counted in `rounds` as the next
-        // fix round, so it is claimed and recorded like one and runs once.
-        let pool = &config.policy.diagnostic_pool;
-        if !config.policy.agent_recovery && marker.rounds == MAX_FIX_ROUNDS && !pool.is_empty() {
+        // fix round, so it is claimed and recorded like one and runs once;
+        // it ends the rounds whatever their budget became since.
+        let (pool, rounds) = (&config.policy.diagnostic_pool, config.policy.fix_rounds());
+        if !config.policy.agent_recovery
+            && marker.rounds == rounds
+            && !marker.diagnosed
+            && !pool.is_empty()
+        {
             return Decision {
                 action: "fix",
-                reason: format!(
-                    "{why}; {MAX_FIX_ROUNDS} fix rounds used, so a diagnostic round on {pool}"
-                ),
-                round: Some(MAX_FIX_ROUNDS + 1),
+                reason: format!("{why}; {rounds} fix rounds used, so a diagnostic round on {pool}"),
+                round: Some(rounds + 1),
                 queue: None,
                 waiting: WaitReason::Person,
             };
         }
-        if marker.rounds >= MAX_FIX_ROUNDS {
-            let used = if marker.rounds > MAX_FIX_ROUNDS {
-                format!("{MAX_FIX_ROUNDS} fix rounds and a diagnostic round")
+        if marker.rounds >= rounds || marker.diagnosed {
+            let used = if marker.diagnosed {
+                format!(
+                    "{} fix rounds and a diagnostic round",
+                    marker.rounds.saturating_sub(1)
+                )
             } else {
                 format!("{} fix rounds", marker.rounds)
             };
@@ -4606,6 +4665,21 @@ fn slim_runs(list: &Value) -> Value {
         slim
     };
     json!({"workflow_runs": runs.iter().map(slim).collect::<Vec<_>>()})
+}
+
+/// A repository's comments, each with what [`Pass::review_reservations`]
+/// reads.
+fn slim_reservations(list: &Value) -> Value {
+    let comments = list.as_array().map_or(&[][..], Vec::as_slice);
+    let slim = |c: &Value| {
+        json!({
+            "user": {"login": c["user"]["login"]},
+            "issue_url": c["issue_url"],
+            "created_at": c["created_at"],
+            "body": c["body"],
+        })
+    };
+    comments.iter().map(slim).collect()
 }
 
 fn events_url(repo: &str) -> String {
@@ -5081,8 +5155,8 @@ struct Pass<'a, R, G> {
     /// See [`Outcome::reviewing`].
     reviewing: usize,
     /// Why the review job's runs counted toward `wip` may be too few: a
-    /// list cut short or unread. With [`PollPolicy::review_wip`] it holds
-    /// every review start and rerun.
+    /// list cut short or unread. With [`PollPolicy::wip`] it holds every
+    /// start and rerun.
     review_unread: Option<String>,
     /// The review starts and reruns decided, taken once every followed pull
     /// request is ([`Pass::start_reviews`]), and the one [`Pass::pull`] just
@@ -5292,6 +5366,27 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             outcome.error(&format!("{repo} review job's runs"), &error);
             self.review_unread
                 .get_or_insert(format!("the review job's runs in {repo} could not be read"));
+        }
+    }
+
+    /// With [`PollPolicy::wip`], counts the review job's runs in each of
+    /// `repos` before any start: one admitted ([`Self::admits`]) while a
+    /// later repository's runs were still uncounted could fill slots they
+    /// hold. Each is read once a pass, so the walk's own count adds nothing.
+    /// So too [`PollPolicy::review_census`]'s.
+    fn review_census<'r>(
+        &mut self,
+        repos: impl IntoIterator<Item = &'r String>,
+        outcome: &mut Outcome,
+    ) {
+        let config = self.config;
+        if config.policy.wip.is_some() {
+            for repo in repos {
+                self.count_reviews(repo, outcome);
+            }
+            for repo in &config.policy.review_census {
+                self.count_reviews(repo, outcome);
+            }
         }
     }
 
@@ -5835,7 +5930,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 .get(&at.reason)
                 .filter(|_| at.reason != "cap" || !carried.raised)
         });
-        let diagnostic = !continuing && !rebasing && round > MAX_FIX_ROUNDS;
+        let fix_rounds = policy.fix_rounds();
+        let diagnostic = !continuing && !rebasing && round > fix_rounds;
         // A rebase is picked for as a first fix round is: the toil pool where
         // one is set, as an approved conflict is toil, else the first pool.
         let pool_round = if rebasing { 1 } else { round };
@@ -5870,10 +5966,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             Err(why) => return Ok(format!("not started: {why}")),
         };
         if self.apply.is_none() {
-            if self.dispatched >= POLL_DISPATCH_LIMIT {
-                return Ok(format!(
-                    "not started: this pass started {POLL_DISPATCH_LIMIT} fix runs already"
-                ));
+            if let Err(why) = self.admits() {
+                return Ok(format!("not started: {why}"));
             }
             self.dispatched += 1;
             if let Some(pool) = &pool {
@@ -5922,10 +6016,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         } else {
             (
                 format!("fix round {round}"),
-                format!(
-                    "Fix round {round} of {MAX_FIX_ROUNDS} for `{}`",
-                    short(head)
-                ),
+                format!("Fix round {round} of {fix_rounds} for `{}`", short(head)),
             )
         };
         let state = json!({"from": claim_from(marker), "round": round, "sha": head});
@@ -5959,6 +6050,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 carried.rounds
             } else {
                 round
+            },
+            diagnosed: if continuing || rebasing {
+                carried.diagnosed
+            } else {
+                diagnostic
             },
             sha: Some(head.to_owned()),
             run: None,
@@ -6008,7 +6104,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     Some((Review::ChangesRequested, body)) => Some(body),
                     _ => None,
                 };
-                fix_task(repo, pull, checks, review, round)
+                fix_task(repo, pull, checks, review, (round, fix_rounds))
             }
         };
         let task = midstream_task(&self.config.policy, repo, task);
@@ -6254,10 +6350,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
             action @ ("fix" | "continue" | "rebase") => {
                 let round = decision.round.context("a run without a round")?;
-                if self.dispatched >= POLL_DISPATCH_LIMIT {
-                    return Ok(Some(format!(
-                        "not started: this pass started {POLL_DISPATCH_LIMIT} fix runs already"
-                    )));
+                if let Err(why) = self.admits() {
+                    return Ok(Some(format!("not started: {why}")));
                 }
                 self.start_fix(
                     repo,
@@ -6771,7 +6865,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         );
         let counted_by_caller = repo.eq_ignore_ascii_case(&self.config.dispatch_repo)
             && Some(workflow) == self.config.policy.review_caller_workflow.as_deref()
-            && self.config.policy.review_wip.is_some();
+            && self.config.policy.wip.is_some();
+        let reserved = match self.reservations_counted() {
+            true => self.review_reservations(repo, page)?,
+            false => 0,
+        };
+        self.reviewing += reserved;
         self.reviewing += page
             .iter()
             .filter(|r| {
@@ -6791,6 +6890,78 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         self.review_runs.insert(repo.to_owned(), runs.clone());
         Ok(runs)
+    }
+
+    /// Whether reserved review starts are counted with their repository's
+    /// runs ([`Self::review_reservations`]) rather than as the walk finds
+    /// them: where they count toward `wip` ([`Self::admits`]).
+    fn reservations_counted(&self) -> bool {
+        self.config.policy.wip.is_some() && !self.config.policy.review_pools.is_empty()
+    }
+
+    /// With [`PollPolicy::wip`], the review starts reserved in `repo` within
+    /// [`REVIEW_START_SECONDS`] ([`Self::review_unlisted`]) with no run of
+    /// the job for their head in `runs` created since: read with the runs,
+    /// before any start, as one found only when the walk reaches its pull
+    /// request would come after starts that took its slot. One for a head
+    /// the pull request has moved on from counts too, until it ages out.
+    fn review_reservations(&mut self, repo: &str, runs: &[Value]) -> Result<usize> {
+        let since = (self.now - time::Duration::seconds(REVIEW_START_SECONDS))
+            .replace_nanosecond(0)
+            .context("review reservations since")?
+            .format(&Rfc3339)
+            .context("review reservations since")?;
+        let url = format!(
+            "{API_ROOT}repos/{repo}/issues/comments?since={since}&per_page={REVIEW_RESERVATION_READS}"
+        );
+        let (list, next) = self.get_url(&url, slim_reservations, false)?;
+        if next.is_some() {
+            self.review_unread.get_or_insert(format!(
+                "{repo} has more comments since {since} than the {REVIEW_RESERVATION_READS} read for review reservations"
+            ));
+        }
+        let mut reserved = BTreeSet::new();
+        for comment in nodes(&list, "").iter() {
+            if text(comment, "/user/login") != self.config.bot {
+                continue;
+            }
+            let body = text(comment, "/body");
+            let (head, at) = match (parse_marker(MARKER, body), parse_marker(CLAIM, body)) {
+                (Some(marker), _) => (
+                    text(&marker, "/review_head").to_owned(),
+                    marker["review_at"].as_str().map(str::to_owned),
+                ),
+                (_, Some(claim)) => match text(&claim, "/from").strip_prefix(&format!("{REVIEW}:"))
+                {
+                    Some(key) => (
+                        key.to_owned(),
+                        comment["created_at"].as_str().map(str::to_owned),
+                    ),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let head = head.split('/').next().unwrap_or_default();
+            let number = text(comment, "/issue_url")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default();
+            let Some(at) = timestamp(at.as_deref()) else {
+                continue;
+            };
+            if head.is_empty() || (self.now - at).whole_seconds() >= REVIEW_START_SECONDS {
+                continue;
+            }
+            let title = format!("{REVIEW} {repo}#{number} {head}").to_ascii_lowercase();
+            let listed = runs.iter().any(|r| {
+                (text(r, "/display_title").to_ascii_lowercase()).starts_with(&title)
+                    && timestamp(r["created_at"].as_str()).is_some_and(|created| created >= at)
+            });
+            if !listed {
+                reserved.insert((number.to_owned(), head.to_owned()));
+            }
+        }
+        Ok(reserved.len())
     }
 
     /// The step for `pull`'s head where no run of the review job for it is
@@ -6836,31 +7007,43 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         };
         let age = timestamp(at.as_deref()).map(|at| (self.now - at).whole_seconds());
         if age.is_some_and(|age| age < REVIEW_START_SECONDS) {
-            self.reviewing += 1;
+            if !self.reservations_counted() {
+                self.reviewing += 1;
+            }
             waiting.followed(timestamp(at.as_deref()))
         } else {
             step("needs-human", stop)
         }
     }
 
-    /// Whether one more review start or rerun fits: within the poll's
-    /// [`POLL_DISPATCH_LIMIT`] and, with [`PollPolicy::review_wip`], the
-    /// pass's `wip`, counting the runs active besides, the review job's
-    /// ([`Outcome::reviewing`]) and every run this pass started; else why not.
-    fn review_admits(&self) -> std::result::Result<(), String> {
+    /// Whether one more start or rerun fits, of any round, triage or review:
+    /// with [`PollPolicy::wip`], within the pass's `wip`, counting the runs
+    /// active besides, with `reviewPools` the review job's
+    /// ([`Outcome::reviewing`]), and every run this pass started, as its
+    /// `--max-dispatch` and pacing bound them too; without, as a standalone
+    /// poll or a pass with no work to schedule, within
+    /// [`POLL_DISPATCH_LIMIT`]. Else why not.
+    pub(crate) fn admits(&self) -> std::result::Result<(), String> {
         let started = self.dispatched + self.planned;
-        if started >= POLL_DISPATCH_LIMIT {
-            return Err(format!(
-                "this pass started {POLL_DISPATCH_LIMIT} runs already"
-            ));
-        }
-        let Some(wip) = &self.config.policy.review_wip else {
+        let Some(wip) = &self.config.policy.wip else {
+            if started >= POLL_DISPATCH_LIMIT {
+                return Err(format!(
+                    "this pass started {POLL_DISPATCH_LIMIT} runs already"
+                ));
+            }
             return Ok(());
         };
-        if let Some(why) = wip.held.as_ref().or(self.review_unread.as_ref()) {
+        // The review job's runs count only where the pass starts them, with
+        // `reviewPools`; else they are the job's own, outside `wip`.
+        let reviews = !self.config.policy.review_pools.is_empty();
+        let (reviewing, unread) = match reviews {
+            true => (self.reviewing, self.review_unread.as_ref()),
+            false => (0, None),
+        };
+        if let Some(why) = wip.held.as_ref().or(unread) {
             return Err(why.clone());
         }
-        let active = wip.active + self.reviewing + started;
+        let active = wip.active + reviewing + started;
         if active >= wip.wip {
             return Err(format!("wip: {active} of {} runs active", wip.wip));
         }
@@ -6903,8 +7086,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     }
 
     /// One deferred review start or rerun, a dispatch step within the caps,
-    /// admitted ([`Self::review_admits`]) before anything is written: what
-    /// came of it, and whether it was taken, or in a preview would be.
+    /// admitted ([`Self::admits`]) before anything is written: what came of
+    /// it, and whether it was taken, or in a preview would be.
     fn take_review(&mut self, review: &Deferred) -> Result<(Option<String>, bool)> {
         self.rest.start_kind(review.action);
         if let Some(apply) = &self.apply {
@@ -6913,7 +7096,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if let Some(held) = self.caps.and_then(|caps| caps.check(Kind::Dispatch)) {
             return Ok((Some(held), false));
         }
-        if let Err(why) = self.review_admits() {
+        if let Err(why) = self.admits() {
             let verb = if review.action == REVIEW {
                 "started"
             } else {
@@ -8768,9 +8951,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // Read only for a diagnostic round that starts, or the stop after
         // one, and only where the step is taken. A read that fails is said
         // in its place, so that it cannot hold the round or the stop.
+        let fix_rounds = self.config.policy.fix_rounds();
         let diagnostic = match decision.action {
-            "fix" => decision.round > Some(MAX_FIX_ROUNDS),
-            "needs-human" => marker.rounds > MAX_FIX_ROUNDS && !marker.stopped,
+            "fix" => decision.round > Some(fix_rounds),
+            "needs-human" => marker.diagnosed && !marker.stopped,
             _ => false,
         };
         if self.apply.is_some() && diagnostic {
@@ -8873,10 +9057,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 let run = marker.run.context("a run rerun without its run")?;
                 let caller = self.config.dispatch_repo.clone();
                 let pool = marker.pool.clone().filter(|p| !p.is_empty());
-                if self.dispatched >= POLL_DISPATCH_LIMIT {
-                    Ok(Some(format!(
-                        "not re-run: this pass started {POLL_DISPATCH_LIMIT} fix runs already"
-                    )))
+                if let Err(why) = self.admits() {
+                    Ok(Some(format!("not re-run: {why}")))
                 } else {
                     let done = self.rerun(dispatcher, (&caller, run), pool, &fix)?;
                     self.dispatched += usize::from(done == RE_RUN);
@@ -9519,6 +9701,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         pass.intake_refused = std::mem::take(&mut state.intake_refused);
     }
     let follow: BTreeSet<&String> = follow.iter().collect();
+    pass.review_census(follow.iter().copied(), &mut outcome);
     // What the operator asks the bot is answered within the pass: before the
     // followed repositories' reads, whose share would otherwise leave the
     // intake nothing pass after pass (agent-board#840).
@@ -9816,8 +9999,12 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
     prior: Option<(Outcome, usize)>,
 ) -> Result<(Outcome, usize)> {
     let budget = share.min(POLL_REQUEST_LIMIT);
+    let (mut outcome, prior_requests) = prior.unwrap_or_default();
     let mut pass = Pass {
-        dispatched: prior.as_ref().map_or(0, |(o, _)| o.dispatched),
+        dispatched: outcome.dispatched,
+        reviewing: outcome.reviewing,
+        review_runs: std::mem::take(&mut outcome.review_runs),
+        review_unread: outcome.review_unread.take(),
         apply,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps: Some(caps),
@@ -9836,7 +10023,7 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
         );
     }
     let mut cursors = Cursors::new(config, &mut state);
-    let (mut outcome, prior_requests) = prior.unwrap_or_default();
+    pass.review_census(follow, &mut outcome);
     read_direction(
         &mut pass,
         config,
@@ -9854,6 +10041,9 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
     state.intake_refused = pass.intake_refused;
     state.operator_direction = pass.operator_direction;
     outcome.dispatched = pass.dispatched;
+    outcome.reviewing = pass.reviewing;
+    outcome.review_runs = pass.review_runs;
+    outcome.review_unread = pass.review_unread;
     outcome.state = state;
     Ok((outcome, prior_requests + budget - pass.remaining))
 }
@@ -10064,9 +10254,10 @@ impl PlannedCharge {
 fn planned_round(
     marker: &Marker,
     read: &[Value],
-    bot: &str,
+    config: &Config,
     head: &str,
 ) -> std::result::Result<Marker, String> {
+    let (bot, rounds) = (config.bot.as_str(), config.policy.fix_rounds());
     let carried = if marker.stopped {
         Marker::default()
     } else {
@@ -10079,8 +10270,8 @@ fn planned_round(
             short(head)
         ));
     }
-    if carried.rounds >= MAX_FIX_ROUNDS {
-        return Err(format!("its {MAX_FIX_ROUNDS} fix rounds are used"));
+    if carried.rounds >= rounds || carried.diagnosed {
+        return Err(format!("its {rounds} fix rounds are used"));
     }
     if let Some((id, _)) = earliest_claim(read, bot, &claim_from(marker)) {
         return Err(format!(
@@ -10111,14 +10302,14 @@ pub(crate) fn planned_fix_hold<R: Rest, G: Transport>(
         &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
         true,
     )?;
-    Ok(planned_round(&find_marker(&read, &config.bot), &read, &config.bot, head).err())
+    Ok(planned_round(&find_marker(&read, &config.bot), &read, config, head).err())
 }
 
 /// Charge the next fix round of pull request `number` in `repo` at `head`
 /// to a fix the pass starts from an issue's plan (agent-board#735), as
 /// [`Pass::start_fix`] charges its own: claimed from the bot's newest marker
 /// and recorded over the claim, so that planned fixes and stage 2's share
-/// [`MAX_FIX_ROUNDS`]. The run is not recorded in the marker, so stage 2
+/// [`PollPolicy::fix_rounds`]. The run is not recorded in the marker, so stage 2
 /// waits on its head as on any round whose run it cannot name. Why not,
 /// where the rounds are used, a round already started on `head`, or another
 /// pass claimed first; a stop whose label was taken off starts them again.
@@ -10147,13 +10338,14 @@ pub(crate) fn charge_planned_fix<R: Rest, G: Transport>(
     let comments = format!("repos/{repo}/issues/{number}/comments?per_page=100");
     let read = pass.paged(&comments, true)?;
     let marker = find_marker(&read, &config.bot);
-    let carried = match planned_round(&marker, &read, &config.bot, head) {
+    let carried = match planned_round(&marker, &read, config, head) {
         Ok(carried) => carried,
         Err(why) => return Ok(Err(why)),
     };
     let round = carried.rounds + 1;
     let of = format!(
-        "Planned fix round {round} of {MAX_FIX_ROUNDS} for `{}`",
+        "Planned fix round {round} of {} for `{}`",
+        config.policy.fix_rounds(),
         short(head)
     );
     let state = json!({"from": claim_from(&marker), "round": round, "sha": head});
@@ -10592,7 +10784,7 @@ mod tests {
                 "a conflict with the rounds exhausted goes to a human",
                 "pull-470",
                 json!({"mergeable": CONFLICTING}),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "needs-human",
                 None,
@@ -10601,7 +10793,7 @@ mod tests {
                 "an approved conflict past its fix rounds is rebased apart from them",
                 "pull-470",
                 json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "rebase",
                 Some(1),
@@ -10638,7 +10830,7 @@ mod tests {
                 "a marker's rebase count past the cap reads as the cap",
                 "pull-470",
                 json!({"mergeable": CONFLICTING, "policy": {"rebaseRounds": REBASE_ROUNDS_LIMIT}}),
-                json!({"rounds": 2, "rebased": 99, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "rebased": 99, "sha": "older"}),
                 none.clone(),
                 "needs-human",
                 None,
@@ -10647,7 +10839,7 @@ mod tests {
                 "both kinds of rounds used goes to a human",
                 "pull-470",
                 json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
-                json!({"rounds": 2, "rebased": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "rebased": 2, "sha": "older"}),
                 none.clone(),
                 "needs-human",
                 None,
@@ -10665,7 +10857,7 @@ mod tests {
                 "a conflict with a failed check is not a rebase round",
                 "pull-470",
                 json!({"mergeable": CONFLICTING, "contexts": ci_failed.clone(), "policy": rebase.clone()}),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "needs-human",
                 None,
@@ -10674,7 +10866,7 @@ mod tests {
                 "a rebase round running for this head waits",
                 "pull-470",
                 json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
-                json!({"rounds": 2, "rebased": 1, "rebasing": true, "sha": HEAD, "run": 7}),
+                json!({"rounds": FIX_ROUNDS, "rebased": 1, "rebasing": true, "sha": HEAD, "run": 7}),
                 running.clone(),
                 "wait",
                 None,
@@ -10692,7 +10884,7 @@ mod tests {
                 "the bot's release-train conflict is rebased as a dispatch one is",
                 "pull-470",
                 json!({"mergeable": CONFLICTING, "headRefName": "release-train/v1.2.3", "policy": rebase.clone()}),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "rebase",
                 Some(1),
@@ -10801,7 +10993,7 @@ mod tests {
                 "continuation rounds are counted apart from fix rounds",
                 "pull-470",
                 json!({"isDraft": true, "body": checkpointed("cap")}),
-                json!({"rounds": 2, "continued": 1, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "continued": 1, "sha": "older"}),
                 none.clone(),
                 "continue",
                 Some(2),
@@ -11036,7 +11228,7 @@ mod tests {
                 "rounds exhausted goes to a human",
                 "pull-470",
                 json!({"contexts": changes}),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "needs-human",
                 None,
@@ -11064,7 +11256,7 @@ mod tests {
                 "removing needs-human gives used-up rounds back",
                 "pull-470",
                 json!({"contexts": changes}),
-                json!({"stopped": true, "rounds": 2, "sha": "older"}),
+                json!({"stopped": true, "rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "fix",
                 Some(1),
@@ -11082,7 +11274,7 @@ mod tests {
                 "removing needs-human on a conflicting head rebases it",
                 "pull-470",
                 json!({"mergeable": CONFLICTING}),
-                json!({"stopped": true, "rounds": 2, "sha": HEAD, "run": 7}),
+                json!({"stopped": true, "rounds": FIX_ROUNDS, "sha": HEAD, "run": 7}),
                 json!({"status": "completed", "updated_at": "2026-10-12T01:00:00Z"}),
                 "fix",
                 Some(1),
@@ -11091,7 +11283,7 @@ mod tests {
                 "a stopped pull request still labelled stays stopped",
                 "pull-470",
                 json!({"labels": label, "contexts": changes}),
-                json!({"stopped": true, "rounds": 2, "sha": HEAD}),
+                json!({"stopped": true, "rounds": FIX_ROUNDS, "sha": HEAD}),
                 none.clone(),
                 "skip",
                 None,
@@ -11100,7 +11292,7 @@ mod tests {
                 "a stopped pull request that is approved and green merges",
                 "pull-470",
                 json!({}),
-                json!({"stopped": true, "rounds": 2, "sha": HEAD}),
+                json!({"stopped": true, "rounds": FIX_ROUNDS, "sha": HEAD}),
                 none.clone(),
                 "merge",
                 None,
@@ -11233,7 +11425,7 @@ mod tests {
                 "a placeholder with the rounds used up goes to a human",
                 "pull-511",
                 json!({}),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "needs-human",
                 None,
@@ -11433,25 +11625,25 @@ mod tests {
                 "fix rounds used up get a diagnostic round where a pool is set",
                 "pull-470",
                 json!({"contexts": ci_failed, "policy": diagnostic}),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "fix",
-                Some(3),
+                Some(FIX_ROUNDS + 1),
             ),
             (
                 "a review's change request gets one too",
                 "pull-470",
                 json!({"contexts": changes, "policy": diagnostic}),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 none.clone(),
                 "fix",
-                Some(3),
+                Some(FIX_ROUNDS + 1),
             ),
             (
                 "the diagnostic round running waits",
                 "pull-470",
                 json!({"contexts": ci_failed, "policy": diagnostic}),
-                json!({"rounds": 3, "sha": HEAD, "run": 7}),
+                json!({"rounds": FIX_ROUNDS + 1, "sha": HEAD, "run": 7}),
                 running.clone(),
                 "wait",
                 None,
@@ -11460,7 +11652,7 @@ mod tests {
                 "a diagnostic round that failed goes to a human",
                 "pull-470",
                 json!({"contexts": ci_failed, "policy": diagnostic}),
-                json!({"rounds": 3, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS + 1, "sha": "older"}),
                 none.clone(),
                 "needs-human",
                 None,
@@ -11469,7 +11661,7 @@ mod tests {
                 "and one whose run ended with the head as it was",
                 "pull-470",
                 json!({"contexts": ci_failed, "policy": diagnostic}),
-                json!({"rounds": 3, "sha": HEAD, "run": 7}),
+                json!({"rounds": FIX_ROUNDS + 1, "sha": HEAD, "run": 7}),
                 failed_run.clone(),
                 "needs-human",
                 None,
@@ -11478,7 +11670,7 @@ mod tests {
                 "removing needs-human gives fix rounds back first",
                 "pull-470",
                 json!({"contexts": ci_failed, "policy": diagnostic}),
-                json!({"rounds": 3, "sha": "older", "stopped": true}),
+                json!({"rounds": FIX_ROUNDS + 1, "sha": "older", "stopped": true}),
                 none.clone(),
                 "fix",
                 Some(1),
@@ -13477,6 +13669,22 @@ mod tests {
             self.rest
                 .insert(format!("{API_ROOT}{path}"), (etag, modified, None, body));
         }
+
+        /// `repo`'s comments read for its reserved review starts
+        /// ([`Pass::review_reservations`]) at [`now`].
+        pub(in crate::poll) fn reservations(&mut self, repo: &str, comments: Value) {
+            let since = (now() - time::Duration::seconds(REVIEW_START_SECONDS))
+                .format(&Rfc3339)
+                .unwrap();
+            self.page(
+                &format!(
+                    "repos/{repo}/issues/comments?since={since}&per_page={REVIEW_RESERVATION_READS}"
+                ),
+                None,
+                None,
+                comments,
+            );
+        }
     }
 
     impl Rest for Fake {
@@ -14720,6 +14928,114 @@ mod tests {
         .unwrap();
         assert!(queue_only(&policy, REPO));
         assert!(!queue_only(&policy, "other/repo"));
+    }
+
+    /// `fixRounds` sets how many fix rounds a pull request gets before its
+    /// budget is exhausted, within its bounds, and the decision follows it.
+    #[test]
+    fn fix_rounds_are_configured_and_bounded() {
+        for (setting, rounds) in [
+            (json!(null), Some(FIX_ROUNDS)),
+            (json!(1), Some(1)),
+            (json!(FIX_ROUNDS_LIMIT), Some(FIX_ROUNDS_LIMIT)),
+            (json!(0), None),
+            (json!(FIX_ROUNDS_LIMIT + 1), None),
+            (json!(-1), None),
+            (json!("2"), None),
+        ] {
+            let policy = PollPolicy::from_json(&json!({"fixRounds": setting}));
+            assert_eq!(policy.ok().map(|p| p.fix_rounds()), rounds, "{setting}");
+        }
+        let failing = pull(
+            "pull-470",
+            json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
+        );
+        // A marker from before `fixRounds` with more rounds than its fixed
+        // budget ran its diagnostic round, which is not run twice.
+        for (fix_rounds, state, pool, expected) in [
+            (
+                None,
+                json!({"rounds": FIX_ROUNDS - 1}),
+                "",
+                ("fix", Some(FIX_ROUNDS)),
+            ),
+            (
+                None,
+                json!({"rounds": FIX_ROUNDS}),
+                "",
+                ("needs-human", None),
+            ),
+            (
+                Some(4),
+                json!({"rounds": FIX_ROUNDS}),
+                "",
+                ("fix", Some(FIX_ROUNDS + 1)),
+            ),
+            (Some(1), json!({"rounds": 1}), "", ("needs-human", None)),
+            (Some(1), json!({"rounds": 1}), "large", ("fix", Some(2))),
+            (
+                Some(3),
+                json!({"rounds": 2, "diagnosed": true}),
+                "large",
+                ("needs-human", None),
+            ),
+            (
+                Some(3),
+                json!({"rounds": 3}),
+                "large",
+                ("needs-human", None),
+            ),
+            (Some(5), json!({"rounds": 3}), "", ("needs-human", None)),
+            (
+                Some(3),
+                json!({"rounds": 3, "diagnosed": false}),
+                "large",
+                ("fix", Some(4)),
+            ),
+            (
+                Some(3),
+                json!({"rounds": 4, "diagnosed": true}),
+                "large",
+                ("needs-human", None),
+            ),
+            (
+                Some(5),
+                json!({"rounds": 4, "diagnosed": false}),
+                "",
+                ("fix", Some(5)),
+            ),
+        ] {
+            let mut cfg = config();
+            cfg.policy.fix_rounds = fix_rounds;
+            cfg.policy.diagnostic_pool = pool.into();
+            let mut state = state;
+            state["sha"] = "older".into();
+            let decision = decide(
+                &cfg,
+                &failing,
+                &classify_checks(&failing, &required()),
+                &marker(state.clone()),
+                (None, None),
+                &Outages::Off,
+                now(),
+            );
+            assert_eq!(
+                (decision.action, decision.round),
+                expected,
+                "{fix_rounds:?} {state}: {}",
+                decision.reason
+            );
+        }
+        // Past the old budget the marker says which its last round was.
+        for diagnosed in [false, true] {
+            let state = json!({"rounds": LEGACY_FIX_ROUNDS + 1, "diagnosed": diagnosed});
+            let read = marker(state.clone());
+            assert_eq!((read.diagnosed, read.state()), (diagnosed, state));
+        }
+        assert_eq!(marker(json!({"rounds": 1})).state(), json!({"rounds": 1}));
+        // A diagnostic round within the old budget, after `fixRounds: 1`.
+        let state = json!({"rounds": 2, "diagnosed": true});
+        assert_eq!(marker(state.clone()).state(), state);
     }
 
     #[test]
@@ -17061,7 +17377,7 @@ mod tests {
         let follow = [REPO.to_owned()];
         for (legacy, rounds) in [false, true]
             .into_iter()
-            .flat_map(|legacy| [0, MAX_FIX_ROUNDS].map(|rounds| (legacy, rounds)))
+            .flat_map(|legacy| [0, FIX_ROUNDS].map(|rounds| (legacy, rounds)))
         {
             let mut fake = failed_check_github();
             let dispatcher = Fake::default();
@@ -18526,7 +18842,7 @@ mod tests {
             (
                 "rounds used up label it and add a stopped marker",
                 changes.clone(),
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 vec![],
                 vec![],
                 "-> labelled needs-human",
@@ -18704,7 +19020,7 @@ mod tests {
         let promoted = json!({"contexts": {"review": {"state": "FAILURE"}},
             "headRepository": {"nameWithOwner": MIDSTREAM}});
         let changes = json!({"contexts": {"review": {"state": "FAILURE"}}});
-        let used_up = json!({"rounds": 2, "sha": "older"});
+        let used_up = json!({"rounds": FIX_ROUNDS, "sha": "older"});
         // The recorded pull request and its reads, moved to `repo`; GraphQL
         // reads go by number.
         let moved = |repo: &str, mut change: Value, marker: &Value, author: &str| {
@@ -19252,7 +19568,7 @@ mod tests {
                 "a rebase round folds the round it follows",
                 true,
                 false,
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 json!({"mergeable": CONFLICTING}),
                 "rebase round 1 of 2 -> https://",
                 Some("fold: 1 superseded markers minimized"),
@@ -19261,7 +19577,7 @@ mod tests {
                 "a stop is a new comment and folds nothing",
                 true,
                 false,
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 failing.clone(),
                 "-> labelled needs-human",
                 None,
@@ -19395,7 +19711,7 @@ mod tests {
             (failing.clone(), json!({"sha": "older"}), "fix:"),
             (
                 failing,
-                json!({"rounds": 2, "sha": "older"}),
+                json!({"rounds": FIX_ROUNDS, "sha": "older"}),
                 "needs-human:",
             ),
         ] {
@@ -19430,7 +19746,7 @@ mod tests {
         let cases = [
             (json!({}), json!({}), json!({}), "merge:"),
             (json!({}), json!({"contexts": failing}), json!({"sha": "older"}), "fix:"),
-            (json!({}), json!({"contexts": failing}), json!({"rounds": 2, "sha": "older"}), "needs-human:"),
+            (json!({}), json!({"contexts": failing}), json!({"rounds": FIX_ROUNDS, "sha": "older"}), "needs-human:"),
             (json!({"rebaseRounds": 1}), json!({"mergeable": CONFLICTING}), json!({}), "rebase:"),
             (json!({}), json!({"isDraft": true, "body": checkpoint, "contexts": {"review": null}}), json!({}), "continue:"),
         ];
@@ -19549,7 +19865,7 @@ mod tests {
         let (line, fake, dispatcher) = applied_with(
             policy.clone(),
             failing.clone(),
-            json!({"rounds": 2, "sha": "older"}),
+            json!({"rounds": FIX_ROUNDS, "sha": "older"}),
         );
         assert!(
             line.ends_with("fix: review requested changes, check ci failed; 2 fix rounds used, so a diagnostic round on large -> https://github.com/cgwalters-forge/tracker/actions/runs/1234"),
@@ -19573,7 +19889,10 @@ mod tests {
             &[json!({"id": 99, "user": {"login": BOT}, "body": writes[1].1["body"]})],
             BOT,
         );
-        assert_eq!((marker.rounds, marker.pool.as_deref()), (3, Some("large")));
+        assert_eq!(
+            (marker.rounds, marker.pool.as_deref()),
+            (FIX_ROUNDS + 1, Some("large"))
+        );
         assert!(text(&writes[1].1, "/body").contains("Diagnostic round for `488f45ebacd0`"));
         drop(writes);
 
@@ -19581,7 +19900,7 @@ mod tests {
         let (line, fake, dispatcher) = applied_with(
             policy.clone(),
             failing,
-            json!({"rounds": 3, "sha": "older"}),
+            json!({"rounds": FIX_ROUNDS + 1, "sha": "older"}),
         );
         assert!(
             line.ends_with("needs-human: 2 fix rounds and a diagnostic round used and 488f45ebacd0 still fails (review requested changes, check ci failed) -> labelled needs-human"),
@@ -19611,7 +19930,7 @@ mod tests {
         let (line, fake, _) = applied_with(
             json!({}),
             json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
-            json!({"rounds": 2, "sha": "older"}),
+            json!({"rounds": FIX_ROUNDS, "sha": "older"}),
         );
         assert!(
             line.ends_with("needs-human: 2 fix rounds used and 488f45ebacd0 still fails (check ci failed) -> labelled needs-human"),
@@ -19630,7 +19949,7 @@ mod tests {
 
     #[test]
     fn conflict_only_rebases_do_not_need_approval_or_spend_fix_rounds() {
-        for rounds in [0, MAX_FIX_ROUNDS] {
+        for rounds in [0, FIX_ROUNDS] {
             let (line, fake, dispatcher) = applied_with(
                 json!({"rebaseRounds": 2}),
                 json!({"mergeable": CONFLICTING, "contexts": {"review": null}}),
@@ -19717,7 +20036,7 @@ mod tests {
                 ),
                 (
                     json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
-                    json!({"rounds": 2}),
+                    json!({"rounds": FIX_ROUNDS}),
                 ),
             ] {
                 let fake = Fake {
@@ -19751,7 +20070,7 @@ mod tests {
             assign_holds: true,
             ..PollPolicy::default()
         };
-        let state = json!({"rounds": 2, "sha": "older"});
+        let state = json!({"rounds": FIX_ROUNDS, "sha": "older"});
         let failed = json!({"contexts": {"ci": {"conclusion": "FAILURE"}}});
         let (outcome, fake, dispatcher) =
             applied_policy(github(), policy.clone(), failed.clone(), state);
@@ -19834,8 +20153,12 @@ mod tests {
             format!("{API_ROOT}repos/{REPO}/pulls/470/requested_reviewers"),
             vec![(403, json!({"message": "forbidden"}))],
         );
-        let (outcome, fake, dispatcher) =
-            applied_policy(fake, policy, failed, json!({"rounds": 2, "sha": "older"}));
+        let (outcome, fake, dispatcher) = applied_policy(
+            fake,
+            policy,
+            failed,
+            json!({"rounds": FIX_ROUNDS, "sha": "older"}),
+        );
         assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
         assert_eq!(fake.writes.borrow().len(), 1);
         assert!(dispatcher.writes.borrow().is_empty());
@@ -19848,7 +20171,7 @@ mod tests {
         let (line, fake, dispatcher) = applied_with(
             policy.clone(),
             conflict.clone(),
-            json!({"rounds": 2, "continued": 1, "sha": "older"}),
+            json!({"rounds": FIX_ROUNDS, "continued": 1, "sha": "older"}),
         );
         assert!(
             line.ends_with("rebase: conflicts with main; approved, so rebase round 1 of 2 -> https://github.com/cgwalters-forge/tracker/actions/runs/1234"),
@@ -19873,20 +20196,23 @@ mod tests {
                 marker.rebased,
                 marker.rebasing
             ),
-            (2, 1, 1, true)
+            (FIX_ROUNDS, 1, 1, true)
         );
         assert_eq!(marker.round_name(), "rebase round 1");
         // An outage's refund gives back the rebase round, not a fix round.
         let refunded = marker.refunded();
         assert_eq!(
             (refunded.rounds, refunded.rebased, refunded.rebasing),
-            (2, 0, false)
+            (FIX_ROUNDS, 0, false)
         );
         drop(writes);
 
         // Off (the default), the same pull request goes to a human as before.
-        let (line, fake, dispatcher) =
-            applied_with(json!({}), conflict, json!({"rounds": 2, "sha": "older"}));
+        let (line, fake, dispatcher) = applied_with(
+            json!({}),
+            conflict,
+            json!({"rounds": FIX_ROUNDS, "sha": "older"}),
+        );
         assert!(
             line.ends_with("needs-human: 2 fix rounds used and 488f45ebacd0 still fails (conflicts with main) -> labelled needs-human"),
             "{line}"
@@ -19908,7 +20234,7 @@ mod tests {
         let (_, fake, _) = applied_with(
             json!({}),
             json!({"mergeable": CONFLICTING}),
-            json!({"rounds": 2, "sha": "older"}),
+            json!({"rounds": FIX_ROUNDS, "sha": "older"}),
         );
         fake.writes.borrow()[2].1["body"]
             .as_str()
@@ -20391,8 +20717,10 @@ mod tests {
             assert_eq!((marker.rounds, marker.run), (2, Some(5678)));
             newer["headRefOid"] = "still-failing".into();
             newer["reviews"]["nodes"][0]["commit"]["oid"] = "still-failing".into();
+            let mut two = config();
+            two.policy.fix_rounds = Some(2);
             let decision = decide(
-                &config(),
+                &two,
                 &newer,
                 &classify_checks(&newer, &required()),
                 &marker,
@@ -20404,7 +20732,7 @@ mod tests {
         }
         // Nor can it undo a stop another pass added after B's round.
         let stop = marker_body(
-            &json!({"rounds": 2, "sha": "newer", "stopped": true}),
+            &json!({"rounds": FIX_ROUNDS, "sha": "newer", "stopped": true}),
             "Stopped.",
         );
         let stop = comment(102, &json!(stop), "2026-10-12T02:01:30Z");
@@ -20499,7 +20827,7 @@ mod tests {
             5,
             "2026-10-10T00:00:00Z",
             marker_body(
-                &json!({"rounds": 2, "sha": "older", "stopped": true}),
+                &json!({"rounds": FIX_ROUNDS, "sha": "older", "stopped": true}),
                 "Stopped.",
             ),
         );
@@ -20559,7 +20887,7 @@ mod tests {
         let stop = find_marker(std::slice::from_ref(&restop), BOT);
         assert_eq!(
             (stop.stopped, stop.rounds, stop.sha, stop.run),
-            (true, 2, Some(HEAD.to_owned()), None)
+            (true, FIX_ROUNDS, Some(HEAD.to_owned()), None)
         );
 
         // The label is taken off again: that stop is claimed and a round starts.
@@ -20601,7 +20929,7 @@ mod tests {
             BOT,
             "2026-10-11T00:00:00Z",
             &marker_body(
-                &json!({"rounds": 2, "sha": "older", "stopped": true}),
+                &json!({"rounds": FIX_ROUNDS, "sha": "older", "stopped": true}),
                 "Stopped.",
             ),
         );
@@ -20609,7 +20937,10 @@ mod tests {
             5,
             BOT,
             "2026-10-11T00:00:00Z",
-            &marker_body(&json!({"rounds": 2, "sha": "older"}), "Fix round 2."),
+            &marker_body(
+                &json!({"rounds": FIX_ROUNDS, "sha": "older"}),
+                "Fix round 2.",
+            ),
         );
         let before = said(
             4,
@@ -20970,7 +21301,11 @@ mod tests {
         let body = fake.writes.borrow().last().unwrap().1["body"].clone();
         let rewritten = json!({"id": 99, "user": {"login": BOT}, "created_at": "2026-10-11T09:00:00Z", "body": body});
         let restop = find_marker(std::slice::from_ref(&rewritten), BOT);
-        assert_eq!((restop.stopped, restop.rounds), (true, 2), "{body}");
+        assert_eq!(
+            (restop.stopped, restop.rounds),
+            (true, FIX_ROUNDS),
+            "{body}"
+        );
         assert_eq!(
             parse_marker(MARKER, body.as_str().unwrap()).unwrap()["refused"],
             json!(["issuecomment-6"])
@@ -21344,7 +21679,7 @@ mod tests {
             ),
         );
         fake.rest.get_mut(&comments).unwrap().3 = json!([
-            {"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 2, "sha": "older", "stopped": true}), "Stopped.")}
+            {"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": FIX_ROUNDS, "sha": "older", "stopped": true}), "Stopped.")}
         ]);
         fake.labelled_after = Some(comments);
         let dispatcher = Fake::default();
@@ -21382,7 +21717,7 @@ mod tests {
             (
                 "a stop whose label was taken off is reset without its run",
                 json!({}),
-                json!({"rounds": 2, "sha": HEAD, "run": 7, "stopped": true}),
+                json!({"rounds": FIX_ROUNDS, "sha": HEAD, "run": 7, "stopped": true}),
                 "rounds start again -> run started",
             ),
         ];
@@ -21638,6 +21973,9 @@ mod tests {
         }
     }
 
+    /// Without a `wip` to share, as a standalone poll, a pass starts at
+    /// most [`POLL_DISPATCH_LIMIT`] fix runs; with one, it starts as many as
+    /// its free slots, past that limit (agent-board#1025).
     #[test]
     fn a_pass_starts_at_most_its_dispatch_limit_of_fix_runs() {
         let mut fake = github();
@@ -21673,11 +22011,91 @@ mod tests {
         assert_eq!(dispatcher.writes.borrow().len(), POLL_DISPATCH_LIMIT);
         assert!(
             outcome.lines.last().unwrap().ends_with(&format!(
-                "fix: review requested changes -> not started: this pass started {POLL_DISPATCH_LIMIT} fix runs already"
+                "fix: review requested changes -> not started: this pass started {POLL_DISPATCH_LIMIT} runs already"
             )),
             "{:?}",
             outcome.lines
         );
+        // With the pass's `wip`, its free slots bound the runs instead: all
+        // of them where there is room, else as many as fit, the rest held.
+        // With `reviewPools`, the review job's runs in a repository the walk
+        // reaches after these hold their slots from the start, and the
+        // intake before the walk counts them too.
+        let later = "zz/later".to_owned();
+        let follow = [REPO.to_owned(), later.clone()];
+        let since = (now() - time::Duration::days(1)).date();
+        for path in ["events?per_page=100", "pulls?state=open&per_page=100"] {
+            fake.page(&format!("repos/{later}/{path}"), None, None, json!([]));
+        }
+        for (active, reviews, started, last) in [
+            (0, 0, numbers.len(), "run started".to_owned()),
+            (8, 0, 2, "not started: wip: 10 of 10 runs active".to_owned()),
+            (
+                0,
+                0,
+                0,
+                "not started: another pass is in progress".to_owned(),
+            ),
+            (0, 8, 2, "not started: wip: 10 of 10 runs active".to_owned()),
+        ] {
+            let mut cfg = config();
+            cfg.policy.wip = Some(Wip {
+                wip: 10,
+                active,
+                held: (last.contains("another pass")).then(|| "another pass is in progress".into()),
+            });
+            if reviews > 0 {
+                cfg.policy.review_pools = vec!["claude".into()];
+                let workflow = review_workflow(&cfg, REPO).unwrap();
+                for repo in &follow {
+                    let runs: Vec<Value> = (0..reviews)
+                        .filter(|_| *repo == later)
+                        .map(|n| json!({"id": 900 + n, "status": "in_progress", "event": DISPATCH_EVENT,
+                            "path": format!("{WORKFLOWS_DIR}{workflow}"), "repository": {"full_name": repo},
+                            "display_title": format!("review {repo}#{n} {HEAD} (claude)")}))
+                        .collect();
+                    fake.page(&format!("repos/{repo}/actions/workflows/{workflow}/runs?event={DISPATCH_EVENT}&created=%3E%3D{since}&per_page={REVIEW_DISPATCH_READS}"), None, None, json!({"workflow_runs": runs}));
+                    fake.reservations(repo, json!([]));
+                }
+                let (intake, _) = run_direction_capped(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &follow,
+                    None,
+                    &caps::Caps::default(),
+                    now(),
+                    100,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(intake.reviewing, reviews, "{:?}", intake.lines);
+            }
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &follow,
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(
+                dispatcher.writes.borrow().len(),
+                started,
+                "{:?}",
+                outcome.lines
+            );
+            assert!(
+                outcome.lines.last().unwrap().ends_with(&last),
+                "{:?}",
+                outcome.lines
+            );
+        }
         // The one left over is still in flight, so the next pass is soon.
         assert_eq!((outcome.errors, outcome.in_flight), (0, numbers.len()));
         assert_eq!(outcome.state.interval_seconds, MIN_INTERVAL_SECONDS);
@@ -21698,7 +22116,7 @@ mod tests {
         let outcome = applied(&fake, &dispatcher);
         assert_eq!(dispatcher.writes.borrow().len(), POLL_DISPATCH_LIMIT);
         assert!(
-            !outcome.lines.iter().any(|l| l.contains("fix runs already")),
+            !outcome.lines.iter().any(|l| l.contains("runs already")),
             "{:?}",
             outcome.lines
         );
@@ -22338,7 +22756,13 @@ mod tests {
             "pull-470",
             json!({"mergeable": CONFLICTING, "contexts": {"review": null}}),
         );
-        let rebase = fix_task(REPO, &p, &classify_checks(&p, &required()), None, 1);
+        let rebase = fix_task(
+            REPO,
+            &p,
+            &classify_checks(&p, &required()),
+            None,
+            (1, FIX_ROUNDS),
+        );
         for want in [
             "fix round 1 of 2",
             "Rebase its commits onto current main",
@@ -22355,7 +22779,13 @@ mod tests {
             assert!(!rebase.contains(not), "{not}");
         }
         let p = pull("pull-511", json!({}));
-        let named = fix_task(REPO, &p, &classify_checks(&p, &required()), None, 1);
+        let named = fix_task(
+            REPO,
+            &p,
+            &classify_checks(&p, &required()),
+            None,
+            (1, FIX_ROUNDS),
+        );
         assert!(
             named.contains("is the subject of: 4b0f8188b7da."),
             "{named}"
@@ -22368,12 +22798,14 @@ mod tests {
             "<!-- hidden -->Please fix.<!-->{}",
             "x".repeat(2 * REVIEW_TEXT_LIMIT)
         );
-        let task = fix_task(REPO, &p, &checks, Some(&long), 2);
+        let task = fix_task(REPO, &p, &checks, Some(&long), (2, 2));
         assert!(task.contains("fix round 2 of 2"));
         assert!(task.contains("<review>\nPlease fix.<!-->x"));
         assert!(task.contains("\n[cut]\n</review>"));
         assert!(!task.contains("hidden"));
-        assert!(fix_task(REPO, &p, &checks, Some(""), 1).contains("It left no text."));
+        assert!(
+            fix_task(REPO, &p, &checks, Some(""), (1, FIX_ROUNDS)).contains("It left no text.")
+        );
     }
     #[test]
     fn merge_queue_policy_table() {
@@ -22724,7 +23156,7 @@ mod tests {
                 let mut cfg = config();
                 cfg.policy.action_first = true;
                 cfg.policy.review_pools = vec!["claude".into()];
-                cfg.policy.review_wip = Some(ReviewWip {
+                cfg.policy.wip = Some(Wip {
                     wip: 1,
                     active: 0,
                     held: None,
@@ -22756,8 +23188,13 @@ mod tests {
                     &format!("repos/{REPO}/issues/470/comments?per_page=100"),
                     None,
                     None,
-                    comments,
+                    comments.clone(),
                 );
+                let mut repo_comments = comments;
+                for comment in repo_comments.as_array_mut().unwrap() {
+                    comment["issue_url"] = format!("{API_ROOT}repos/{REPO}/issues/470").into();
+                }
+                fake.reservations(REPO, repo_comments);
                 let workflow = review_workflow(&cfg, REPO).unwrap();
                 let since = (now() - time::Duration::days(1)).date();
                 let runs = if receipt == "listed" {
@@ -22772,6 +23209,12 @@ mod tests {
                     "items": [{"repository_url": format!("{API_ROOT}repos/{REPO}"), "number": 470, "user": {"login": BOT}, "pull_request": {}}]}));
                 let dispatcher = Fake::default();
                 let follow = [REPO.to_owned()];
+                // The census before any start holds the slot already, before
+                // the walk reaches the pull request it is reserved for.
+                let mut census = Pass::new(&fake, &fake, &cfg, now());
+                let mut counted = Outcome::default();
+                census.review_census(&follow, &mut counted);
+                assert_eq!(census.reviewing, 1, "{receipt}: {:?}", counted.lines);
                 let caps = caps::Caps::default();
                 let applying = || if apply { applying(&dispatcher) } else { None };
                 let prior = action_first::run_approved_capped(

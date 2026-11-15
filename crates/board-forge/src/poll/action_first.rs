@@ -112,6 +112,7 @@ pub(crate) fn run_approved_capped<R: Rest, G: Transport>(
         );
     }
     let mut outcome = Outcome::default();
+    pass.review_census(follow, &mut outcome);
     if let Err(error) = pass.approved(&follow.iter().collect(), cursor, &mut outcome) {
         outcome.error("pull requests: approved search", &error);
     }

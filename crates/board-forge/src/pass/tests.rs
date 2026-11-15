@@ -17223,7 +17223,7 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
             held("its upstream round accounting needs operator migration to the midstream pull request")),
         ("ownerBranches missing", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
             held(&format!("its head is a branch of {CONTROL}, not the bot's fork, and apply pushes there only once {CONTROL}'s default branch has .github/agentic-job/accept-owner-branches naming it"))),
-        // Stage 2's rounds and the plan's share MAX_FIX_ROUNDS.
+        // Stage 2's rounds and the plan's share `fixRounds`, 2 by default.
         ("after stage 2's first fix round", true, Some(UPSTREAM), &brief, Some(pull.clone()),
             (vec![marker(5, earlier.clone())], 2), start.clone()),
         ("after both fix rounds", true, Some(UPSTREAM), &brief, Some(pull.clone()),
@@ -19200,6 +19200,18 @@ fn config_table() {
         ),
         (json!({"pr": {"staleDays": 31}}), "staleDays is not 0 to 30"),
         (
+            json!({"pr": {"fixRounds": 0}}),
+            "pr fixRounds is not 1 to 5",
+        ),
+        (
+            json!({"pr": {"fixRounds": 6}}),
+            "pr fixRounds is not 1 to 5",
+        ),
+        (
+            json!({"pr": {"fixRounds": "3"}}),
+            "invalid type: string \"3\", expected u64",
+        ),
+        (
             json!({"pr": {"headOwners": ["cgwalters-forge", "not a login"]}}),
             "pr headOwners names \"not a login\", not a login",
         ),
@@ -19532,12 +19544,17 @@ fn config_table() {
         .is_ok()
     );
     // The PR stage keeps today's poll defaults but for its own keys.
-    let poll =
-        config(json!({"pr": {"mergeQueue": {}, "rebaseRounds": 2, "staleDays": 7}})).poll(None);
+    let poll = config(
+        json!({"pr": {"mergeQueue": {}, "rebaseRounds": 2, "staleDays": 7, "fixRounds": 5}}),
+    )
+    .poll(None);
     assert_eq!(poll.policy.merge_queue, Some(poll::QUEUE_TRIES));
     assert_eq!(poll.policy.rebase_rounds, 2);
     assert_eq!(poll.policy.stale_days, 7);
-    assert_eq!(config(json!({})).poll(None).policy.stale_days, 0);
+    assert_eq!(poll.policy.fix_rounds(), 5);
+    let defaults = config(json!({})).poll(None).policy;
+    assert_eq!(defaults.stale_days, 0);
+    assert_eq!(defaults.fix_rounds(), poll::FIX_ROUNDS);
     assert_eq!(poll.policy.continuation, poll::Continuation::default());
     assert!(poll.policy.operator_comments.is_empty() && poll.policy.notifications.is_none());
     let intake = config(json!({"notifications": true})).poll(None);
@@ -22943,40 +22960,55 @@ fn pull_request_comments_come_with_its_query() {
 /// 23 October, live: a pass whose published snapshot was stale refused
 /// every pull request's continuation, though it read the broker fresh in the
 /// same pass. Stage 2 now paces by stage 1's reading, so the continuation
-/// starts, and takes a slot from scheduling.
+/// starts, in the slot left by the two runs in flight, and takes it from
+/// scheduling.
 #[test]
 fn apply_paces_pull_requests_by_this_pass_reading() {
-    let mut forge = Forge::new(None, false);
-    let mut settings = json!({"wip": 2});
-    forge.replay.now += time::Duration::minutes(45);
-    let broker = json!({"body": usage::tests::broker()});
-    with_broker(&mut forge.replay, &mut settings, broker);
-    followed_draft(&mut forge.replay, &mut settings);
-    for (url, body) in [
-        (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+    // With no slot left, the continuation shares `wip` as stage 4's starts
+    // do, rather than starting past it (agent-board#1025).
+    for (wip, outcome, hold) in [
+        (3, "https://github.com/", "hold wip: 3 of 3 runs active"),
         (
-            format!("{API_ROOT}repos/cgwalters-forge/bot-ops"),
-            json!({"private": true}),
+            2,
+            "not started: wip: 2 of 2 runs active",
+            "hold wip: 2 of 2 runs active",
         ),
     ] {
-        let answer = json!({"status": 200, "link": null, "body": body});
-        let request = json!({"request": {"get": url}, "answer": answer});
-        forge.replay.requests.push(request);
-    }
-    let report = apply(&forge, &config(settings));
-    let lines = &report.lines;
-    for line in [
-        "usage: published ",
-        "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1): its checkpoint says budget -> https://github.com/",
-        "pools: claude normal 18% used of 145% allowed, openai normal 3% used of 5% allowed",
-        "hold wip: 3 of 2 runs active",
-    ] {
-        assert!(
-            lines.iter().any(|l| l.starts_with(line)),
-            "{line}: {lines:#?}"
+        let mut forge = Forge::new(None, false);
+        let mut settings = json!({"wip": wip});
+        forge.replay.now += time::Duration::minutes(45);
+        let broker = json!({"body": usage::tests::broker()});
+        with_broker(&mut forge.replay, &mut settings, broker);
+        followed_draft(&mut forge.replay, &mut settings);
+        for (url, body) in [
+            (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+            (
+                format!("{API_ROOT}repos/cgwalters-forge/bot-ops"),
+                json!({"private": true}),
+            ),
+        ] {
+            let answer = json!({"status": 200, "link": null, "body": body});
+            let request = json!({"request": {"get": url}, "answer": answer});
+            forge.replay.requests.push(request);
+        }
+        let report = apply(&forge, &config(settings));
+        let lines = &report.lines;
+        let continuation = format!(
+            "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1): its checkpoint says budget -> {outcome}"
         );
+        for line in [
+            "usage: published ",
+            &continuation,
+            "pools: claude normal 18% used of 145% allowed, openai normal 3% used of 5% allowed",
+            hold,
+        ] {
+            assert!(
+                lines.iter().any(|l| l.starts_with(line)),
+                "{line}: {lines:#?}"
+            );
+        }
+        assert_eq!(report.failures, 0, "{lines:#?}");
     }
-    assert_eq!(report.failures, 0, "{lines:#?}");
 }
 
 /// Past [`FOLLOW_MARGIN`] over the weekly budget, an applying pass starts no
@@ -22988,7 +23020,7 @@ fn budget_past_its_margin_holds_pull_request_rounds() {
         (1100.0, " -> not started: every pool is held (claude)"),
     ] {
         let mut forge = Forge::new(None, false);
-        let mut settings = json!({"wip": 2});
+        let mut settings = json!({"wip": 3});
         with_spend(&mut forge.replay, &mut settings, spend(total));
         followed_draft(&mut forge.replay, &mut settings);
         for (url, body) in [
@@ -23353,6 +23385,9 @@ fn blockers_move_or_are_carded() {
             Read::Followed(change, comments, besides) => {
                 followed(&mut forge.replay, (REPO, 889), change, comments);
                 if let Some((url, body)) = besides {
+                    if url.contains("/actions/workflows/review.yml/") {
+                        reservations(&mut forge.replay, REPO, json!([]));
+                    }
                     let answer = json!({"status": 200, "link": null, "body": body});
                     forge
                         .replay
@@ -26242,6 +26277,21 @@ fn sessions_skip_an_action_whose_issue_changed_since_the_session_read_it() {
     assert_eq!(session_writes(&forge).len(), written.len());
 }
 
+/// `repo`'s comments since review starts are reserved for, `comments`, as
+/// stage 2's review census reads them with `wip`.
+fn reservations(replay: &mut Replay, repo: &str, comments: Value) {
+    let since = (replay.now - time::Duration::minutes(10))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let url = format!("{API_ROOT}repos/{repo}/issues/comments?since={since}&per_page=100");
+    let answer = json!({"status": 200, "link": null, "body": comments});
+    replay
+        .requests
+        .push(json!({"request": {"get": url}, "answer": answer}));
+}
+
 /// tracker#889 closes tracker#468, at P0, and agentic-job#9 closes
 /// tracker#527, at P2: the bot's pull requests from its fork, followed with
 /// `pr.reviewPools`, whose head `abc` has no review yet. Repository and
@@ -26269,6 +26319,7 @@ fn reviews_due(wip: u64, runs: [Vec<Value>; 2], comments: Value) -> (Forge, Conf
         } else {
             json!([])
         };
+        let mut reserved = on.clone();
         followed(replay, (repo, number), closing, on);
         for entry in &mut replay.requests {
             let items = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
@@ -26289,6 +26340,10 @@ fn reviews_due(wip: u64, runs: [Vec<Value>; 2], comments: Value) -> (Forge, Conf
         replay
             .requests
             .push(json!({"request": {"get": url}, "answer": answer}));
+        for comment in reserved.as_array_mut().into_iter().flatten() {
+            comment["issue_url"] = format!("{API_ROOT}repos/{repo}/issues/{number}").into();
+        }
+        reservations(replay, repo, reserved);
     }
     for (url, body) in [
         (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),

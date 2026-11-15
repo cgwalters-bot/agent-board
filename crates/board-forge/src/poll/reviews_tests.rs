@@ -62,6 +62,7 @@ fn ordinary_runs(fake: &mut Fake, runs: Vec<Value>) {
     let since = (now() - time::Duration::days(1)).date();
     fake.page(&format!("repos/{REPO}/actions/workflows/dispatch.yml/runs?event=workflow_dispatch&created=%3E%3D{since}&per_page={REVIEW_DISPATCH_READS}"),
         None, None, json!({"workflow_runs": runs}));
+    fake.reservations(REPO, json!([]));
 }
 
 fn ordinary_run() -> Value {
@@ -319,7 +320,7 @@ fn ordinary_review_old_commands_do_not_authorize_new_heads() {
 #[test]
 fn ordinary_review_uses_shared_wip_caps_and_strict_run_identity() {
     let (mut fake, mut cfg) = ordinary_fixture(BOT, "COLLABORATOR", false);
-    cfg.policy.review_wip = Some(ReviewWip {
+    cfg.policy.wip = Some(Wip {
         wip: 1,
         active: 1,
         held: None,

@@ -91,7 +91,7 @@ fn upstream_publication_ci_repairs_the_original_fork_pr() {
         if ["second round", "exhausted"].contains(&case) {
             let url = format!("repos/{FORK}/issues/34/comments?per_page=100");
             let mut rows = fake.rest[&format!("{API_ROOT}{url}")].3.clone();
-            rows.as_array_mut().unwrap().push(json!({"id":100,"user":{"login":BOT},"body":marker_body(&json!({"rounds":if case == "exhausted" {2} else {1},"sha":"old repaired head"}), "Fix round.")}));
+            rows.as_array_mut().unwrap().push(json!({"id":100,"user":{"login":BOT},"body":marker_body(&json!({"rounds":if case == "exhausted" {FIX_ROUNDS} else {1},"sha":"old repaired head"}), "Fix round.")}));
             fake.page(&url, None, None, rows.clone());
             // Authenticate all comments, including the existing round marker.
             for entry in &mut replay.requests {

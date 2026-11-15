@@ -116,7 +116,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(Some((
             decision,
             Stale {
-                brief: fix_task(repo, pull, checks, review, 1),
+                brief: fix_task(
+                    repo,
+                    pull,
+                    checks,
+                    review,
+                    (1, self.config.policy.fix_rounds()),
+                ),
                 labelled: labelled["id"].clone(),
             },
         )))

@@ -126,7 +126,7 @@ fn assert_no_operator_park(fake: &Fake, dispatcher: &Fake) {
 #[test]
 fn recovery_exhausted_rounds_dispatch_triage_without_operator_parking() {
     for (name, change, state) in [
-        ("fix", json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}), json!({"rounds": 2, "sha": "older"})),
+        ("fix", json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}), json!({"rounds": FIX_ROUNDS, "sha": "older"})),
         ("continuation", json!({"isDraft": true, "body": "```checkpoint\n{\"reason\":\"cap\",\"done\":\"half\",\"left\":\"rest\",\"next\":\"finish\"}\n```"}), json!({"rounds": 0, "continued": 3, "sha": "older"})),
         ("rebase", json!({"mergeable": CONFLICTING}), json!({"rounds": 0, "rebased": 2, "sha": "older"})),
         ("unfinished", json!({"isDraft": true, "title": "[partial: incomplete] Work", "body": "**Partial work.**"}), json!({"rounds": 0, "continued": 3, "sha": "older"})),
@@ -157,7 +157,7 @@ fn recovery_is_opt_in_and_changes_the_parking_symptom() {
         policy.agent_recovery = enabled;
         let (out, fake, dispatcher) = applied_policy(github(), policy,
             json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
-            json!({"rounds": 2, "sha": "older"}));
+            json!({"rounds": FIX_ROUNDS, "sha": "older"}));
         assert_eq!(out.errors, 0, "{:?}", out.lines);
         let expected = if enabled { "triage" } else { "needs-human" };
         assert_eq!(out.steps[0].action, expected);
@@ -230,7 +230,7 @@ fn recovery_result_pass(mut fake: Fake, result: Value, state: Value, run_change:
 
 #[test]
 fn recovery_dispositions_and_negative_evidence_table() {
-    let state = json!({"rounds": 2, "sha": "older", "recovery": {"head": HEAD, "run": 1234, "at": "2026-10-12T01:00:00Z", "granted": false, "pending": true, "attempts": 2}});
+    let state = json!({"rounds": FIX_ROUNDS, "sha": "older", "recovery": {"head": HEAD, "run": 1234, "at": "2026-10-12T01:00:00Z", "granted": false, "pending": true, "attempts": 2}});
     for (decision, question, author, head, run, run_change, expected) in [
         ("more-rounds", Value::Null, BOT, HEAD, 1234, json!({}), "triage-grant"),
         ("obsolete", Value::Null, BOT, HEAD, 1234, json!({}), "wait"),
@@ -259,7 +259,7 @@ fn recovery_dispositions_and_negative_evidence_table() {
             assert_eq!(saved["rounds"], 0);
             assert_eq!(saved["recovery"]["granted"], true);
             let mut exhausted = saved;
-            exhausted["rounds"] = 2.into();
+            exhausted["rounds"] = FIX_ROUNDS.into();
             let mut next = github();
             next.pulls.insert(470, pull("pull-470", json!({"contexts": {"ci": {"conclusion": "FAILURE"}}})));
             let (out, fake, dispatcher) = recovery_result_pass(next, Value::Null, exhausted, json!({}));
@@ -277,7 +277,7 @@ fn recovery_respects_explicit_holds_and_resumes_released_parks() {
         (json!({"reviewRequests": {"nodes": [{"requestedReviewer": {"login": "cgwalters"}}], "pageInfo": {"hasNextPage": false}}}), "skip"),
         (json!({}), "merge"),
     ] {
-        let (out, fake, dispatcher) = applied_policy(github(), recovery_policy(), change, json!({"rounds": 2, "stopped": true, "sha": HEAD}));
+        let (out, fake, dispatcher) = applied_policy(github(), recovery_policy(), change, json!({"rounds": FIX_ROUNDS, "stopped": true, "sha": HEAD}));
         assert_eq!(out.errors, 0, "{:?}", out.lines);
         assert_eq!(out.steps[0].action, expected, "{:?}", out.lines);
         assert_no_operator_park(&fake, &dispatcher);
@@ -294,14 +294,14 @@ fn recovery_failed_triage_and_exhausted_grant_are_bounded() {
     ] {
         let mut fake = github();
         fake.pulls.insert(470, pull("pull-470", json!({"contexts": {"ci": {"conclusion": "FAILURE"}}})));
-        let state = json!({"rounds": 2, "recovery": {"head": HEAD, "run": 1234, "at": "2026-10-12T01:00:00Z", "granted": granted, "pending": pending, "attempts": attempts}});
+        let state = json!({"rounds": FIX_ROUNDS, "recovery": {"head": HEAD, "run": 1234, "at": "2026-10-12T01:00:00Z", "granted": granted, "pending": pending, "attempts": attempts}});
         let (out, fake, dispatcher) = recovery_result_pass(fake, Value::Null, state, run_change);
         assert_eq!(out.errors, 0, "{:?}", out.lines);
         assert_eq!(out.steps[0].action, expected, "{:?}", out.lines);
         assert_no_operator_park(&fake, &dispatcher);
         if expected == "wait" { assert!(dispatcher.writes.borrow().is_empty()); }
     }
-    let (out, fake, dispatcher) = recovery_result_pass(github(), Value::Null, json!({"rounds": 2, "recovery": {"unknown": true}}), json!({}));
+    let (out, fake, dispatcher) = recovery_result_pass(github(), Value::Null, json!({"rounds": FIX_ROUNDS, "recovery": {"unknown": true}}), json!({}));
     assert_eq!(out.errors, 0, "{:?}", out.lines);
     assert_eq!(out.steps[0].action, "wait");
     assert_no_operator_park(&fake, &dispatcher);
@@ -314,7 +314,7 @@ fn recovery_triage_obeys_dispatch_caps_and_late_holds() {
         let mut fake = github();
         fake.pulls.insert(470, pull("pull-470", json!({"contexts": {"ci": {"conclusion": "FAILURE"}}})));
         fake.page(&format!("repos/{REPO}/issues/470/comments?per_page=100"), None, None,
-            json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 2, "sha": "older"}), "Exhausted")}]) );
+            json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": FIX_ROUNDS, "sha": "older"}), "Exhausted")}]) );
         if held { fake.hold_after = Some(1); }
         let mut cfg = config();
         cfg.policy = recovery_policy();
@@ -336,7 +336,7 @@ fn recovery_never_overrides_incomplete_hold_coverage() {
             let fields = json!({field: {"nodes": [], "pageInfo": {"hasNextPage": true}}});
             if late { fake.late_pull_fields = Some(fields); }
             else { fake.pulls.insert(470, pull("pull-470", fields)); }
-            let state = json!({"rounds": 2, "recovery": {"head": HEAD, "run": 1234, "at": "2026-10-12T01:00:00Z", "granted": false, "pending": true, "attempts": 1}});
+            let state = json!({"rounds": FIX_ROUNDS, "recovery": {"head": HEAD, "run": 1234, "at": "2026-10-12T01:00:00Z", "granted": false, "pending": true, "attempts": 1}});
             let (out, fake, dispatcher) = recovery_result_pass(fake, Value::Null, state, json!({"conclusion": "failure"}));
             assert_eq!(out.errors, 0, "{field} late={late}: {:?}", out.lines);
             assert!(dispatcher.writes.borrow().is_empty(), "{field} late={late}: {:?}", out.lines);
@@ -350,7 +350,7 @@ fn recovery_never_overrides_incomplete_hold_coverage() {
 fn recovery_exhaustion_respects_manual_and_unknown_queue_stops() {
     for reason in ["manually_removed", "unknown_future_reason"] {
         for (change, state) in [
-            (json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}), json!({"rounds": 2})),
+            (json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}), json!({"rounds": FIX_ROUNDS})),
             (json!({"isDraft": true, "body": checkpointed("cap")}), json!({"rounds": 0, "continued": 3})),
             (json!({"mergeable": CONFLICTING}), json!({"rounds": 0, "rebased": 2})),
         ] {
@@ -374,7 +374,7 @@ fn recovery_replacement_head_uses_its_own_review_gates_without_refunding_triage(
     for (change, expected) in [(json!({}), "merge"), (json!({"contexts": {"review": null}}), "wait")] {
         let mut fake = github();
         fake.pulls.insert(470, pull("pull-470", change));
-        let state = json!({"rounds": 2, "recovery": {"head": "older-head", "run": 1234, "at": "2026-10-12T01:00:00Z", "granted": false, "pending": true, "attempts": 1}});
+        let state = json!({"rounds": FIX_ROUNDS, "recovery": {"head": "older-head", "run": 1234, "at": "2026-10-12T01:00:00Z", "granted": false, "pending": true, "attempts": 1}});
         let (out, fake, dispatcher) = recovery_result_pass(fake, Value::Null, state, json!({}));
         assert_eq!(out.errors, 0, "{:?}", out.lines);
         assert_eq!(out.steps[0].action, expected, "{:?}", out.lines);
@@ -388,7 +388,7 @@ fn recovery_replacement_head_uses_its_own_review_gates_without_refunding_triage(
 fn recovery_exhaustion_offers_ci_its_existing_retry_first() {
     let mut fake = failed_check_github();
     fake.page(&format!("repos/{REPO}/issues/470/comments?per_page=100"), None, None,
-        json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 2, "sha": "older"}), "Exhausted")}]) );
+        json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": FIX_ROUNDS, "sha": "older"}), "Exhausted")}]) );
     let mut cfg = config();
     cfg.policy = recovery_policy();
     cfg.policy.check_reruns = true;
