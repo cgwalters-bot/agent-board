@@ -76,6 +76,44 @@ fn open_pr_cap_reuses_repository_and_path_reads() {
     assert_eq!(fake.sent.borrow().len(), 3, "one census and two file lists: {:?}", fake.sent.borrow());
 }
 
+#[test]
+fn open_pr_cap_skips_parked_older_work() {
+    let stop = |stopped: bool| json!([{"id":5, "user":{"login":BOT}, "body":marker_body(&json!({"rounds":2, "stopped":stopped}), "Stopped")}]);
+    let operator = json!([{"login":config().operator}]);
+    let label = |name: &str| json!([{"name":name}]);
+    // Reads: the census, then the stop's comments, then the older PR's files.
+    for (name, older, comments, assign_holds, held, reads) in [
+        ("unparked", json!({}), None, true, true, 2),
+        ("hold", json!({"labels":label("Hold")}), None, true, false, 1),
+        ("needs-human", json!({"labels":label(LABEL)}), None, true, false, 1),
+        ("other label", json!({"labels":label("bug")}), None, true, true, 2),
+        ("stop held by review", json!({"requested_reviewers":operator}), Some(stop(true)), true, false, 2),
+        ("review without a stop", json!({"requested_reviewers":operator}), Some(stop(false)), true, true, 3),
+        ("review holds off", json!({"requested_reviewers":operator}), Some(stop(true)), false, true, 2),
+        ("stop released", json!({}), Some(stop(true)), true, true, 2),
+        // The fixture's comments list fails on its second page.
+        ("unreadable stop", json!({"requested_reviewers":operator}), None, true, true, 4),
+    ] {
+        let mut fake = github();
+        let mut first = older;
+        first["number"] = 470.into();
+        first["user"] = json!({"login":BOT});
+        fake.page(&format!("repos/{REPO}/pulls?state=open&per_page=100"), None, None, json!([first, {"number":471,"user":{"login":BOT}}]));
+        fake.page(&format!("repos/{REPO}/pulls/470/files?per_page=100"), None, None, json!([{"filename":"src/a.rs"}]));
+        if let Some(comments) = comments {
+            fake.page(&format!("repos/{REPO}/issues/470/comments?per_page=100"), None, None, comments);
+        }
+        let mut cfg = config();
+        cfg.policy.open_pr_cap = Some(2);
+        cfg.policy.assign_holds = assign_holds;
+        let mut pass = Pass::new(&fake, &fake, &cfg, now());
+        let mut p = pull("pull-470", json!({"files":{"nodes":[{"path":"src/a.rs"}],"pageInfo":{"hasNextPage":false}}}));
+        p["number"] = 471.into();
+        assert_eq!(pass.pressure_ahead(REPO, &p).unwrap(), held.then_some(470), "{name}");
+        assert_eq!(fake.sent.borrow().len(), reads, "{name}: {:?}", fake.sent.borrow());
+    }
+}
+
 fn assert_no_operator_park(fake: &Fake, dispatcher: &Fake) {
     for (url, body) in fake.writes.borrow().iter().chain(dispatcher.writes.borrow().iter()) {
         assert!(!url.contains("requested_reviewers"), "{url}");
