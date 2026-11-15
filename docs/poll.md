@@ -1017,8 +1017,8 @@ work or failed/unavailable verification must retain a checkpoint. Head messages
 without one still fall back to the body's checkpoint, even an old one; removing
 that fallback would turn absent notes into false completion.
 
-The deployed tracker `dispatch.yml` calls actions' `cgwalters-agentic-job.yml`,
-whose policy/check/apply pin inspected for this slice is
+The tracker `dispatch.yml` calls actions' `cgwalters-agentic-job.yml`.
+The policy/check/apply pin inspected for the initial continuation correction was
 [`427ce2295925654be9c35e91ca5cee91bbc2c9ea`](https://github.com/cgwalters-forge/agentic-job/tree/427ce2295925654be9c35e91ca5cee91bbc2c9ea).
 Its `run/handback.rs` reads `outcome.json`'s `checkpoint.complete`, but
 `check/mod.rs` exports a checkpoint only from an accepted PR body or push
@@ -1030,6 +1030,16 @@ artifact to apply, bound through policy to repository/PR, exact head and run
 failed verification evidence and recheck the open PR/head and holds before any
 readiness change. Raw agent outcomes must not become completion authority here.
 No new format or consumer is introduced; unchanged acceptance remains disabled.
+
+The companion has since added trusted continuation identity, attempt-bound
+artifacts and an inert producer/checker with caller-pinned required verification;
+the [handoff at `0ddd539`](https://github.com/cgwalters-forge/agentic-job/blob/0ddd539a1613f0872fdd5af5dc9815750bc65427/docs/safe-outputs.md#unchanged-completion-remains-unavailable)
+still explicitly leaves unchanged readiness unavailable. Guarded apply is owned
+by [agentic-job#3381](https://github.com/cgwalters-forge/agentic-job/issues/3381).
+These prerequisites are not evidence of caller activation or accepted completion.
+The brief/docs/regression correction is independently valid without that consumer;
+it neither enables unchanged acceptance nor completes the live acceptance below.
+
 [tracker#1071](https://github.com/cgwalters-forge/tracker/issues/1071) owns remaining
 live acceptance: a separately authorized continuation must record PR/head/run,
 working fmt/clippy, required checks and a valid changed or explicitly complete
