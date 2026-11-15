@@ -4989,7 +4989,10 @@ issue recovery also requires `triage`. Preview starts nothing. Epic plans that
 parse but fail apply's policy or relationship checks remain refused as before.
 Planning prompts require serializing and strictly parsing the exact JSON before
 posting it, including when submitted as a comment safe-output; generated plan
-comments already use JSON serialization. The independent safe-output checker
+comments already use JSON serialization. A raw control character inside a
+JSON string, usually a brief's literal line break, is read as if escaped
+rather than failing the plan (agent-board#1023); one outside a string still
+does. The independent safe-output checker
 in agentic-job is not changed here. In `cgwalters-forge/tracker`, enable this
 with `.github/pass.json`'s `replanInvalid` set to `true` after deploying this revision.
 

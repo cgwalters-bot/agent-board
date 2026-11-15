@@ -5579,7 +5579,7 @@ fn invalid_bot_plan_replans_once() {
                 "lastEditedAt": null, "author": {"login": "cgwalters-bot"}, "editor": null}));
         }
         nodes.push(json!({"url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-9",
-            "body": "```agent-board-plan\n{\"brief\":\"raw\nnewline\"}\n```",
+            "body": "```agent-board-plan\n{\"brief\":\"truncated\n```",
             "createdAt": "2026-10-23T00:00:00Z",
             "lastEditedAt": if case == "foreign-edit" {json!("2026-10-23T00:00:00Z")} else {Value::Null},
             "author": {"login": if case == "operator" {"cgwalters"} else {"cgwalters-bot"}},
