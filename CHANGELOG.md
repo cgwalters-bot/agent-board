@@ -11,6 +11,10 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- A plan, epic plan, triage verdict or other fenced record whose JSON strings hold raw line
+  breaks or other control characters now reads as if they were escaped,
+  rather than holding as "not valid JSON" (agent-board#1023).
+
 - `agent-board eval summarize MANIFEST RUNS`, agenthome's offline three-arm
   role evaluation summarizer, moved here with its protocol (docs/eval.md),
   pending manifest, preflight report and opt-in arm bundles under `eval/`

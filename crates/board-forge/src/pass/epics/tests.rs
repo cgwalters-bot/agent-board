@@ -371,7 +371,7 @@ fn invalid_596(replay: &mut Replay) {
 fn invalid_bot_epic_plan_replans_once() {
     for case in ["off", "bot", "operator", "foreign-edit", "twice", "pending"] {
         let mut replay = replay();
-        let broken = "```agent-board-epic-plan\n{\"reason\":\"raw\nnewline\"}\n```";
+        let broken = "```agent-board-epic-plan\n{\"reason\":\"truncated\n```";
         let mut from = posted(
             &replay,
             596,

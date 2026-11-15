@@ -15,6 +15,8 @@ use crate::poll::pace::is_tier;
 use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
 use serde_json::{Value, json};
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const JOB_PLAN_SCHEMA: &str = "agent-board/job-plan/v1";
@@ -505,7 +507,7 @@ fn triage_answer(body: &str, key: &str) -> Option<String> {
     let [Some(block)] = &fence_blocks(body, TRIAGE_FENCE)[..] else {
         return None;
     };
-    let answer: Value = serde_json::from_str(block).ok()?;
+    let answer: Value = serde_json::from_str(&escape_string_controls(block)).ok()?;
     answer[key].as_str().map(str::to_owned)
 }
 
@@ -599,10 +601,50 @@ pub(crate) fn fenced_json_as(body: &str, fence: &str, noun: &str) -> Result<Opti
     for block in fence_blocks(body, fence) {
         ensure!(found.is_none(), "comment holds more than one {noun}");
         let json = block.with_context(|| format!("{noun} fence is not closed"))?;
-        found =
-            Some(serde_json::from_str(&json).with_context(|| format!("{noun} is not valid JSON"))?);
+        found = Some(
+            serde_json::from_str(&escape_string_controls(&json))
+                .with_context(|| format!("{noun} is not valid JSON"))?,
+        );
     }
     Ok(found)
+}
+
+/// `json` with each raw control character inside a string escaped, as an
+/// agent that writes a brief's line breaks literally means them
+/// (agent-board#1023). This changes only what strict JSON refuses: valid
+/// JSON has no raw control character in a string, and one outside a string
+/// or after a backslash stays an error. A literal line that closes the
+/// fence still ends the block early ([`fence_blocks`]).
+fn escape_string_controls(json: &str) -> Cow<'_, str> {
+    let raw = |c: char| c.is_ascii_control() && c != '\x7f';
+    let (mut in_string, mut escaped) = (false, false);
+    // Only allocated at the first character escaped.
+    let mut out: Option<String> = None;
+    for (at, c) in json.char_indices() {
+        if in_string && !escaped && raw(c) {
+            let out = out.get_or_insert_with(|| json[..at].to_owned());
+            match c {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => {
+                    let _ = write!(out, "\\u{:04x}", u32::from(c));
+                }
+            }
+            continue;
+        }
+        if in_string && escaped {
+            escaped = false;
+        } else if in_string && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            in_string = !in_string;
+        }
+        if let Some(out) = &mut out {
+            out.push(c);
+        }
+    }
+    out.map_or(Cow::Borrowed(json), Cow::Owned)
 }
 
 fn login(node: &Value, key: &str) -> Option<String> {
@@ -1719,6 +1761,53 @@ mod tests {
                 (result, _) => panic!("{body}: {result:?}"),
             }
         }
+    }
+
+    #[test]
+    fn string_controls_table() {
+        // Fenced JSON, then the value it reads as, or an error.
+        for (json, expected) in [
+            ("{\"a\":\"x\ny\"}", Ok(json!({"a": "x\ny"}))),
+            // A fence's lines lose a CRLF's carriage return, not a lone one.
+            ("{\"a\":\"x\r\n\ty\r\"}", Ok(json!({"a": "x\n\ty\r"}))),
+            ("{\"a\":\"x\u{1}y\"}", Ok(json!({"a": "x\u{1}y"}))),
+            ("{\"a\":\"\\\"\n\\\\\n\"}", Ok(json!({"a": "\"\n\\\n"}))),
+            ("{\"a\":\"é\n\"}", Ok(json!({"a": "é\n"}))),
+            ("{\n\t\"a\": \"\\n\"\n}", Ok(json!({"a": "\n"}))),
+            // Strict JSON's errors stay: a control character outside a
+            // string, or one a backslash escapes.
+            ("{\"a\":\"x\\\ny\"}", Err("not valid JSON")),
+            ("{\"a\":\u{1}\"x\"}", Err("not valid JSON")),
+            ("{\"a\":\"x\n", Err("not valid JSON")),
+        ] {
+            let body = format!("```{PLAN_FENCE}\n{json}\n```");
+            match (fenced_json(&body, PLAN_FENCE), expected) {
+                (Ok(found), Ok(expected)) => assert_eq!(found, Some(expected), "{json:?}"),
+                (Err(error), Err(expected)) => {
+                    assert!(
+                        format!("{error:#}").contains(expected),
+                        "{json:?}: {error:#}"
+                    )
+                }
+                (result, _) => panic!("{json:?}: {result:?}"),
+            }
+        }
+        assert!(matches!(
+            escape_string_controls("{\"a\":\"b\"}"),
+            Cow::Borrowed(_)
+        ));
+        // A plan whose brief breaks its lines literally reads as meant.
+        let mut value = plan();
+        value["brief"] = json!("First line.\nSecond line.");
+        let literal = body(&value).replace("\\n", "\n");
+        let job = JobPlan::from_comment(&literal).unwrap().unwrap();
+        assert_eq!(job.brief, "First line.\nSecond line.");
+        // So does a triage verdict, whose answer is agent output too.
+        let triage = format!(
+            "```{TRIAGE_FENCE}\n{{\"verdict\":\"needs-operator\",\"operator\":\"one\ntwo\"}}\n```"
+        );
+        assert_eq!(triage_verdict(&triage).as_deref(), Some("needs-operator"));
+        assert_eq!(triage_operator(&triage).as_deref(), Some("one\ntwo"));
     }
 
     #[test]
