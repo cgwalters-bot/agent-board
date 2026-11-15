@@ -125,6 +125,9 @@ impl<'a, T: Transport> Forgejo<'a, T> {
             run_details: false,
         }
         .body(start);
+        // GitHub midstream publication instructions do not apply to Forgejo.
+        // Keep the caller's task exact, including the inputs used for recovery.
+        body["inputs"]["task"] = start.brief.into();
         ensure!(
             body["inputs"]
                 .as_object()

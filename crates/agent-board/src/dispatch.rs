@@ -1395,7 +1395,7 @@ mod tests {
                 assert!(out.is_empty());
             } else {
                 result.unwrap();
-                let request: Value = serde_json::from_slice(&out).unwrap();
+                let mut request: Value = serde_json::from_slice(&out).unwrap();
                 assert_eq!(
                     request["url"],
                     "https://api.github.com/repos/bootc-dev/cgwalters-devspace-sandbox/actions/workflows/agent.yml/dispatches"
@@ -1404,6 +1404,10 @@ mod tests {
                 if staged {
                     expected["kind"] = "implement".into();
                     expected["issue_repo"] = "example/tracker".into();
+                    let task = request["body"]["inputs"]["task"].as_str().unwrap();
+                    assert!(task.starts_with("No mutation.\n\nWhen working in a midstream fork"));
+                    assert!(task.contains("Part of https://github.com/OWNER/FORK/issues/N"));
+                    request["body"]["inputs"]["task"] = "No mutation.".into();
                 }
                 assert_eq!(request["body"]["inputs"], expected);
                 // Each active status, twice, on both workflows.

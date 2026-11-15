@@ -111,24 +111,53 @@ pub(crate) fn closes(body: &str, repo: &str, number: u64) -> bool {
 /// whose issue URLs are `{web}OWNER/REPO/issues/N` (GitHub's and Forgejo's).
 pub(crate) fn closes_at(body: &str, web: &str, repo: &str, number: u64) -> bool {
     let references = references(web, repo, number);
+    closing_targets(body).any(|reference| refers(&references, reference))
+}
+
+/// Conservatively detect closing targets newly joined by a text transformation.
+/// Check tokens rather than repository identities so foreign references cannot
+/// slip through. Non-reference words after a closing keyword may also hold.
+/// Count occurrences, since the same target in an example (code, HTML) must
+/// not authorize a new active one outside it.
+pub(crate) fn introduces_closing_reference(before: &str, after: &str) -> bool {
+    let normalize = |word: &str| {
+        word.trim_end_matches([',', '.', ';', ':', ')', ']', '!', '?'])
+            .to_ascii_lowercase()
+    };
+    let count = |body| {
+        closing_targets(body).fold(
+            std::collections::BTreeMap::<_, usize>::new(),
+            |mut counts, target| {
+                *counts.entry(normalize(target)).or_default() += 1;
+                counts
+            },
+        )
+    };
+    let original = count(before);
+    count(after)
+        .iter()
+        .any(|(target, n)| original.get(target).is_none_or(|o| n > o))
+}
+
+fn closing_targets(body: &str) -> impl Iterator<Item = &str> {
     let mut words = body.split_whitespace().peekable();
-    while let Some(word) = words.next() {
-        // A list marker, quote or bracket before the keyword: `- Closes`, `(fixes`.
-        let word = word.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
-        // `Closes: #41`, `Closes:#41` and `Closes #41` alike.
-        let (keyword, attached) = word.split_once(':').unwrap_or((word, ""));
-        if !CLOSING.contains(&keyword.to_ascii_lowercase().as_str()) {
-            continue;
+    std::iter::from_fn(move || {
+        while let Some(word) = words.next() {
+            // A list marker, quote or bracket before the keyword: `- Closes`, `(fixes`.
+            let word = word.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+            // `Closes: #41`, `Closes:#41` and `Closes #41` alike.
+            let (keyword, attached) = word.split_once(':').unwrap_or((word, ""));
+            if !CLOSING.contains(&keyword.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+            let reference = match attached {
+                "" => words.peek().copied().unwrap_or_default(),
+                attached => attached,
+            };
+            return Some(reference);
         }
-        let reference = match attached {
-            "" => words.peek().copied().unwrap_or_default(),
-            attached => attached,
-        };
-        if refers(&references, reference) {
-            return true;
-        }
-    }
-    false
+        None
+    })
 }
 
 /// The ways a description names issue `number` of `repo`.
@@ -536,6 +565,40 @@ mod tests {
             ("", false),
         ] {
             assert_eq!(closes(body, "example/widgets", 41), expected, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn closing_reference_transformations() {
+        for (before, after, introduced) in [
+            (
+                "Fixes\nPart of fork/repo#31\nupstream/repo#99",
+                "Fixes\nupstream/repo#99",
+                true,
+            ),
+            ("Fixes\nRefs #99\n#42", "Fixes\n#42", true),
+            ("Fixes #31", "", false),
+            ("Fixes:upstream/repo#99", "Fixes:upstream/repo#99", false),
+            ("Fixes UPSTREAM/REPO#99!", "Fixes upstream/repo#99.", false),
+            ("Fixes", "Fixes", false),
+            ("Fixes", "Fixes #99", true),
+            (
+                "```\nFixes a/b#99\n```\nFixes\nRefs #99\na/b#99",
+                "```\nFixes a/b#99\n```\nFixes\na/b#99",
+                true,
+            ),
+            ("Fixes a/b#99\nFixes a/b#99", "Fixes a/b#99", false),
+            (
+                "Part of fork/repo#31\nFixes upstream/repo#99",
+                "Fixes upstream/repo#99",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                introduces_closing_reference(before, after),
+                introduced,
+                "{before:?} -> {after:?}"
+            );
         }
     }
 

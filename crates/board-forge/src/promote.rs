@@ -652,12 +652,14 @@ fn gates_impl(
     })
 }
 
+mod drafts;
 pub(crate) mod handoff;
 mod publish;
 mod repair;
 mod rewrite;
 mod text;
 
+pub use drafts::repair_drafts;
 pub use publish::apply;
 pub use repair::repair;
 pub(crate) use text::midstream_brief;
@@ -914,6 +916,63 @@ fn publication_text(repo: &str, upstream: &str, pull: &Value) -> Result<String> 
         text::check(repo, upstream, text)?;
     }
     Ok(published)
+}
+
+/// Only an entire source-reference line is bookkeeping. Never silently delete
+/// surrounding approved prose, or reinterpret a bare reference upstream.
+/// Hold rather than remove an example ([`text::top_level`]) that happens to
+/// match the real source metadata.
+fn source_text(repo: &str, pull: &Value) -> Result<String> {
+    let source = source_issue(repo, pull)?;
+    let text = pull["body"].as_str().context("missing pull body")?;
+    let qualified = format!("{repo}#{}", source.number);
+    let url = format!("https://github.com/{repo}/issues/{}", source.number);
+    let mut removed = false;
+    let mut body = String::new();
+    for (at, line) in text.split_inclusive('\n').enumerate() {
+        let words: Vec<_> = line.split_whitespace().collect();
+        let reference = match words.as_slice() {
+            [part, of, reference]
+                if part.eq_ignore_ascii_case("part") && of.eq_ignore_ascii_case("of") =>
+            {
+                Some(*reference)
+            }
+            [keyword, reference]
+                if [
+                    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves",
+                    "resolved",
+                ]
+                .contains(&keyword.trim_end_matches(':').to_ascii_lowercase().as_str()) =>
+            {
+                Some(*reference)
+            }
+            _ => None,
+        };
+        let bookkeeping = reference.is_some_and(|r| {
+            let r = r.trim_end_matches(['.', ',', ';', '!', '?']);
+            r.eq_ignore_ascii_case(&qualified) || r.eq_ignore_ascii_case(&url)
+        });
+        if bookkeeping {
+            hold!(
+                text::top_level(text, at) && line.starts_with(|c: char| c.is_ascii_alphabetic()),
+                "source metadata in code or HTML needs manual publication repair"
+            );
+            removed = true;
+        } else {
+            body.push_str(line);
+        }
+    }
+    // Removing bookkeeping can join a dangling keyword to unrelated prose or
+    // an upstream issue. Approval of the original text does not authorize that.
+    hold!(
+        !crate::stack::introduces_closing_reference(text, &body),
+        "removing source metadata would introduce a closing reference; manual publication repair required"
+    );
+    Ok(if removed {
+        body.trim_matches('\n').to_owned()
+    } else {
+        body
+    })
 }
 
 /// Only this mechanically derived closing line supplements the approved text,

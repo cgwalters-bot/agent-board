@@ -423,6 +423,12 @@ work, without weakening the current-head authorization boundary.
   operator edits it again. The controller runs the preview
   first, reviews the logged changes, then applies with the same token and
   bounds as its promote job; the worker that built this never ran it live.
+  The narrower `--repair-drafts` migration repairs only bodies containing bare
+  references, with an apply cap of 1–10. It verifies the source issue exists,
+  preserves completion semantics, and drops other standalone bare bookkeeping.
+  Inline references, code and HTML hold for manual repair. Completed edits remain
+  in diagnostics after a later failure; rerun after reaching the cap. These two
+  explicit repair modes are mutually exclusive and neither publishes upstream.
 * **Policy gate.** Only a candidate that passed every read gate above reads
   its upstream's record, once per run, from
   `policyRepository/policyPath/OWNER/REPO.md` on that repository's default

@@ -37,7 +37,11 @@ fn forgejo_target_names_and_path_are_not_github_rules() {
     let mut start = start();
     start.repository = "team.example/work.repo";
     start.pool = None;
-    assert!(adapter.body(&start).is_ok());
+    for kind in ["implement", "research", "triage"] {
+        start.kind = kind;
+        start.brief = "fail";
+        assert_eq!(adapter.body(&start).unwrap()["inputs"]["task"], "fail");
+    }
     for bad in [
         "../repo",
         "a/..",
