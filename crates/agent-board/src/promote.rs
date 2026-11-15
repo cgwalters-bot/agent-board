@@ -16,9 +16,12 @@ pub struct Promote {
     /// Publish at most one approved candidate; also requires promote.publish.
     #[arg(long, conflicts_with_all = ["record", "replay"], requires = "max_writes")]
     pub apply: bool,
-    /// Whole-step publication cap (three writes, or four with a rebase/sign-off branch).
+    /// Whole-step publication cap (three writes, or four with a rebase/sign-off branch); with --repair-bodies, the most draft bodies edited.
     #[arg(long, requires = "apply")]
     pub max_writes: Option<usize>,
+    /// One-time repair instead of promotion (agent-board#1002): normalize source bookkeeping in the bot's open drafts in verified midstream forks to one full-URL source line, dropping forge-internal reference lines, and log each before/after or why a draft is left for manual repair. Preview by default; --apply --max-writes N edits at most N fork draft bodies, never anything upstream, and does not need promote.publish.
+    #[arg(long, conflicts_with_all = ["record", "replay"])]
+    pub repair_bodies: bool,
     /// Trusted shared pass configuration. Promotion discovers midstream forks from origin=fork and bot-midstream metadata; legacy promote.forks remains readable for one release as checked parent/base hints. Without promote settings or any discovery scope, off with no token lookup. Reads use the pass's request/time bounds.
     #[arg(long, value_name = "FILE")]
     pub config: PathBuf,
@@ -39,6 +42,25 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
         config.forgejo_board().is_none(),
         "promote supports GitHub only"
     );
+    if args.repair_bodies && !promote::enabled(&config) {
+        writeln!(out, "promote: off")?;
+        return Ok(());
+    }
+    if args.repair_bodies {
+        let client = Client::from_env()?
+            .retry_within(Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT));
+        let mut lines = Vec::new();
+        let resolved = config.resolve(&client, &mut lines)?;
+        lines.extend(promote::repair(
+            &client,
+            resolved.as_ref().unwrap_or(&config),
+            args.max_writes.filter(|_| args.apply),
+        )?);
+        for line in lines {
+            writeln!(out, "{line}")?;
+        }
+        return Ok(());
+    }
     if args.apply && promote::enabled(&config) {
         ensure!(
             config.promote.as_ref().is_some_and(|p| p.publish),

@@ -928,7 +928,7 @@ fn verify_pr(pr: &Value, head: &str, fork: &Value, upstream: &str, base: &str) -
     Ok(())
 }
 
-fn send(client: &impl Rest, method: &str, path: &str, body: Value) -> Result<Value> {
+pub(super) fn send(client: &impl Rest, method: &str, path: &str, body: Value) -> Result<Value> {
     let (status, response) = client.send(method, &format!("{API}{path}"), &body)?;
     ensure!(
         (200..300).contains(&status),

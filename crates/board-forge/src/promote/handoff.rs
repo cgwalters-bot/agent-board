@@ -25,12 +25,17 @@ pub(super) struct Record {
     pub(super) completes_source: bool,
 }
 
-pub(super) fn source(repo: &str, pull: &Value) -> Result<u64> {
-    let body = pull["body"].as_str().context("missing source linkage")?;
-    let issues: Vec<_> = referenced_numbers(body)
+/// The issues of `repo` that `body` closes or is part of.
+fn linked(repo: &str, body: &str) -> Vec<u64> {
+    referenced_numbers(body)
         .into_iter()
         .filter(|n| crate::stack::closes(body, repo, *n) || crate::stack::part_of(body, repo, *n))
-        .collect();
+        .collect()
+}
+
+pub(super) fn source(repo: &str, pull: &Value) -> Result<u64> {
+    let body = pull["body"].as_str().context("missing source linkage")?;
+    let issues = linked(repo, body);
     ensure!(
         issues.len() == 1,
         "handoff needs one deterministic source issue"
@@ -364,6 +369,11 @@ fn enrich_pull(
         &format!("repos/{}/pulls/{}", target.upstream, record.upstream_pr),
     )?;
     repository(&upstream["base"]["repo"], &target.upstream)?;
+    // Publication removes the fork's source line (agent-board#1002): an
+    // upstream body linking no fork issue rests on the authenticated record's
+    // source; one linking any must link this source, the recorded way.
+    let upstream_body = upstream["body"].as_str().context("missing upstream body")?;
+    let linked = linked(repo, upstream_body);
     ensure!(
         upstream["number"] == record.upstream_pr
             && upstream["head"]["sha"] == record.published_oid
@@ -373,15 +383,12 @@ fn enrich_pull(
             && upstream["user"]["login"]
                 .as_str()
                 .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
-            && source(repo, &upstream)? == issue,
+            && (linked.is_empty() || linked == [issue]),
         "live upstream handoff identity mismatch"
     );
     ensure!(
-        crate::stack::closes(
-            upstream["body"].as_str().context("missing upstream body")?,
-            repo,
-            issue
-        ) == record.completes_source,
+        linked.is_empty()
+            || crate::stack::closes(upstream_body, repo, issue) == record.completes_source,
         "upstream handoff linkage kind mismatch"
     );
     let partial_merge =

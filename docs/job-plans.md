@@ -78,6 +78,12 @@ receipts remain on the tracking issue. Deploy the receiving workflow's
 the field. Native Forgejo does not accept this input and refuses it. Fix plans
 on existing fork PRs keep their existing same-repository protocol.
 
+The pass appends promotion guidance to the brief of an implement or fix plan
+working in a topic-admitted midstream fork: a draft PR whose source is one
+full-URL line, with no bare `#N` or forge-internal references
+([the source line](architecture.md#promote)). A staged plan's line names its
+tracker issue as it is; no fork issue is invented for it.
+
 ### Runner profiles (caller integration gated)
 
 The threat is a plan redirecting execution to credential-bearing runner labels

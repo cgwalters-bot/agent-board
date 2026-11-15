@@ -19,6 +19,11 @@ const RECORD: &str =
 /// The record's two recorded commits, oldest first.
 const OLDER: &str = "220fbc83e8e46c5ea6614a285c3848ab253bd6db";
 const NEWER: &str = "07834ad32644607d1cd79add4af025659c988104";
+/// The scenario body: prose, then the canonical source line publication removes.
+const SOURCED: &str =
+    "Implement the slice.\n\nPart of https://github.com/cgwalters-forge/composefs-rs/issues/31";
+/// What publication sends upstream for [`SOURCED`].
+const PUBLISHED: &str = "Implement the slice.";
 
 fn entry<'a>(replay: &'a mut Replay, needle: &str) -> &'a mut Value {
     replay
@@ -112,7 +117,7 @@ fn scenario() -> Replay {
     body(&mut replay, "/compare/")["commits"][0]["commit"] =
         json!({"message":"Implement the slice"});
     body(&mut replay, "/compare/")["commits"][0]["author"]["login"] = json!("cgwalters-bot");
-    pull(&mut replay)["body"] = json!(format!("Part of {REPO}#31"));
+    pull(&mut replay)["body"] = json!(SOURCED);
     pull(&mut replay)["title"] = json!("Implement the slice");
     plan_comments(&mut replay, json!([]));
     replay.requests.push(json!({"request":{"get":format!("{API}repos/{REPO}/issues/31")},
@@ -335,12 +340,10 @@ fn plan_comments(replay: &mut Replay, nodes: Value) {
 #[test]
 fn upstream_association_controls_only_the_derived_closing_line() {
     for (link, expected) in [
-        ("No association", Ok(format!("Part of {REPO}#31"))),
+        ("No association", Ok(PUBLISHED.to_owned())),
         (
             "Upstream: #9",
-            Ok(format!(
-                "Part of {REPO}#31\n\nFixes composefs/composefs-rs#9"
-            )),
+            Ok(format!("{PUBLISHED}\n\nFixes composefs/composefs-rs#9")),
         ),
         ("Upstream: #1\nUpstream: #2", Err("ambiguous")),
         ("Upstream: other-org/project#9", Err("malformed")),
@@ -353,8 +356,9 @@ fn upstream_association_controls_only_the_derived_closing_line() {
             Ok(expected) => assert_eq!(result.unwrap(), expected),
             Err(cause) => assert!(format!("{:#}", result.unwrap_err()).contains(cause)),
         }
-        // The association never changes the fork PR's approved text.
-        assert_eq!(p["body"], format!("Part of {REPO}#31"));
+        // Neither the association nor the source line's removal changes the
+        // fork PR's approved text.
+        assert_eq!(p["body"], SOURCED);
     }
     let mut replay = scenario();
     body(&mut replay, "/issues/31")["body"] = json!("Upstream: #9");
@@ -709,7 +713,7 @@ fn human_text_provenance() {
             "attribution",
             |r| {
                 pull(r)["body"] = json!(format!(
-                    "Part of {REPO}#31\nGenerated-by: https://github.com/cgwalters/#llms"
+                    "{SOURCED}\nGenerated-by: https://github.com/cgwalters/#llms"
                 ))
             },
             "body still has Generated-by attribution",
@@ -1419,6 +1423,92 @@ fn candidate_read_gates() {
             |r| pull(r)["body"] = json!(format!("Closes https://github.com/{REPO}/issues/31")),
             gate_hold(&format!("text has a closing reference to {REPO}#31")),
         ),
+        // Midstream body shapes (agent-board#1002): only a standalone full-URL
+        // `Part of`/`Fixes` line is bookkeeping that publication removes.
+        (
+            "bare Fixes",
+            |r| pull(r)["body"] = json!("Work.\n\nFixes #31"),
+            gate_hold("text has a bare #N reference that changes repository upstream"),
+        ),
+        (
+            "URL Fixes",
+            |r| pull(r)["body"] = json!(SOURCED.replace("Part of", "Fixes")),
+            candidate(false),
+        ),
+        (
+            "upstream link kept",
+            |r| pull(r)["body"] = json!(format!("See composefs/composefs-rs#9.\n\n{SOURCED}")),
+            candidate(false),
+        ),
+        (
+            "qualified repo#N",
+            |r| pull(r)["body"] = json!(format!("Work.\n\nPart of {REPO}#31")),
+            gate_hold(&format!(
+                "text references {REPO}, inside the midstream, which upstream readers cannot follow"
+            )),
+        ),
+        (
+            "punctuated source line",
+            |r| pull(r)["body"] = json!(format!("{SOURCED}.")),
+            gate_hold(&format!(
+                "text references {REPO}, inside the midstream, which upstream readers cannot follow"
+            )),
+        ),
+        (
+            "tracker line",
+            |r| {
+                pull(r)["body"] = json!(format!("{SOURCED}\nPart of cgwalters-forge/tracker#12"))
+            },
+            gate_hold(
+                "text references cgwalters-forge/tracker, inside the midstream, which upstream readers cannot follow",
+            ),
+        ),
+        (
+            "fork link in title",
+            |r| pull(r)["title"] = json!(format!("Implement {REPO}#31")),
+            gate_hold(&format!(
+                "text references {REPO}, inside the midstream, which upstream readers cannot follow"
+            )),
+        ),
+        (
+            "no source",
+            |r| pull(r)["body"] = json!("Work."),
+            gate_hold("cannot tie fork PR to one issue deterministically"),
+        ),
+        (
+            "two source issues",
+            |r| {
+                pull(r)["body"] = json!(format!(
+                    "{SOURCED}\nPart of https://github.com/{REPO}/issues/32"
+                ))
+            },
+            gate_hold("cannot tie fork PR to one issue deterministically"),
+        ),
+        (
+            "duplicate source line",
+            |r| {
+                pull(r)["body"] = json!(format!(
+                    "{SOURCED}\nPart of https://github.com/{REPO}/issues/31"
+                ))
+            },
+            gate_hold(&format!(
+                "text has 2 source lines; keep one `Part of https://github.com/{REPO}/issues/31`"
+            )),
+        ),
+        (
+            "only the source line",
+            |r| pull(r)["body"] = json!(format!("Part of https://github.com/{REPO}/issues/31")),
+            gate_hold("empty body without its source line"),
+        ),
+        (
+            // Issues disabled: staged in the tracker, never an invented fork issue.
+            "staged tracker source",
+            |r| {
+                pull(r)["body"] =
+                    json!("Work.\n\nPart of https://github.com/cgwalters-forge/tracker/issues/12")
+            },
+            gate_hold("cannot tie fork PR to one issue deterministically"),
+        ),
         (
             "third party",
             |r| body(r, "/compare/")["commits"][0]["author"]["login"] = json!("visitor"),
@@ -2113,13 +2203,13 @@ fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
             )
         );
         assert_eq!(publication.2["title"], forge.fresh["title"]);
+        // The fork's source line is the one thing removed; the approved fork
+        // text itself is unchanged.
+        assert_eq!(forge.fresh["body"], SOURCED);
         let expected_body = if linked {
-            format!(
-                "{}\n\nFixes composefs/composefs-rs#9",
-                forge.fresh["body"].as_str().unwrap()
-            )
+            format!("{PUBLISHED}\n\nFixes composefs/composefs-rs#9")
         } else {
-            forge.fresh["body"].as_str().unwrap().to_owned()
+            PUBLISHED.to_owned()
         };
         assert_eq!(publication.2["body"], expected_body);
         if existing {
@@ -2391,7 +2481,9 @@ fn publication_human_text_requires_provenance_and_preserves_bytes() {
         if valid {
             assert!(result[0].starts_with("promoted "));
             let writes = forge.writes.borrow();
-            assert_eq!(writes[1].2["body"], forge.fresh["body"]);
+            // The operator's bytes, less only the source bookkeeping line.
+            assert_eq!(forge.fresh["body"], SOURCED);
+            assert_eq!(writes[1].2["body"], PUBLISHED);
             assert_eq!(writes[1].2["title"], forge.fresh["title"]);
         } else {
             assert!(result[0].contains("pusher"));
@@ -2600,9 +2692,10 @@ fn confirmed_rewritten_publication_is_not_rebuilt_after_an_upstream_advance() {
     assert_eq!(git.prepared.len(), 1);
     assert!(forge.writes.borrow().is_empty());
     // Changed fork text updates the published PR, still without a rebuild.
-    let edited = json!(format!("Part of {REPO}#31\n\nEdited after publication."));
+    let edited = json!(format!("{SOURCED}\n\nEdited after publication."));
     forge.fresh["body"] = edited.clone();
     pull(&mut forge.replay)["body"] = edited.clone();
+    let edited = json!(format!("{PUBLISHED}\n\nEdited after publication."));
     let third = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
     assert!(third[0].starts_with("promoted "), "{third:?}");
     assert_eq!(git.prepared.len(), 1);
@@ -3723,4 +3816,181 @@ fn comments_and_activity_paginate_completely_or_hit_the_bound() {
         run(replay, &config).0.unwrap_err().to_string(),
         "listing exceeds 10 pages"
     );
+}
+
+/// The one-time body repair's forge: the scenario's reads, a PR read just
+/// before a write that may have changed, and the edits it answers.
+struct RepairForge {
+    replay: Replay,
+    fresh: Value,
+    writer: &'static str,
+    writes: RefCell<Vec<(String, String, Value)>>,
+}
+
+impl Rest for RepairForge {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        let body = if url == format!("{API}user") {
+            json!({"login":self.writer})
+        } else if url == format!("{API}repos/{REPO}/pulls/34") {
+            self.fresh.clone()
+        } else {
+            return self.replay.get(url, validator);
+        };
+        Ok(RestResponse {
+            status: 200,
+            body,
+            etag: None,
+            last_modified: None,
+            link: None,
+        })
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.writes
+            .borrow_mut()
+            .push((method.into(), url.into(), body.clone()));
+        let mut edited = self.fresh.clone();
+        edited["body"] = body["body"].clone();
+        Ok((200, edited))
+    }
+}
+
+impl Transport for RepairForge {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.replay.graphql(query, variables)
+    }
+}
+
+#[test]
+fn repair_bodies_previews_applies_within_caps_and_is_idempotent() {
+    const BEFORE: &str = "Work.\n\nFixes #31\nPart of cgwalters-forge/tracker#12";
+    let after = format!("Work.\n\nFixes https://github.com/{REPO}/issues/31");
+    let change = format!(
+        "before={} after={}",
+        json!(BEFORE),
+        serde_json::to_string(&after).unwrap()
+    );
+    let config = Config::parse(CONFIG).unwrap();
+    let forge = |body: &str, edit: fn(&mut Value)| {
+        let mut replay = scenario();
+        pull(&mut replay)["draft"] = json!(true);
+        pull(&mut replay)["body"] = json!(body);
+        edit(pull(&mut replay));
+        let fresh = pull(&mut replay).clone();
+        RepairForge {
+            replay,
+            fresh,
+            writer: "cgwalters-bot",
+            writes: RefCell::new(vec![]),
+        }
+    };
+    type Case = (
+        &'static str,
+        String,
+        fn(&mut Value),
+        Option<usize>,
+        String,
+        usize,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "preview",
+            BEFORE.into(),
+            |_| {},
+            None,
+            format!("would repair {REPO}#34: {change}"),
+            0,
+        ),
+        (
+            "cap",
+            BEFORE.into(),
+            |_| {},
+            Some(0),
+            format!("held by --max-writes: repair {REPO}#34: {change}"),
+            0,
+        ),
+        (
+            "apply",
+            BEFORE.into(),
+            |_| {},
+            Some(1),
+            format!("repaired {REPO}#34: {change}"),
+            1,
+        ),
+        (
+            "idempotent",
+            after.clone(),
+            |_| {},
+            Some(1),
+            format!("repair {REPO}#34: unchanged"),
+            0,
+        ),
+        (
+            "two source issues",
+            "Work.\n\nPart of #31\nPart of #32".into(),
+            |_| {},
+            Some(1),
+            format!(
+                "repair {REPO}#34: held for manual repair: source lines name 2 fork issues; which is the source is for a person"
+            ),
+            0,
+        ),
+        (
+            "substantive prose",
+            "Builds on #30.\n\nFixes #31".into(),
+            |_| {},
+            Some(1),
+            format!(
+                "repair {REPO}#34: held for manual repair: text has a bare #N reference that changes repository upstream"
+            ),
+            0,
+        ),
+        (
+            "title",
+            BEFORE.into(),
+            |p| p["title"] = json!("Implement #31"),
+            Some(1),
+            format!(
+                "repair {REPO}#34: held for manual repair: text has a bare #N reference that changes repository upstream"
+            ),
+            0,
+        ),
+    ];
+    for (name, body, edit, max_writes, expected, writes) in cases {
+        let forge = forge(&body, edit);
+        let lines = repair(&forge, &config, max_writes).unwrap();
+        assert_eq!(lines, [expected], "{name}");
+        let sent = forge.writes.borrow();
+        assert_eq!(sent.len(), writes, "{name}");
+        if writes > 0 {
+            assert_eq!(sent[0].0, "PATCH");
+            assert_eq!(sent[0].1, format!("{API}repos/{REPO}/pulls/34"));
+            assert_eq!(sent[0].2, json!({"body": after}), "{name}");
+        }
+    }
+    // Only the bot's own open drafts in the fork are candidates.
+    for edit in [
+        (|p| p["draft"] = json!(false)) as fn(&mut Value),
+        |p| p["user"]["login"] = json!("visitor"),
+        |p| p["base"]["repo"]["full_name"] = json!("composefs/composefs-rs"),
+    ] {
+        let forge = forge(BEFORE, edit);
+        assert!(repair(&forge, &config, Some(1)).unwrap().is_empty());
+        assert!(forge.writes.borrow().is_empty());
+    }
+    // A body changed since the listing is read again and not written.
+    let mut changed = forge(BEFORE, |_| {});
+    changed.fresh["body"] = json!("Edited meanwhile.\n\nFixes #31");
+    assert_eq!(
+        repair(&changed, &config, Some(1)).unwrap(),
+        [format!(
+            "repair failed: repair {REPO}#34: body changed since it was read; run the repair again"
+        )]
+    );
+    assert!(changed.writes.borrow().is_empty());
+    // Applying needs the bot's own credential.
+    let mut visitor = forge(BEFORE, |_| {});
+    visitor.writer = "cgwalters";
+    assert!(repair(&visitor, &config, Some(1)).is_err());
+    assert!(visitor.writes.borrow().is_empty());
 }

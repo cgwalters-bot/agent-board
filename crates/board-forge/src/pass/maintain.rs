@@ -950,6 +950,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             waiver: Default::default(),
             routing: None,
             direction: self.direction_hash(),
+            midstreams: None,
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);

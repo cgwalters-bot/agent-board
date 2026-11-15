@@ -661,6 +661,9 @@ pub struct PollPolicy {
     /// The pass's `pr.noMerge`: exact base repositories never merged or
     /// enqueued by the poll. Empty leaves merge decisions unchanged.
     pub no_merge: Vec<String>,
+    /// Pass-only: the topic-admitted midstream forks stage 2 read, whose
+    /// fix briefs get [`crate::promote::midstream_brief`]. Empty by default.
+    pub midstreams: Vec<String>,
     /// The pass's `pr.operatorPaths` (agent-board#683): paths, or with a
     /// trailing `/` directories, or a JSON file's values other than its
     /// `FILE#/json/pointer` exemptions, a pull request changing any of which merges
@@ -1382,6 +1385,7 @@ impl PollPolicy {
             // [`PrOptions::apply`]'s, below.
             head_owners: Vec::new(),
             no_merge: Vec::new(),
+            midstreams: Vec::new(),
             operator_paths: Vec::new(),
             stale_days: 0,
             check_reruns: false,
@@ -4879,6 +4883,19 @@ fn approval_only(pull: &Value, checks: &Checks, run: Option<&Value>, config: &Co
         })
 }
 
+/// `task` with the midstream sentences where `repo` is a midstream fork the
+/// pass read: what a fix run writes there is promoted unchanged.
+pub(crate) fn midstream_task(policy: &PollPolicy, repo: &str, task: String) -> String {
+    match policy
+        .midstreams
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(repo))
+    {
+        true => task + &crate::promote::midstream_brief(repo, None),
+        false => task,
+    }
+}
+
 /// Whether `pull`'s base repository is in `pr.noMerge`.
 fn no_merge(config: &Config, pull: &Value) -> bool {
     let repository = text(pull, "/baseRepository/nameWithOwner");
@@ -5940,6 +5957,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 fix_task(repo, pull, checks, review, round)
             }
         };
+        let task = midstream_task(&self.config.policy, repo, task);
         let start = Start {
             issue_repository: None,
             repository: repo,
@@ -21903,6 +21921,33 @@ mod tests {
             ("some-new-step", Some(Write)),
         ] {
             assert_eq!(step_kind(action), kind, "{action}");
+        }
+    }
+
+    #[test]
+    fn midstream_fix_tasks_get_the_promotion_brief() {
+        let policy = PollPolicy {
+            midstreams: vec!["cgwalters-forge/composefs-rs".into()],
+            ..PollPolicy::default()
+        };
+        let midstream = format!(
+            "Fix it.{}",
+            crate::promote::midstream_brief("Cgwalters-Forge/composefs-rs", None)
+        );
+        for (policy, repo, expected) in [
+            (&policy, "Cgwalters-Forge/composefs-rs", midstream.as_str()),
+            (&policy, "composefs/composefs-rs", "Fix it."),
+            (
+                &PollPolicy::default(),
+                "cgwalters-forge/composefs-rs",
+                "Fix it.",
+            ),
+        ] {
+            assert_eq!(
+                midstream_task(policy, repo, "Fix it.".into()),
+                expected,
+                "{repo}"
+            );
         }
     }
 

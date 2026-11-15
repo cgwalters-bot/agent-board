@@ -645,6 +645,10 @@ mod tests {
             "null linkage",
             "multiple sources",
             "metadata read",
+            // Publication removed the source line (agent-board#1002).
+            "stripped upstream",
+            "stripped merge",
+            "other upstream source",
         ];
         let (mut mixed, mixed_config) = crate::promote::tests::handoff_scenario();
         let good = crate::pass::tests::facts(REPO, 31, "2026-10-23T00:00:00Z");
@@ -659,13 +663,20 @@ mod tests {
                 let body = &mut entry["answer"]["body"];
                 if path.ends_with("/pulls/70") {
                     match case {
-                        "merge" | "partial merge" => {
+                        "merge" | "partial merge" | "stripped merge" => {
                             body["state"] = json!("closed");
                             body["merged"] = json!(true);
                             body["merged_at"] = json!("2026-10-24T00:00:00Z");
                             if case == "partial merge" {
                                 body["body"] = json!(format!("Part of {REPO}#31"));
                             }
+                            if case == "stripped merge" {
+                                body["body"] = json!("Implement the slice.");
+                            }
+                        }
+                        "stripped upstream" => body["body"] = json!("Implement the slice."),
+                        "other upstream source" => {
+                            body["body"] = json!(format!("Closes {REPO}#32"))
                         }
                         "linkage kind" => body["body"] = json!(format!("Part of {REPO}#31")),
                         "closed-unmerged" => body["state"] = json!("closed"),
@@ -865,6 +876,8 @@ mod tests {
                     | "forged"
                     | "no record"
                     | "partial merge"
+                    | "stripped upstream"
+                    | "stripped merge"
             );
             let fatal = matches!(
                 case,
@@ -943,10 +956,11 @@ mod tests {
                 );
                 continue;
             }
+            let merged = matches!(case, "merge" | "stripped merge");
             let held = hold(facts, &busy, &[&config.operator, &config.bot]).unwrap();
             assert_eq!(
                 held.kind,
-                if case == "merge" {
+                if merged {
                     HoldKind::Closed
                 } else {
                     HoldKind::PrOpen
@@ -957,7 +971,7 @@ mod tests {
                 revisit::revisit_hold(facts, &busy, &[&config.operator, &config.bot])
                     .unwrap()
                     .kind,
-                if case == "merge" {
+                if merged {
                     HoldKind::Closed
                 } else {
                     HoldKind::PrOpen
@@ -977,19 +991,16 @@ mod tests {
             let mut status = item_facts(&item, Some(&busy), Some(&read), &ours);
             assert_eq!(
                 derive(&status).unwrap().to,
-                if case == "merge" { Done } else { InProgress },
+                if merged { Done } else { InProgress },
                 "{case}"
             );
             status.status = Some(Blocked);
-            assert_eq!(
-                derive(&status).map(|c| c.to),
-                (case == "merge").then_some(Done)
-            );
+            assert_eq!(derive(&status).map(|c| c.to), merged.then_some(Done));
             status.status = Some(Todo);
             status.needs_human = true;
             assert_eq!(
                 derive(&status).unwrap().to,
-                if case == "merge" { Done } else { NeedsHuman }
+                if merged { Done } else { NeedsHuman }
             );
         }
         let notices =

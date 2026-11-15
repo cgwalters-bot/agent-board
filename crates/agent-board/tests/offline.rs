@@ -3742,7 +3742,9 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
             p["draft"] = false.into();
             p["labels"] = serde_json::json!([]);
             p["title"] = "Implement slice".into();
-            p["body"] = "Part of cgwalters-forge/composefs-rs#31".into();
+            p["body"] =
+                "Implement slice.\n\nPart of https://github.com/cgwalters-forge/composefs-rs/issues/31"
+                    .into();
             e["answer"]["body"] = serde_json::json!([p]);
         } else if url.contains("/issues/34/comments?") {
             e["answer"]["body"] = serde_json::json!([{"id":1,"user":{"login":"cgwalters"},"body":"/promote","created_at":"2026-10-23T00:00:00Z","updated_at":"2026-10-23T00:00:00Z"}]);
@@ -3843,7 +3845,9 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
     p["url"] = "https://github.com/cgwalters-forge/composefs-rs/pull/34".into();
     p["headRefOid"] = "866b6ce9050782c50eb0fec1c08b37cebec93dc6".into();
     p["title"] = "Implement slice".into();
-    p["body"] = "Part of cgwalters-forge/composefs-rs#31".into();
+    p["body"] =
+        "Implement slice.\n\nPart of https://github.com/cgwalters-forge/composefs-rs/issues/31"
+            .into();
     p["editor"] = serde_json::json!({"login":"cgwalters"});
     p["lastEditedAt"] = "2026-10-22T12:00:00Z".into();
     p["userContentEdits"] = serde_json::json!({"totalCount":1,"nodes":[{"editedAt":"2026-10-22T12:00:00Z","deletedAt":null,"editor":{"login":"cgwalters"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}});
