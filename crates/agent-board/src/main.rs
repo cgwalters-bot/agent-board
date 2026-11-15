@@ -13,6 +13,7 @@ mod deploy;
 mod digest;
 mod dispatch;
 mod epic;
+mod eval;
 mod intake;
 mod item;
 mod lease;
@@ -135,6 +136,8 @@ enum Command {
     Dispatch(dispatch::FromPlan),
     /// Resolve deployment-owned pool settings (offline; no inference or writes).
     Pools(pools::Args),
+    /// Summarize an offline role evaluation against its frozen manifest (offline; no inference, dispatch or writes; docs/eval.md).
+    Eval(eval::Eval),
     /// The open pull requests of -R, of any author, and the implement runs in flight that share a path with a change, with their age and last activity and which drafts are stale, as the dispatch overlap check reads them (read-only; docs/job-plans.md#the-overlap-command).
     Overlap(overlap::Overlap),
     /// Check a coordinator's plan for an epic's sub-issues.
@@ -728,6 +731,7 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
             )
         }
         Command::Pools(args) => pools::run(args, &mut io::stdout().lock()),
+        Command::Eval(args) => eval::run(args, &mut io::stdout().lock()),
         Command::Dispatch(args) => {
             ensure!(
                 cli.json.is_none(),

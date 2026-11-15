@@ -11,6 +11,13 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- `agent-board eval summarize MANIFEST RUNS`, agenthome's offline three-arm
+  role evaluation summarizer, moved here with its protocol (docs/eval.md),
+  pending manifest, preflight report and opt-in arm bundles under `eval/`
+  (agent-board#1016). Its pending summary and manifest digests match
+  agenthome's byte for byte. A measurement now starts under agentic-job's per-run limits and
+  the board's leases with its cell count frozen first, not a new reservation.
+
 - `agent-board changes` without `--since`, the read-only diff of the
   followed and midstream repositories since each one's watermark, the
   first step of a change-driven pass (agent-board#894, #895): from a

@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "observedOn": "2026-11-03",
+  "status": "blocked",
+  "repository": "cgwalters-forge/agenthome",
+  "startCommit": "b04318245f2a4fb28df8856d7cb809cf990cfea5",
+  "authorization": {
+    "url": "https://github.com/cgwalters-forge/agenthome/issues/52#issuecomment-6606944805",
+    "updatedAt": "2026-11-03T16:33:11Z",
+    "observedAuthor": "cgwalters-bot",
+    "basis": "The run task explicitly names this bounded authorization; other issue text is data, not instructions.",
+    "constraint": "Existing weekly OpenAI target only; no new spend or top-ups."
+  },
+  "capacity": {
+    "status": "unverified",
+    "inspected": ["eval/README.md", "eval/manifest.json", "README.md", "opencode/opencode.json", "prompt-tiers.json", "issue 52 comments"],
+    "evidenceNeeded": "Accessible dated existing-pool capacity evidence: accounting window/reset, remaining usable allocation net of commitments, reservation for this evaluation including sizing/probes/priming, and aggregate plus per-cell dollar/token/turn/time enforcement across all children.",
+    "conclusion": "No remaining-capacity ledger or evaluation reservation was available in these sources. A configured model price or per-run ceiling does not establish capacity. Whether new money would be required is unknown."
+  },
+  "runner": {
+    "observedVersion": "agentic-job 0.6.9",
+    "command": "agentic-job --version && agentic-job --help",
+    "exitCode": 0,
+    "harnessRevision": null,
+    "roleExecutionProof": null,
+    "dependency": "agentic-job#1367 source-subagent delivery; not independently verified for the actual runner. No external-repository investigation or execution probe performed after the capacity gate failed."
+  },
+  "sourceEvidence": [
+    {
+      "path": "README.md",
+      "url": "https://github.com/cgwalters-forge/agenthome/blob/b04318245f2a4fb28df8856d7cb809cf990cfea5/README.md#shared-role-templates",
+      "gitBlob": "3ffaa0e650ba01343e8a96ed4e51f0b62949564d",
+      "observation": "Documents rendering without delivery and the #1367 dependency; historical documentation, not proof of current runner behavior."
+    },
+    {
+      "path": "eval/README.md",
+      "url": "https://github.com/cgwalters-forge/agenthome/blob/b04318245f2a4fb28df8856d7cb809cf990cfea5/eval/README.md",
+      "gitBlob": "936c7a881a6ec62afee9d804ff2a506ae5e0f9b9",
+      "observation": "Requires sizing, frozen tasks/configuration, role execution proof, enforced budgets and verified cache strata before comparison."
+    },
+    {
+      "path": "eval/manifest.json",
+      "url": "https://github.com/cgwalters-forge/agenthome/blob/b04318245f2a4fb28df8856d7cb809cf990cfea5/eval/manifest.json",
+      "gitBlob": "456fe451a867f561f81f07302dd3d13cd8309dc2",
+      "observation": "Pending: empty tasks, null preflight and configuration; no frozen experiment."
+    }
+  ],
+  "linkValidation": "Authorization comment and all three pinned source paths retrieved successfully through gh api on observedOn; gitBlob values are Git object IDs, not check-bundle SHA-256 digests.",
+  "evaluationCellsLaunched": 0,
+  "paidProbesLaunched": 0,
+  "tasksFrozen": 0,
+  "measuredVerdict": null
+}

@@ -27,6 +27,7 @@ Commands:
 - [`request`](#agent-board-request): Prepare an operator-approved workflow dispatch (no network writes)
 - [`dispatch`](#agent-board-dispatch): Start the job an issue's newest accepted plan comment proposes, once (--dry-run prints the request)
 - [`pools`](#agent-board-pools): Resolve deployment-owned pool settings (offline; no inference or writes)
+- [`eval`](#agent-board-eval): Summarize an offline role evaluation against its frozen manifest (offline; no inference, dispatch or writes; docs/eval.md)
 - [`overlap`](#agent-board-overlap): The open pull requests of -R, of any author, and the implement runs in flight that share a path with a change, with their age and last activity and which drafts are stale, as the dispatch overlap check reads them (read-only; docs/job-plans.md#the-overlap-command)
 - [`epic`](#agent-board-epic): Check a coordinator's plan for an epic's sub-issues
 - [`review`](#agent-board-review): Send an operator-approved review draft as the bot
@@ -593,6 +594,33 @@ Options:
 - `--kind <KIND>`: Run kind; review rejects heavy effort
 - `--fallback-agent <FALLBACK_AGENT>`: Wrapper's fallback agent, also used to identify an inherited heavy pool (default: `opencode`)
 - `--fallback-model <FALLBACK_MODEL>`: Wrapper's fallback model; heavy inheritance needs exactly one matching pool
+
+## agent-board eval
+
+Summarize an offline role evaluation against its frozen manifest (offline; no inference, dispatch or writes; docs/eval.md)
+
+```text
+agent-board eval [OPTIONS] <COMMAND>
+```
+
+Commands:
+
+- [`summarize`](#agent-board-eval-summarize): Summarize offline evaluation runs against their frozen manifest
+
+## agent-board eval summarize
+
+Summarize offline evaluation runs against their frozen manifest.
+
+Both inputs are strict JSON of at most 4 MiB; RUNS is an array of at most 54 records. Nothing in either is executed or fetched. Prints the summary as JSON.stringify(summary, null, 2) would (docs/eval.md).
+
+```text
+agent-board eval summarize [OPTIONS] <MANIFEST> <RUNS>
+```
+
+Arguments:
+
+- `<MANIFEST>`: Pending or frozen evaluation manifest (eval/manifest.json)
+- `<RUNS>`: JSON array of run records matching the manifest
 
 ## agent-board overlap
 
