@@ -4632,6 +4632,7 @@ fn describe(repo: &str, event: &Value, config: &Config) -> Option<String> {
 struct Pressure {
     open: BTreeMap<String, Vec<Value>>,
     files: BTreeMap<(String, u64), Option<BTreeSet<String>>>,
+    stopped: BTreeMap<(String, u64), bool>,
 }
 
 /// The result of one pass.
@@ -9022,6 +9023,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             if at == crate::pass::pressure::OLDER_LIMIT {
                 return Ok(Some(older));
             }
+            if self.pressure_parked(repo, &open, older) {
+                continue;
+            }
             let key = (repo.to_ascii_lowercase(), older);
             if !self.pressure.files.contains_key(&key) {
                 let files = self.paged(
@@ -9047,6 +9051,44 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
         }
         Ok(None)
+    }
+
+    /// Whether the older bot PR `number` waits on a person, so it does not
+    /// hold younger work's paths: labelled [`HOLD_LABEL`] or [`LABEL`], or
+    /// the poll's newest marker is a stop still held by the operator's review
+    /// request (without that hold, a stop reads as reset). Releasing the hold
+    /// puts it back in the order. A failed read is not parked. An operator
+    /// review requested without a stop still holds, though the poll skips it.
+    fn pressure_parked(&mut self, repo: &str, open: &[Value], number: u64) -> bool {
+        let Some(pull) = open.iter().find(|p| p["number"].as_u64() == Some(number)) else {
+            return false;
+        };
+        let labels = nodes(pull, "/labels");
+        if holds(labels)
+            || labels
+                .iter()
+                .any(|l| text(l, "/name").eq_ignore_ascii_case(LABEL))
+        {
+            return true;
+        }
+        let requested = self.config.policy.assign_holds
+            && nodes(pull, "/requested_reviewers")
+                .iter()
+                .any(|r| text(r, "/login").eq_ignore_ascii_case(&self.config.operator));
+        if !requested {
+            return false;
+        }
+        let key = (repo.to_ascii_lowercase(), number);
+        if !self.pressure.stopped.contains_key(&key) {
+            let stopped = self
+                .paged(
+                    &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+                    false,
+                )
+                .is_ok_and(|comments| find_marker(&comments, &self.config.bot).stopped);
+            self.pressure.stopped.insert(key.clone(), stopped);
+        }
+        self.pressure.stopped[&key]
     }
 
     fn pressure_open(&mut self, repo: &str) -> Result<Vec<Value>> {

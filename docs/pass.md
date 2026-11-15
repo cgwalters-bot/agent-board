@@ -74,8 +74,12 @@ The approved-first phase uses the same policy. Repository censuses and older-PR
 paths are read once and shared across these phases. Unread path coverage is
 conservative. The older-PR scan considers at most 100
 older PRs, within the poll's shared request/time budget; further older work holds
-the step. Older PRs parked on a person can therefore hold younger overlapping
-work until landed or closed. This setting does not automatically close PRs or
+the step. An older PR parked on a person does not hold younger work: one labelled
+`hold` or `needs-human`, or whose newest poll marker is a stop still held by an
+operator review request. Without this, a parked PR that will not land held every
+approved overlapping PR. It still counts toward the cap. Releasing the hold puts
+it back in the order; a stop marker that cannot be read counts as not parked.
+This setting does not automatically close PRs or
 grant more fix rounds. Explicit stage-4 `fixPlans` retain their existing policy.
 
 Stacked multi-issue runs remain deferred until the stacked-output dependencies
