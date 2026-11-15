@@ -3053,6 +3053,25 @@ impl Bounds {
         })
     }
 
+    /// Once, as stage 4 begins: where the stages before it left less than a
+    /// start takes, what maintain, the pull request walk and the epics spent
+    /// of the pass's limit, so that a starved scheduling stage says why
+    /// (agent-board#1022).
+    fn starved_line(&self) -> Option<String> {
+        let left = self.left.get();
+        let start = START_RESERVE + WRITE_RESERVE;
+        (left < start).then(|| {
+            let by_stage = self.by_stage.get();
+            format!(
+                "budget: the pull request walk used {} of {} requests, maintain {} and epics {}; scheduling got {left}, less than a start takes ({start})",
+                by_stage[Stage::PullRequests as usize],
+                self.limit.get(),
+                by_stage[Stage::Maintain as usize],
+                by_stage[Stage::Epics as usize],
+            )
+        })
+    }
+
     /// Gives back the request of `class` a 304 spent, up to
     /// [`REVALIDATED_LIMIT`].
     fn refund(&self, class: &str) {
@@ -4482,6 +4501,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     }
     // Stage 4: choose and start work.
     bounds.enter(Stage::Schedule);
+    if let Some(line) = bounds.starved_line() {
+        scheduler.line(line);
+    }
     if let Err(error) = scheduler.schedule(earlier, &git_ref) {
         scheduler.holds_whole = false;
         scheduler.report.error("schedule", &error);
@@ -4534,16 +4556,26 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
 
 /// What stages 2 and 3 keep for the stages after them, in requests: their
 /// legacy fixed shares, or no stage shares with `requestShare` enabled.
+/// `reserveScheduling` keeps its shares either way, of the limit
+/// `requestShare` sized, and at least what a start takes where the limit
+/// has it: without them a busy pull request walk spent the derived budget
+/// and left scheduling nothing to start (agent-board#1022).
 fn kept_shares(config: &Config, bounds: &Bounds) -> (usize, usize) {
+    if config.reserve_scheduling {
+        // A limit too small for a start keeps its plain shares.
+        let start = START_RESERVE + WRITE_RESERVE;
+        let start = if bounds.limit.get() >= start {
+            start
+        } else {
+            0
+        };
+        let kept = |percent| bounds.share(percent).max(start);
+        return (kept(SCHEDULE_SHARE + EPICS_SHARE), kept(SCHEDULE_SHARE));
+    }
     if config.request_share.is_some() {
         return (0, 0);
     }
-    let (pulls, epics) = if config.reserve_scheduling {
-        (SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE)
-    } else {
-        (AFTER_PULL_REQUESTS, AFTER_EPICS)
-    };
-    (bounds.share(pulls), bounds.share(epics))
+    (bounds.share(AFTER_PULL_REQUESTS), bounds.share(AFTER_EPICS))
 }
 
 fn size_request_share(

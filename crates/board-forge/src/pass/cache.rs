@@ -252,6 +252,11 @@ mod tests {
             .insert("o/r#1".into(), "2026-11-08T00:00:00Z".into());
         state.intake_refused.push("o/r#1/issuecomment-2".into());
         state.bind_responses("host-identity-config-one");
+        // Decided under one scope, they are not carried to another.
+        state.quiet_waits = poll::quiet::from_json(Some(&json!({"o/r#2": {
+            "head": "abc", "updated_at": "2026-11-08T00:00:00Z",
+            "read_at": "2026-11-08T00:00:00Z", "kind": "promote"}})))
+        .unwrap();
         state
             .responses
             .insert(url.clone(), seal(json!({"body": [1], "etag": "1"})));
@@ -271,6 +276,7 @@ mod tests {
             let mut changed = original.clone();
             changed.bind_responses(scope);
             assert!(changed.responses.is_empty());
+            assert!(changed.quiet_waits.is_empty());
             assert_eq!(changed.intake_waiting, original.intake_waiting);
             assert_eq!(changed.intake_refused, original.intake_refused);
         }

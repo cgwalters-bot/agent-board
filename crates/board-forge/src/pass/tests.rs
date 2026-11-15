@@ -3128,6 +3128,27 @@ fn scheduling_reserve_precedes_all_discovery_stages() {
     bounds.enter(Stage::Schedule);
     assert_eq!(client.share_left(), None);
     assert!(bounds.left.get() > START_RESERVE + START_REQUESTS);
+    assert_eq!(bounds.starved_line(), None);
+    // Without the reserve, a walk that spends the pass says so once.
+    let bounds = Bounds::new(765, Instant::now() + Duration::from_secs(60));
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    for (stage, requests) in [(Stage::PullRequests, 568), (Stage::Epics, 80)] {
+        bounds.enter(stage);
+        for _ in 0..requests {
+            client.get("https://api.github.com/x", None).unwrap();
+        }
+    }
+    bounds.left.set(4);
+    assert_eq!(
+        bounds.starved_line().unwrap(),
+        format!(
+            "budget: the pull request walk used 568 of 765 requests, maintain 0 and epics 80; scheduling got 4, less than a start takes ({})",
+            START_RESERVE + WRITE_RESERVE
+        )
+    );
 }
 
 /// Legacy stage shares remain available without requestShare.
@@ -3146,10 +3167,29 @@ fn legacy_stage_shares() {
             json!({"reserveScheduling": true}),
             fixed(SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE),
         ),
+        ("request share", json!({"requestShare": 60}), (0, 0)),
+        // The reserve under a derived limit too (agent-board#1022).
+        (
+            "request share with reserve scheduling",
+            json!({"requestShare": 60, "reserveScheduling": true}),
+            fixed(SCHEDULE_SHARE + EPICS_SHARE, SCHEDULE_SHARE),
+        ),
     ] {
         let (pulls, epics) = kept_shares(&config(settings), &bounds);
         assert_eq!((pulls, epics), expected, "{name}");
-        assert!(pulls > epics, "{name}");
+        assert!(pulls == 0 && epics == 0 || pulls > epics, "{name}");
+    }
+    // A small derived limit still keeps a start for scheduling, where it has
+    // one to keep.
+    let reserve = config(json!({"requestShare": 60, "reserveScheduling": true}));
+    let start = START_RESERVE + WRITE_RESERVE;
+    for (limit, expected) in [
+        (start * 2, (start * 8 / 5, start * 6 / 5)),
+        (start * 4 / 3, (start * 4 / 3 * 4 / 5, start)),
+        (start - 1, ((start - 1) * 4 / 5, (start - 1) * 3 / 5)),
+    ] {
+        let bounds = Bounds::new(limit, Instant::now() + Duration::from_secs(60));
+        assert_eq!(kept_shares(&reserve, &bounds), expected, "limit {limit}");
     }
     // Even without a later-stage reserve, the PR walk sees the derived read
     // capacity. The client, not a second poll counter, enforces that share.
@@ -8204,10 +8244,17 @@ fn authored_read_at_its_share_is_deferred() {
     );
     assert_eq!(report.failures, without.failures, "{:#?}", report.lines);
     assert!(report.state.is_some());
+    // Too small a pass for a start, which stage 4 says once.
+    let starved = (report.lines.iter())
+        .filter(|l| l.starts_with("budget: the pull request walk used ") && l.contains(" of 10 "))
+        .count();
+    assert_eq!(starved, 1, "{:#?}", report.lines);
 }
 
-/// Derived headroom removes stage reservations without increasing the total
-/// budget; the PR walk merges all thirty, then scheduling and Status run.
+/// Derived headroom removes the default stage reservations without increasing
+/// the total budget; the PR walk merges all thirty, then scheduling and
+/// Status run. `reserveScheduling` keeps its shares of the derived budget,
+/// as of the legacy one (agent-board#1022).
 #[test]
 fn derived_budget_merges_past_the_legacy_stage_share() {
     const REPOSITORIES: u64 = 10;
@@ -8264,9 +8311,13 @@ fn derived_budget_merges_past_the_legacy_stage_share() {
         (report.lines.iter())
             .any(|l| l.starts_with("pull requests: the stage's request share is spent at "))
     };
-    for (name, share, all) in [("legacy", None, false), ("derived", Some(50), true)] {
+    for (name, share, reserve, all) in [
+        ("legacy", None, true, false),
+        ("derived", Some(50), false, true),
+        ("derived reserve", Some(50), true, false),
+    ] {
         let settings = json!({"follow": repositories, "pr": {"fixPools": ["claude"]},
-            "reserveScheduling": true});
+            "reserveScheduling": reserve});
         let mut cfg = config(settings);
         cfg.request_share = share;
         let mut forge = forge();
@@ -8309,6 +8360,7 @@ fn derived_budget_merges_past_the_legacy_stage_share() {
         assert!(
             !(report.lines.iter()).any(|l| {
                 l.starts_with("budget: candidate discovery stopped")
+                    || l.starts_with("budget: the pull request walk used ")
                     || l.starts_with("budget: ")
                         && (l.contains("requests left") || l.contains("keeps its last"))
                     || l.starts_with("status: the pass's request budget")
@@ -18145,6 +18197,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
             p.owner_branches,
             p.own_space_only,
             p.fold_rounds,
+            p.quiet_waits,
             p.review_pools,
             p.review_dispatch_repositories,
             p.draft_review_repositories,
@@ -18172,11 +18225,21 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
             .direction_first
     );
     assert!(!poll(&json!({})).unwrap().direction_first);
+    // On unless set to false (agent-board#1019), whether read by either.
+    for (pr, on) in [
+        (json!({}), true),
+        (json!({"quietWaits": true}), true),
+        (json!({"quietWaits": false}), false),
+    ] {
+        assert_eq!(pass(&pr).unwrap().quiet_waits, on, "{pr}");
+        assert_eq!(poll(&pr).unwrap().quiet_waits, on, "{pr}");
+    }
     for (pr, ok) in [
         (json!({}), true),
         (every.clone(), true),
         (json!({"mergeQueue": {}, "staleDays": 0}), true),
         (json!({"unstall": "true"}), false),
+        (json!({"quietWaits": "true"}), false),
         (json!({"noMerge": [null]}), false),
         (json!({"noMerge": ["o/*"]}), false),
         (json!({"headOwners": ["not a login"]}), false),

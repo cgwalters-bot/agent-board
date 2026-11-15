@@ -33,6 +33,7 @@ pub mod notify;
 mod operator_keys;
 pub mod pace;
 mod publication;
+pub mod quiet;
 mod recovery;
 pub mod report;
 mod reviews;
@@ -563,6 +564,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "ownerBranches",
     "ownSpaceOnly",
     "actionFirst",
+    "quietWaits",
     "foldRounds",
     "reviewPools",
     "reviewDispatchRepositories",
@@ -648,6 +650,11 @@ pub struct PollPolicy {
     /// Prevent upstream/draft reads from starving ready own-space merges.
     /// Off by default; discovery and actions retain the poll's request bounds.
     pub action_first: bool,
+    /// Prevent re-reading, pass after pass, pull requests unchanged since a
+    /// read that left them waiting on the operator alone ([`quiet`]). On unless
+    /// the config sets it to `false`; each is read whole again within
+    /// [`quiet::QUIET_REREAD_SECONDS`].
+    pub quiet_waits: bool,
     /// Optional issue for the edited maintainer report; absent publishes nothing.
     pub maintainer_report: Option<report::Destination>,
     pub merge_authors: Vec<String>,
@@ -1097,6 +1104,9 @@ pub struct PrOptions {
     pub hold_dependencies: bool,
     #[serde(default)]
     pub action_first: bool,
+    /// On unless set to `false` (agent-board#1019).
+    #[serde(default)]
+    pub quiet_waits: Option<bool>,
     #[serde(default)]
     pub check_reruns: bool,
     #[serde(default)]
@@ -1241,6 +1251,7 @@ impl PrOptions {
             hold_missing_data,
             hold_dependencies,
             action_first,
+            quiet_waits,
             check_reruns,
             unstall,
             direction_first,
@@ -1261,6 +1272,7 @@ impl PrOptions {
         policy.hold_dependencies = hold_dependencies;
         policy.hold_missing_data = hold_missing_data;
         policy.action_first = action_first;
+        policy.quiet_waits = quiet_waits.unwrap_or(true);
         policy.check_reruns = check_reruns;
         policy.unstall = unstall;
         policy.direction_first = direction_first;
@@ -1405,6 +1417,7 @@ impl PollPolicy {
             fix_plans: false,
             own_space_only: false,
             action_first: false,
+            quiet_waits: false,
             hold_dependencies: false,
             agent_recovery: false,
             fold_rounds: false,
@@ -1734,6 +1747,12 @@ pub struct State {
     /// input check refused them, `OWNER/REPO#N` to the `updated_at` it read,
     /// which go to the back of the next pass's queue until they change.
     pub lock_refused: BTreeMap<String, String>,
+    /// `quietWaits` ([`quiet`]): `OWNER/REPO#N`, lower case, to the last
+    /// whole read that left it waiting on the operator alone, at most
+    /// [`quiet::QUIET_LIMIT`]. A pass without the option, or another
+    /// response scope ([`Self::bind_responses`]), drops them; losing them
+    /// costs each pull request one whole read.
+    pub quiet_waits: BTreeMap<String, quiet::Quiet>,
     /// `repositoriesPerPass`: the followed repository the next pass's
     /// envelope starts from ([`board_core::admission`]); none starts over.
     /// Only an applying pass moves it, and a pass without the option drops
@@ -1788,6 +1807,8 @@ impl State {
             eprintln!("cache: absent or incompatible response scope; cold reads");
             self.responses.clear();
             self.pass_responses.clear();
+            // Decided under another configuration or identity.
+            self.quiet_waits.clear();
             self.response_scope = Some(scope.to_owned());
         }
     }
@@ -1813,6 +1834,7 @@ impl State {
                     "intake_refused",
                     "operator_direction",
                     "lock_refused",
+                    "quiet_waits",
                     "follow_cursor",
                     "share_cursor",
                     "action_first_cursor",
@@ -1963,6 +1985,7 @@ impl State {
                 })
                 .collect::<Result<_>>()?,
         };
+        let quiet_waits = quiet::from_json(object.get("quiet_waits"))?;
         let cursor = |key: &str| {
             object
                 .get(key)
@@ -2061,6 +2084,7 @@ impl State {
             intake_refused,
             operator_direction,
             lock_refused,
+            quiet_waits,
             follow_cursor,
             share_cursor,
             action_first_cursor,
@@ -2108,6 +2132,9 @@ impl State {
         }
         if !self.lock_refused.is_empty() {
             state["lock_refused"] = json!(self.lock_refused);
+        }
+        if !self.quiet_waits.is_empty() {
+            state["quiet_waits"] = json!(self.quiet_waits);
         }
         if let Some(cursor) = &self.follow_cursor {
             state["follow_cursor"] = cursor.as_str().into();
@@ -5069,6 +5096,11 @@ struct Pass<'a, R, G> {
     /// superseded, to fold at its end ([`PollPolicy::fold_rounds`]).
     folds: Vec<(String, String)>,
     report_pulls: BTreeMap<(String, u64), report::Pull>,
+    /// `quietWaits`: the last pass's, still fresh, and this pass's whole
+    /// reads that left a pull request waiting on the operator ([`quiet`]), and
+    /// how many this pass decided from them.
+    quiet: BTreeMap<String, quiet::Quiet>,
+    quiet_replayed: usize,
 }
 
 /// A review start or rerun, deferred so that they go in Priority order.
@@ -5211,6 +5243,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             planned: 0,
             folds: Vec::new(),
             report_pulls: BTreeMap::new(),
+            quiet: BTreeMap::new(),
+            quiet_replayed: 0,
         }
     }
 
@@ -7958,6 +7992,56 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         self.person_skip(repo, number, merge_only, listed, &reason)
     }
 
+    /// What [`Pass::pull`] last came to for a pull request unchanged in its
+    /// `listing` since, with `quietWaits` ([`quiet`]).
+    fn quiet_replay(
+        &mut self,
+        repo: &str,
+        number: u64,
+        listing: Option<&Value>,
+    ) -> Option<(String, bool, Option<Wait>, Option<Stepped>)> {
+        let quiet = self.quiet.get(&quiet::key(repo, number))?;
+        let read = quiet.replay((repo, number), listing?, self.now, self.apply.is_none())?;
+        if let Some(p) = self.report_pulls.get_mut(&(repo.to_owned(), number))
+            && let Some(stepped) = &read.3
+        {
+            p.action = stepped.action.into();
+            p.reason = stepped.reason.clone();
+            p.ran = stepped.ran;
+        }
+        self.quiet_replayed += 1;
+        Some(read)
+    }
+
+    /// Keeps, with `quietWaits`, what a whole read of a pull request came to
+    /// where it waits on the operator alone ([`quiet::Quiet::record`]); forgets it
+    /// otherwise.
+    fn quiet_record(
+        &mut self,
+        repo: &str,
+        number: u64,
+        listing: Option<&Value>,
+        read: &Result<(String, bool, Option<Wait>, Option<Stepped>)>,
+    ) {
+        if !self.config.policy.quiet_waits {
+            return;
+        }
+        let key = quiet::key(repo, number);
+        self.quiet.remove(&key);
+        // A deferred review start is a step the listing cannot repeat.
+        let recorded = match (listing, read) {
+            (Some(listing), Ok(read)) if self.deferring.is_none() => {
+                quiet::Quiet::record(listing, self.now, read)
+            }
+            _ => None,
+        };
+        if let Some(quiet) = recorded
+            && self.quiet.len() < quiet::QUIET_LIMIT
+        {
+            self.quiet.insert(key, quiet);
+        }
+    }
+
     fn person_skip(
         &self,
         repo: &str,
@@ -9166,6 +9250,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             .filter(|p| p["labels"].as_array().is_some_and(|l| holds(l)))
             .filter_map(|p| p["number"].as_u64())
             .collect();
+        let listings: BTreeMap<u64, &Value> = open
+            .iter()
+            .filter_map(|p| Some((p["number"].as_u64()?, p)))
+            .collect();
         for (number, merge_only) in numbers {
             if outcome
                 .decided
@@ -9173,7 +9261,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             {
                 continue;
             }
-            if !self.share_allows(repo, Some(number)) {
+            // Decided from its listing, it costs no share.
+            let quiet = (!merge_only && !left.contains_key(&number))
+                .then(|| self.quiet_replay(repo, number, listings.get(&number).copied()))
+                .flatten();
+            if quiet.is_none() && !self.share_allows(repo, Some(number)) {
                 break;
             }
             self.deferring = None;
@@ -9182,9 +9274,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             } else {
                 LABEL
             };
-            let read = match left.get(&number) {
-                Some(listed) => Ok(self.labelled_skip(repo, number, merge_only, (listed, label))),
-                None => self.pull(repo, number, merge_only, &mut required),
+            let read = match (left.get(&number), quiet) {
+                (Some(listed), _) => {
+                    Ok(self.labelled_skip(repo, number, merge_only, (listed, label)))
+                }
+                (None, Some(quiet)) => Ok(quiet),
+                (None, None) => {
+                    let read = self.pull(repo, number, merge_only, &mut required);
+                    self.quiet_record(repo, number, listings.get(&number).copied(), &read);
+                    read
+                }
             };
             // A round's claim made its reads under way ([`Self::claim`]).
             self.rest.under_way(false);
@@ -9371,6 +9470,14 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
             .unwrap_or_default(),
         review_unread: direction.as_mut().and_then(|(o, _)| o.review_unread.take()),
         previous: std::mem::take(&mut state.responses),
+        // What went stale is read whole again, so it is not carried.
+        quiet: if policy.quiet_waits {
+            let mut quiet = std::mem::take(&mut state.quiet_waits);
+            quiet.retain(|_, q| q.fresh(now));
+            quiet
+        } else {
+            BTreeMap::new()
+        },
         apply,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps,
@@ -9559,6 +9666,12 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
             }
         }
     }
+    if pass.quiet_replayed > 0 {
+        outcome.lines.push(format!(
+            "pull requests: quietWaits decided {} unchanged pull request(s) waiting on the operator from their listings",
+            pass.quiet_replayed
+        ));
+    }
     // As the other cursors, only an applying pass moves it.
     let share_cursor = match &pass.cut {
         Some(repo) => {
@@ -9652,6 +9765,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         intake_refused: pass.intake_refused,
         operator_direction: pass.operator_direction,
         lock_refused,
+        quiet_waits: pass.quiet,
         follow_cursor,
         share_cursor,
         action_first_cursor,
@@ -15261,6 +15375,121 @@ mod tests {
             }
             assert!(dispatcher.writes.borrow().is_empty());
         }
+    }
+
+    /// With `quietWaits`, a midstream draft unchanged in its listing since
+    /// the read that left it waiting for promotion is decided again from the
+    /// listing alone, as before, without reading it whole (agent-board#1022),
+    /// whether the REST listing or `actionFirst`'s lists it. A changed
+    /// listing, a stale read, or the option off, reads it whole.
+    #[test]
+    fn an_unchanged_midstream_draft_is_not_read_again() {
+        const UPDATED: &str = "2026-10-12T00:00:00Z";
+        let pulls = format!("repos/{REPO}/pulls?state=open&per_page=100");
+        let fake = |updated: &str| {
+            let mut fake = github();
+            let draft = pull("pull-470", json!({"isDraft": true}));
+            let head = draft["headRefOid"].clone();
+            fake.pulls.insert(470, draft);
+            fake.pulls.get_mut(&470).unwrap()["updatedAt"] = updated.into();
+            let listed = json!([{"number": 470, "user": {"login": BOT}, "head": {"sha": head},
+                "updated_at": updated}]);
+            fake.page(&pulls, None, None, listed);
+            let approved = json!({"incomplete_results": false, "total_count": 0, "items": []});
+            fake.page(
+                &action_first::approved_path(&config()),
+                None,
+                None,
+                approved,
+            );
+            fake
+        };
+        let head = fake(UPDATED).pulls[&470]["headRefOid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let waiting = format!("{REPO}#470 {} wait: {PROMOTE_WAIT}", short(&head));
+        let dispatcher = Fake::default();
+        for action_first in [false, true] {
+            let mut cfg = config();
+            cfg.policy.no_merge = vec![REPO.to_owned()];
+            cfg.policy.quiet_waits = true;
+            cfg.policy.action_first = action_first;
+            let first = run(
+                &fake(UPDATED),
+                &fake(UPDATED),
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert!(first.lines.contains(&waiting), "{:?}", first.lines);
+            let state = State::from_json(&first.state.to_json()).unwrap();
+            assert_eq!(
+                state.quiet_waits.keys().collect::<Vec<_>>(),
+                [&quiet::key(REPO, 470)],
+                "actionFirst {action_first}"
+            );
+            for (name, quiet_waits, updated, later, replayed) in [
+                ("unchanged", true, UPDATED, 30, true),
+                ("commented on", true, "2026-10-12T01:00:00Z", 30, false),
+                ("read five hours ago", true, UPDATED, 300, false),
+                ("option off", false, UPDATED, 30, false),
+            ] {
+                let name = format!("{name}, actionFirst {action_first}");
+                cfg.policy.quiet_waits = quiet_waits;
+                let fake = fake(updated);
+                let second = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    state.clone(),
+                    &[],
+                    &[REPO.into()],
+                    applying(&dispatcher),
+                    now() + time::Duration::minutes(later),
+                )
+                .unwrap();
+                assert_eq!(
+                    *fake.pull_reads.borrow() == 0,
+                    replayed,
+                    "{name}: {:?}",
+                    second.lines
+                );
+                assert_eq!(second.errors, 0, "{name}: {:?}", second.lines);
+                assert!(
+                    second.lines.contains(&waiting),
+                    "{name}: {:?}",
+                    second.lines
+                );
+                // As a whole read decides it.
+                assert_eq!(second.waits, first.waits, "{name}");
+                assert_eq!(second.steps, first.steps, "{name}");
+                assert_eq!(second.in_flight, first.in_flight, "{name}");
+                let kinds: Vec<_> = second.waits.iter().map(|w| w.kind).collect();
+                assert_eq!(kinds, ["promote"], "{name}");
+                assert_eq!(
+                    second
+                        .state
+                        .quiet_waits
+                        .contains_key(&quiet::key(REPO, 470)),
+                    quiet_waits,
+                    "{name}"
+                );
+                assert_eq!(
+                    second
+                        .lines
+                        .iter()
+                        .any(|l| l.starts_with("pull requests: quietWaits decided 1 ")),
+                    replayed,
+                    "{name}"
+                );
+            }
+        }
+        assert!(dispatcher.writes.borrow().is_empty());
     }
 
     #[test]
@@ -23520,6 +23749,8 @@ mod tests {
             planned: 0,
             folds: Vec::new(),
             report_pulls: BTreeMap::new(),
+            quiet: BTreeMap::new(),
+            quiet_replayed: 0,
         };
         let mut outcome = Outcome::default();
         let error = pass.follow(REPO, &mut outcome).unwrap_err();
