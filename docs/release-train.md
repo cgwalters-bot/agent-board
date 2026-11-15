@@ -40,8 +40,9 @@ The steps of a train, each a pass:
    that, from Dependabot's "`# vX.Y.Z`" right after it, which moves with it
    (the release's pins only: beside a caller's pin of the wrappers it is the
    wrappers' tag); pins or versions that disagree stall the train.
-   With `secureHost` configured, also move secure-host action references in the
-   configured wrapper files directly to `cgwalters-forge/actions/secure-host`
+   With `secureHost` configured, also move secure-host action references on
+   `uses:` lines of the configured wrapper files (strings in a test file are
+   left alone) directly to `cgwalters-forge/actions/secure-host`
    at the image PR's merge commit. Before doing so, check that commit is on
    actions' default branch and its image pin matches the release's newly
    resolved, verified digest. Subsequent trains move these direct pins too.
@@ -134,7 +135,8 @@ train changes its `uses: ./.agentic-job-source/secure-host` (or an older remote
 `cgwalters-forge/actions`, keeping any comment after it. Keep
 `.github/workflows/cgwalters-agentic-job.yml`, `.github/workflows/secure-host.yml`
 (its wrapper smoke job) and `lint/tests/review_wrapper.rs` in `wrappers.files`
-too. The policy-source checkout and local prepare/run references are not changed.
+too; the test file changes only through its release pin, since its secure-host
+references are strings, not `uses:` lines. The policy-source checkout and local prepare/run references are not changed.
 Update actions' wrapper tests to permit this separate secure-host commit while
 continuing to require all other agentic-job pins to match the release commit.
 Provision the verification tools in tracker's release-train workflow if absent.
