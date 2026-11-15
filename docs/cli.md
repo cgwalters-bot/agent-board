@@ -990,6 +990,7 @@ agent-board promote [OPTIONS] --config <FILE>
 Options:
 
 - `--apply`: Publish at most one approved candidate; also requires promote.publish
+- `--repair-drafts`: One-time repair of bare references in bot-owned midstream drafts, not publication. Preview by default; --apply --max-writes 1..10 edits bodies and logs each repair. Ambiguous sources hold
 - `--max-writes <MAX_WRITES>`: Whole-step publication cap (three writes, or four with a rebase/sign-off branch); with --repair-bodies, the most draft bodies edited
 - `--repair-bodies`: One-time repair instead of promotion (agent-board#1002): normalize source bookkeeping in the bot's open drafts in verified midstream forks to one full-URL source line, dropping forge-internal reference lines, and log each before/after or why a draft is left for manual repair. Preview by default; --apply --max-writes N edits at most N fork draft bodies, never anything upstream, and does not need promote.publish
 - `--config <FILE>`: Trusted shared pass configuration. Promotion discovers midstream forks from origin=fork and bot-midstream metadata; legacy promote.forks remains readable for one release as checked parent/base hints. Without promote settings or any discovery scope, off with no token lookup. Reads use the pass's request/time bounds

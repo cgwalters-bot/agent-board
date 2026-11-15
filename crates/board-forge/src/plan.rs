@@ -1891,7 +1891,7 @@ mod tests {
                 "method": "POST",
                 "url": "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches",
                 "body": {"ref": "main", "inputs": {
-                    "task": "Follow up on the review of ostreedev/ostree#3665.",
+                    "task": format!("Follow up on the review of ostreedev/ostree#3665.\n\n{}", crate::dispatch::MIDSTREAM_TEXT),
                     "repo": "ostreedev/ostree",
                     "item": "3665",
                     "kind": "implement",
@@ -2529,7 +2529,8 @@ mod tests {
             .unwrap();
             let dispatches = dispatcher.dispatches.borrow();
             assert_eq!(
-                dispatches[0]["inputs"]["task"], **expected,
+                dispatches[0]["inputs"]["task"],
+                format!("{expected}\n\n{}", crate::dispatch::MIDSTREAM_TEXT),
                 "{midstreams:?}"
             );
         }
@@ -2629,7 +2630,15 @@ mod tests {
             let dispatches = dispatcher.dispatches.borrow();
             assert_eq!(dispatches.len(), sent, "{name}");
             for request in dispatches.iter() {
-                assert_eq!(request["inputs"]["task"], plan()["brief"], "{name}");
+                assert_eq!(
+                    request["inputs"]["task"],
+                    format!(
+                        "{}\n\n{}",
+                        plan()["brief"].as_str().unwrap(),
+                        crate::dispatch::MIDSTREAM_TEXT
+                    ),
+                    "{name}"
+                );
             }
             match (result, expected) {
                 (Ok(done), Ok(run)) => {
@@ -3227,7 +3236,15 @@ mod tests {
                 "{name}: {record}"
             );
             let task = dispatches[0]["inputs"]["task"].as_str().unwrap();
-            assert_eq!(task, p["brief"].as_str().unwrap(), "{name}");
+            assert_eq!(
+                task,
+                format!(
+                    "{}\n\n{}",
+                    p["brief"].as_str().unwrap(),
+                    crate::dispatch::MIDSTREAM_TEXT
+                ),
+                "{name}"
+            );
         }
         // The bot's login goes into a query: it must be one.
         let forge = Forge::new(vec![planned], vec![]);
@@ -3334,7 +3351,15 @@ mod tests {
             assert!(record.ends_with(says), "{name}: {record}");
             if base.is_empty() {
                 assert!(inputs.get("base").is_none(), "{name}");
-                assert_eq!(task, p["brief"], "{name}");
+                assert_eq!(
+                    task,
+                    format!(
+                        "{}\n\n{}",
+                        p["brief"].as_str().unwrap(),
+                        crate::dispatch::MIDSTREAM_TEXT
+                    ),
+                    "{name}"
+                );
                 continue;
             }
             // Its pull request says what it stacks on; the lower one's files

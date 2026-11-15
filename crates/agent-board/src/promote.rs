@@ -16,6 +16,9 @@ pub struct Promote {
     /// Publish at most one approved candidate; also requires promote.publish.
     #[arg(long, conflicts_with_all = ["record", "replay"], requires = "max_writes")]
     pub apply: bool,
+    /// One-time repair of bare references in bot-owned midstream drafts, not publication. Preview by default; --apply --max-writes 1..10 edits bodies and logs each repair. Ambiguous sources hold.
+    #[arg(long, conflicts_with = "repair_bodies")]
+    pub repair_drafts: bool,
     /// Whole-step publication cap (three writes, or four with a rebase/sign-off branch); with --repair-bodies, the most draft bodies edited.
     #[arg(long, requires = "apply")]
     pub max_writes: Option<usize>,
@@ -61,7 +64,7 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
         }
         return Ok(());
     }
-    if args.apply && promote::enabled(&config) {
+    if args.apply && !args.repair_drafts && promote::enabled(&config) {
         ensure!(
             config.promote.as_ref().is_some_and(|p| p.publish),
             "promote.publish must be true for --apply"
@@ -84,17 +87,37 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
         }
         vec!["promote: off".to_owned()]
     } else if let Some(replay) = &replay {
-        preview(replay, &config, replay.now)?
+        if args.repair_drafts {
+            repair(replay, &config, 0)?
+        } else {
+            preview(replay, &config, replay.now)?
+        }
     } else {
         let now = time::OffsetDateTime::now_utc();
         let client = Client::from_env()?
             .retry_within(Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT));
         if let Some(path) = &args.record {
             let recorder = Recorder::new(&client);
-            let result = preview(&recorder, &config, now);
+            let result = if args.repair_drafts {
+                repair(&recorder, &config, 0)
+            } else {
+                preview(&recorder, &config, now)
+            };
             std::fs::write(path, promote::recording(&recorder.fixture(now)?)?)
                 .with_context(|| format!("write {}", path.display()))?;
             result?
+        } else if args.repair_drafts {
+            repair(
+                &client,
+                &config,
+                if args.apply {
+                    args.max_writes
+                        .filter(|n| *n > 0)
+                        .context("repair requires --max-writes 1..10")?
+                } else {
+                    0
+                },
+            )?
         } else if args.apply {
             let mut lines = Vec::new();
             let resolved = config.resolve(&client, &mut lines)?;
@@ -113,6 +136,21 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
         writeln!(out, "{line}")?;
     }
     Ok(())
+}
+
+fn repair<C: board_forge::poll::Rest + board_forge::github::Transport>(
+    client: &C,
+    config: &Config,
+    max_writes: usize,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let resolved = config.resolve(client, &mut lines)?;
+    lines.extend(promote::repair_drafts(
+        client,
+        resolved.as_ref().unwrap_or(config),
+        max_writes,
+    )?);
+    Ok(lines)
 }
 
 fn preview<C: board_forge::poll::Rest + board_forge::github::Transport>(

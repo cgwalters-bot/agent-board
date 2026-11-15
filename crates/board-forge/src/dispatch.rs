@@ -319,6 +319,10 @@ pub struct GitHub<'a> {
     pub run_details: bool,
 }
 
+// A relative issue reference resolves in a different repository after promotion;
+// internal tracker links also expose bookkeeping instead of upstream context.
+pub(crate) const MIDSTREAM_TEXT: &str = "When working in a midstream fork, write for upstream readers, who see only the pull request. In the PR body, link the fork's source issue only on a standalone line: Part of https://github.com/OWNER/FORK/issues/N (use the actual fork and source issue). Use no bare #N references and no tracker or forge-internal references in the title, body or commit messages. For an issues-off fork, do not invent a fork issue or link the internal tracker; report the missing source association instead. A fix run preserves an existing full-URL source line; it must not use the PR number as the source issue.";
+
 impl GitHub<'_> {
     /// The request's path below the API root.
     pub fn path(&self) -> String {
@@ -331,10 +335,15 @@ impl GitHub<'_> {
     /// The request body, without `return_run_details`. The inputs are the
     /// caller workflow's, all strings.
     pub fn body(&self, start: &Start) -> Value {
+        let task = if matches!(start.kind, "implement" | "fix") {
+            format!("{}\n\n{}", start.brief, MIDSTREAM_TEXT)
+        } else {
+            start.brief.to_owned()
+        };
         let mut body = json!({
             "ref": self.target.git_ref,
             "inputs": {
-                "task": start.brief,
+                "task": task,
                 "repo": start.repository,
                 "item": start.item.to_string(),
                 "kind": start.kind,
@@ -880,7 +889,7 @@ mod tests {
             base: None,
         };
         let path = "repos/example/tracker/actions/workflows/dispatch.yml/dispatches";
-        let plain = json!({"ref": "main", "inputs": {"task": "Fix it.", "repo": "example/app", "item": "7", "kind": "fix"}});
+        let plain = json!({"ref": "main", "inputs": {"task": format!("Fix it.\n\n{MIDSTREAM_TEXT}"), "repo": "example/app", "item": "7", "kind": "fix"}});
         let mut detailed = plain.clone();
         detailed["return_run_details"] = true.into();
         // Answers in turn, `None` a lost one.

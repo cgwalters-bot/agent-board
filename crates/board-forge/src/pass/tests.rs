@@ -16954,7 +16954,15 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
             .find(|(_, url, _)| url.ends_with("/dispatches"))
             .unwrap();
         assert_eq!(sent["inputs"]["kind"], "fix", "{name}");
-        assert_eq!(sent["inputs"]["task"], *brief, "{name}");
+        let task = sent["inputs"]["task"].as_str().unwrap();
+        assert!(
+            task.starts_with(&format!("{brief}\n\nWhen working in a midstream fork")),
+            "{name}: {task}"
+        );
+        assert!(
+            task.contains("no tracker or forge-internal references"),
+            "{name}: {task}"
+        );
     }
 }
 

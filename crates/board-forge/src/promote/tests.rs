@@ -338,6 +338,523 @@ fn plan_comments(replay: &mut Replay, nodes: Value) {
 }
 
 #[test]
+fn source_body_shapes_and_published_text() {
+    for (text, source, hold, published) in [
+        (
+            format!("Part of https://github.com/{REPO}/issues/31"),
+            Some(31),
+            Some("empty body without its source line"),
+            None,
+        ),
+        (
+            "Summary.\n\nFixes #31".to_owned(),
+            Some(31),
+            Some("bare #N"),
+            None,
+        ),
+        (
+            format!("Summary.\n\nPart of https://github.com/{REPO}/issues/31"),
+            Some(31),
+            None,
+            Some("Summary."),
+        ),
+        (
+            format!("Summary.\n\nFixes https://github.com/{REPO}/issues/31"),
+            Some(31),
+            None,
+            Some("Summary."),
+        ),
+        // Code and HTML outside the source line's context are approved text.
+        (
+            format!("Fix the `foo` parser.\n\nPart of https://github.com/{REPO}/issues/31"),
+            Some(31),
+            None,
+            Some("Fix the `foo` parser."),
+        ),
+        (
+            format!("```cargo test``` passes.\n\nPart of https://github.com/{REPO}/issues/31"),
+            Some(31),
+            None,
+            Some("```cargo test``` passes."),
+        ),
+        (
+            format!(
+                "Example:\n\n~~~text\nfoo < bar\n~~~\n\nPart of https://github.com/{REPO}/issues/31\n\n<!-- marker -->"
+            ),
+            Some(31),
+            None,
+            Some("Example:\n\n~~~text\nfoo < bar\n~~~\n\n<!-- marker -->"),
+        ),
+        (
+            format!("    indented example\n\nPart of https://github.com/{REPO}/issues/31"),
+            Some(31),
+            None,
+            Some("    indented example"),
+        ),
+        (
+            format!("Summary.\n\nPart of {REPO}#31"),
+            Some(31),
+            Some("inside the midstream"),
+            None,
+        ),
+        (
+            "Summary.".to_owned(),
+            None,
+            Some("cannot tie fork PR"),
+            None,
+        ),
+        (
+            format!(
+                "Summary.\n\nFixes\nPart of https://github.com/{REPO}/issues/31\ncomposefs/composefs-rs#99"
+            ),
+            Some(31),
+            Some("introduce a closing reference"),
+            None,
+        ),
+        (
+            format!(
+                "Part of https://github.com/{REPO}/issues/31\nPart of https://github.com/{REPO}/issues/32"
+            ),
+            None,
+            Some("cannot tie fork PR"),
+            None,
+        ),
+        (
+            format!(
+                "Summary mentions https://github.com/{REPO}/issues/31\nPart of https://github.com/{REPO}/issues/31"
+            ),
+            Some(31),
+            Some("inside the midstream"),
+            None,
+        ),
+    ] {
+        let mut replay = scenario();
+        pull(&mut replay)["body"] = json!(text);
+        let p = pull(&mut replay).clone();
+        assert_eq!(
+            source_issue(REPO, &p).ok().map(|s| s.number),
+            source,
+            "{text}"
+        );
+        let config = Config::parse(CONFIG).unwrap();
+        let result = gates(&replay, &config, REPO, &p, "composefs/composefs-rs", "main");
+        if let Some(cause) = hold {
+            assert!(
+                format!("{:#}", result.err().unwrap()).contains(cause),
+                "{text}"
+            );
+        } else {
+            assert!(result.is_ok(), "{text}: {:?}", result.err());
+            let actual = promotion_body(&replay, REPO, &p, "composefs/composefs-rs").unwrap();
+            assert_eq!(actual, published.unwrap(), "{text}");
+            assert!(!actual.contains(REPO));
+        }
+    }
+}
+
+#[test]
+fn publication_holds_source_metadata_in_code_or_html() {
+    for example in [
+        format!("```text\nPart of {REPO}#31\n```"),
+        format!("~~~text\nPart of {REPO}#31\n~~~"),
+        format!("    Part of {REPO}#31"),
+        format!("\tPart of {REPO}#31"),
+        format!("<pre>\nPart of {REPO}#31\n</pre>"),
+        format!("<!--\nPart of {REPO}#31\n-->"),
+        format!("<div>\nPart of {REPO}#31\n</div>"),
+        format!("`\nPart of {REPO}#31\n`"),
+        format!("````\n```\nPart of {REPO}#31\n````"),
+        format!("<!-- a\n\nPart of {REPO}#31\n\n-->"),
+        format!("Unclosed fence:\n\n```\nPart of {REPO}#31"),
+        format!("- ```text\n  example\n\n  Part of {REPO}#31\n  ```"),
+        format!("Ex:\n\n    ```\n\nReal:\n\n```\nPart of {REPO}#31\n```"),
+        format!("```md\nx\n    ```\nPart of {REPO}#31\n```"),
+        format!("- item\n\n  ```\n  code\n```\n\nPart of {REPO}#31"),
+        format!("- <pre>\n\n  Part of {REPO}#31\n  </pre>"),
+        format!("1. <!--\n\nPart of {REPO}#31\n-->"),
+        format!("<code>\n\nPart of {REPO}#31\n\n</code>"),
+        format!("<pre>\n\nPart of {REPO}#31\n\n</pre>"),
+        format!("See <code>\n\nPart of {REPO}#31\n\n</code>"),
+        format!("<details><pre>\n\nPart of {REPO}#31\n\n</pre></details>"),
+        format!("x <!-- y\n\nPart of {REPO}#31\n\n-->"),
+        // Markup that could fool a scan: a fence after text starting `<`, an
+        // end tag in an attribute, a backtick in an attribute.
+        format!("<3 love\n```\n\nPart of {REPO}#31\n```\n```"),
+        format!("<code>\n<a title=\"</code>\"></a>\n\nPart of {REPO}#31\n\n</code>"),
+        format!("<i title='`'><code>`</i>\n\nPart of {REPO}#31"),
+        format!("| a |\n|---|\n| b |\nPart of {REPO}#31"),
+        format!("[see\nPart of {REPO}#31\n](https://example.com)"),
+    ] {
+        let mut replay = scenario();
+        let example = example.replace(
+            &format!("{REPO}#31"),
+            &format!("https://github.com/{REPO}/issues/31"),
+        );
+        let body =
+            format!("Example input:\n\n{example}\n\nPart of https://github.com/{REPO}/issues/31");
+        pull(&mut replay)["body"] = json!(body);
+        let p = pull(&mut replay).clone();
+        let config = Config::parse(CONFIG).unwrap();
+        for result in [
+            gates(&replay, &config, REPO, &p, "composefs/composefs-rs", "main")
+                .map(|_| String::new()),
+            promotion_body(&replay, REPO, &p, "composefs/composefs-rs"),
+        ] {
+            let error = result.unwrap_err();
+            assert!(error.is::<Held>(), "{body}: {error:#}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("source metadata in code or HTML"),
+                "{body}: {error:#}"
+            );
+        }
+        assert_eq!(p["body"], body, "approved example changed");
+        assert!(matches!(
+            text::repair(REPO, "composefs/composefs-rs", "Example", &body),
+            text::Repair::Skip(why) if why.contains("source metadata in code or HTML")
+        ));
+    }
+}
+
+#[test]
+fn publication_and_repair_hold_new_closing_adjacency_without_writes() {
+    for keyword in ["Fixes", "closes:", "(RESOLVED", "- Closes"] {
+        for target in [
+            "composefs/composefs-rs#99",
+            "https://github.com/composefs/composefs-rs/issues/99",
+        ] {
+            for repair in [0, 1, 2] {
+                let (mut forge, config) = publication();
+                let source = if repair != 0 {
+                    "#31".to_owned()
+                } else {
+                    format!("https://github.com/{REPO}/issues/31")
+                };
+                let text = format!("Summary.\n\n{keyword}\nPart of {source}\n{target}");
+                assert!(!crate::stack::closes(&text, "composefs/composefs-rs", 99));
+                forge.fresh["body"] = json!(text);
+                if repair != 0 {
+                    forge.fresh["draft"] = json!(true);
+                }
+                *pull(&mut forge.replay) = forge.fresh.clone();
+                let lines = match repair {
+                    1 => repair_drafts(&forge, &config, 1).unwrap(),
+                    2 => super::repair(&forge, &config, Some(1)).unwrap(),
+                    _ => apply(&forge, &config, forge.replay.now, 3).unwrap(),
+                };
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("introduce a closing reference")),
+                    "repair={repair}: {text}: {lines:?}"
+                );
+                assert!(forge.writes.borrow().is_empty(), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_draft_repair_is_explicit_scoped_and_revalidated() {
+    for case in [
+        "preview",
+        "apply",
+        "ready",
+        "other author",
+        "other base",
+        "ambiguous",
+        "changed",
+        "wrong writer",
+        "oversized cap",
+        "already repaired",
+        "numeric code",
+        "numeric fragment",
+        "fenced example",
+        "HTML example",
+        "multiline code",
+        "HTML code",
+        "HTML pre",
+        "inline HTML code",
+        "unclosed HTML",
+        "unclosed comment",
+        "end tag in indented code",
+        "escaped end tag",
+        "unpaired backticks",
+        "fence after text starting <",
+        "end tag in attribute",
+        "backtick in attribute",
+        "code elsewhere",
+        "indented code",
+        "inline reference",
+        "empty body",
+        "unknown source",
+        "closing adjacency",
+        "closing target in example",
+    ] {
+        let (mut forge, config) = publication();
+        let mut p = forge.fresh.clone();
+        p["draft"] = json!(true);
+        p["body"] = json!("Summary.\n\nFixes #31\nRefs #99");
+        match case {
+            "ready" => p["draft"] = json!(false),
+            "other author" => p["user"]["login"] = json!("visitor"),
+            "other base" => p["base"]["repo"]["full_name"] = json!("elsewhere/repo"),
+            "ambiguous" => p["body"] = json!("Fixes #31\nPart of #32"),
+            "numeric code" => p["body"] = json!("Use `color: #123abc`.\n\nFixes #31"),
+            "numeric fragment" => {
+                p["body"] = json!("Read https://example.com/page#123\n\nFixes #31")
+            }
+            "fenced example" => p["body"] = json!("```text\nFixes #31\n```\n\nFixes #31"),
+            "HTML example" => {
+                p["body"] = json!("Summary.\n\n<pre>\nFixes #31\n</pre>\n\nPart of #31")
+            }
+            "multiline code" => p["body"] = json!("`\nFixes #31\n`\n\nPart of #31"),
+            // An element stays open across blank lines until its closing tag.
+            "HTML code" => {
+                p["body"] = json!("Summary.\n\n<code>\n\nFixes #31\n\n</code>\n\nPart of #31")
+            }
+            "HTML pre" => {
+                p["body"] = json!("Summary.\n\n<pre>\n\nFixes #31\n\n</pre>\n\nPart of #31")
+            }
+            "inline HTML code" => {
+                p["body"] = json!("See <code>\n\nFixes #31\n\n</code>\n\nPart of #31")
+            }
+            // Ambiguous context anywhere holds the whole repair.
+            "unclosed HTML" => p["body"] = json!("Summary.\n\nFixes #31\n\n<details>"),
+            "unclosed comment" => p["body"] = json!("Fixes #31\n\nSummary. <!-- note"),
+            // An end tag that may be text closes nothing.
+            "end tag in indented code" => {
+                p["body"] = json!("Summary <code>\n\n    </code>\n\nFixes #31\n\nmore")
+            }
+            "escaped end tag" => {
+                p["body"] = json!("Summary <code>\n\n\\</code>\n\nFixes #31\n\nmore")
+            }
+            "unpaired backticks" => p["body"] = json!("a ``` <code> `\n\nFixes #31\n\n</code>"),
+            "fence after text starting <" => {
+                p["body"] = json!("Intro.\n\n<3 love\n```\nFixes #31\n```\n```\n\nPart of #31")
+            }
+            "end tag in attribute" => {
+                p["body"] =
+                    json!("<code>\n<a title=\"</code>\"></a>\n\nSee #7\n\n</code>\n\nFixes #31")
+            }
+            "backtick in attribute" => {
+                p["body"] = json!("<i title='`'><code>`</i>\n\nFixes #31\n\nmore")
+            }
+            "code elsewhere" => {
+                p["body"] = json!("Use `foo` with:\n\n```text\nfoo < bar\n```\n\nFixes #31")
+            }
+            "indented code" => p["body"] = json!("    example command\n\nFixes #31"),
+            "inline reference" => p["body"] = json!("This fixes #31 in prose."),
+            "empty body" => p["body"] = json!(null),
+            "unknown source" => p["body"] = json!("Summary.\n\nFixes #77"),
+            "closing adjacency" => {
+                p["body"] = json!("Summary.\n\nFixes\nPart of #31\ncomposefs/composefs-rs#99")
+            }
+            // The same target in an example does not authorize a new one.
+            "closing target in example" => {
+                p["body"] = json!(
+                    "Example:\n\n```text\nFixes composefs/composefs-rs#99\n```\n\nFixes\nRefs #99\ncomposefs/composefs-rs#99\n\nPart of #31"
+                )
+            }
+            "already repaired" => {
+                p["body"] = json!(format!(
+                    "Summary.\n\nPart of https://github.com/{REPO}/issues/31"
+                ))
+            }
+            _ => {}
+        }
+        *pull(&mut forge.replay) = p.clone();
+        forge.fresh = p;
+        if case == "changed" {
+            forge.fresh["body"] = json!("Changed by someone else");
+        }
+        if case == "wrong writer" {
+            forge.writer = "visitor".into();
+        }
+        let cap = match case {
+            "preview" => 0,
+            "oversized cap" => 11,
+            _ => 1,
+        };
+        let result = repair_drafts(&forge, &config, cap);
+        if matches!(case, "changed" | "wrong writer" | "oversized cap") {
+            assert!(result.is_err(), "{case}");
+        } else {
+            let lines = result.unwrap();
+            if matches!(case, "preview" | "apply") {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("replace/drop 2 bare reference(s)")),
+                    "{case}: {lines:?}"
+                );
+            }
+            if case == "ambiguous" {
+                assert!(lines.iter().any(|l| l.contains("cannot tie fork PR")));
+            }
+            if case == "unknown source" {
+                assert!(
+                    lines.iter().any(|l| l.starts_with("hold repair")),
+                    "{case}: {lines:?}"
+                );
+            }
+            if matches!(case, "closing adjacency" | "closing target in example") {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.contains("introduce a closing reference")),
+                    "{case}: {lines:?}"
+                );
+            }
+            if matches!(
+                case,
+                "numeric code"
+                    | "numeric fragment"
+                    | "fenced example"
+                    | "HTML example"
+                    | "multiline code"
+                    | "HTML code"
+                    | "HTML pre"
+                    | "inline HTML code"
+                    | "unclosed HTML"
+                    | "unclosed comment"
+                    | "end tag in indented code"
+                    | "escaped end tag"
+                    | "unpaired backticks"
+                    | "fence after text starting <"
+                    | "end tag in attribute"
+                    | "backtick in attribute"
+                    | "inline reference"
+            ) {
+                assert!(
+                    lines.iter().any(|l| l.contains("manual repair")),
+                    "{case}: {lines:?}"
+                );
+            }
+        }
+        let writes = forge.writes.borrow();
+        let kept = match case {
+            "apply" => Some("Summary."),
+            "code elsewhere" => Some("Use `foo` with:\n\n```text\nfoo < bar\n```"),
+            "indented code" => Some("    example command"),
+            _ => None,
+        };
+        if let Some(kept) = kept {
+            assert_eq!(writes.len(), 1, "{case}");
+            assert_eq!(writes[0].0, "PATCH");
+            assert_eq!(writes[0].1, format!("{API}repos/{REPO}/pulls/34"));
+            assert_eq!(
+                writes[0].2,
+                json!({"body":format!("{kept}\n\nFixes https://github.com/{REPO}/issues/31")}),
+                "{case}"
+            );
+        } else {
+            assert!(writes.is_empty(), "{case}");
+        }
+    }
+}
+
+#[test]
+fn repair_caps_and_partial_failure_keep_completed_edit_logs() {
+    for (cap, fail) in [(1, false), (2, true)] {
+        let (mut forge, config) = publication();
+        forge.fresh["draft"] = json!(true);
+        forge.fresh["body"] = json!("Summary.\n\nFixes #31");
+        *pull(&mut forge.replay) = forge.fresh.clone();
+        with_second(&mut forge);
+        if fail {
+            forge.fail = Some(2);
+        }
+        let result = repair_drafts(&forge, &config, cap);
+        if fail {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(&format!("repaired {REPO}#34")), "{error}");
+            assert!(error.contains("simulated lost response"));
+        } else {
+            assert!(
+                result
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.contains("held by --max-writes"))
+            );
+        }
+        assert_eq!(forge.writes.borrow().len(), cap);
+    }
+}
+
+#[test]
+fn repaired_published_text_reconciles_open_and_merged_handoffs() {
+    use crate::pass::{Promotion, key};
+    for closes in [false, true] {
+        let (mut forge, config) = publication();
+        let keyword = if closes { "Fixes" } else { "Part of" };
+        forge.fresh["draft"] = json!(true);
+        forge.fresh["body"] = json!(format!("Summary.\n\n{keyword} #31"));
+        *pull(&mut forge.replay) = forge.fresh.clone();
+        repair_drafts(&forge, &config, 1).unwrap();
+        let repaired = forge.writes.borrow()[0].2["body"].clone();
+        assert_eq!(
+            repaired,
+            format!("Summary.\n\n{keyword} https://github.com/{REPO}/issues/31")
+        );
+        forge.fresh["draft"] = json!(false);
+        forge.fresh["body"] = repaired;
+        *pull(&mut forge.replay) = forge.fresh.clone();
+        forge.writes.borrow_mut().clear();
+        let lines = apply(&forge, &config, forge.replay.now, 3).unwrap();
+        assert!(lines[0].starts_with("promoted "), "{lines:?}");
+        let writes = forge.writes.borrow();
+        assert_eq!(writes[1].2["body"], "Summary.");
+        let (mut replay, config) = handoff_scenario();
+        exact(&mut replay, &format!("repos/{REPO}/pulls/34"))["answer"]["body"] =
+            forge.fresh.clone();
+        body(&mut replay, "/issues/34/comments?")[0]["body"] = writes[2].2["body"].clone();
+        body(&mut replay, "/pulls/70")["body"] = writes[1].2["body"].clone();
+        for merged in [false, true] {
+            if merged {
+                let upstream = body(&mut replay, "/pulls/70");
+                upstream["state"] = json!("closed");
+                upstream["merged"] = json!(true);
+                upstream["merged_at"] = json!("2026-10-24T00:00:00Z");
+            }
+            let facts = crate::pass::Facts {
+                issue: crate::parse_github_item(
+                    &format!("{REPO}#31"),
+                    None,
+                    crate::github::DEFAULT_HOST,
+                )
+                .unwrap(),
+                open: true,
+                promotion: None,
+                created: forge.replay.now,
+                updated: None,
+                author: None,
+                labels: vec![],
+                labels_complete: true,
+                assignees: None,
+                blocked_by: 0,
+                pulls: vec![],
+                pulls_complete: true,
+                parent: None,
+                priority: None,
+                status: None,
+                why: None,
+            };
+            let at = key(&facts.issue);
+            let mut items = BTreeMap::from([(at.clone(), facts)]);
+            let notices = handoff::enrich(&replay, &config, &mut items).unwrap();
+            assert!(notices.is_empty(), "{notices:?}");
+            if merged {
+                assert_eq!(items[&at].promotion, closes.then_some(Promotion::Merged));
+            } else {
+                assert!(matches!(items[&at].promotion, Some(Promotion::Open(_))));
+            }
+        }
+    }
+}
+
+#[test]
 fn upstream_association_controls_only_the_derived_closing_line() {
     for (link, expected) in [
         ("No association", Ok(PUBLISHED.to_owned())),
@@ -1419,8 +1936,8 @@ fn candidate_read_gates() {
             gate_hold(&format!("text has a closing reference to {REPO}#31")),
         ),
         (
-            "closing body",
-            |r| pull(r)["body"] = json!(format!("Closes https://github.com/{REPO}/issues/31")),
+            "embedded closing body",
+            |r| pull(r)["body"] = json!(format!("This closes https://github.com/{REPO}/issues/31")),
             gate_hold(&format!("text has a closing reference to {REPO}#31")),
         ),
         // Midstream body shapes (agent-board#1002): only a standalone full-URL

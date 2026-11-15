@@ -97,6 +97,12 @@ pub(super) fn strip(repo: &str, body: &str, source: u64) -> Result<String> {
         .filter_map(|(i, line)| standalone(line, repo).map(|found| (i, found)))
         .collect();
     let canonical = source_line(repo, source);
+    for (at, _) in &lines {
+        hold!(
+            top_level(body, *at),
+            "source metadata in code or HTML needs manual publication repair"
+        );
+    }
     hold!(
         lines.len() <= 1,
         "text has {} source lines; keep one `{canonical}`",
@@ -109,11 +115,135 @@ pub(super) fn strip(repo: &str, body: &str, source: u64) -> Result<String> {
         number == source,
         "source line names {repo}#{number}, not the linked source {repo}#{source}"
     );
-    Ok(without(body, &BTreeSet::from([at])))
+    let published = without(body, &BTreeSet::from([at]));
+    hold!(
+        !stack::introduces_closing_reference(body, &published),
+        "removing source metadata would introduce a closing reference; manual publication repair required"
+    );
+    Ok(published)
+}
+
+/// Why a persistent repair holds a body that fails [`closed`].
+pub(super) const UNCLOSED: &str = "unclosed or ambiguous code or HTML needs manual repair";
+
+/// Whether line `at` of `body` is top-level Markdown, so that a matching
+/// source line there is bookkeeping rather than part of an approved example.
+pub(super) fn top_level(body: &str, at: usize) -> bool {
+    contexts(body).0.get(at).copied().unwrap_or(false)
+}
+
+/// Whether every code or HTML context in `body` is closed by its end, and
+/// none is ambiguous: a persistent repair holds otherwise, wherever its
+/// references are.
+pub(super) fn closed(body: &str) -> bool {
+    contexts(body).1
+}
+
+/// For each line of `body`, whether it is top-level Markdown; then whether
+/// all contexts closed (see [`closed`]). Without a Markdown parser, anything
+/// that could put a line in code or HTML counts as not: an open fence, its
+/// own indentation (a tab or four spaces), or a backtick, `<`, `[` or `|`
+/// earlier in its paragraph, since a code span, inline HTML, link text or
+/// table can span lines. Fenced code closed earlier does not matter. HTML
+/// does, wherever it is: elements stay open across blank lines and hide
+/// fences, and telling where one ends takes a parser, so every line after a
+/// line starting with `<`, or a tag-like `<` outside code spans, counts as
+/// HTML. So does every line after an indented fence, or a fence or HTML in a
+/// list or quote, which may end where a parser would not.
+fn contexts(body: &str) -> (Vec<bool>, bool) {
+    let mut fence: Option<(char, usize)> = None;
+    let mut inline = false;
+    let mut ambiguous = false;
+    let mut lines = Vec::new();
+    for line in body.split('\n') {
+        let trimmed = line.trim_start();
+        let blank = trimmed.trim_end().is_empty();
+        let indent = &line[..line.len() - trimmed.len()];
+        let top = !indent.contains('\t') && indent.len() < 4;
+        lines.push(!ambiguous && fence.is_none() && !inline && top);
+        if ambiguous {
+            continue;
+        }
+        if let Some((mark, open)) = fence {
+            let closes = fence_mark(trimmed).is_some_and(|(m, run)| {
+                m == mark && run >= open && trimmed[run..].trim().is_empty()
+            });
+            if top && closes {
+                fence = None;
+            }
+        } else if blank {
+            inline = false;
+        } else if let Some(found) = fence_mark(trimmed) {
+            ambiguous = !indent.is_empty();
+            fence = Some(found);
+            inline = false;
+        } else if nested_block(trimmed) || trimmed.starts_with('<') || has_tag(line, inline) {
+            ambiguous = true;
+        } else {
+            inline |= line.contains(['`', '<', '[', '|']);
+        }
+    }
+    (lines, fence.is_none() && !ambiguous)
+}
+
+/// Whether `line` may hold raw HTML: a `<` starting a tag, closing tag,
+/// comment or declaration, outside code spans only where the line alone
+/// pairs its backticks (single, unescaped, an even number of them, and no
+/// span `continued` from earlier in its paragraph).
+fn has_tag(line: &str, continued: bool) -> bool {
+    let paired = !continued
+        && !line.contains('\\')
+        && line.matches('`').count().is_multiple_of(2)
+        && !line.contains("``");
+    let text = match paired {
+        true => line.split('`').step_by(2).collect::<Vec<_>>().join(" "),
+        false => line.to_owned(),
+    };
+    text.match_indices('<').any(|(i, _)| {
+        text[i + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'))
+    })
+}
+
+/// The mark and length of a code fence starting `text`: three or more
+/// backticks or tildes, where a backtick fence's info string has no backtick
+/// (`` ```x``` `` is a code span).
+fn fence_mark(text: &str) -> Option<(char, usize)> {
+    let mark = text.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let run = text.chars().take_while(|c| *c == mark).count();
+    (run >= 3 && (mark == '~' || !text[run..].contains('`'))).then_some((mark, run))
+}
+
+/// Whether `text` opens a fence or HTML block after list item or block quote
+/// markers.
+fn nested_block(text: &str) -> bool {
+    let mut rest = text;
+    loop {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let marker = match rest.as_bytes().get(digits) {
+            Some(b'.' | b')') if digits > 0 => digits + 1,
+            Some(b'-' | b'*' | b'+' | b'>') if digits == 0 => 1,
+            _ => return rest != text && (fence_mark(rest).is_some() || rest.starts_with('<')),
+        };
+        rest = rest[marker..].trim_start();
+    }
+}
+
+/// `text` less its leading and trailing blank lines and trailing whitespace;
+/// unlike `trim`, the first line kept keeps its indentation (code).
+pub(super) fn trim_blank_lines(text: &str) -> &str {
+    let start: usize = text
+        .split_inclusive('\n')
+        .take_while(|line| line.trim().is_empty())
+        .map(str::len)
+        .sum();
+    text[start..].trim_end()
 }
 
 /// `body` without the lines numbered in `drop`, leaving one blank line where
-/// a dropped paragraph was, and no surrounding whitespace.
+/// a dropped paragraph was, and no surrounding blank lines.
 fn without(body: &str, drop: &BTreeSet<usize>) -> String {
     let blank = |line: &str| line.trim().is_empty();
     let mut kept: Vec<&str> = Vec::new();
@@ -130,7 +260,7 @@ fn without(body: &str, drop: &BTreeSet<usize>) -> String {
         gap = false;
         kept.push(line);
     }
-    kept.join("\n").trim().to_owned()
+    trim_blank_lines(&kept.join("\n")).to_owned()
 }
 
 /// Holds `text` (a title, or a body as it would be published) that would
@@ -265,6 +395,12 @@ pub(super) fn repair(repo: &str, upstream: &str, title: &str, body: &str) -> Rep
         .enumerate()
         .filter_map(|(i, line)| bookkeeping(line, repo, upstream).map(|b| (i, b)))
         .collect();
+    if lines.iter().any(|(at, _)| !top_level(body, *at)) {
+        return Repair::Skip("source metadata in code or HTML needs manual repair".into());
+    }
+    if !closed(body) {
+        return Repair::Skip(UNCLOSED.into());
+    }
     let sources: BTreeSet<(u64, bool)> = lines
         .iter()
         .filter_map(|(_, b)| match b {
@@ -305,11 +441,16 @@ pub(super) fn repair(repo: &str, upstream: &str, title: &str, body: &str) -> Rep
     if let Some(first) = first {
         rewritten[first] = canonical;
     }
+    let normalized = rewritten.join("\n");
     let rewritten = match drop.is_empty() {
-        true => rewritten.join("\n"),
-        false => without(&rewritten.join("\n"), &drop),
+        true => normalized.clone(),
+        false => without(&normalized, &drop),
     };
     let checked = (|| -> Result<()> {
+        hold!(
+            !stack::introduces_closing_reference(&normalized, &rewritten),
+            "removing source metadata would introduce a closing reference; manual repair required"
+        );
         check(repo, upstream, title)?;
         let tied: Vec<u64> = referenced_numbers(&rewritten)
             .into_iter()
@@ -364,6 +505,33 @@ mod tests {
                 ),
                 61,
                 Ok("Work.\n\nFixes composefs/composefs-rs#9"),
+            ),
+            // Tags in code spans and comparisons are prose; any raw HTML
+            // earlier holds, since only a parser can tell where it ends.
+            (
+                format!("Use `<code>` if a < b.\n\nPart of {}", url(61)),
+                61,
+                Ok("Use `<code>` if a < b."),
+            ),
+            (
+                format!("x `a\nb` <details> `c\n\nPart of {}", url(61)),
+                61,
+                Err("source metadata in code or HTML needs manual publication repair".into()),
+            ),
+            (
+                format!("Use \\`<details>\\` here.\n\nPart of {}", url(61)),
+                61,
+                Err("source metadata in code or HTML needs manual publication repair".into()),
+            ),
+            (
+                format!("Use <code>x</code>.\n\nPart of {}", url(61)),
+                61,
+                Err("source metadata in code or HTML needs manual publication repair".into()),
+            ),
+            (
+                format!("<code>\n\nPart of {}\n\n</code>", url(61)),
+                61,
+                Err("source metadata in code or HTML needs manual publication repair".into()),
             ),
             // No source line: byte for byte, whitespace included.
             ("  Work.\n\n".into(), 61, Ok("  Work.\n\n")),
