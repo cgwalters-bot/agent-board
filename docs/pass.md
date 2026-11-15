@@ -105,6 +105,16 @@ omitting the key leaves it off. Values must be 1–100. At or above the cap, a n
 work remain eligible under their existing pools, bounds and dispatch limits.
 The summary shows the cap and observed open bot PR counts by repository.
 
+The cap is advice to the coordinator, not a stop it cannot get past
+([#1020](https://github.com/cgwalters-forge/agent-board/issues/1020)). An
+implementation starts at the cap anyway when its plan says why in
+[`past_cap`](job-plans.md#format), its issue is at the board's top Priority, or
+it is a child of the live [`epics.focus`](#scheduling). Its start or rerun line
+then carries `past open-pr-cap (…): REASON`, giving the count and the reason;
+the hold of any other start names `past_cap`. An unread
+count is overridden the same way, and the start line says the count was unread.
+Every other limit and check still applies to such a start.
+
 Counts include drafts and all open PRs authored by the configured bot, not other
 authors or only board-linked PRs. Followed repositories reuse their complete
 stage-2 census; other destinations read at most ten pages of 100 PRs once per

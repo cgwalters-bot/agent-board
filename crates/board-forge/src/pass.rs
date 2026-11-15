@@ -2436,6 +2436,11 @@ impl Facts {
     }
 }
 
+/// Whether `facts` is at `board`'s first Priority option (P0).
+fn at_top(facts: &Facts, board: &BoardRead) -> bool {
+    (board.options.first()).is_some_and(|p| facts.priority.as_ref() == Some(p))
+}
+
 /// `OWNER/REPO#N` in lower case, as runs and holds are matched. An issue of
 /// another forge carries its instance as its host, which leads its key, so
 /// that two instances' `OWNER/REPO#N` never meet.
@@ -7719,7 +7724,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }));
             }
             return self.rerun(
-                (issue, issue),
+                (issue, issue, ""),
                 &plan,
                 run,
                 slots,
@@ -7802,12 +7807,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .accepted_plans
             .borrow_mut()
             .insert(issue.display(), plan.kind.clone());
-        if let Some(held) = self.pr_pressure(&dest.repository, &plan.kind) {
-            return Ok(Step::Hold(held));
-        }
+        let past = self.past_cap(&facts, board, &plan);
+        let past = match self.pr_pressure((&dest.repository, &plan.kind), past.as_deref()) {
+            pressure::Pressure::Clear => String::new(),
+            pressure::Pressure::Past(note) => note,
+            pressure::Pressure::Held(held) => return Ok(Step::Hold(held)),
+        };
         if let Some(run) = failed {
             return self.rerun(
-                (issue, &dest),
+                (issue, &dest, &past),
                 &plan,
                 run,
                 slots,
@@ -7841,7 +7849,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             false => format!(" target={}", dest.display()),
         };
         let line = format!(
-            "start {} {} plan={id}{on} pool={pool}",
+            "start {} {} plan={id}{on} pool={pool}{past}",
             plan.kind,
             issue.display()
         );
@@ -7970,7 +7978,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// ([`Self::before_agent`]).
     fn rerun(
         &self,
-        (issue, dest): (&ItemRef, &ItemRef),
+        (issue, dest, past): (&ItemRef, &ItemRef, &str),
         plan: &plan::JobPlan,
         (run, early): (&Value, Option<&starts::Infra>),
         slots: &Slots,
@@ -8026,7 +8034,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             false => format!(" target={}", dest.display()),
         };
         let line = format!(
-            "run rerun {}: {ended}, so its failed jobs run once more{on} pool={pool} run={url}",
+            "run rerun {}: {ended}, so its failed jobs run once more{on} pool={pool}{past} run={url}",
             issue.display()
         );
         let holds = vec![issue.clone(), dest.clone()];
@@ -8199,8 +8207,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let hours = settings.stale_draft_hours;
         overlap::Waiver {
             stale_draft: (hours > 0).then_some((self.now, hours)),
-            top: (board.options.first()).is_some_and(|p| facts.priority.as_ref() == Some(p)),
+            top: at_top(facts, board),
         }
+    }
+
+    /// Why the candidate `facts`' `plan` starts past `openPrCap`, if it
+    /// does: the coordinator's own reason in the plan, or work that outranks
+    /// landing, at the board's top Priority or under the epic focus.
+    fn past_cap(&self, facts: &Facts, board: &BoardRead, plan: &plan::JobPlan) -> Option<String> {
+        if let Some(why) = &plan.past_cap {
+            return Some(format!("the plan says {why:?}"));
+        }
+        if let Some(p) = facts.priority.as_ref().filter(|_| at_top(facts, board)) {
+            return Some(format!("it is at {p}"));
+        }
+        let focus = self.focus.live.as_ref()?;
+        let parent = &facts.parent.as_ref()?.issue;
+        (key(parent) == key(focus)).then(|| format!("it is under the focus {}", focus.display()))
     }
 
     /// An overlap check's `decision` for `issue`, whose plan changes

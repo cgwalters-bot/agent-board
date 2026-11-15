@@ -54,6 +54,8 @@ pub const SESSION_KIND: &str = "session";
 /// Characters of a brief. GitHub caps a dispatch's inputs at 65,535
 /// characters together, and the profile is put in front of the brief.
 pub const PLAN_BRIEF_LIMIT: usize = 16_000;
+/// Characters of a plan's `past_cap` reason.
+pub const PAST_CAP_LIMIT: usize = 200;
 /// Comment pages read for one issue (100 each). An issue with more is refused,
 /// since the newest plan could be in the part not read.
 pub const PLAN_COMMENT_PAGES: usize = 10;
@@ -69,6 +71,7 @@ const FIELDS: &[&str] = &[
     "effort",
     "brief",
     "stacks_on",
+    "past_cap",
 ];
 
 /// A plan's pool: lowercase letters, digits, `-` and `_`, led by a letter or digit.
@@ -120,6 +123,10 @@ pub struct JobPlan {
     /// An issue in `repo` whose open pull request this run builds on
     /// ([`crate::stack`]): an implement run only, and never the plan's own item.
     pub stacks_on: Option<u64>,
+    /// Why this implement run starts although its repository is at the
+    /// pass's `openPrCap`: the coordinator's override, logged by the pass
+    /// ([`PAST_CAP_LIMIT`] characters, one line).
+    pub past_cap: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +249,23 @@ impl JobPlan {
             target_repo.is_none() || stacks_on.is_none(),
             "plan target_repo does not support stacking"
         );
+        let past_cap = match object.get("past_cap") {
+            None => None,
+            Some(_) => {
+                let why = text("past_cap")?;
+                ensure!(kind == "implement", "plan past_cap needs kind implement");
+                // It is copied into a start line, which is read back for its
+                // `run=`: one bounded line with no `=` cannot forge a line
+                // or one of its fields.
+                ensure!(
+                    !why.trim().is_empty()
+                        && why.chars().count() <= PAST_CAP_LIMIT
+                        && !why.chars().any(|c| c.is_control() || c == '='),
+                    "plan past_cap must be one line of at most {PAST_CAP_LIMIT} characters, without '='"
+                );
+                Some(why.trim().to_owned())
+            }
+        };
         Ok(Self {
             repo: repo.into(),
             target_repo,
@@ -252,6 +276,7 @@ impl JobPlan {
             effort,
             brief: brief.into(),
             stacks_on,
+            past_cap,
         })
     }
 
@@ -1584,12 +1609,36 @@ mod tests {
                 "another positive issue number",
             ),
             ("stacks_on", json!(3665), "another positive issue number"),
+            ("past_cap", Value::Null, "past_cap is not a string"),
+            ("past_cap", json!(" "), "past_cap must be one line"),
+            (
+                "past_cap",
+                json!("a\nopen-pr-cap"),
+                "past_cap must be one line",
+            ),
+            (
+                "past_cap",
+                json!("a".repeat(201)),
+                "past_cap must be one line",
+            ),
+            (
+                "past_cap",
+                json!("a run=https://x/9"),
+                "past_cap must be one line",
+            ),
         ] {
             let mut edited = plan();
             edited[key] = value;
             let message = format!("{:#}", JobPlan::from_json(&edited).unwrap_err());
             assert!(message.contains(error), "{key}: {message}");
         }
+        let mut past = plan();
+        past["past_cap"] = json!(" operator request ");
+        let parsed = JobPlan::from_json(&past).unwrap();
+        assert_eq!(parsed.past_cap.as_deref(), Some("operator request"));
+        past["kind"] = json!("triage");
+        let message = JobPlan::from_json(&past).unwrap_err().to_string();
+        assert!(message.contains("needs kind implement"), "{message}");
         let mut stacked = plan();
         stacked["stacks_on"] = json!(3664);
         assert_eq!(JobPlan::from_json(&stacked).unwrap().stacks_on, Some(3664));
