@@ -23,6 +23,16 @@ Since the workspace started at 0.1.0 it has gained:
   get less than the floor instead of running it starved; its limit also
   stops GraphQL at that many points (agent-board#1042).
 
+- Stage 2's fix, rebase, continuation, answer and triage runs share the
+  pass's `wip` with its other starts instead of a fixed three a pass, which
+  remains only where there is no `wip` (a standalone poll, or a pass with no
+  work to schedule); a full `wip` now holds them
+  (`not started: wip: N of M runs active`), counting the review job's runs
+  in every followed repository before the first. Fix rounds are
+  `pr.fixRounds` (`fixRounds` in standalone poll), 1 to 5, default the
+  fixed 2 as before; a diagnostic round, recorded in the marker, still ends
+  them (agent-board#1025).
+
 - The pass's `reserveScheduling` keeps its stage shares under `requestShare`
   instead of being disabled by it, and stage 4 says once when the stages
   before it left less than a start takes. The new GitHub-only

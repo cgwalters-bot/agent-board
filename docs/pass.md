@@ -468,7 +468,7 @@ reach to the next pass as before. The trade-off is the
 mirror image: an intake with many waiting threads to retry can leave the
 walk too little to reach a repository, a `pull requests: the stage's request
 share is spent` line, until those threads settle. The intake's starts come
-before the walk's within the poll's three a pass. `operatorAnswers` on a
+before the walk's within the pass's `wip`. `operatorAnswers` on a
 followed pull request is still read in the walk. A claim records admission,
 not an answer.
 
@@ -3703,7 +3703,7 @@ followed. With `fixPlans`, stage 2 leaves upstream PRs read-only but the
 bot's own with no same-head midstream PR, on which it takes the bot's own
 rounds directly ([the poll](poll.md)); a plan's pull request always has one,
 so the two never start on the same pull request. Its midstream
-rounds and planned fixes share that ledger's two fix rounds. Missing or
+rounds and planned fixes share that ledger's `pr.fixRounds` (2 by default). Missing or
 ambiguous ledgers, unread facts, and legacy upstream markers or claims hold
 the plan for operator migration rather than resetting the allowance. Neither
 the claim nor the marker is posted upstream. A confirmed-unsent lease refusal
@@ -4426,8 +4426,8 @@ cancelled too.
   label it `needs-human`:
   `run rerun OWNER/REPO#N SHA: fix round 1's run URL ended (failure) and
   pushed no new head for SHA, so its failed jobs run once more (why) ->
-  re-run`. That is a dispatch within `--max-dispatch` and the poll's three a
-  pass, so it takes a WIP slot from stages 3 and 4. A round a broker outage
+  re-run`. That is a dispatch within `--max-dispatch` and `wip`, so it
+  takes a WIP slot from stages 3 and 4. A round a broker outage
   failed is still given back first; one that failed again is `needs-human`
   (`… ended (failure) again after a rerun …`).
 * **Triage and implement runs, stage 4.** Stage 4 lists the caller
@@ -4975,8 +4975,8 @@ repository and number. The board is read for this before stage 2
 the line `review order: the board could not be read (…); by repository and
 number` says so. Each is a dispatch, a rerun as a start, admitted before
 anything is written: within `--max-dispatch` (`-> held by
---max-dispatch`), the poll's three a pass, and, where the pass schedules
-work, `wip`. Its `wip` count is the caller's runs listed and leased before
+--max-dispatch`) and, where the pass schedules work, `wip`; without
+`wip`, the poll's three a pass. Its `wip` count is the caller's runs listed and leased before
 stage 2, as stage 4 counts them, the runs earlier stages started, the
 review runs above, a start reserved and not listed yet, and every run
 stage 2 started so far, fix rounds included; full, the line ends `-> not
@@ -5945,6 +5945,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.noMerge` | Exact `OWNER/REPO` base repositories never directly merged, enqueued or re-enqueued by the pass, while authorized rounds continue; no globs; `[]` |
 | `pr.operatorPaths` | Files, directories ending in `/`, or a JSON file's values other than its `FILE#/json/pointer` exemptions, a pull request changing any of which merges or is enqueued only on the operator's approval of its head, waiting as an approve row naming them, see [the poll](poll.md#configuration); relative, no globs, at most 50; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
+| `pr.fixRounds` | Fix rounds a pull request gets before its budget is exhausted and it goes to `pr.agentRecovery`'s triage, else `needs-human`; 1–5, more than 2 only once the polling job's approval-free bound allows it; `2`, see [the poll](poll.md) |
 | `pr.ownerBranches` | Skip a round, leaving it to the operator, on a head other than the bot's fork whose repository's default branch has no `.github/agentic-job/accept-owner-branches` naming it, which agentic-job's apply would refuse to push to; one contents read per such round, see [the poll](poll.md); `false` |
 | `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md). Stage 4 likewise starts no plan whose item is outside our own space: its candidate waits on the operator (`needs-operator`, `hold OWNER/REPO#N: its plan's OWNER/REPO#N is outside our own space …`) and draws no revisit. The bot's own pull requests are exempt: on them stage 2 takes its rounds, rebases and edits of them, and stage 4 starts `fixPlans`' fix runs, writing only on that pull request; a merge or stop there stays held; `false` |
 | `pr.operatorReviewFixes` | With `notifications`, route nonempty operator changes-requested reviews on the bot's PR to existing bounded fix rounds instead of intake triage; mixed batches and other intents stay in triage. See [operator intake](poll.md); `false` |

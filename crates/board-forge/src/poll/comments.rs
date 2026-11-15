@@ -29,7 +29,7 @@
 //! GitHub refused its run; the cursor only saves requests. Only the operator's comments count, as only their reviews do,
 //! and the briefs quote them as data. The runs go through the caller's
 //! dispatch workflow like any other, with its fork and bounds, and a fix
-//! round here is one of the pull request's `MAX_FIX_ROUNDS`.
+//! round here is one of the pull request's `fixRounds`.
 //!
 //! With `operatorAnswers`, the operator's comments on a followed pull request
 //! the poll stopped at are read too ([`Pass::answer`]): `needs-human` waits
@@ -384,14 +384,14 @@ fn fix_brief(
     repo: &str,
     number: u64,
     head: &str,
-    round: u64,
+    (round, rounds): (u64, u64),
     url: &str,
     said: &[Said],
     operator: &str,
 ) -> String {
     let mut lines = vec![
         format!(
-            "Pull request {repo}#{number} at head {head}: its operator, {operator}, commented on it. Make the smallest change to its branch that does what the comments below ask, and nothing else. This is fix round {round} of {MAX_FIX_ROUNDS}."
+            "Pull request {repo}#{number} at head {head}: its operator, {operator}, commented on it. Make the smallest change to its branch that does what the comments below ask, and nothing else. This is fix round {round} of {rounds}."
         ),
         String::new(),
         format!(
@@ -412,14 +412,14 @@ fn fix_brief(
 fn answer_brief(
     repo: &str,
     number: u64,
-    head: &str,
+    (head, rounds): (&str, u64),
     url: &str,
     said: &[Said],
     operator: &str,
 ) -> String {
     let mut lines = vec![
         format!(
-            "Pull request {repo}#{number} at head {head} was labelled `{LABEL}`: the poll stopped and left it to its operator, {operator}, whose comments since are their answer. Read the pull request, the poll's comment that says why it stopped, and the answer below. This is fix round 1 of {MAX_FIX_ROUNDS}."
+            "Pull request {repo}#{number} at head {head} was labelled `{LABEL}`: the poll stopped and left it to its operator, {operator}, whose comments since are their answer. Read the pull request, the poll's comment that says why it stopped, and the answer below. This is fix round 1 of {rounds}."
         ),
         String::new(),
         format!(
@@ -1148,7 +1148,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let operator = self.config.operator.clone();
         let url = format!("https://github.com/{repo}/pull/{number}");
         let head = text(pull, "/headRefOid");
-        let brief = answer_brief(repo, number, head, &url, said, &operator);
+        let rounds = self.config.policy.fix_rounds();
+        let brief = answer_brief(repo, number, (head, rounds), &url, said, &operator);
         let keys = said.iter().map(|s| s.key.clone()).collect();
         let on = format!("on {operator}'s answer");
         self.stop_round(repo, pull, (stop, read), (keys, &brief, &on), labelled)
@@ -1166,10 +1167,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         labelled: &Value,
     ) -> Result<String> {
         let apply = self.apply.as_ref().context("not applying")?;
-        if self.dispatched >= POLL_DISPATCH_LIMIT {
-            return Ok(format!(
-                "not started: this pass started {POLL_DISPATCH_LIMIT} runs already"
-            ));
+        if let Err(why) = self.admits() {
+            return Ok(format!("not started: {why}"));
         }
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
         let candidates = fix_pools(&apply.pools, self.config);
@@ -1193,7 +1192,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let head = text(pull, "/headRefOid").to_owned();
         ensure!(!head.is_empty(), "the pull request has no head");
         let of = format!(
-            "Fix round 1 of {MAX_FIX_ROUNDS} for `{}`, {on}",
+            "Fix round 1 of {} for `{}`, {on}",
+            self.config.policy.fix_rounds(),
             short(&head)
         );
         let state = json!({"from": claim_from(stop), "round": 1, "sha": head, "comments": keys});
@@ -1689,7 +1689,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         } else {
             marker.clone()
         };
-        if carried.rounds >= MAX_FIX_ROUNDS {
+        if carried.rounds >= self.config.policy.fix_rounds() || carried.diagnosed {
             return Ok((
                 true,
                 format!("left to a person: {} fix rounds used", carried.rounds),
@@ -1717,11 +1717,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let Some(apply) = &self.apply else {
             return Ok((true, format!("fix round {round}")));
         };
-        if self.dispatched >= POLL_DISPATCH_LIMIT {
-            return Ok((
-                false,
-                format!("not started: this pass started {POLL_DISPATCH_LIMIT} runs already"),
-            ));
+        if let Err(why) = self.admits() {
+            return Ok((false, format!("not started: {why}")));
         }
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
         let candidates = fix_pools(&apply.pools, self.config);
@@ -1735,7 +1732,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
         let operator = self.config.operator.clone();
         let of = format!(
-            "Fix round {round} of {MAX_FIX_ROUNDS} for `{}`, on {operator}'s comments",
+            "Fix round {round} of {} for `{}`, on {operator}'s comments",
+            self.config.policy.fix_rounds(),
             short(&head)
         );
         let state =
@@ -1794,7 +1792,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             (&superseded, read),
         )?;
         let url = format!("https://github.com/{repo}/pull/{number}");
-        let brief = fix_brief(repo, number, &head, round, &url, said, &operator);
+        let rounds = self.config.policy.fix_rounds();
+        let brief = fix_brief(repo, number, &head, (round, rounds), &url, said, &operator);
         let brief = midstream_task(&self.config.policy, repo, brief);
         let start = Start {
             issue_repository: None,
@@ -1896,13 +1895,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let Some(apply) = &self.apply else {
             if self.config.policy.pass_triage_pools.is_some() {
-                if self.dispatched >= POLL_DISPATCH_LIMIT {
-                    return Ok((
-                        false,
-                        format!(
-                            "not started: this pass started {POLL_DISPATCH_LIMIT} runs already"
-                        ),
-                    ));
+                if let Err(why) = self.admits() {
+                    return Ok((false, format!("not started: {why}")));
                 }
                 let pools = self.config.policy.kind_pool_choices(kind);
                 let pool = match self.paced(pools.first().cloned(), &pools) {
@@ -1922,11 +1916,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 },
             ));
         };
-        if self.dispatched >= POLL_DISPATCH_LIMIT {
-            return Ok((
-                false,
-                format!("not started: this pass started {POLL_DISPATCH_LIMIT} runs already"),
-            ));
+        if let Err(why) = self.admits() {
+            return Ok((false, format!("not started: {why}")));
         }
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
         let kind_pool = self.config.policy.kind_pool_choices(kind);
@@ -3226,7 +3217,7 @@ pub(super) mod tests {
                     fake.rest.borrow_mut().get_mut(&pull).unwrap()["labels"] =
                         json!([{"name": LABEL}])
                 }
-                "rounds" => marker.rounds = 2,
+                "rounds" => marker.rounds = FIX_ROUNDS,
                 "running" => fake.page(
                     &format!("repos/{DISPATCH}/actions/runs/5"),
                     json!({"status": "in_progress"}),

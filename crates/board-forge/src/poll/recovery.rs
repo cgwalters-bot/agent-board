@@ -52,6 +52,7 @@ pub(super) fn exhausted(config: &Config, reason: String) -> Decision {
 pub(super) fn granted(marker: &Marker) -> Marker {
     let mut next = marker.clone();
     next.rounds = 0;
+    next.diagnosed = false;
     next.continued = 0;
     next.rebased = 0;
     next.sha = None;
@@ -255,8 +256,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .is_none_or(|r| r.attempts < TRIAGE_LIMIT),
             "PR triage budget exhausted"
         );
-        if self.dispatched >= POLL_DISPATCH_LIMIT {
-            return Ok("not started: pass dispatch cap".into());
+        if let Err(why) = self.admits() {
+            return Ok(format!("not started: {why}"));
         }
         let candidates = self.config.policy.kind_pool_choices("triage");
         let pool = match self.paced(candidates.first().cloned(), &candidates) {

@@ -2678,7 +2678,7 @@ mod tests {
                 .get_mut(&format!("{API_ROOT}{issue}"))
                 .unwrap()["user"]["login"] = BOT.into();
             let state = match case {
-                "rounds" => json!({"rounds": MAX_FIX_ROUNDS, "sha": "old"}),
+                "rounds" => json!({"rounds": FIX_ROUNDS, "sha": "old"}),
                 "running" => json!({"rounds": 1, "sha": "abcdef0123456789", "at": UPDATED}),
                 _ => Value::Null,
             };

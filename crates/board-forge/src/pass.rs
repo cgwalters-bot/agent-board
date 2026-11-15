@@ -5611,20 +5611,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .is_some_and(|(_, c, _)| self.operator_verdict(&c.body))
     }
 
-    /// With `pr.reviewPools`, what stage 2's review starts and reruns go by:
-    /// the board's Priority ranks, and with work to schedule the `wip` they
-    /// fit in, read before stage 2 as stage 4 reads it, with the `earlier`
-    /// runs the pass started. A board that cannot be read leaves them in
-    /// repository and number order; capacity that cannot be read, or another
-    /// pass in progress, holds them all.
-    fn review_bounds(
-        &mut self,
-        git_ref: &str,
-        earlier: usize,
-    ) -> (Option<poll::ReviewWip>, BTreeMap<String, usize>) {
-        let config = self.config;
+    /// With `pr.reviewPools`, the order stage 2's review starts and reruns
+    /// go in: the board's Priority ranks. A board that cannot be read leaves
+    /// them in repository and number order.
+    fn review_ranks(&mut self) -> BTreeMap<String, usize> {
         let mut ranks = BTreeMap::new();
-        if config.board.is_some() {
+        if self.config.board.is_some() {
             match self.board() {
                 Ok(board) => {
                     for (key, facts) in &board.items {
@@ -5638,11 +5630,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 )),
             }
         }
+        ranks
+    }
+
+    /// With work to schedule, the `wip` stage 2's starts and reruns fit in,
+    /// fix rounds and reviews alike, read before stage 2 as stage 4 reads
+    /// it, with the `earlier` runs the pass started. Capacity that cannot be
+    /// read, or another pass in progress, holds them all.
+    fn stage2_wip(&mut self, git_ref: &str, earlier: usize) -> Option<poll::Wip> {
+        let config = self.config;
         if !config.work() {
-            return (None, ranks);
+            return None;
         }
         let wip = config.wip as usize;
-        let mut bound = poll::ReviewWip {
+        let mut bound = poll::Wip {
             wip,
             active: wip,
             held: self.other_holds(),
@@ -5666,7 +5667,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         }
-        (Some(bound), ranks)
+        Some(bound)
     }
 
     /// Stage 2: the followed pull requests, paced by stage 1's reading where
@@ -5819,6 +5820,31 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         poll.policy.notification_intake = routes.as_ref().map(|r| r.staging.clone());
         poll.policy.midstreams = midstreams.clone();
         poll.policy.no_merge.extend(midstreams);
+        // Read before the approved and intake turns where they run, whose
+        // starts it bounds too; the walk counts theirs as its own, carried
+        // with `direction`.
+        let turns = config.pr.poll.action_first || config.notifications;
+        // The `authored` sweep below may add repositories whose review runs
+        // the turns' starts must fit around too: read them first, all of
+        // them, as which the sweep takes is not known yet. Unread, the sweep
+        // adds none this pass.
+        let mut authored_read = None;
+        if turns {
+            poll.policy.wip = self.stage2_wip(git_ref, earlier);
+            if config.authored.is_some() && !config.pr.poll.review_pools.is_empty() {
+                let read = authored::read(&config.bot, &self.client);
+                if let Ok(repos) = &read {
+                    poll.policy.review_census = (repos.iter())
+                        .filter(|repo| {
+                            !never(repo)
+                                && !self.follows.iter().any(|r| r.eq_ignore_ascii_case(repo))
+                        })
+                        .cloned()
+                        .collect();
+                }
+                authored_read = Some(read);
+            }
+        }
         let mut direction = None;
         let mut intake_starts = 0;
         if config.pr.poll.action_first {
@@ -5913,7 +5939,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(per_pass) = config.authored {
             // This pass's, not the last's: a pass without `state` has no last.
             let named = self.authored_named().unwrap_or_default();
-            let read = match authored::read(&config.bot, &self.client) {
+            let read = authored_read
+                .take()
+                .unwrap_or_else(|| authored::read(&config.bot, &self.client));
+            let read = match read {
                 Ok(read) => read,
                 // As the poll's below: the stages after it keep their share,
                 // and the pull requests wait for the next pass.
@@ -5985,11 +6014,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         poll.policy.no_merge.extend(swept.iter().cloned());
         poll.policy.bot_only = swept;
+        if !turns {
+            poll.policy.wip = self.stage2_wip(git_ref, earlier);
+        }
         if !config.pr.poll.review_pools.is_empty() {
-            let (wip, ranks) = self.review_bounds(git_ref, earlier + intake_starts);
-            poll.policy.review_wip = wip;
             poll.policy.review_caller_workflow = Some(config.dispatch_workflow.clone());
-            poll.policy.review_ranks = ranks;
+            poll.policy.review_ranks = self.review_ranks();
         }
         let apply = self.apply.then(|| poll::Apply {
             dispatcher: &self.dispatcher,
