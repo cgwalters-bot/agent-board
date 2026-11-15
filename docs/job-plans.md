@@ -45,8 +45,9 @@ start of a line, holding one JSON object:
 | `effort` | no | Only `"heavy"`: request the selected pool's optional heavy model; omit for the existing default model. Null, empty, `"default"` and other values are refused |
 | `brief` | yes | The task, at most 16,000 characters; the run gets it after the kind's profile |
 | `stacks_on` | no | Another issue number in `repo` whose pull request this implement run builds on ([stacking](#stacking)) |
+| `past_cap` | no | Why this implement plan starts although its repository is at the pass's [`openPrCap`](pass.md#repository-pr-backpressure): one line of at most 200 characters, which the start line records |
 
-Every field but `schema` maps onto one input of the caller's dispatch workflow
+Every field but `schema` and `past_cap` maps onto one input of the caller's dispatch workflow
 ([dispatch](dispatch.md#the-request); `brief` is `task`; `stacks_on` becomes
 `base`, a branch dispatch finds).
 Anything else, including `null` for a field, is refused: the caller has no inputs

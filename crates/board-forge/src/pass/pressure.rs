@@ -58,30 +58,46 @@ pub(crate) fn census(open: &[Value], bot: &str) -> Result<usize> {
 }
 
 impl<C: Rest + Transport> Scheduler<'_, C> {
-    pub(super) fn pr_pressure(&self, repo: &str, kind: &str) -> Option<Hold> {
-        let cap = self.config.open_pr_cap?;
-        if kind != "implement" {
-            return None;
-        }
+    /// What the cap advises for starting a `kind` run in `repo`. It is
+    /// advice the coordinator may override: with `past`, the reason it
+    /// starts anyway, a start at the cap goes ahead and its start line says
+    /// so, with that reason, rather than being held.
+    pub(super) fn pr_pressure(&self, (repo, kind): (&str, &str), past: Option<&str>) -> Pressure {
+        let Some(cap) = self.config.open_pr_cap.filter(|_| kind == "implement") else {
+            return Pressure::Clear;
+        };
         let repo = repo.to_ascii_lowercase();
         let mut counts = self.report.open_pr_counts.borrow_mut();
-        let count = counts
+        let count = *counts
             .entry(repo.clone())
             .or_insert_with(|| count(&self.client, &repo, &self.config.bot).ok());
-        match count {
-            Some(count) if *count < cap => None,
-            Some(count) => Some(Hold::new(
+        let (kind, advice) = match count {
+            Some(count) if count < cap => return Pressure::Clear,
+            Some(count) => (
                 HoldKind::OpenPrCap,
-                format!(
-                    "open-pr-cap: {repo} has {count}/{cap} open bot PRs; land existing work first"
-                ),
-            )),
-            None => Some(Hold::new(
+                format!("{repo} has {count}/{cap} open bot PRs; landing is the cheaper win"),
+            ),
+            None => (
                 HoldKind::Unreadable,
-                format!("open-pr-cap: {repo} open bot PR count could not be read completely"),
+                format!("{repo} open bot PR count could not be read completely"),
+            ),
+        };
+        match past {
+            Some(why) => Pressure::Past(format!(" past open-pr-cap ({advice}): {why}")),
+            None => Pressure::Held(Hold::new(
+                kind,
+                format!("open-pr-cap: {advice}; a plan's past_cap starts it anyway"),
             )),
         }
     }
+}
+
+/// [`Scheduler::pr_pressure`]'s advice.
+pub(super) enum Pressure {
+    Clear,
+    /// Starts anyway; the note its line carries, before any ` run=`.
+    Past(String),
+    Held(Hold),
 }
 
 #[cfg(test)]

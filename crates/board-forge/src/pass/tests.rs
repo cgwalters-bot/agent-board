@@ -16038,32 +16038,50 @@ fn implement_plan(replay: &mut Replay) {
     job_plan(replay, ("implement", 446), "cgwalters", None);
 }
 
+/// A preview of tracker#446's `kind` plan, at P1, with `count` open bot PRs
+/// in tracker (`None`: their read fails) against `cap`, after `edit` of the
+/// recording and settings; with `epics`, the recording keeps its epics.
+fn capped_pass(
+    (cap, count, kind): (Option<usize>, Option<usize>, &str),
+    (epics, edit): (bool, impl Fn(&mut Replay, &mut Value)),
+) -> Report {
+    let mut settings = json!({"wip":3});
+    let mut forge = Forge::new(None, false);
+    if epics {
+        forge.replay = replay();
+    }
+    let fixture = &mut forge.replay;
+    only(fixture, &["cgwalters-forge/tracker#446"]);
+    job_plan(fixture, (kind, 446), "cgwalters", None);
+    unpathed(fixture);
+    prioritize_446(fixture, "P1");
+    edit(fixture, &mut settings);
+    let mut pulls: Vec<Value> = (0..count.unwrap_or(0))
+        .map(|n| json!({"number":1000+n,"user":{"login":"cgwalters-bot"}}))
+        .collect();
+    pulls.push(json!({"number":2000,"user":{"login":"visitor"}}));
+    let status = if count.is_some() { 200 } else { 502 };
+    fixture.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/pulls?state=open&per_page=100")},"answer":{"status":status,"body":pulls,"link":null}}));
+    let mut cfg = config(settings);
+    cfg.open_pr_cap = cap;
+    block(run(
+        &forge,
+        &forge,
+        &cfg,
+        State::default(),
+        (Mode::Preview, Limits::default()),
+        forge.replay.now,
+    ))
+    .unwrap()
+}
+
 #[test]
 fn open_pr_cap_candidate_matrix() {
     for cap in [None, Some(2)] {
         for count in [0, 1, 2, 3] {
             for kind in ["implement", "triage"] {
-                let mut cfg = config(json!({"wip":3}));
-                cfg.open_pr_cap = cap;
-                let mut forge = Forge::new(None, false);
-                let fixture = &mut forge.replay;
-                only(fixture, &["cgwalters-forge/tracker#446"]);
-                job_plan(fixture, (kind, 446), "cgwalters", None);
-                unpathed(fixture);
-                let mut pulls: Vec<Value> = (0..count)
-                    .map(|n| json!({"number":1000+n,"user":{"login":"cgwalters-bot"}}))
-                    .collect();
-                pulls.push(json!({"number":2000,"user":{"login":"visitor"}}));
-                fixture.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/pulls?state=open&per_page=100")},"answer":{"status":200,"body":pulls,"link":null}}));
-                let report = block(run(
-                    &forge,
-                    &forge,
-                    &cfg,
-                    State::default(),
-                    (Mode::Preview, Limits::default()),
-                    forge.replay.now,
-                ))
-                .unwrap();
+                let report =
+                    capped_pass((cap, Some(count), kind), (false, |_: &mut _, _: &mut _| {}));
                 let held = kind == "implement" && cap.is_some_and(|cap| count >= cap);
                 assert_eq!(
                     report.failures, 0,
@@ -16102,6 +16120,111 @@ fn open_pr_cap_candidate_matrix() {
         let mut cfg = config(json!({}));
         cfg.open_pr_cap = Some(cap);
         assert!(cfg.check().is_err());
+    }
+}
+
+/// The cap is advice: the coordinator's `past_cap`, the board's top
+/// Priority or the epic focus starts an implementation at the cap, or with
+/// its count unread, anyway, and its start line says why. Anything else is
+/// held, another epic's child under a focus too.
+#[test]
+fn open_pr_cap_is_passed_with_a_logged_reason() {
+    const ISSUE: &str = "cgwalters-forge/tracker#446";
+    type Edit = fn(&mut Replay, &mut Value);
+    let cases: [(&str, bool, Edit, Option<&str>); 5] = [
+        ("no reason", false, |_, _| {}, None),
+        (
+            "another epic's child under the focus",
+            true,
+            |r, c| {
+                child_of(r, ISSUE, (TRACKER, 596));
+                focused(c, FOCUS_890);
+            },
+            None,
+        ),
+        (
+            "the coordinator's reason",
+            false,
+            |r, _| {
+                let comments = &mut answer(r, r#""name":"tracker","number":446"#)["data"]["repository"]
+                    ["issue"]["comments"]["nodes"];
+                let plan = comments.as_array_mut().unwrap().last_mut().unwrap();
+                plan["body"] = text(plan, "/body")
+                    .replace(
+                        "\"item\":446",
+                        "\"item\":446,\"past_cap\":\"operator request\"",
+                    )
+                    .into();
+            },
+            Some("the plan says \"operator request\""),
+        ),
+        (
+            "the top Priority",
+            false,
+            |r, _| prioritize_446(r, "P0"),
+            Some("it is at P0"),
+        ),
+        (
+            "the epic focus",
+            true,
+            |r, c| {
+                child_of(r, ISSUE, (TRACKER, 890));
+                focused(c, FOCUS_890);
+            },
+            Some("it is under the focus cgwalters-forge/tracker#890"),
+        ),
+    ];
+    let start = format!("start implement {ISSUE}");
+    for (name, epics, edit, why) in cases {
+        for (count, advice) in [
+            (Some(1), None),
+            (
+                Some(2),
+                Some("cgwalters-forge/tracker has 2/2 open bot PRs; landing is the cheaper win"),
+            ),
+            (
+                None,
+                Some("cgwalters-forge/tracker open bot PR count could not be read completely"),
+            ),
+        ] {
+            let report = capped_pass((Some(2), count, "implement"), (epics, edit));
+            let line = (report.lines.iter()).find(|l| l.starts_with(&start));
+            let held = (report.holds.iter()).find(|e| e.hold.reason.starts_with("open-pr-cap:"));
+            let case = format!("{name}/{count:?}: {:#?}", report.lines);
+            match (advice, why) {
+                (None, _) => assert!(line.is_some_and(|l| !l.contains("open-pr-cap")), "{case}"),
+                (Some(advice), Some(why)) => {
+                    let past = format!(" past open-pr-cap ({advice}): {why}");
+                    assert!(line.is_some_and(|l| l.ends_with(&past)), "{case}");
+                    assert!(held.is_none(), "{case}");
+                }
+                (Some(advice), None) => {
+                    assert!(line.is_none(), "{case}");
+                    let held = held.unwrap_or_else(|| panic!("{case}"));
+                    let reason =
+                        format!("open-pr-cap: {advice}; a plan's past_cap starts it anyway");
+                    assert_eq!(held.hold.reason, reason, "{case}");
+                    let kind = match count {
+                        Some(_) => HoldKind::OpenPrCap,
+                        None => HoldKind::Unreadable,
+                    };
+                    assert_eq!(held.hold.kind, kind, "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// Sets tracker#446's Priority on the board to `priority`.
+fn prioritize_446(replay: &mut Replay, priority: &str) {
+    for entry in &mut replay.requests {
+        let nodes = (entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes"))
+            .and_then(Value::as_array_mut);
+        for node in nodes.into_iter().flatten() {
+            if node["content"]["number"] == 446 {
+                node["priority"]["name"] = priority.into();
+            }
+        }
     }
 }
 
