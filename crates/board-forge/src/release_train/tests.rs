@@ -320,6 +320,50 @@ fn host_action_pins_bypass_the_forwarder_and_follow_subsequent_releases() {
 }
 
 #[test]
+fn host_repin_moves_only_uses_lines_and_keeps_test_strings() {
+    // From actions' lint/tests/review_wrapper.rs, a configured wrapper file:
+    // unparseable and refused pins in strings must neither stall nor move.
+    let test = format!(
+        concat!(
+            "const LOCAL_HOST: &str = \"./.agentic-job-source/secure-host\";\n",
+            "    .strip_prefix(\"cgwalters-forge/actions/secure-host@\")\n",
+            "        \"uses: ./.agentic-job-source/secure-host\",\n",
+            "    let direct = format!(\"cgwalters-forge/actions/secure-host@{{}}\", \"a\".repeat(40));\n",
+            "        \"cgwalters-forge/actions/secure-host@v0.6.9\".to_owned(),\n",
+            "        \"cgwalters-forge/actions/secure-host@{}\".to_owned(),\n",
+        ),
+        "a".repeat(40)
+    );
+    let merge = "b".repeat(40);
+    let moved_to = format!("uses: cgwalters-forge/actions/secure-host@{merge}\n");
+    for (workflow, moves) in [
+        ("      - uses: ./.agentic-job-source/secure-host\n", true),
+        (
+            "        uses: cgwalters-forge/agentic-job/secure-host@v0.6.9\n",
+            true,
+        ),
+        (
+            "  run: echo cgwalters-forge/actions/secure-host@v0.6.9\n",
+            false,
+        ),
+    ] {
+        let files = vec![
+            ("workflow.yml".to_owned(), workflow.to_owned()),
+            ("review_wrapper.rs".to_owned(), test.clone()),
+        ];
+        let moved = repin_host(&files, &merge, "0.6.14");
+        if moves {
+            let moved = moved.unwrap();
+            assert!(moved[0].1.ends_with(&moved_to), "{}", moved[0].1);
+            assert_eq!(moved[1].1, test);
+        } else {
+            let error = moved.unwrap_err().to_string();
+            assert!(error.contains("no secure-host action pin"), "{error}");
+        }
+    }
+}
+
+#[test]
 fn optional_host_stage_waits_for_review_and_is_off_by_default() {
     let f = host_fixture();
     assert!(

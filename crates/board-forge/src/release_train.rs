@@ -67,6 +67,8 @@ fn repin_image(files: &[(String, String)], pin: &str) -> Result<Vec<(String, Str
 
 /// Bypass the release-tag forwarder: it predates the image that release
 /// publishes. Only secure-host changes source; other actions stay on the release.
+/// Only workflow `uses:` lines are action references: a wrapper file may be a
+/// test whose strings name the action, including pins it must keep refusing.
 fn repin_host(
     files: &[(String, String)],
     merge: &str,
@@ -74,47 +76,68 @@ fn repin_host(
 ) -> Result<Vec<(String, String)>> {
     let mut found = 0;
     let mut out = files.to_vec();
-    for (_, text) in &mut out {
-        // Current wrappers check out policy's source for prepare and run.
-        // Only this local forwarder is replaced; keep the checkout and all
-        // inputs on the step untouched.
-        let local = "./.agentic-job-source/secure-host";
-        let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
-        let mut from = 0;
-        while let Some(at) = text[from..].find(local) {
-            let start = from + at;
-            let end = start + local.len();
-            if !pin_boundary(&text[end..]) {
-                // A configuration path under secure-host/ is not an action.
-                from = end;
-                continue;
+    for (_, file) in &mut out {
+        let mut moved = String::with_capacity(file.len());
+        for line in file.split_inclusive('\n') {
+            let mut line = line.to_owned();
+            let step = line.trim_start();
+            if step
+                .strip_prefix("- ")
+                .unwrap_or(step)
+                .trim_start()
+                .starts_with("uses:")
+            {
+                found += repin_host_line(&mut line, merge)?;
             }
-            text.replace_range(start..end, &replacement);
-            from = start + replacement.len();
-            found += 1;
+            moved.push_str(&line);
         }
-        for repo in ["cgwalters-forge/agentic-job", "cgwalters-forge/actions"] {
-            let needle = format!("{repo}/secure-host@");
-            let mut from = 0;
-            while let Some(at) = text[from..].find(&needle) {
-                let start = from + at;
-                let end = start + needle.len();
-                let pin = pin_at(&text[end..]).context("unrecognized secure-host action pin")?;
-                let len = pin.len();
-                if !pin_boundary(&text[end + len..]) {
-                    return stall("unrecognized secure-host action pin suffix");
-                }
-                let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
-                text.replace_range(start..end + len, &replacement);
-                from = start + replacement.len();
-                found += 1;
-            }
-        }
+        *file = moved;
     }
     if found == 0 {
         return stall(format!("no secure-host action pin to move for v{version}"));
     }
     Ok(out)
+}
+
+/// Moves the secure-host references on one `uses:` line, returning how many.
+fn repin_host_line(text: &mut String, merge: &str) -> Result<usize> {
+    let mut found = 0;
+    // Current wrappers check out policy's source for prepare and run.
+    // Only this local forwarder is replaced; keep the checkout and all
+    // inputs on the step untouched.
+    let local = "./.agentic-job-source/secure-host";
+    let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
+    let mut from = 0;
+    while let Some(at) = text[from..].find(local) {
+        let start = from + at;
+        let end = start + local.len();
+        if !pin_boundary(&text[end..]) {
+            // A configuration path under secure-host/ is not an action.
+            from = end;
+            continue;
+        }
+        text.replace_range(start..end, &replacement);
+        from = start + replacement.len();
+        found += 1;
+    }
+    for repo in ["cgwalters-forge/agentic-job", "cgwalters-forge/actions"] {
+        let needle = format!("{repo}/secure-host@");
+        let mut from = 0;
+        while let Some(at) = text[from..].find(&needle) {
+            let start = from + at;
+            let end = start + needle.len();
+            let pin = pin_at(&text[end..]).context("unrecognized secure-host action pin")?;
+            let len = pin.len();
+            if !pin_boundary(&text[end + len..]) {
+                return stall("unrecognized secure-host action pin suffix");
+            }
+            let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
+            text.replace_range(start..end + len, &replacement);
+            from = start + replacement.len();
+            found += 1;
+        }
+    }
+    Ok(found)
 }
 
 fn pin_boundary(rest: &str) -> bool {
