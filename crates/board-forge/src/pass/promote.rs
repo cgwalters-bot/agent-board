@@ -33,7 +33,7 @@ pub struct Promote {
     pub policy_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fork {
     pub upstream: String,

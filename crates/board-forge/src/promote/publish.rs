@@ -23,6 +23,9 @@ struct Promoting {
     approved_oid: String,
     published_oid: String,
     published_branch: String,
+    /// Preserve the existing PR and exact old branch head across partial repairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<handoff::Record>,
 }
 
 /// What the candidate's receipt records, once the bot is known to have
@@ -51,6 +54,7 @@ struct Publication {
     /// branch before publishing. None resumes a branch already pushed.
     base: Option<String>,
     existing: Option<Value>,
+    previous: Option<handoff::Record>,
 }
 
 struct Prepared {
@@ -260,7 +264,7 @@ fn prepare<C: Rest + Transport>(
     };
     let branch_of = |branch: &str| {
         ensure!(
-            branch == original_branch || branch == rewrite::branch(&head),
+            branch == original_branch || publication_branch(branch),
             "publication receipt names another branch"
         );
         Ok(())
@@ -291,6 +295,47 @@ fn prepare<C: Rest + Transport>(
                 branch: record.published_branch,
                 base: None,
                 existing: Some(pr),
+                previous: None,
+            }
+        }
+        Receipt::Confirmed(record) => {
+            match repair(
+                client,
+                config,
+                (repo, target),
+                &fresh,
+                &head,
+                &record,
+                None,
+                max_writes,
+                git,
+            )? {
+                Ok(what) => what,
+                Err(needed) => return Ok(Step::Held(held(repo, number, needed))),
+            }
+        }
+        Receipt::Pending(record) if record.previous.is_some() => {
+            ensure!(
+                record.approved_oid == head,
+                "unfinished repair publication needs its approved head restored"
+            );
+            let previous = record
+                .previous
+                .as_ref()
+                .context("missing prior publication")?;
+            match repair(
+                client,
+                config,
+                (repo, target),
+                &fresh,
+                &head,
+                previous,
+                Some(&record),
+                max_writes,
+                git,
+            )? {
+                Ok(what) => what,
+                Err(needed) => return Ok(Step::Held(held(repo, number, needed))),
             }
         }
         Receipt::Pending(record) if record.approved_oid == head => {
@@ -318,6 +363,7 @@ fn prepare<C: Rest + Transport>(
                         branch: record.published_branch,
                         base: None,
                         existing: existing.into_iter().next(),
+                        previous: None,
                     }
                 }
                 Some(_) => anyhow::bail!(
@@ -325,13 +371,15 @@ fn prepare<C: Rest + Transport>(
                     record.published_branch
                 ),
                 // Nothing was pushed: publish again, under a new receipt.
-                None => match rebuild(client, config, target, &fresh, &head, max_writes, git)? {
-                    Ok(what) => what,
-                    Err(needed) => return Ok(Step::Held(held(repo, number, needed))),
-                },
+                None => {
+                    match rebuild(client, config, target, &fresh, &head, max_writes, git, None)? {
+                        Ok(what) => what,
+                        Err(needed) => return Ok(Step::Held(held(repo, number, needed))),
+                    }
+                }
             }
         }
-        _ => match rebuild(client, config, target, &fresh, &head, max_writes, git)? {
+        _ => match rebuild(client, config, target, &fresh, &head, max_writes, git, None)? {
             Ok(what) => what,
             Err(needed) => return Ok(Step::Held(held(repo, number, needed))),
         },
@@ -343,7 +391,9 @@ fn prepare<C: Rest + Transport>(
     if let Some(pr) = &what.existing {
         verify_pr(
             pr,
-            &what.published,
+            what.previous
+                .as_ref()
+                .map_or(what.published.as_str(), |r| r.published_oid.as_str()),
             &publication,
             &target.upstream,
             &target.base,
@@ -357,12 +407,6 @@ fn prepare<C: Rest + Transport>(
                 pr["number"].as_u64().context("invalid upstream number")?
             )));
         }
-    }
-    // A retained branch can wait without spending this pass's write slot.
-    // Otherwise an early candidate whose CI never reports would starve every
-    // later candidate by rewriting its pending receipt on every invocation.
-    if what.base.is_none() {
-        publication_checks(client, repo, &fresh, &what.published)?;
     }
     let needed = STEP_WRITES + usize::from(what.base.is_some());
     if max_writes < needed {
@@ -381,9 +425,91 @@ fn held(repo: &str, number: u64, needed: usize) -> String {
     format!("held by --max-writes: promote {repo}#{number} (needs {needed})")
 }
 
+fn publication_branch(branch: &str) -> bool {
+    branch.strip_prefix("bot/promote/").is_some_and(oid)
+}
+
+/// Renew publication only after `validate` has authorized the repaired current
+/// head. The authenticated old receipt selects the PR, never a new head's branch.
+#[allow(clippy::too_many_arguments)]
+fn repair<C: Rest + Transport>(
+    client: &C,
+    config: &Config,
+    (repo, target): (&str, &pass::promote::Fork),
+    fresh: &Value,
+    head: &str,
+    previous: &handoff::Record,
+    pending: Option<&Promoting>,
+    max_writes: usize,
+    git: &mut impl rewrite::Rewrite,
+) -> Result<std::result::Result<Publication, usize>> {
+    handoff::verify_record(repo, target, fresh, previous)?;
+    let original = fresh["head"]["ref"]
+        .as_str()
+        .context("missing approved branch")?;
+    ensure!(
+        previous.published_branch == original || publication_branch(&previous.published_branch),
+        "prior publication names another branch"
+    );
+    let mut observed = previous.clone();
+    if previous.published_branch == original {
+        // This ref already moved with the fork fix; never force-update it.
+        observed.published_oid = head.into();
+    } else if let Some(pending) = pending {
+        ensure!(
+            pending.published_branch == previous.published_branch,
+            "repair changed publication branch"
+        );
+        let head_repo = fresh["head"]["repo"]["full_name"]
+            .as_str()
+            .context("missing head repository")?;
+        if ref_head(client, head_repo, &previous.published_branch)?.as_deref()
+            == Some(&pending.published_oid)
+        {
+            observed.published_oid = pending.published_oid.clone();
+        }
+    }
+    let pr = handoff::verify_upstream(client, &config.bot, repo, target, fresh, &observed)?;
+    ensure!(
+        pr["state"] == "open" && pr["merged"] == false,
+        "repair publication is no longer open"
+    );
+    if let Some(pending) = pending.filter(|p| p.published_oid == observed.published_oid) {
+        return Ok(Ok(Publication {
+            published: pending.published_oid.clone(),
+            branch: pending.published_branch.clone(),
+            base: None,
+            existing: Some(pr),
+            previous: Some(observed),
+        }));
+    }
+    let result = rebuild(
+        client,
+        config,
+        target,
+        fresh,
+        head,
+        max_writes,
+        git,
+        Some(&observed),
+    )?;
+    if let Ok(what) = &result {
+        ensure!(
+            what.branch == previous.published_branch
+                && what
+                    .existing
+                    .as_ref()
+                    .is_some_and(|p| p["number"] == previous.upstream_pr),
+            "repair must update the existing upstream publication"
+        );
+    }
+    Ok(result)
+}
+
 /// Publish the approved head from its own branch, or rebuild it on the
 /// current upstream base. `Err` is the cap the step needs and lacks, found
 /// before any Git run.
+#[allow(clippy::too_many_arguments)]
 fn rebuild<C: Rest + Transport>(
     client: &C,
     config: &Config,
@@ -392,6 +518,7 @@ fn rebuild<C: Rest + Transport>(
     head: &str,
     max_writes: usize,
     git: &mut impl rewrite::Rewrite,
+    previous: Option<&handoff::Record>,
 ) -> Result<std::result::Result<Publication, usize>> {
     let owner = fresh["head"]["repo"]["owner"]["login"]
         .as_str()
@@ -422,7 +549,9 @@ fn rebuild<C: Rest + Transport>(
     )?["commit"]
         .clone();
     let (_, _, missing) = signoff_gate(config, &compare, head)?;
-    let rewriting = missing > 0 || compare["behind_by"].as_u64().context("missing behind_by")? > 0;
+    let rewriting = missing > 0
+        || compare["behind_by"].as_u64().context("missing behind_by")? > 0
+        || previous.is_some_and(|r| r.published_branch != original_branch);
     let needed = STEP_WRITES + usize::from(rewriting);
     if max_writes < needed {
         return Ok(Err(needed));
@@ -438,12 +567,13 @@ fn rebuild<C: Rest + Transport>(
             .context("invalid publication base")?
             .to_owned();
         let (published, branch) = git.prepare(config, target, fresh, &compare)?;
+        let branch = previous.map_or(branch, |r| r.published_branch.clone());
         // The branch name is the approved head's. One from an earlier base,
         // or a partial publication without a receipt, holds here, not after
         // the first write; the ref is never force-updated.
         if let Some(sha) = ref_head(client, head_repo, &branch)? {
             ensure!(
-                sha == published,
+                sha == published || previous.is_some_and(|r| sha == r.published_oid),
                 "publication branch {branch} exists at another head (an earlier upstream base?); delete it to publish again"
             );
         }
@@ -458,6 +588,7 @@ fn rebuild<C: Rest + Transport>(
         branch,
         base,
         existing: existing.into_iter().next(),
+        previous: previous.cloned().filter(|_| rewriting),
     }))
 }
 
@@ -474,25 +605,37 @@ fn read_receipt(
     let body = receipt["body"]
         .as_str()
         .context("missing promote status body")?;
-    let pending = crate::plan::fenced_json_as(body, PROMOTING_FENCE, "promotion record")?;
+    let pending = decode_pending(body)?;
     let recorded = match (handoff::decode(body)?, pending) {
         (None, None) => return Ok(Receipt::Opaque),
         (Some(record), None) => Receipt::Confirmed(record),
-        (None, Some(value)) => {
-            let record: Promoting =
-                serde_json::from_value(value).context("invalid promotion record")?;
-            handoff::canonical(body, PROMOTING_FENCE, &record)?;
-            ensure!(
-                record.schema == PROMOTING_SCHEMA && oid(&record.approved_oid),
-                "promotion record identity mismatch"
-            );
-            validate_branch(&record.published_branch)?;
-            Receipt::Pending(record)
-        }
+        (None, Some(record)) => Receipt::Pending(record),
         (Some(_), Some(_)) => anyhow::bail!("promote status comment holds two records"),
     };
     handoff::authenticate(client, config, repo, number, receipt, comments)?;
     Ok(recorded)
+}
+
+fn decode_pending(body: &str) -> Result<Option<Promoting>> {
+    let Some(value) = crate::plan::fenced_json_as(body, PROMOTING_FENCE, "promotion record")?
+    else {
+        return Ok(None);
+    };
+    let record: Promoting = serde_json::from_value(value).context("invalid promotion record")?;
+    handoff::canonical(body, PROMOTING_FENCE, &record)?;
+    ensure!(
+        record.schema == PROMOTING_SCHEMA
+            && oid(&record.approved_oid)
+            && oid(&record.published_oid),
+        "promotion record identity mismatch"
+    );
+    validate_branch(&record.published_branch)?;
+    Ok(Some(record))
+}
+
+/// Pending publication is a hold, never permission to fall back to fork CI.
+pub(super) fn pending(body: &str) -> Result<bool> {
+    Ok(decode_pending(body)?.is_some())
 }
 
 /// A branch's head in `repo`, or none when the branch does not exist.
@@ -544,6 +687,7 @@ fn publish<C: Rest + Transport>(
             approved_oid: head.clone(),
             published_oid: what.published.clone(),
             published_branch: what.branch.clone(),
+            previous: what.previous.clone(),
         })?
     );
     let pending = format!(
@@ -601,7 +745,12 @@ fn publish<C: Rest + Transport>(
                 live["commit"]["sha"] == *base,
                 "upstream base moved before publication; retry"
             );
-            git.publish(head_repo, &what.branch, &what.published)?;
+            git.publish(
+                head_repo,
+                &what.branch,
+                &what.published,
+                what.previous.as_ref().map(|r| r.published_oid.as_str()),
+            )?;
         }
         let reference = get(
             client,
@@ -610,15 +759,6 @@ fn publish<C: Rest + Transport>(
         ensure!(
             reference["object"]["sha"] == what.published,
             "publication branch moved"
-        );
-        publication_checks(client, repo, &fresh, &what.published)?;
-        let reference = get(
-            client,
-            &format!("repos/{head_repo}/git/ref/heads/{}", encode(&what.branch)),
-        )?;
-        ensure!(
-            reference["object"]["sha"] == what.published,
-            "publication branch moved while reading checks"
         );
         let text = json!({"title":publication["title"], "body":publication["body"]});
         let published = if let Some(pr) = &what.existing {
@@ -706,7 +846,7 @@ fn publish<C: Rest + Transport>(
     )?;
     if what.published != head {
         body.push_str(&format!(
-            "\n\nOperator approval of {head} carried over to publication head {} after a clean replay and passing fork required checks; no new review was requested.",
+            "\n\nOperator approval of {head} carried over to publication head {} after a clean replay; no new review was requested. The upstream PR's CI checks the publication head; fork CI does not gate promotion.",
             what.published
         ));
     }
@@ -717,135 +857,6 @@ fn publish<C: Rest + Transport>(
         json!({"body":body}),
     )?;
     Ok(format!("promoted {repo}#{number} -> {url} head={head}"))
-}
-
-const PUBLICATION_CHECKS: &str = "query($owner:String!,$name:String!,$head:String!,$after:String){repository(owner:$owner,name:$name){object(expression:$head){... on Commit{oid statusCheckRollup{contexts(first:100,after:$after){totalCount nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl checkSuite{app{databaseId} workflowRun{event workflow{databaseId}}}} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}";
-
-/// Read checks at the exact publication oid, not the approved oid or the
-/// upstream default. The fork PR's base defines the required contexts even
-/// when the publication ref lives in the bot's fork. Missing results hold;
-/// retries resume the authenticated pending receipt without replaying again.
-fn publication_checks(
-    client: &(impl Rest + Transport),
-    repo: &str,
-    pull: &Value,
-    head: &str,
-) -> Result<()> {
-    let base = pull["base"]["ref"].as_str().context("missing fork base")?;
-    validate_branch(base)?;
-    let rules = pages(
-        client,
-        &format!("repos/{repo}/rules/branches/{}", encode(base)),
-    )?;
-    for rule in &rules {
-        ensure!(rule["type"].is_string(), "missing fork rule type");
-        if rule["type"] == "required_status_checks" {
-            ensure!(
-                rule["parameters"]["required_status_checks"].is_array(),
-                "unreadable fork required status checks"
-            );
-        }
-    }
-    let branch = get(client, &format!("repos/{repo}/branches/{}", encode(base)))?;
-    let required = crate::poll::required_checks(&json!(rules), &branch)?;
-    for check in &required {
-        ensure!(
-            check["context"].as_str().is_some_and(|s| !s.is_empty())
-                && check
-                    .get("integration_id")
-                    .is_none_or(|id| id.is_null() || id.is_u64()),
-            "unreadable fork required check"
-        );
-    }
-    let head_repo = pull["head"]["repo"]["full_name"]
-        .as_str()
-        .context("missing publication repository")?;
-    validate_repository(head_repo)?;
-    let (owner, name) = head_repo
-        .split_once('/')
-        .context("invalid head repository")?;
-    let mut after = None;
-    let mut cursors = BTreeSet::new();
-    let mut rows = Vec::new();
-    let mut total = None;
-    for _ in 0..MAX_PAGES {
-        let response = client
-            .graphql(
-                PUBLICATION_CHECKS,
-                json!({"owner":owner,"name":name,"head":head,"after":after}),
-            )
-            .context("read publication checks")?;
-        let commit = &response["repository"]["object"];
-        hold!(
-            commit["oid"] == head,
-            "publication commit checks not yet available"
-        );
-        let rollup = &commit["statusCheckRollup"];
-        // A null rollup is GitHub's explicit 'no checks yet', not evidence of
-        // success. In particular it must not vacuously pass an unprotected base.
-        hold!(!rollup.is_null(), "publication checks have not reported");
-        let contexts = &rollup["contexts"];
-        let count = contexts["totalCount"]
-            .as_u64()
-            .context("missing publication check count")?;
-        ensure!(
-            total.is_none_or(|n| n == count),
-            "publication checks changed during pagination"
-        );
-        total = Some(count);
-        let page = contexts["nodes"]
-            .as_array()
-            .context("missing publication checks")?;
-        ensure!(page.len() <= PAGE_SIZE, "oversized publication checks page");
-        for row in page {
-            match row["__typename"].as_str() {
-                Some("CheckRun") => ensure!(
-                    row["name"].as_str().is_some_and(|s| !s.is_empty())
-                        && row["databaseId"].is_u64()
-                        && row["checkSuite"]["app"]["databaseId"].is_u64()
-                        && row["status"].is_string()
-                        && (row["status"] != "COMPLETED" || row["conclusion"].is_string()),
-                    "unreadable publication check run"
-                ),
-                Some("StatusContext") => ensure!(
-                    row["context"].as_str().is_some_and(|s| !s.is_empty())
-                        && row["state"].is_string(),
-                    "unreadable publication status"
-                ),
-                _ => anyhow::bail!("unknown publication check kind"),
-            }
-        }
-        rows.extend(page.iter().cloned());
-        let more = contexts["pageInfo"]["hasNextPage"]
-            .as_bool()
-            .context("missing publication checks pagination")?;
-        if !more {
-            ensure!(rows.len() as u64 == count, "incomplete publication checks");
-            let evidence = json!({"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":rows}}}}]}});
-            let checks = crate::poll::classify_checks(&evidence, &required);
-            hold!(
-                checks.failed.is_empty(),
-                "publication required checks failed: {:?}",
-                checks.failed
-            );
-            hold!(
-                checks.pending.is_empty(),
-                "publication required checks pending: {}",
-                checks.pending.join(", ")
-            );
-            return Ok(());
-        }
-        let cursor = contexts["pageInfo"]["endCursor"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .context("missing publication checks cursor")?;
-        ensure!(
-            !page.is_empty() && cursors.insert(cursor.to_owned()),
-            "publication checks pagination did not advance"
-        );
-        after = Some(cursor.to_owned());
-    }
-    anyhow::bail!("publication checks exceed {MAX_PAGES} pages")
 }
 
 fn validate(

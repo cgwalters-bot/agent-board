@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 
 pub(super) const SCHEMA: &str = "agent-board/promoted/v1";
 pub(super) const FENCE: &str = "agent-board-promoted";
-pub(super) const STATUS: &str = "<!-- agent-board-promote-status -->";
+pub(crate) const STATUS: &str = "<!-- agent-board-promote-status -->";
 
 /// A confirmed publication: what the pass hands off, and what a publication
 /// retry skips or updates without rebuilding the published head.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Record {
     pub(super) schema: String,
@@ -258,7 +258,6 @@ fn enrich_pull(
     }
     // GitHub represents an absent description as null. It is no
     // source linkage, not a failure to read the board.
-    let body = pull["body"].as_str().unwrap_or_default();
     if let Ok(issue) = source(repo, &pull) {
         affected.insert(crate::pass::key(&crate::parse_github_item(
             &format!("{repo}#{issue}"),
@@ -291,7 +290,7 @@ fn enrich_pull(
     // not erase the original issue's handoff from the pass.
     let record = receipts
         .first()
-        .map(|receipt| read_record(client, config, repo, n, receipt, comments.len()))
+        .map(|receipt| read_record(client, &config.bot, repo, n, receipt, comments.len()))
         .transpose()?;
     if let Some(record) = &record {
         let at = crate::parse_github_item(
@@ -308,18 +307,9 @@ fn enrich_pull(
     }
     let issue = source(repo, &pull)?;
     if let Some(record) = &record {
+        verify_record(repo, target, &pull, record)?;
         ensure!(
-            record.schema == SCHEMA
-                && record.fork_repository == *repo
-                && record.fork_pr == n
-                && record.source_repository == *repo
-                && record.source_issue == issue
-                && record.completes_source == crate::stack::closes(body, repo, issue)
-                && record.upstream_repository == target.upstream
-                && record.upstream_pr > 0
-                && oid(&record.approved_oid)
-                && oid(&record.published_oid)
-                && pull["head"]["sha"] == record.approved_oid,
+            pull["head"]["sha"] == record.approved_oid || pull["state"] == "open",
             "handoff identity mismatch"
         );
     }
@@ -348,6 +338,81 @@ fn enrich_pull(
             }),
         )));
     };
+    // A repair does not inherit the old head's approval or completion credit.
+    // Keep the source active until the repaired head is published again.
+    if pull["head"]["sha"] != record.approved_oid {
+        return Ok(Some((
+            at,
+            Promotion::Open(ClosingPull {
+                number: n,
+                repository: repo.into(),
+                author: Some(config.bot.clone()),
+                updated: None,
+            }),
+        )));
+    }
+    let upstream = verify_upstream(client, &config.bot, repo, target, &pull, &record)?;
+    let partial_merge =
+        !record.completes_source && upstream["state"] == "closed" && upstream["merged"] == true;
+    match (upstream["state"].as_str(), upstream["merged"].as_bool()) {
+        (Some("open"), Some(false)) if upstream.get("merged_at") == Some(&Value::Null) => {
+            // Verified publication remains active even after staleness or
+            // fork closure. None is deliberately not a stale timestamp.
+            Ok(Some((
+                at,
+                Promotion::Open(ClosingPull {
+                    number: record.upstream_pr,
+                    repository: target.upstream.clone(),
+                    author: Some(config.bot.clone()),
+                    updated: None,
+                }),
+            )))
+        }
+        (Some("closed"), Some(true)) if upstream["merged_at"].as_str().is_some() => {
+            super::at(&upstream["merged_at"])?;
+            Ok((!partial_merge).then_some((at, Promotion::Merged)))
+        }
+        _ => anyhow::bail!("upstream handoff is closed-unmerged or incomplete"),
+    }
+}
+
+pub(super) fn verify_record(
+    repo: &str,
+    target: &crate::pass::promote::Fork,
+    pull: &Value,
+    record: &Record,
+) -> Result<()> {
+    let issue = source(repo, pull)?;
+    ensure!(
+        record.schema == SCHEMA
+            && record.fork_repository == repo
+            && pull["number"] == record.fork_pr
+            && record.source_repository == repo
+            && record.source_issue == issue
+            && record.completes_source
+                == crate::stack::closes(
+                    pull["body"].as_str().context("missing fork body")?,
+                    repo,
+                    issue
+                )
+            && record.upstream_repository == target.upstream
+            && record.upstream_pr > 0
+            && oid(&record.approved_oid)
+            && oid(&record.published_oid),
+        "handoff identity mismatch"
+    );
+    repository(&pull["base"]["repo"], repo)
+}
+
+pub(super) fn verify_upstream(
+    client: &impl Rest,
+    bot: &str,
+    repo: &str,
+    target: &crate::pass::promote::Fork,
+    pull: &Value,
+    record: &Record,
+) -> Result<Value> {
+    let issue = source(repo, pull)?;
     let head_repo = pull["head"]["repo"]["full_name"]
         .as_str()
         .context("missing handoff head repository")?;
@@ -382,7 +447,7 @@ fn enrich_pull(
             && upstream["base"]["ref"] == target.base
             && upstream["user"]["login"]
                 .as_str()
-                .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
+                .is_some_and(|s| s.eq_ignore_ascii_case(bot))
             && (linked.is_empty() || linked == [issue]),
         "live upstream handoff identity mismatch"
     );
@@ -391,28 +456,71 @@ fn enrich_pull(
             || crate::stack::closes(upstream_body, repo, issue) == record.completes_source,
         "upstream handoff linkage kind mismatch"
     );
-    let partial_merge =
-        !record.completes_source && upstream["state"] == "closed" && upstream["merged"] == true;
-    match (upstream["state"].as_str(), upstream["merged"].as_bool()) {
-        (Some("open"), Some(false)) if upstream.get("merged_at") == Some(&Value::Null) => {
-            // Verified publication remains active even after staleness or
-            // fork closure. None is deliberately not a stale timestamp.
-            Ok(Some((
-                at,
-                Promotion::Open(ClosingPull {
-                    number: record.upstream_pr,
-                    repository: target.upstream.clone(),
-                    author: Some(config.bot.clone()),
-                    updated: None,
-                }),
-            )))
-        }
-        (Some("closed"), Some(true)) if upstream["merged_at"].as_str().is_some() => {
-            super::at(&upstream["merged_at"])?;
-            Ok((!partial_merge).then_some((at, Promotion::Merged)))
-        }
-        _ => anyhow::bail!("upstream handoff is closed-unmerged or incomplete"),
+    Ok(upstream)
+}
+
+/// A fork's authenticated publication, for routing upstream CI back to its
+/// original PR. Prose and visitor comments cannot select a repair target.
+pub(crate) enum Publication {
+    Current(Value),
+    AwaitingApproval,
+}
+
+pub(crate) fn published(
+    client: &(impl Rest + Transport),
+    bot: &str,
+    repo: &str,
+    target: &crate::pass::promote::Fork,
+    pull: &Value,
+    comments: &[Value],
+) -> Result<Option<Publication>> {
+    let receipts: Vec<_> = comments
+        .iter()
+        .filter(|c| {
+            c["user"]["login"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(bot))
+                && c["body"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(FENCE) || s.contains(STATUS))
+        })
+        .collect();
+    ensure!(receipts.len() <= 1, "duplicate handoff records");
+    let Some(receipt) = receipts.first() else {
+        return Ok(None);
+    };
+    ensure!(
+        pull["user"]["login"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(bot)),
+        "handoff fork author mismatch"
+    );
+    let n = pull["number"].as_u64().context("missing fork number")?;
+    let body = receipt["body"]
+        .as_str()
+        .context("missing publication receipt body")?;
+    if super::publish::pending(body)? {
+        ensure!(
+            decode(body)?.is_none(),
+            "promote status comment holds two records"
+        );
+        authenticate_bot(client, bot, repo, n, receipt, comments.len())?;
+        return Ok(Some(Publication::AwaitingApproval));
     }
+    let record = read_record(client, bot, repo, n, receipt, comments.len())?;
+    verify_record(repo, target, pull, &record)?;
+    let metadata = get(client, &format!("repos/{repo}"))?;
+    repository(&metadata, repo)?;
+    ensure!(
+        observed_network(&metadata, &target.upstream)?,
+        "handoff fork-network mismatch"
+    );
+    if pull["head"]["sha"] != record.approved_oid {
+        return Ok(Some(Publication::AwaitingApproval));
+    }
+    Ok(Some(Publication::Current(verify_upstream(
+        client, bot, repo, target, pull, &record,
+    )?)))
 }
 
 fn at_time(value: &Value, field: &str) -> Result<OffsetDateTime> {
@@ -421,13 +529,13 @@ fn at_time(value: &Value, field: &str) -> Result<OffsetDateTime> {
 
 fn read_record(
     client: &impl Transport,
-    config: &Config,
+    bot: &str,
     repo: &str,
     n: u64,
     receipt: &Value,
     comments: usize,
 ) -> Result<Record> {
-    authenticate(client, config, repo, n, receipt, comments)?;
+    authenticate_bot(client, bot, repo, n, receipt, comments)?;
     let body = receipt["body"].as_str().context("missing handoff body")?;
     decode(body)?.context("no machine handoff record (readable receipt is not authority)")
 }
@@ -438,6 +546,17 @@ fn read_record(
 pub(super) fn authenticate(
     client: &impl Transport,
     config: &Config,
+    repo: &str,
+    n: u64,
+    receipt: &Value,
+    comments: usize,
+) -> Result<()> {
+    authenticate_bot(client, &config.bot, repo, n, receipt, comments)
+}
+
+fn authenticate_bot(
+    client: &impl Transport,
+    bot: &str,
     repo: &str,
     n: u64,
     receipt: &Value,
@@ -464,13 +583,13 @@ pub(super) fn authenticate(
             && observed
                 .author
                 .as_deref()
-                .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
+                .is_some_and(|s| s.eq_ignore_ascii_case(bot))
             && receipt["user"]["login"].as_str() == observed.author.as_deref()
             && if observed.edited {
                 observed
                     .editor
                     .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
+                    .is_some_and(|s| s.eq_ignore_ascii_case(bot))
             } else {
                 observed.editor.is_none()
             },
