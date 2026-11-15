@@ -532,7 +532,7 @@ work, without weakening the current-head authorization boundary.
   onto the observed upstream base and adds the trailer wherever missing,
   regardless of detected DCO checks. It creates a deterministic
   `bot/promote/APPROVED_OID` branch in the same head repository,
-  never overwriting an existing ref. The approved fork branch remains untouched;
+   initially creating rather than overwriting a ref. The approved fork branch remains untouched;
   approval and human-text provenance stay bound to that original head. The
   branch name has only the approved head, so a rebuild after upstream advanced
   would be a different head on the same name: a retry reads the fork PR's
@@ -543,17 +543,28 @@ work, without weakening the current-head authorization boundary.
   rewriting holds for manual migration, rather than creating a duplicate PR.
   The upstream base and approved head are checked again before pushing the new
   branch.
-  Before any upstream PR write, read the fork PR base's required checks from
-  rules and classic protection, and the exact publication oid's check rollup
-  from its head repository. App-bound requirements cannot be satisfied by
-  another app or a plain status. Paginate the full rollup; missing, pending or
-  failed required checks hold publication, and malformed or incomplete evidence
-  is an error. A null rollup holds even on an unprotected base. A retained
-  pending receipt lets later invocations wait for checks without replaying the
-  approved head again. Success records approval carryover from the approved oid
-  to the checked publication oid; the original approval is still revalidated
-  on each retry. This gate does not itself arrange CI for a new publication ref;
-  a fork whose workflows do not check that ref remains held.
+  Fork CI never gates publication: disabled fork workflows and publication
+  branches without CI triggers must not prevent opening the upstream PR.
+  Publish the rebased head first; the upstream PR's own CI is the check.
+  Success records approval carryover after clean replay, not a claim that CI
+  passed. The original approval is still revalidated on every publication retry.
+  With publication enabled, the pass authenticates the handoff and verifies
+  both live PR identities before reading the upstream PR's complete checks and
+  base requirements within the existing poll request budget. Red upstream CI
+  feeds the original fork PR's bounded fix rounds, even when its approved head
+  and branch differ from the publication head and branch. Fixes target the
+  fork PR, never write upstream, and retain its existing holds and round ledger.
+  Upstream check reruns are not attempted through the fork's retry machinery.
+   Missing or pending upstream CI does not start a repair or certify success.
+   A repaired fork head supersedes its old receipt: polling waits for renewed
+   current-head approval and publication, without reusing the old upstream CI.
+   Publication authenticates the prior receipt and live PR identity and retains
+   the same upstream PR. A separate `bot/promote/OID` branch may then be replaced
+   only under an exact lease on its recorded old head; the approved fork ref is
+   never force-updated. Pending repair receipts preserve that prior identity so
+   an interrupted update resumes the same publication, not a second PR. The
+   fork's round ledger is not reset. If promotion target discovery fails, those
+   forks hold while ordinary followed repositories continue polling.
   Draft creation is deliberate:
   GitHub's branch-based POST can race a push, so it must not mark an unapproved
   head ready. Verify the branch immediately before publication and verify the
@@ -636,9 +647,8 @@ The answers to the brief's open questions:
    is not stacked.
 5. **Drafts.** A draft fork pull request is never promoted, unless
    `promote.onApproval` is set; it is then published as an upstream draft.
-6. **Behind upstream.** Refused, with one notice, even where it would merge
-   cleanly: the command-bound head would go upstream untested against the new
-   base, and rebasing needs `git`.
+6. **Behind upstream.** Publication cleanly replays onto the observed upstream
+   base using Git; conflicts hold. The upstream PR checks the replayed head.
 7. **A head in the bot's fork.** Whether an upstream takes a pull request
    whose head is in the bot's fork is verified with one recorded call in a
    staging organisation, not assumed. If it does not, the branch is pushed

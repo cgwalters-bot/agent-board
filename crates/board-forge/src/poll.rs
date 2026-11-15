@@ -32,6 +32,7 @@ pub mod lock;
 pub mod notify;
 mod operator_keys;
 pub mod pace;
+mod publication;
 mod recovery;
 pub mod report;
 mod reviews;
@@ -664,6 +665,11 @@ pub struct PollPolicy {
     /// Pass-only: the topic-admitted midstream forks stage 2 read, whose
     /// fix briefs get [`crate::promote::midstream_brief`]. Empty by default.
     pub midstreams: Vec<String>,
+    /// Pass-only promotion targets: authenticated publication CI feeds the
+    /// original fork PR's existing bounded fix rounds. Empty by default.
+    pub publication_forks: BTreeMap<String, crate::pass::promote::Fork>,
+    /// Pass-only fail-closed scope when publication discovery is unavailable.
+    pub unavailable_publication_forks: Vec<String>,
     /// The pass's `pr.operatorPaths` (agent-board#683): paths, or with a
     /// trailing `/` directories, or a JSON file's values other than its
     /// `FILE#/json/pointer` exemptions, a pull request changing any of which merges
@@ -1314,6 +1320,8 @@ impl PollPolicy {
         .context("mergeQueue fixedFlakes")?;
         check_flake_fixes(&fixed_flakes)?;
         let mut policy = Self {
+            publication_forks: BTreeMap::new(),
+            unavailable_publication_forks: vec![],
             open_pr_cap: None,
             queue_only_repository: None,
             maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
@@ -4896,7 +4904,7 @@ pub(crate) fn midstream_task(policy: &PollPolicy, repo: &str, task: String) -> S
     }
 }
 
-/// Whether `pull`'s base repository is in `pr.noMerge`.
+/// Whether merging into `pull`'s base repository is disabled.
 fn no_merge(config: &Config, pull: &Value) -> bool {
     let repository = text(pull, "/baseRepository/nameWithOwner");
     config
@@ -4904,6 +4912,14 @@ fn no_merge(config: &Config, pull: &Value) -> bool {
         .no_merge
         .iter()
         .any(|r| r.eq_ignore_ascii_case(repository))
+        // Publication approval authorizes upstream repair, not a fork merge.
+        // This includes legacy promote.forks targets absent from pr.noMerge:
+        // substituted upstream checks may describe a different rebased head.
+        || config
+            .policy
+            .publication_forks
+            .keys()
+            .any(|r| r.eq_ignore_ascii_case(repository))
 }
 
 fn queue_only(policy: &PollPolicy, repository: &str) -> bool {
@@ -8215,10 +8231,18 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         {
             return Ok(result);
         }
-        if drafts::eligible(self.config, repo, &pull) {
+        let publication_checks = if !merge_only && !labelled(&pull) {
+            self.publication_checks(repo, number, &pull, &comments)?
+        } else {
+            None
+        };
+        if publication_checks.is_none() && drafts::eligible(self.config, repo, &pull) {
             return self.draft_review(repo, &mut pull, &comments, &marker, intake);
         }
-        if intake && let Some(result) = self.ordinary_review(repo, &pull, &comments, &marker)? {
+        if publication_checks.is_none()
+            && intake
+            && let Some(result) = self.ordinary_review(repo, &pull, &comments, &marker)?
+        {
             return Ok(result);
         }
         if !(text(&pull, "/author/login") == self.config.bot
@@ -8262,7 +8286,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let (base_required, queued) = &required[&base];
         // Without a merge queue the poll's own merge is the last gate, so
         // every check on the head holds it, required or not (#163).
-        let mut checks = if *queued {
+        let promoted = publication_checks.is_some();
+        let mut checks = if let Some(checks) = publication_checks {
+            checks
+        } else if *queued {
             classify_checks(&pull, base_required)
         } else {
             classify_all_checks(&pull, base_required)
@@ -8506,6 +8533,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // Retry CI before charging a fix round or stopping, but never replace
         // a stack operation, an operator answer, or an in-flight round.
         let retry_scope = (self.config.policy.reruns || self.config.policy.check_reruns)
+            && !promoted
             && !missing_data
             && !recovery::pending(&marker)
             && !merge_only
@@ -10020,6 +10048,7 @@ mod tests {
     include!("poll/dependencies_tests.rs");
     include!("poll/report_tests.rs");
     include!("poll/recovery_tests.rs");
+    include!("poll/publication_tests.rs");
 
     /// A marker as a pass with the default attribution posts it.
     pub(super) fn marker_body(state: &Value, text: &str) -> String {

@@ -5499,6 +5499,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
         let mut poll = config.poll(fresh.as_ref());
+        if config.promote.as_ref().is_some_and(|p| p.publish) {
+            match crate::promote::targets(&self.client, config) {
+                Ok(targets) => poll.policy.publication_forks = targets,
+                Err(error) => {
+                    self.report.error("publication CI targets", &error);
+                    // Discovery fails closed for midstreams, not for ordinary
+                    // followed repositories. No fork CI fallback may dispatch
+                    // a repair while the upstream publication is unknown.
+                    poll.policy.unavailable_publication_forks = midstreams.clone();
+                    if let Some(settings) = &config.promote {
+                        poll.policy
+                            .unavailable_publication_forks
+                            .extend(settings.forks.keys().cloned());
+                    }
+                }
+            }
+        }
         poll.policy.notification_intake = routes.as_ref().map(|r| r.staging.clone());
         poll.policy.midstreams = midstreams.clone();
         poll.policy.no_merge.extend(midstreams);

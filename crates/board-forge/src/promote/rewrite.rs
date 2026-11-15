@@ -1,5 +1,6 @@
 //! Isolated Git replay. Never check out or execute a candidate's code, hooks or
-//! configuration, and never update its approved ref. Only create a new ref.
+//! configuration, and never update its approved ref. An authenticated prior
+//! publication may replace its separate bot branch under an exact lease.
 use super::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
@@ -63,7 +64,13 @@ pub(super) trait Rewrite {
         pull: &Value,
         compare: &Value,
     ) -> Result<(String, String)>;
-    fn publish(&mut self, repo: &str, branch: &str, head: &str) -> Result<()>;
+    fn publish(
+        &mut self,
+        repo: &str,
+        branch: &str,
+        head: &str,
+        previous: Option<&str>,
+    ) -> Result<()>;
 }
 
 #[derive(Default)]
@@ -212,23 +219,31 @@ impl Rewrite for Git {
         self.replay(config, pull, compare)
     }
 
-    fn publish(&mut self, repo: &str, branch: &str, head: &str) -> Result<()> {
-        // Empty expected value is create-only. A retry accepts an existing ref
-        // only at this exact deterministic head; never force-update any ref.
+    fn publish(
+        &mut self,
+        repo: &str,
+        branch: &str,
+        head: &str,
+        previous: Option<&str>,
+    ) -> Result<()> {
+        // Initial publication is create-only. A repair's authenticated receipt
+        // supplies the exact previous head of its separate publication branch.
         let url = format!("https://github.com/{repo}.git");
         let reference = format!("refs/heads/{branch}");
         let existing = self.run(&["ls-remote", &url, &reference], &[])?;
         if !existing.is_empty() {
+            if existing == format!("{head}\t{reference}") {
+                return Ok(());
+            }
             ensure!(
-                existing == format!("{head}\t{reference}"),
+                previous.is_some_and(|old| existing == format!("{old}\t{reference}")),
                 "promotion branch already exists at another head"
             );
-            return Ok(());
         }
         self.run(
             &[
                 "push",
-                &format!("--force-with-lease={reference}:"),
+                &format!("--force-with-lease={reference}:{}", previous.unwrap_or("")),
                 &url,
                 &format!("{head}:{reference}"),
             ],
