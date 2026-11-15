@@ -114,22 +114,27 @@ bound is fixed, and every request has the client's 30-second timeout.
 
 ### Caller settings
 
-For `cgwalters-forge/tracker`, add this optional key to
-`.github/release-train/config.json` and extend its config test to assert the
-fork. It is supported only for the `cgwalters-forge/agentic-job` release, with
-the fixed actions repository and image path:
+`cgwalters-forge/tracker` sets this optional key in
+`.github/release-train/config.json`, asserted by its config test
+([tracker#1554](https://github.com/cgwalters-forge/tracker/pull/1554)). It is
+supported only for the `cgwalters-forge/agentic-job` release, with the fixed
+actions repository and image path:
 
 ```json
 {"secureHost": {"fork": "cgwalters-bot/actions-1"}}
 ```
 
-Keep `.github/workflows/cgwalters-agentic-job.yml` in `wrappers.files`: the
+With `secureHost` set, keep `.github/workflows/cgwalters-agent.yml` in
+`wrappers.files`: the agent job, and so its secure-host step, moved there from
+`cgwalters-agentic-job.yml`. It has no release pin, so without `secureHost` the
+wrappers step would stall on it. Each listed file must change through one of the two edits. The
 train changes its `uses: ./.agentic-job-source/secure-host` (or an older remote
 `cgwalters-forge/agentic-job/secure-host@…` reference) to
 `uses: cgwalters-forge/actions/secure-host@<image PR merge commit>` in
-`cgwalters-forge/actions`. Keep `.github/workflows/secure-host.yml` (its wrapper
-smoke job) and `lint/tests/review_wrapper.rs` in `wrappers.files` too. The
-policy-source checkout and local prepare/run references are not changed.
+`cgwalters-forge/actions`, keeping any comment after it. Keep
+`.github/workflows/cgwalters-agentic-job.yml`, `.github/workflows/secure-host.yml`
+(its wrapper smoke job) and `lint/tests/review_wrapper.rs` in `wrappers.files`
+too. The policy-source checkout and local prepare/run references are not changed.
 Update actions' wrapper tests to permit this separate secure-host commit while
 continuing to require all other agentic-job pins to match the release commit.
 Provision the verification tools in tracker's release-train workflow if absent.
