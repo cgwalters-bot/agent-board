@@ -4000,6 +4000,8 @@ mod tests {
                 planned: 0,
                 folds: Vec::new(),
                 report_pulls: BTreeMap::new(),
+                quiet: BTreeMap::new(),
+                quiet_replayed: 0,
             };
             let mut outcome = Outcome::default();
             let next = pass

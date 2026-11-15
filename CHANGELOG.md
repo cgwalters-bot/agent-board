@@ -11,6 +11,15 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The pass's `reserveScheduling` keeps its stage shares under `requestShare`
+  instead of being disabled by it, and stage 4 says once when the stages
+  before it left less than a start takes. The new GitHub-only
+  `pr.quietWaits` (on unless set to `false`) decides a bot pull request
+  unchanged in its listing since a read that left it waiting on the operator
+  alone, a clean midstream draft waiting for promotion or a withheld
+  approval, without reading it again, for at most four hours
+  (agent-board#1022, #1019).
+
 - A plan, epic plan, triage verdict or other fenced record whose JSON strings hold raw line
   breaks or other control characters now reads as if they were escaped,
   rather than holding as "not valid JSON" (agent-board#1023).

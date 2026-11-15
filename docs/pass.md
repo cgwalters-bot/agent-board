@@ -81,6 +81,44 @@ grant more fix rounds. Explicit stage-4 `fixPlans` retain their existing policy.
 Stacked multi-issue runs remain deferred until the stacked-output dependencies
 in #750 and agentic-job#3438 are usable. This option does not synthesize stacks.
 
+## Quiet pull request waits (GitHub)
+
+The concrete failure `pr.quietWaits` stops is the PR walk spending the
+pass's requests reading, pass after pass, pull requests that nothing has
+changed and only a person can move. On 2026-11-15 about 110 clean midstream
+drafts (`wait: a midstream draft, waiting for promotion`) were read whole each
+pass, and the walk left scheduling 4 requests (agent-board#1022). The option
+is GitHub-only and on unless set to `false` (agent-board#1019).
+
+With it, a whole read of a bot pull request that waits on the operator alone,
+a promotion wait or a head whose approval the review withheld, at the head its
+repository's listing (or `pr.actionFirst`'s) shows, is kept in the poll state
+under `quiet_waits`. While the listing still shows that head and `updated_at`,
+the next passes decide it from the listing alone, with the same line, wait and
+step, and no request or share of their own. Anything else is read whole as
+before, other waits on a person included: they depend on other pull requests
+(one brought up to date or to land first), the configuration or a read that
+failed, none of which moves the listing. A push, comment, review or label
+moves `updated_at`. What the listing does not show waits at most four hours,
+when each entry is read whole again: a base that moved under a draft so that
+it conflicts, or checks rerun red at its head, start their rebase or fix round
+up to four hours later than the next pass, and a review job rerun past a
+withheld approval is seen as late. That is the cost of the option.
+The walk says how many it decided so (`pull requests: quietWaits decided N
+unchanged pull request(s) waiting on the operator from their listings`).
+
+The state keeps at most 1,000 entries, validated on load; they hold no text,
+only the head, times and which of the two waits. A pass with the option set
+to `false`, or with another configuration or token (the response cache's scope), drops
+them. The state file is already trusted (see
+[persisting conditional responses](#persisting-conditional-responses)); a
+forged entry could only repeat one of these waits, which takes no step. Only
+an applying pass writes the state, so a preview decides from what the last
+applying pass kept. A binary older than this one refuses a state file with
+`quiet_waits`; set `pr.quietWaits: false` to stop writing them, or delete the
+file to roll back. Without a `state` setting nothing is kept between passes,
+so the option decides nothing.
+
 ## Local GitHub credentials
 
 `pass --config FILE` uses the first nonempty token from `GH_TOKEN`, then
@@ -465,7 +503,8 @@ The approved turn does not need the caller to relax scheduling reserves.
 For more capacity for the remaining ordinary walk, in `cgwalters-forge/tracker`, file
 `.github/pass.json`, set `pr.actionFirst` to `true`, `reserveScheduling` to
 `false` and remove the obsolete `scan` object. With `requestShare` enabled,
-stages share the derived budget without fixed stage shares.
+stages share the derived budget without the default stage shares;
+`reserveScheduling` keeps its shares of it.
 No deployed config is changed here.
 
 The hosted client gives the PR walk the pass's remaining read share, after the approved
@@ -2798,8 +2837,15 @@ It uses the same discovery-share mechanism: maintain and PR discovery leave
 for scheduling and the later Status/holds stages. Unused requests remain
 available to later stages; neither the total limit nor mutation authority
 changes. The existing finish exceptions above still apply, so this is not a
-hard partition for writes or a guarantee of starts. With `requestShare`, fixed
-stage shares are disabled. A deferred
+hard partition for writes or a guarantee of starts. With `requestShare`, the
+default stage shares are disabled, but these keep their fractions of the
+limit it sets, and never less than a start's reserve and the writes' where
+the limit holds that much: when they were disabled too, the PR walk spent 568
+of a 765-request pass and left scheduling 4, with pools under pace and every
+live epic deferred (agent-board#1022). Where the stages before it leave
+scheduling less than a start takes, stage 4 says so once (`budget: the pull
+request walk used N of M requests, maintain P and epics E; scheduling got K,
+less than a start takes (S)`). A deferred
 maintain read keeps its cached state for the next pass, not a successful
 empty digest.
 Before posting a digest's plan, maintain also requires that the pass has
@@ -2948,7 +2994,8 @@ the fixed 650, and the pass says so first (`budget: requestShare keeps the
 pass to 1203 requests, 25% of the 4812 the token has left until
 2026-11-11T13:00:00Z (core; core 4812, graphql 4990); GraphQL share is an
 estimate, not a retained-headroom guarantee`). With it, stages share the
-remaining budget without fixed stage shares. A start's reserve, the writes'
+remaining budget without the default stage shares; `reserveScheduling`'s
+shares are of this limit. A start's reserve, the writes'
 reserve and 304 refunds remain counts. The 15-minute time bound is unchanged,
 and the optional `--max-*` flags remain overrides. A pass may be larger
 than 650. The combined request ceiling is strict, including the cost stage's
@@ -5610,6 +5657,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md). Stage 4 likewise starts no plan whose item is outside our own space: its candidate waits on the operator (`needs-operator`, `hold OWNER/REPO#N: its plan's OWNER/REPO#N is outside our own space …`) and draws no revisit. The bot's own pull requests are exempt: on them stage 2 takes its rounds, rebases and edits of them, and stage 4 starts `fixPlans`' fix runs, writing only on that pull request; a merge or stop there stays held; `false` |
 | `pr.operatorReviewFixes` | With `notifications`, route nonempty operator changes-requested reviews on the bot's PR to existing bounded fix rounds instead of intake triage; mixed batches and other intents stay in triage. See [operator intake](poll.md); `false` |
 | `pr.foldRounds` | Minimize as outdated the bot's routine marker each new round, refund, check rerun or review start supersedes, at the end of the pass, so a pull request shows its current round with the earlier ones folded; stops are never folded; at most 20 a pass, one `--max-writes` step; see [the poll](poll.md); `false` |
+| `pr.quietWaits` | Decide a bot pull request unchanged in its listing (head, `updated_at`) since a whole read that left it waiting on the operator alone (a promotion or withheld-approval wait) from that listing, without reading it again, for at most four hours; GitHub only; see [quiet pull request waits](#quiet-pull-request-waits-github); `true` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |
 | `pr.directionFirst` | Run the intake's search (a standalone poll's `operatorComments` and `notifications`) before the followed repositories' reads, so that they cannot spend stage 2's share first, at the walk's expense, see [the intake](#github-operator-direction-intake); `false` |

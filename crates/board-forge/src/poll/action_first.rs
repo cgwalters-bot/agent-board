@@ -135,7 +135,7 @@ pub(crate) const SCREEN: &str = r#"query($owner: String!, $name: String!) {
       nodes { number isDraft reviewDecision mergeable author { login }
         autoMergeRequest { enabledAt } mergeQueueEntry { id }
         reviews(last: 10) { nodes { state commit { oid } } }
-        headRefOid labels(first: 100) { nodes { name } } }
+        headRefOid updatedAt labels(first: 100) { nodes { name } } }
       pageInfo { hasNextPage }
     }
   }
@@ -185,8 +185,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     p["number"].as_u64().is_some(),
                     "actionFirst listing has no PR number"
                 );
+                // As the REST listing has them, `updated_at` for `quietWaits`.
                 Ok(json!({"number": p["number"], "user": p["author"],
-                "head": {"sha": p["headRefOid"]}, "labels": p["labels"]["nodes"],
+                "head": {"sha": p["headRefOid"]}, "updated_at": p["updatedAt"],
+                "labels": p["labels"]["nodes"],
                 "ready": ready(p) && !self.config.policy.no_merge.iter().any(|r| r.eq_ignore_ascii_case(repo))}))
             })
             .collect()
