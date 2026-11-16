@@ -380,11 +380,13 @@ work, without weakening the current-head authorization boundary.
   `Part of https://github.com/FORK/issues/N` (`Fixes` for a slice that
   completes it), which upstream readers could not follow. Publication removes
   exactly that line: the whole line, less surrounding whitespace, is `Part of`
-  or `Fixes`, one space and the fork issue's full URL, and it names the issue
-  the source tie above found. One blank line is left where its paragraph was
-  and the result is trimmed; nothing else changes. Two such lines, or one
-  naming another issue, hold; a punctuated, quoted or listed one is prose and
-  holds as a midstream reference. The fork PR keeps the line, so stacking,
+  or `Fixes`, one space and the fork issue's full URL, at most with a
+  sentence's period, and it names the issue the source tie above found. One
+  blank line is left where its paragraph was and the result is trimmed;
+  nothing else changes. Two such lines, or one naming another issue, hold;
+  otherwise punctuated, quoted or listed, it is prose, and a body naming the
+  source issue's URL without a source line holds as "source line not
+  recognised" (composefs-rs#66). The fork PR keeps the line, so stacking,
   the `Upstream: #N` derivation, the handoff and retries still read the same
   source. The removal is the one permitted deterministic edit, like the
   derived closing line: it is not a rewrite of prose, grants no approval and

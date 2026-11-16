@@ -17,7 +17,7 @@ const PART_OF: &str = "Part of";
 const FIXES: &str = "Fixes";
 
 /// Punctuation the one-time [`repair`] accepts after a reference, as people
-/// end a sentence; a source line itself carries none.
+/// end a sentence; a source line itself carries at most a period.
 const TRAILING: &[char] = &['.', ',', ';', '!'];
 
 /// The canonical standalone line tying a midstream pull request to issue
@@ -61,9 +61,11 @@ fn issue_url(repo: &str, number: u64) -> String {
 
 /// The issue of `repo` that `line` ties to, and whether it closes it, where
 /// the whole line, less surrounding whitespace, is `Part of URL` or `Fixes
-/// URL` with the issue's full URL (any case, one space, no punctuation).
+/// URL` with the issue's full URL (any case, one space, at most a trailing
+/// period, as people end a sentence: composefs-rs#66).
 fn standalone(line: &str, repo: &str) -> Option<(u64, bool)> {
     let line = line.trim();
+    let line = line.strip_suffix('.').unwrap_or(line);
     let prefix = format!("{}{repo}/issues/", stack::GITHUB_WEB);
     [(PART_OF, false), (FIXES, true)]
         .into_iter()
@@ -89,7 +91,9 @@ fn number(digits: &str) -> Option<u64> {
 
 /// `body` less its one standalone source line for `source`, or unchanged,
 /// byte for byte, without one. More than one, or one naming another issue,
-/// holds: which to remove would be a guess.
+/// holds: which to remove would be a guess. So does a body without one where
+/// a line still names the source issue's URL, saying why, since [`check`]
+/// would hold it only as a reference into the midstream (composefs-rs#66).
 pub(super) fn strip(repo: &str, body: &str, source: u64) -> Result<String> {
     let lines: Vec<(usize, (u64, bool))> = body
         .split('\n')
@@ -97,6 +101,11 @@ pub(super) fn strip(repo: &str, body: &str, source: u64) -> Result<String> {
         .filter_map(|(i, line)| standalone(line, repo).map(|found| (i, found)))
         .collect();
     let canonical = source_line(repo, source);
+    // A closing reference is held as one by `check`, more precisely.
+    hold!(
+        !lines.is_empty() || !names_issue(body, repo, source) || stack::closes(body, repo, source),
+        "source line not recognised; put `{canonical}` on a line of its own"
+    );
     for (at, _) in &lines {
         hold!(
             top_level(body, *at),
@@ -121,6 +130,19 @@ pub(super) fn strip(repo: &str, body: &str, source: u64) -> Result<String> {
         "removing source metadata would introduce a closing reference; manual publication repair required"
     );
     Ok(published)
+}
+
+/// Whether `text` has issue `number` of `repo`'s full URL, any case, not
+/// followed by another digit.
+fn names_issue(text: &str, repo: &str, number: u64) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let url = issue_url(repo, number).to_ascii_lowercase();
+    lower.match_indices(&url).any(|(i, _)| {
+        !lower[i + url.len()..]
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_digit())
+    })
 }
 
 /// Why a persistent repair holds a body that fails [`closed`].
@@ -535,9 +557,35 @@ mod tests {
             ),
             // No source line: byte for byte, whitespace included.
             ("  Work.\n\n".into(), 61, Ok("  Work.\n\n")),
-            // Punctuation or a list marker makes it prose, not bookkeeping.
-            (format!("Work.\n\nPart of {}.", url(61)), 61, Ok("checked")),
-            (format!("Work.\n\n- Part of {}", url(61)), 61, Ok("checked")),
+            // A sentence's period is still a source line (composefs-rs#66).
+            (format!("Work.\n\nPart of {}.", url(61)), 61, Ok("Work.")),
+            (format!("Work.\n\nFixes {}. ", url(61)), 61, Ok("Work.")),
+            // Other punctuation or a list marker makes it prose, held as an
+            // unrecognised source line where it names the source issue.
+            (
+                format!("Work.\n\nPart of {}!", url(61)),
+                61,
+                Err(format!(
+                    "source line not recognised; put `Part of {}` on a line of its own",
+                    url(61)
+                )),
+            ),
+            (
+                format!("Work.\n\n- Part of {}", url(61).to_uppercase()),
+                61,
+                Err(format!(
+                    "source line not recognised; put `Part of {}` on a line of its own",
+                    url(61)
+                )),
+            ),
+            (format!("Work.\n\nPart of {}..", url(62)), 61, Ok("checked")),
+            // `check` holds a closing reference as one.
+            (format!("Work.\n\n- Fixes {}", url(61)), 61, Ok("checked")),
+            (
+                format!("Work.\n\n- Part of {}0", url(61)),
+                61,
+                Ok("checked"),
+            ),
             (
                 format!("Part of {}\nPart of {}", url(61), url(61)),
                 61,
