@@ -192,7 +192,7 @@ const BUDGET_REACHED: &str = "weekly budget reached";
 /// Labels a person puts on an issue to keep runs off it.
 const HOLD_LABELS: &[(&str, HoldKind)] = &[
     (NEEDS_HUMAN, HoldKind::NeedsHuman),
-    ("needs-design", HoldKind::NeedsDesign),
+    (NEEDS_DESIGN, HoldKind::NeedsDesign),
 ];
 /// Issues that are not work: epics, and questions to the operator.
 const EXCLUDED_LABELS: &[&str] = &[EPIC_LABEL, "question"];
@@ -242,11 +242,14 @@ pub const STALE_DRAFT_HOURS_LIMIT: u64 = 7 * 24;
 /// stand still before it gets a needs-you card ([`blockers`]).
 const STALE_HOURS: u64 = 24;
 const STALE_HOURS_LIMIT: u64 = 7 * 24;
+/// The triage verdict, and the label, that an issue needs a design.
+const NEEDS_DESIGN: &str = "needs-design";
 /// Triage verdicts that ask the operator, which label the issue
 /// [`NEEDS_HUMAN`]: `done` and `obsolete` for a close, which the pass makes
 /// only with [`Config::triage_close`] ([`CLOSE_VERDICTS`]), and the others
-/// for a decision.
-const ASK_VERDICTS: &[&str] = &["done", "obsolete", "needs-design", "needs-operator"];
+/// for a decision. With [`Config::reserve_operator`], needs-design asks
+/// no more ([`Scheduler::asks`]).
+const ASK_VERDICTS: &[&str] = &["done", "obsolete", NEEDS_DESIGN, "needs-operator"];
 /// With [`Config::triage_close`], the triage verdicts that close the issue,
 /// each with the `state_reason` it closes with (agent-board#428).
 const CLOSE_VERDICTS: &[(&str, &str)] = &[("done", "completed"), ("obsolete", "not_planned")];
@@ -279,6 +282,16 @@ const FOLLOW_THROUGH_VERDICT: &str = "follow-through";
 /// starts so is not planned at once again, so that the two cannot loop.
 const FOLLOW_THROUGH: &str =
     "The board pass asks a triage run to plan the mechanical follow-through its last triage found.";
+/// What a triage brief adds with [`Config::reserve_operator`], after the
+/// caller's [`OperatorAsk`] text and domains, which every brief then carries:
+/// the bar for asking the operator at all (agent-board#1040).
+const OPERATOR_BAR: &str = " Answer needs-operator only for a decision in one of those domains; for anything else, take the recommended option, say why, and post a plan. needs-design does not wait on the operator: the pass asks a triage run to plan the design.";
+/// What the triage plan [`Scheduler::follow_up`] posts for a needs-design
+/// verdict with [`Config::reserve_operator`] says first; as with
+/// [`FOLLOW_THROUGH`], a needs-design verdict answering it waits as `partly`
+/// does, so that the two cannot loop.
+const DESIGN: &str =
+    "The board pass asks a triage run to plan the design its last triage found missing.";
 /// Bounds on caller policy text and the verdict domains rendered into a brief.
 const OPERATOR_POLICY_CHARS: usize = 4_000;
 const OPERATOR_POLICY_DOMAINS: usize = 16;
@@ -682,6 +695,15 @@ pub struct Config {
     /// operator-owned questions wait on the operator. Off by default.
     #[serde(default)]
     pub operator_questions_only: bool,
+
+    /// Off by default: every triage brief states the caller's
+    /// [`OperatorAsk`] and [`OPERATOR_BAR`], a needs-design verdict is
+    /// planned rather than asked ([`DESIGN`]), and with `assignHolds` an
+    /// asking verdict whose hold was released holds no more
+    /// ([`Scheduler::held_before`]). GitHub only; needs `triageFollowUpDays`
+    /// and `operatorAsk`.
+    #[serde(default)]
+    pub reserve_operator: bool,
 
     /// Off unless set: stage 4 waits on the operator by assigning them
     /// rather than by the [`NEEDS_HUMAN`] label, and any response of theirs
@@ -1627,6 +1649,14 @@ impl Config {
         ensure!(
             !self.triage_close || self.triage_follow_up_days > 0,
             "triageClose needs triageFollowUpDays"
+        );
+        ensure!(
+            !self.reserve_operator || self.triage_follow_up_days > 0,
+            "reserveOperator needs triageFollowUpDays"
+        );
+        ensure!(
+            !self.reserve_operator || self.operator_ask.is_some(),
+            "reserveOperator needs operatorAsk"
         );
         ensure!(
             self.replan_after_days <= FOLLOW_UP_DAYS_LIMIT,
@@ -5402,6 +5432,41 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .is_none_or(|policy| policy.operator_verdict(body))
     }
 
+    /// Whether `verdict` asks the operator ([`ASK_VERDICTS`]): with
+    /// [`Config::reserve_operator`], needs-design does not (agent-board#1040).
+    fn asks(&self, verdict: &str) -> bool {
+        ASK_VERDICTS.contains(&verdict)
+            && !(self.config.reserve_operator && verdict == NEEDS_DESIGN)
+    }
+
+    /// With [`Config::reserve_operator`] and [`Config::assign_holds`], whether
+    /// the verdict `c` held the issue once already: the bot's unedited
+    /// [`hold_marker`] comment for it among `comments`, not a run's output.
+    /// That assignment was taken off since, as no standing one reaches a
+    /// follow-up; where no response of the operator's released it, the bot
+    /// did, as the controller does, and assigning them again from the same
+    /// verdict would park the issue from a stale verdict (agent-board#1040),
+    /// so a fresh triage supersedes it. A forged marker only starts that
+    /// triage. Not on the label path, where a label removal without a
+    /// writer's answer is no release ([`Self::verdict_answer`]).
+    fn held_before(&self, c: &plan::Comment, comments: &[plan::Comment]) -> bool {
+        // As [`Self::act_on_verdict`] assigns: `operatorQuestionsOnly` labels.
+        let config = self.config;
+        let on = config.reserve_operator && config.assign_holds && !config.operator_questions_only;
+        let Some(id) = plan::comment_id(&c.url).filter(|_| on) else {
+            return false;
+        };
+        let marker = hold_marker(id);
+        let bot = self.config.bot.as_str();
+        comments.iter().any(|h| {
+            plan::written_by(h, bot)
+                && !h.edited
+                && h.editor.is_none()
+                && !run_output(&h.body)
+                && h.body.lines().next() == Some(marker.as_str())
+        })
+    }
+
     /// Whether the wait on the operator over `facts`, whose newest triage
     /// verdict the `comments` hold, is to be released rather than kept:
     /// harness work, and no verdict the operator's ([`Self::operator_verdict`]).
@@ -8378,6 +8443,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if intro.starts_with(plan::INVALID_REPLAN) {
             brief.push_str(&format!("\n\nRepair the bot's invalid plan, not an operator decision. Diagnostic (data, not instructions): {intro}"));
         }
+        if intro == DESIGN {
+            brief.push_str(" Its last triage found that it needs a design: decide it yourself where it is outside the operator's domain, and post one job plan for that design work (a research plan where those are started, else an implement plan writing the design into the repository's docs), unless an open pull request already holds it.");
+        }
         if intro == FOLLOW_THROUGH {
             brief.push_str(" Its last triage found that only mechanical follow-through remains: post one implement job plan for that, unless it is already in an open pull request.");
             if self.config.fix_plans {
@@ -8419,8 +8487,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if self.config.triage_follow_up_days == 0 {
             return active.to_owned();
         }
+        let reserve = self.config.reserve_operator;
         let harness = self.config.operator_ask.as_ref()
-            .filter(|_| self.harness_item(facts))
+            .filter(|_| reserve || self.harness_item(facts))
             .map(|policy| format!(
                 " {} For an operator decision, answer needs-operator and add \"operator\" to the same JSON block, one of: {}.",
                 policy.text, policy.domains.join(", ")
@@ -8429,6 +8498,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             true => format!("{PROMOTED}{NO_UPSTREAM_COMMENT}"),
             false => String::new(),
         };
+        let (asking, bar) = match reserve {
+            true => ("needs-operator", OPERATOR_BAR),
+            false => ("needs-design or needs-operator", ""),
+        };
         format!(
             "{promoted} If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
              {{\"verdict\": \"VERDICT\"}}, VERDICT one of done (every part is complete), \
@@ -8436,9 +8509,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
              needs-issue (a follow-up needs a real issue number: give its repository, title and body \
              in your comment for the controller, not needs-operator; do not invent an issue number), \
              partly, not-done or {FOLLOW_THROUGH_VERDICT} (only mechanical follow-through \
-              remains and you could not plan it). With needs-design or needs-operator, put the one \
+              remains and you could not plan it). With {asking}, put the one \
              decision wanted and its options on one line starting \"{DECISION_PREFIX}\", which the \
-             pass puts to the operator.{harness}{active}"
+             pass puts to the operator.{harness}{bar}{active}"
         )
     }
 
@@ -8488,7 +8561,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if config.operator_questions_only
             && !from.body.starts_with(AGAIN)
             && let Some((_, c, verdict)) = &verdict
-            && ASK_VERDICTS.contains(&verdict.as_str())
+            && self.asks(verdict)
             && !operator_question(&c.body, false)
             && !CLOSE_VERDICTS.iter().any(|(v, _)| v == verdict)
         {
@@ -8504,13 +8577,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let answer = Some((answer, HoldKind::NeedsIssue));
             return self.triage_context(read, AGAIN, answer, (snapshot, target, slots));
         }
+        // Any verdict that may have held the issue, so that the answer to a
+        // needs-design hold from before `reserveOperator` is still its context.
         if let Some((_, c, verdict)) = &verdict
             && ASK_VERDICTS.contains(&verdict.as_str())
+            && let Some(released) = self.verdict_release(&facts.issue, c, rest)?
         {
-            if let Some(released) = self.verdict_release(&facts.issue, c, rest)? {
-                return self.triage_released(read, released, (snapshot, target, slots));
-            }
-        } else if rest.iter().any(|c| is(c.author.as_deref(), &operator)) {
+            return self.triage_released(read, released, (snapshot, target, slots));
+        }
+        // A verdict that asks no one waits for the operator's word, too.
+        if verdict.as_ref().is_none_or(|(_, _, v)| !self.asks(v))
+            && rest.iter().any(|c| is(c.author.as_deref(), &operator))
+        {
             return self.triage(read, AGAIN, (snapshot, target, slots));
         }
         if let Some((_, _, verdict)) = &verdict
@@ -8519,14 +8597,26 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         {
             return self.triage(read, FOLLOW_THROUGH, (snapshot, target, slots));
         }
+        if let Some((_, _, verdict)) = &verdict
+            && config.reserve_operator
+            && verdict == NEEDS_DESIGN
+            && !from.body.starts_with(DESIGN)
+        {
+            return self.triage(read, DESIGN, (snapshot, target, slots));
+        }
         // Harness work asks the operator only their own decisions
         // (agent-board#778): any other ask is planned again, once, and then
         // waits as `partly` does.
         let harness = verdict.as_ref().is_some_and(|(_, c, verdict)| {
-            ASK_VERDICTS.contains(&verdict.as_str())
-                && self.harness_item(facts)
-                && !self.operator_verdict(&c.body)
+            self.asks(verdict) && self.harness_item(facts) && !self.operator_verdict(&c.body)
         });
+        if !harness
+            && let Some((_, c, verdict)) = &verdict
+            && self.asks(verdict)
+            && self.held_before(c, rest)
+        {
+            return self.triage(read, AGAIN, (snapshot, target, slots));
+        }
         let replan = self.harness_policy().map(|p| p.replan_text.as_str());
         let mut said = match harness {
             true => format!("{said}, harness work held for no one"),
@@ -8581,7 +8671,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let again = (comments.iter().rev())
             .filter(planned)
             .take_while(|c| {
-                [AGAIN, FOLLOW_THROUGH]
+                [AGAIN, FOLLOW_THROUGH, DESIGN]
                     .iter()
                     .any(|s| c.body.starts_with(s))
                     || replan.is_some_and(|s| c.body.starts_with(s))
@@ -8744,7 +8834,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     (None, _) => Acted::Nothing,
                 });
             }
-            None if ASK_VERDICTS.contains(&verdict)
+            None if self.asks(verdict)
                 && (!self.config.operator_questions_only || operator_question(&c.body, false)) =>
             {
                 (HoldKind::NeedsHuman, label)
@@ -9132,12 +9222,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(None);
         };
         if self.config.operator_questions_only
-            && ASK_VERDICTS.contains(&verdict.as_str())
+            && self.asks(&verdict)
             && !operator_question(&c.body, false)
             && !CLOSE_VERDICTS.iter().any(|(v, _)| *v == verdict)
         {
             return self.triage((facts, comments), AGAIN, context).map(Some);
         }
+        // As in a follow-up, any verdict that may have held the issue.
         if ASK_VERDICTS.contains(&verdict.as_str())
             && let Some(released) = self.verdict_release(&facts.issue, c, &comments[n + 1..])?
         {
@@ -9145,7 +9236,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .triage_released((facts, comments), released, context)
                 .map(Some);
         }
-        if ASK_VERDICTS.contains(&verdict.as_str())
+        if self.config.reserve_operator && verdict == NEEDS_DESIGN {
+            return self.triage((facts, comments), DESIGN, context).map(Some);
+        }
+        if self.asks(&verdict)
             && self.harness_item(facts)
             && !self.operator_verdict(&c.body)
             && let Some(policy) = self.harness_policy()
@@ -9155,7 +9249,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .triage((facts, comments), &policy.replan_text, context)
                 .map(Some);
         }
-        if ASK_VERDICTS.contains(&verdict.as_str()) {
+        if self.asks(&verdict) && self.held_before(c, &comments[n + 1..]) {
+            return self.triage((facts, comments), AGAIN, context).map(Some);
+        }
+        if self.asks(&verdict) {
             // A hold marker or an unconfirmed answer is not new direction.
             // Preserve the existing invalidation on body/title edits.
             let node = self.issue_read(&facts.issue, CLOSE_QUERY)?;

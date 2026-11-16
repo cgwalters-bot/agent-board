@@ -57,6 +57,42 @@ or `planPools`, and include `architecture` in the existing `operatorAsk.domains`
 when using that brief policy. No deployed caller or live assignments are changed
 by this patch.
 
+## Reserving the operator
+
+The concrete failure `reserveOperator: true` (GitHub only, off by default, needs
+`triageFollowUpDays` and `operatorAsk`) stops is routine engineering parked on
+the operator by triage verdicts (agent-board#1040). It does three things.
+
+Every triage brief that asks for a verdict carries the caller's
+`operatorAsk.text` and domains, not only harness work's, and states the bar:
+answer `needs-operator` only for a decision in one of those domains, and
+otherwise take the recommended option and post a plan. The domains stay caller
+policy, as described for `operatorAsk` below; only harness work also checks the
+verdict's `operator` domain.
+
+A `needs-design` verdict no longer asks the operator: the issue is triaged
+again at once, its plan starting "The board pass asks a triage run to plan the
+design", and a `needs-design` verdict answering that plan waits as `partly`
+does, sharing its doubling wait, so the two cannot loop. A design the run cannot
+decide reaches the operator only as a `needs-operator` verdict. A `needs-design`
+hold from before the option is still released as before, its answer the new
+triage's context.
+
+With `assignHolds` and without `operatorQuestionsOnly` (which labels), an
+asking verdict assigns the operator once: where the bot's
+hold comment for it stands on the issue but the assignment was taken off without
+a response of the operator's (the bot's own unassignment, as a controller
+release makes), the issue is triaged again rather than assigned again from that
+verdict, so a fresh verdict supersedes it. A new verdict from that triage may
+still ask. The operator's comment after a `needs-design` verdict, which holds
+nothing, triages the issue again at once. On the label path a label removal without a writer's answer still
+releases nothing, and harness work keeps its `replanText`. A forged hold comment
+can only start that triage. Standing holds are not released by this option, and
+starts and writes stay under the existing caps.
+
+Caller: `cgwalters-forge/tracker`, `.github/pass.json`, set `reserveOperator`
+to `true`.
+
 ## Local configuration defaults
 
 From the root of a trusted caller checkout, `agent-board pass` reads
@@ -3288,8 +3324,9 @@ default instruction in every triage brief. The example `operatorAsk.text` in
 [`fixtures/operator-ask.json`](../fixtures/operator-ask.json) asks harness work
 to plan rebases, CI reruns, conflict fixes and stale-branch refreshes as implement
 jobs, preserving existing `Signed-off-by` trailers and adding none. Without that
-config, or outside its harness scope, none of that project-specific prose is
-added. The verdict protocol still defines `follow-through`: for work the run
+config, or outside its harness scope without
+[`reserveOperator`](#reserving-the-operator), none of that project-specific
+prose is added. The verdict protocol still defines `follow-through`: for work the run
 did not plan, it labels
 nothing: the issue is triaged again at once, the plan and brief saying it is
 for that follow-through. A `follow-through` verdict on such a plan waits as
@@ -3337,8 +3374,8 @@ is an allowlisted work repository that is neither in
 and its read failed). All labels must have been read, with none matching
 `excludedLabels` or the foreign-target rule. The example retains
 `operator-action`, `decision`, `question`, `review-draft` and `target:`;
-these conventions are not defaults in the binary. On harness work
-the triage brief adds the configured text, and says that an operator-domain
+these conventions are not defaults in the binary. On harness work (on every
+item with `reserveOperator`) the triage brief adds the configured text, and says that an operator-domain
 decision is answered `needs-operator` with `"operator"` in the same JSON
 block, one of the configured domains. A `needs-operator` or
 `needs-design` verdict without one, as a follow-up or an earlier verdict,
@@ -5651,6 +5688,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `readFreeHolds` | GitHub only: apply board-proven holds before assignment reads, leaving request budget for ready candidates; no cached holds or new eligibility; `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
+| `reserveOperator` | GitHub only: every triage brief states the `operatorAsk` bar for `needs-operator`, a `needs-design` verdict is planned rather than asked, and with `assignHolds` a verdict whose assignment the bot took off is triaged again rather than assigned again, see [reserving the operator](#reserving-the-operator); needs `triageFollowUpDays` and `operatorAsk`; `false` |
 | `replanInvalid` | GitHub only: request one replacement of an invalid bot-written job plan or unparseable epic plan before asking the operator; existing holds and start caps remain; `false` |
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
 | `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling). Stage 2 then takes no step outside our own space but the bot's own rounds on a pull request it authored there with no same-head midstream pull request, see [the poll](poll.md); `false` |

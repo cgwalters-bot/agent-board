@@ -9468,6 +9468,87 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             LABEL,
         ),
         (
+            "needs-operator with reserveOperator still asks the operator",
+            vec![(bot, None, "needs-operator", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-operator, {answer}; label needs-human",
+            false,
+            LABEL,
+        ),
+        (
+            // agent-board#1040: needs-design goes to a planning run.
+            "needs-design with reserveOperator is planned as a design, unlabelled",
+            vec![(bot, None, "needs-design", 0)],
+            (true, None),
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            "",
+        ),
+        (
+            "needs-design on a design plan with reserveOperator waits twice as long, not looping",
+            vec![
+                (bot, None, "design-plan", 0),
+                (bot, None, "needs-design", 0),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-design, {answer}; triaged again from {due2} if anything changed, or once cgwalters comments",
+            false,
+            "",
+        ),
+        (
+            "with reserveOperator the operator's comment after needs-design on a design plan triages it again",
+            vec![
+                (bot, None, "design-plan", 0),
+                (bot, None, "needs-design", 0),
+                ("cgwalters", None, "Use the queue design.", 0),
+            ],
+            (true, None),
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            "",
+        ),
+        (
+            // operatorQuestionsOnly labels even with assignHolds.
+            "with reserveOperator, operatorQuestionsOnly and with assignHolds a label hold taken off without an answer is held again",
+            vec![
+                (
+                    bot,
+                    None,
+                    "**Decision needed:** Should deployments share one trust domain?\n```schedule-triage\n{\"verdict\":\"needs-operator\",\"operator\":\"architecture\"}\n```",
+                    0,
+                ),
+                (bot, None, "hold-marker", 0),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-operator, {answer}; label needs-human",
+            false,
+            LABEL,
+        ),
+        (
+            // A label removal without a writer's answer is no release.
+            "with reserveOperator a label hold taken off without an answer is held again",
+            vec![
+                (bot, None, "needs-operator", 0),
+                (bot, None, "hold-marker", 0),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-operator, {answer}; label needs-human",
+            false,
+            LABEL,
+        ),
+        (
+            // agent-board#1040: a stale verdict parks nothing again.
+            "with reserveOperator and with assignHolds a verdict whose assignment was taken off is triaged again",
+            vec![
+                (bot, None, "needs-operator", 0),
+                (bot, None, "hold-marker", 0),
+            ],
+            (true, None),
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            "",
+        ),
+        (
             "a verdict's own decision line heads the hold comment",
             vec![(bot, None, "decided", 0)],
             (true, None),
@@ -9682,14 +9763,20 @@ fn apply_follows_up_a_triage_by_its_verdict() {
     for (name, answers, (close, writes), expected, again, held) in cases {
         let promoted = name.contains("promoted");
         let replans = u64::from(name.contains("triageReplans"));
-        let mut config = outside_harness(config(json!({
+        let reserve = name.contains("reserveOperator");
+        let mut settings = json!({
             "triageFollowUpDays": 3, "triageClose": close, "fixPlans": promoted,
-            "triageReplans": replans,
-        })));
+            "triageReplans": replans, "reserveOperator": reserve,
+        });
+        if reserve {
+            settings["operatorAsk"] = tracker_operator_ask();
+        }
+        let mut config = outside_harness(config(settings));
         let mut forge = Forge::new(None, false);
         let first = apply(&forge, &config);
         assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
         config.assign_holds = name.contains("with assignHolds");
+        config.operator_questions_only = name.contains("operatorQuestionsOnly");
         if name.contains("still assigned") {
             let events = [("AssignedEvent", "cgwalters-bot", -1)];
             assignments(&mut forge.replay, 446, &events, &["cgwalters"]);
@@ -9701,12 +9788,15 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             comments[0].contains("schedule-triage fenced JSON block"),
             "{name}"
         );
-        assert!(
-            !comments[0].contains("Only a real decision goes to the operator"),
+        // Outside harness work, the caller's policy only with reserveOperator.
+        assert_eq!(
+            comments[0].contains("Only a real decision goes to the operator"),
+            reserve,
             "{name}"
         );
         let fix_plan = format!("{PROMOTED}{NO_UPSTREAM_COMMENT}");
         assert_eq!(comments[0].contains(&fix_plan), promoted, "{name}");
+        assert_eq!(comments[0].contains(OPERATOR_BAR), reserve, "{name}");
         assert!(comments[0].contains("needs-issue"), "{name}");
         assert!(
             comments[0].contains("\n\n<!-- agent-board-inputs: "),
@@ -9730,11 +9820,15 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 continue;
             }
             // A plan posted for an earlier follow-through verdict.
-            if said == "follow-through-plan" {
+            if let Some(intro) = match said {
+                "follow-through-plan" => Some(FOLLOW_THROUGH),
+                "design-plan" => Some(DESIGN),
+                _ => None,
+            } {
                 let key = ("cgwalters-forge/tracker".to_owned(), 446);
                 let mut added = forge.added.borrow_mut();
                 let plan = &mut added.get_mut(&key).unwrap()[0]["body"];
-                *plan = format!("{FOLLOW_THROUGH}\n\n{}", plan.as_str().unwrap()).into();
+                *plan = format!("{intro}\n\n{}", plan.as_str().unwrap()).into();
                 continue;
             }
             // The operator's edit, `days` from now, of their first answer.
@@ -9975,6 +10069,9 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         let followed = (forge.comments_on("cgwalters-forge/tracker", 446).iter())
             .any(|c| c.starts_with(FOLLOW_THROUGH) && c.contains("post one implement job plan"));
         assert_eq!(followed, again && name.contains("follow-through"), "{name}");
+        let designed = (forge.comments_on("cgwalters-forge/tracker", 446).iter())
+            .any(|c| c.starts_with(DESIGN) && c.contains("job plan for that design work"));
+        assert_eq!(designed, again && name.contains("as a design"), "{name}");
         // A fix plan goes on this issue, where the pass reads plans, never
         // on the upstream pull request it names.
         let briefs = forge.comments_on("cgwalters-forge/tracker", 446);
@@ -10020,6 +10117,9 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 "needs-design" => "**Decision needed:** Decide the design [this triage verdict](",
                 _ if name.contains("decision line") => {
                     "**Decision needed:** Ship now, or after 1.0? Options: now, after."
+                }
+                _ if name.contains("operatorQuestionsOnly") => {
+                    "**Decision needed:** Should deployments share one trust domain?"
                 }
                 _ => "**Decision needed:** Decide what [this triage verdict](",
             };
@@ -11665,6 +11765,8 @@ fn apply_takes_an_earlier_triage_verdict() {
     let off = json!({});
     let on = json!({"triageFollowUpDays": 3});
     let close = json!({"triageFollowUpDays": 3, "triageClose": true});
+    let reserve = json!({"triageFollowUpDays": 3, "reserveOperator": true,
+        "operatorAsk": tracker_operator_ask()});
     let cases: Vec<Case> = vec![
         (
             "needs-issue stays with the controller after the cooldown too",
@@ -11812,10 +11914,48 @@ fn apply_takes_an_earlier_triage_verdict() {
             "",
             None,
         ),
+        (
+            // agent-board#1040.
+            "needs-design with reserveOperator is planned as a design",
+            &reserve,
+            vec![(bot, None, "needs-design", -4)],
+            "",
+            None,
+        ),
+        (
+            "with reserveOperator and assignHolds a verdict whose assignment was taken off is triaged again",
+            &reserve,
+            vec![
+                (bot, None, "needs-operator", -4),
+                (bot, None, "hold-marker", -4),
+            ],
+            "",
+            None,
+        ),
+        (
+            "with reserveOperator a label hold taken off without an answer is held again",
+            &reserve,
+            vec![
+                (bot, None, "needs-operator", -4),
+                (bot, None, "hold-marker", -4),
+            ],
+            "",
+            Some((
+                "earlier triage verdict needs-operator, {answer}; label needs-human",
+                LABEL,
+            )),
+        ),
     ];
     for (name, settings, answers, edited, expected) in cases {
-        let config = config(settings.clone());
+        let mut config = config(settings.clone());
         let mut forge = Forge::new(None, false);
+        if name.contains("reserveOperator") {
+            config = outside_harness(config);
+        }
+        config.assign_holds = name.contains("assignHolds");
+        if config.assign_holds {
+            assignments(&mut forge.replay, 446, &[], &[]);
+        }
         let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
         let at = (forge.replay.now - time::Duration::days(1))
             .format(&Rfc3339)
@@ -11856,7 +11996,18 @@ fn apply_takes_an_earlier_triage_verdict() {
                 continue;
             }
             let body = match said {
-                "done" | "obsolete" | "partly" | "needs-issue" => verdict(said),
+                "done" | "obsolete" | "partly" | "needs-issue" | "needs-design"
+                | "needs-operator" => verdict(said),
+                // The pass's hold comment for the verdict before it.
+                "hold-marker" => {
+                    let key = ("cgwalters-forge/tracker".to_owned(), 446);
+                    let added = &forge.added.borrow()[&key];
+                    let fenced = (added.iter().rev())
+                        .find(|c| text(c, "/body").contains(TRIAGE_FENCE))
+                        .unwrap();
+                    let id = plan::comment_id(text(fenced, "/url")).unwrap();
+                    format!("{}\nThe operator was assigned.", hold_marker(id))
+                }
                 "status" => format!("Done.{}", crate::supervise::health::status_end(7)),
                 "note" => format!("Create it.\n\n{}", crate::input::SUPERVISOR_NOTE),
                 text => text.to_owned(),
@@ -11899,6 +12050,9 @@ fn apply_takes_an_earlier_triage_verdict() {
                 assert_eq!(verdict_writes(&forge, &issue), vec![], "{name}");
             }
         }
+        let designed = (forge.comments_on("cgwalters-forge/tracker", 446).iter())
+            .any(|c| c.starts_with(DESIGN));
+        assert_eq!(designed, name.contains("as a design"), "{name}");
     }
 }
 
@@ -18785,6 +18939,15 @@ fn config_table() {
         (
             json!({"triageClose": true}),
             "triageClose needs triageFollowUpDays",
+        ),
+        (
+            json!({"reserveOperator": true}),
+            "reserveOperator needs triageFollowUpDays",
+        ),
+        (
+            json!({"triage": true, "pools": {"claude": {}}, "triagePools": ["claude"],
+                "triageFollowUpDays": 3, "reserveOperator": true}),
+            "reserveOperator needs operatorAsk",
         ),
         (
             json!({"replanAfterDays": 31}),
