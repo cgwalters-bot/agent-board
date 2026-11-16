@@ -15,8 +15,8 @@ build-static:
     cargo build --release --locked --target x86_64-unknown-linux-musl -p agent-board --bin agent-board --bin gh-agent-board
 
 # Needs just, cargo and docker (or CONTAINER=podman); pulls linter images.
-# Checks .github/, not live/. Remove site/{node_modules,dist,.astro} first:
-# zizmor otherwise reads dependencies' workflows.
+# Checks .github/, not live/. Remove site/{.venv,dist,pages} first: zizmor
+# otherwise reads dependencies' workflows.
 # Run the forge's shared workflow check.
 lint:
     {{ just_executable() }} --justfile "{{ forge_actions }}/lint/Justfile" --working-directory . check
@@ -69,14 +69,21 @@ cli-docs:
 test-action-schema:
     node tests/operator-actions.cjs
 
-# The documentation site in site/, rendering docs/ under site/index.md, as
-# agentic-job's (its Justfile has the same recipes). Dependencies come from
-# the lock alone, without their install scripts. SITE_BASE, SITE_URL and
-# SITE_SOURCE_URL (site/astro.config.mjs) place it.
-# Node 22; observed build 8 s, not a deadline.
+# The documentation site in site/ (site/zensical.toml), rendering
+# site/index.md and docs/*.md, staged under site/pages/ since Zensical reads
+# only its docs directory. Zensical and its dependencies come from
+# site/requirements.txt alone, by hash and as wheels, so no package's build
+# code runs. SITE_URL (the served address, for the 404 page and canonical
+# links; the config's copy in site/build.toml gets it) and SITE_SOURCE_URL
+# (site/repository_links.py) place it.
+# Python 3.11+; observed build 2 s after the first install, not a deadline.
 site-build:
-    cd site && npm ci --ignore-scripts --no-audit --no-fund
-    cd site && ASTRO_TELEMETRY_DISABLED=1 npm run build
+    rm -rf site/pages && mkdir -p site/pages/docs
+    cp site/index.md site/public/favicon.svg site/pages/ && cp docs/*.md site/pages/docs/
+    python3 -m venv site/.venv
+    site/.venv/bin/pip install --quiet --disable-pip-version-check --require-hashes --only-binary :all: -r site/requirements.txt
+    sed "/^\[project\]$/a site_url = \"${SITE_URL:-}\"" site/zensical.toml > site/build.toml
+    cd site && PYTHONPATH=. .venv/bin/zensical build --clean -f build.toml
 
 # site-build for GitHub Pages, from a GitHub Actions run's own variables:
 # served at the repository's default project-site address,
@@ -84,12 +91,12 @@ site-build:
 # OWNER.github.io would need other values), and linking repository files
 # at the built commit. Nothing here names an owner or repository.
 site-build-pages:
-    SITE_URL="https://$GITHUB_REPOSITORY_OWNER.github.io" SITE_BASE="/${GITHUB_REPOSITORY#*/}/" SITE_SOURCE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/" {{ just_executable() }} site-build
+    SITE_URL="https://$GITHUB_REPOSITORY_OWNER.github.io/${GITHUB_REPOSITORY#*/}/" SITE_SOURCE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/" {{ just_executable() }} site-build
 
-# dist.test.mjs checks the pages site-build renders, so it builds first.
+# The link rewriting's tests import Zensical, so they need site-build's
+# environment.
 site-test: site-build
-    node --test site/links.test.mjs
-    node --test site/dist.test.mjs
+    cd site && .venv/bin/python -m unittest
 
 # Site CI uses the lychee action, then on main rebuilds with site-build-pages
 # and uploads Pages. Serve at / as site-build does by default; repository

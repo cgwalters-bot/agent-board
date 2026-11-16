@@ -3,7 +3,7 @@
 # deploy to GitHub Pages. Pages with source "GitHub Actions" is a
 # repository setting; until it is on, deploy fails and nothing is
 # published. The shape is agentic-job's site.yml, so both sites pass the
-# same checks.
+# same checks; the site is built with Zensical (site/zensical.toml).
 #
 # Only deploy holds the Pages write grant and the OIDC request credential
 # deploy-pages needs. It is a deploy-only job as `agentic-job workflows
@@ -12,7 +12,8 @@
 # beside those credentials; it publishes the artifact the hardened check
 # job uploaded. deploy-pages is pinned at v5.0.1 (node24, same inputs as
 # v4); the check admits it once its allowlist names that commit. What is
-# published is therefore only as good as main's site/ code and the locked dependencies that build it.
+# published is therefore only as good as main's site/ code and the
+# hash-pinned wheels (site/requirements.txt) that build it.
 name: site
 
 on:
@@ -34,11 +35,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      # The toolchain first: no step may run between the checkout and
-      # secure-host, with root and the checked-out tree.
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "22"
+      # No step may run between the checkout and secure-host, with root and
+      # the checked-out tree. The build needs only the image's python3.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
