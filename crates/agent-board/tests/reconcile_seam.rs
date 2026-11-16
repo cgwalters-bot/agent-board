@@ -11,8 +11,9 @@ const WORKFLOW: &str = include_str!("../../../.github/workflows/reconcile.yml");
 // JSON without adding a TOML dependency to this crate. Any other line fails
 // the test, so a bound added later cannot be silently skipped by the oracle.
 fn parse_bounds(text: &str) -> Value {
-    let mut bounds = json!({"outputs": {}});
-    // The table lines go to: the top level, then [outputs], then [outputs.TYPE].
+    let mut bounds = json!({"github": {"outputs": {}}});
+    // The table lines go to: the top level, then [github.outputs], then
+    // [github.outputs.TYPE].
     let mut table: Vec<String> = vec![];
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
@@ -20,8 +21,11 @@ fn parse_bounds(text: &str) -> Value {
         }
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             table = name.split('.').map(str::to_owned).collect();
-            assert_eq!(table[0], "outputs", "{line}");
-            assert!(table.len() <= 2, "{line}");
+            assert!(
+                table.starts_with(&["github".into(), "outputs".into()]),
+                "{line}"
+            );
+            assert!(table.len() <= 3, "{line}");
             continue;
         }
         let (key, value) = line.split_once(" = ").expect(line);
@@ -43,10 +47,11 @@ fn fits_bounds(proposals: &[Value], bounds: &Value) -> bool {
         return false;
     }
     let repos = bounds["repos"].as_array().unwrap();
+    let outputs = &bounds["github"]["outputs"];
     let mut counts = BTreeMap::new();
     for proposal in proposals {
         let kind = proposal["type"].as_str().unwrap();
-        let Some(max) = bounds["outputs"][kind]["max"].as_u64() else {
+        let Some(max) = outputs[kind]["max"].as_u64() else {
             return false;
         };
         let count = counts.entry(kind).or_insert(0);
@@ -56,7 +61,7 @@ fn fits_bounds(proposals: &[Value], bounds: &Value) -> bool {
         }
         let fits = match kind {
             "update_project" => {
-                let limits = &bounds["outputs"]["update_project"];
+                let limits = &outputs["update_project"];
                 let fields = limits["fields"].as_array().unwrap();
                 repos.contains(&proposal["target_repo"])
                     && limits["projects"]
@@ -236,7 +241,7 @@ fn apply_call_stays_within_bounds() {
     assert_eq!(with_input("allow"), ".github/agentic-job/reconcile.toml");
     let max: u64 = with_input("max-outputs").parse().unwrap();
     assert!(max <= bounds["max_outputs"].as_u64().unwrap());
-    let outputs: &Map<String, Value> = bounds["outputs"].as_object().unwrap();
+    let outputs: &Map<String, Value> = bounds["github"]["outputs"].as_object().unwrap();
     for kind in with_input("outputs").split(',') {
         assert!(outputs.contains_key(kind), "{kind} not in bounds");
     }
