@@ -791,6 +791,9 @@ pub struct Config {
     pub cost: Option<crate::cost::Publish>,
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
+    /// Off unless set: the SQLite store ([`crate::store`]) an applying pass
+    /// records its dispatch records and triage verdicts in.
+    pub store: Option<String>,
     /// Opt-in durable ledger path for one living status comment per issue.
     /// Retain it across runs; applying passes must still be serialized.
     pub living_status: Option<String>,
@@ -1424,6 +1427,15 @@ impl Config {
             !config.cleanup_history || config.living_status.is_some(),
             "cleanupHistory requires livingStatus"
         );
+        // A rebuild replaces the store's file, which must not be another's.
+        if let Some(store) = &config.store {
+            ensure!(!store.is_empty(), "store must name a file");
+            let others = [&config.state, &config.living_status];
+            ensure!(
+                !others.into_iter().flatten().any(|other| other == store),
+                "store must differ from state and livingStatus"
+            );
+        }
         if sources.is_empty() {
             config.check()?;
         } else {
@@ -4102,6 +4114,9 @@ pub struct Report {
     pub accepted_plans: RefCell<BTreeMap<String, String>>,
     /// Suppressed candidates, by rule; absent from the summary when disabled.
     pub triage_skipped: RefCell<BTreeMap<String, u64>>,
+    /// The dispatch records and triage verdicts this pass made or read, for
+    /// [`Config::store`]; never read back for a decision.
+    pub records: RefCell<crate::store::Records>,
     /// Confirmed effects only, independently of the step caps.
     pub effects: Effects,
     /// Previewed starts, never included in confirmed effects or daily totals.
@@ -7763,6 +7778,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             match batch::held(&self.client, &comments, &writers, &id, issue)?.first() {
                 None => (plan, id, None, None, operators),
                 Some((_, record)) => {
+                    let dispatch = crate::store::Dispatch {
+                        item: key(issue),
+                        kind: Some(plan.kind.clone()),
+                        plan: Some(id.clone()),
+                        run: epics::record_run(&record.body),
+                        ..Default::default()
+                    };
+                    self.report
+                        .records
+                        .borrow_mut()
+                        .dispatch(&record.url, dispatch);
                     // A record may be an HTTP refusal with no run URL, or a
                     // caller run that refused a profile after accepting it.
                     // The failed-run cache is optional and cannot distinguish
@@ -8456,6 +8482,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
                 let run = done.run.as_deref().unwrap_or("unnamed");
                 let record = done.record.unwrap_or_default();
+                if let Some(issue) = holds.first() {
+                    let dispatch = crate::store::Dispatch {
+                        item: key(issue),
+                        kind: Some(start_line_kind(&line).into()),
+                        pool: line_pool(&line).map(Into::into),
+                        plan: None,
+                        run: done.run.as_deref().and_then(epics::record_run),
+                    };
+                    self.report.records.borrow_mut().dispatch(&record, dispatch);
+                }
                 Step::Started(format!("{line} record={record} run={run}"), holds)
             }
             // Refused before it was sent, its records released: a later
@@ -8859,10 +8895,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let unedited = |c: &plan::Comment| {
             (!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &writers)
         };
-        comments.iter().enumerate().rev().find_map(|(n, c)| {
+        let newest = comments.iter().enumerate().rev().find_map(|(n, c)| {
             let trusted = is(c.author.as_deref(), &bot) && unedited(c);
             Some((n, c, plan::triage_verdict(&c.body).filter(|_| trusted)?))
-        })
+        });
+        if let Some((_, c, verdict)) = &newest {
+            let operator = plan::triage_operator(&c.body);
+            let mut records = self.report.records.borrow_mut();
+            records.verdict(&c.url, verdict, operator, c.created);
+        }
+        newest
     }
 
     /// What `verdict`, in the bot's comment `c` among the issue's

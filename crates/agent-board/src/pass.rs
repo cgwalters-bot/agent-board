@@ -433,6 +433,9 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                         std::fs::write(path, serde_json::to_vec(&state.to_json())?)
                             .with_context(|| format!("write {path}"))?;
                     }
+                    if let (true, Some(path)) = (args.apply, &config.store) {
+                        save_store(path, &report, now);
+                    }
                     report
                 }
             }
@@ -494,6 +497,25 @@ fn load_state(path: &str) -> State {
             eprintln!("warning: missing or unreadable pass state; starting cold");
             State::default()
         }
+    }
+}
+
+/// Record the pass's dispatch records and triage verdicts in the store.
+/// No decision reads it yet, so a store that cannot be saved only warns:
+/// the pass's own writes are done, and the next pass rebuilds it.
+fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
+    let records = report.records.borrow();
+    match board_forge::store::save(std::path::Path::new(path), &records, now) {
+        Ok(saved) => {
+            if let Some(why) = &saved.rebuilt {
+                eprintln!("store: rebuilt {path} ({why}) from this pass's reads");
+            }
+            eprintln!(
+                "store: {} dispatch record(s), {} triage verdict(s)",
+                saved.dispatches, saved.verdicts
+            );
+        }
+        Err(error) => eprintln!("warning: store {path} not saved: {error:#}"),
     }
 }
 

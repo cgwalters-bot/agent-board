@@ -969,6 +969,14 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 run,
                 ..
             }) => {
+                let dispatch = crate::store::Dispatch {
+                    item: key(issue),
+                    kind: Some(DIGEST_KIND.into()),
+                    pool: Some(pool.to_string()),
+                    plan: Some(id.clone()),
+                    run: run.as_deref().and_then(epics::record_run),
+                };
+                self.report.records.borrow_mut().dispatch(&record, dispatch);
                 let run = run.as_deref().unwrap_or("unnamed");
                 self.line(format!("{line} record={record} run={run}"));
                 Ok(Start::Posted(Some(id)))
