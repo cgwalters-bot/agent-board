@@ -1026,6 +1026,13 @@ pub struct Continuation {
     /// from its head commit, which the continuation was asked to write for
     /// them (agentic-job v0.5.1 cannot change either). Off, a person writes them.
     pub retitle: bool,
+    /// The runner profile (or `hosted`) on which a clean midstream draft whose
+    /// own text says it is partial, incomplete or untested ([`UNTESTED_WORDS`])
+    /// gets continuation rounds rather than waiting for promotion as if
+    /// finished (agent-board#1058). Other continuations keep their runner. A
+    /// sandbox that cannot build the project is why a profile such as a
+    /// devspace is named. None (the default) leaves such a draft waiting.
+    pub untested: Option<String>,
 }
 
 const MAX_FLAKE_FIXES: usize = 20;
@@ -1065,6 +1072,7 @@ impl Default for Continuation {
             rounds: CONTINUATION_ROUNDS,
             pools: BTreeMap::new(),
             retitle: false,
+            untested: None,
         }
     }
 }
@@ -1077,7 +1085,7 @@ impl Continuation {
         let object = value.as_object().context("continuation is not an object")?;
         for key in object.keys() {
             ensure!(
-                ["rounds", "pools", "retitle"].contains(&key.as_str()),
+                ["rounds", "pools", "retitle", "untested"].contains(&key.as_str()),
                 "unknown continuation field {key}"
             );
         }
@@ -1108,10 +1116,22 @@ impl Continuation {
             .map(|r| r.as_bool().context("continuation retitle is not a boolean"))
             .transpose()?
             .unwrap_or(false);
+        // Threat: a runner name is a dispatch input the caller resolves to a
+        // machine; carry only a bounded profile name, as plans do.
+        let untested = object
+            .get("untested")
+            .map(|r| {
+                r.as_str()
+                    .filter(|r| crate::plan::valid_pool(r))
+                    .map(str::to_owned)
+                    .context("continuation untested is not hosted or a runner profile name")
+            })
+            .transpose()?;
         Ok(Self {
             rounds,
             pools,
             retitle,
+            untested,
         })
     }
 }
@@ -3403,6 +3423,46 @@ fn undescribed(pull: &Value) -> Vec<&'static str> {
     out
 }
 
+/// Words by which a hand-back says its work is unfinished or unverified, as
+/// implement runs word it where they could not build or test (agent-board#1058).
+/// Lower case; matched in the lower-cased text.
+const UNTESTED_WORDS: &[&str] = &[
+    "partial work",
+    "incomplete",
+    "untested",
+    "not tested",
+    "could not run",
+    "could not be run",
+    "were not run",
+    "was not run",
+];
+
+/// Why a midstream draft is unfinished or untested by its own words, with
+/// `continuation.untested` on: the description's, or once a continuation ran,
+/// the head commit's message, as the round could not change the description.
+/// A rebase or fix round alone does not end the description's say. Only the
+/// matched word of [`UNTESTED_WORDS`] is repeated, not the bot's text.
+fn untested(config: &Config, pull: &Value, continued: bool) -> Option<String> {
+    config.policy.continuation.untested.as_ref()?;
+    let (what, words) = if continued {
+        (
+            "its head commit",
+            text(pull, "/commits/nodes/0/commit/message"),
+        )
+    } else {
+        ("its description", text(pull, "/body"))
+    };
+    let words = words.to_lowercase();
+    let word = UNTESTED_WORDS.iter().find(|w| words.contains(*w))?;
+    Some(format!("an untested midstream draft: {what} says {word:?}"))
+}
+
+/// Whether the bot's pull request is a draft on a midstream fork, which only
+/// the operator promotes.
+fn midstream_draft(config: &Config, pull: &Value) -> bool {
+    pull["isDraft"].as_bool().unwrap_or(false) && is_harness(pull, config) && no_merge(config, pull)
+}
+
 /// The title and description the head commit's message gives a completed
 /// continuation, as its task asks it to write them: a subject and a body,
 /// neither the harness's words nor a checkpoint, and each within GitHub's
@@ -4538,8 +4598,33 @@ pub fn decide(
     // On a midstream fork every pull request stays a draft, and only the
     // operator promotes it; its rounds above run as anywhere else, and a
     // clean, green one waits for that promotion rather than a label, which
-    // would stop its later rounds (agent-board#628).
+    // would stop its later rounds (agent-board#628). With
+    // `continuation.untested`, one that says it is unfinished or untested is
+    // continued instead, as a checkpoint draft is, within the same rounds.
     if midstream {
+        if let Some(why) = untested(config, pull, marker.continued > 0) {
+            if marker.sha.as_deref() == Some(head) {
+                return started(config, marker, (fix_run, outages), head, &why, now);
+            }
+            let rounds = config.policy.continuation.rounds;
+            if marker.continued >= rounds {
+                return recovery::exhausted(
+                    config,
+                    format!(
+                        "{why}; {} of {rounds} continuation rounds used",
+                        marker.continued
+                    ),
+                );
+            }
+            let round = marker.continued + 1;
+            return Decision {
+                round: Some(round),
+                ..step(
+                    "continue",
+                    format!("{why}, so continuation round {round} of {rounds}"),
+                )
+            };
+        }
         return if !checks.pending.is_empty() {
             step(
                 "wait",
@@ -5968,6 +6053,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         review_run: Option<&Value>,
     ) -> Result<String> {
         let continuing = action == "continue";
+        // An untested midstream draft's round runs where it can be built and
+        // tested, on the runner `continuation.untested` names.
+        let midstream = continuing
+            && self.config.policy.continuation.untested.is_some()
+            && midstream_draft(self.config, pull);
+        let mut untested_round = false;
         if let Some(why) = self.dependency_work_hold(repo, pull)? {
             return Ok(format!("not started: {why}"));
         }
@@ -5995,6 +6086,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                         .into(),
                     next: "Inspect the branch and its issue; finish and test the change.".into(),
                 },
+                None if midstream => {
+                    untested_round = true;
+                    Checkpoint {
+                        reason: "untested".into(),
+                        done: "The branch holds the change its description describes, which says it is unfinished or untested.".into(),
+                        left: "Build the change and run the project's own CI steps and tests; fix what fails.".into(),
+                        next: "Inspect the branch and its issue; build, test and finish the change.".into(),
+                    }
+                }
                 None => bail!("a continuation without a checkpoint"),
             })
         } else {
@@ -6068,8 +6168,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             if let Some(pool) = &pool {
                 self.rest.preview_pool_start(pool);
             }
+            let runner = match &self.config.policy.continuation.untested {
+                Some(runner) if untested_round => format!(" runner={runner}"),
+                _ => String::new(),
+            };
             return Ok(format!(
-                "would start {action} round {round} pool={}",
+                "would start {action} round {round} pool={}{runner}",
                 pool.as_deref().unwrap_or("default")
             ));
         }
@@ -6211,7 +6315,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             brief: &task,
             pool: pool.as_deref(),
             effort: None,
-            runner: None,
+            runner: self
+                .config
+                .policy
+                .continuation
+                .untested
+                .as_deref()
+                .filter(|_| untested_round),
             base: None,
         };
         let run = match self.dispatch(dispatcher, &workflow, &start) {
@@ -15854,6 +15964,194 @@ mod tests {
                 assert!(labels);
             }
             assert!(dispatcher.writes.borrow().is_empty());
+        }
+    }
+
+    /// With `continuation.untested`, a clean midstream draft whose own words
+    /// say it is unfinished or untested is continued within the continuation
+    /// rounds rather than waiting for promotion (agent-board#1058); after a
+    /// round left a new head, that head's message is read, not the description
+    /// the round could not change. Off, or a draft that says neither, waits.
+    #[test]
+    fn an_untested_midstream_draft_is_continued() {
+        let untested = "Switch decoding.\n\nThis is an incomplete draft: no build was run.";
+        let tested = "Switch decoding.\n\nVerified with make check.";
+        let unrun = "importer: Decode\n\nThe full build and make check could not run here.";
+        let promote = ("wait", PROMOTE_WAIT.to_owned());
+        let said = |what: &str, word: &str, rest: &str| {
+            format!("an untested midstream draft: its {what} says \"{word}\"{rest}")
+        };
+        let newer = json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older"});
+        for (name, runner, body, message, state, want) in [
+            (
+                "off",
+                None,
+                untested,
+                tested,
+                json!({"rounds": 0}),
+                promote.clone(),
+            ),
+            (
+                "tested",
+                Some("hosted"),
+                tested,
+                tested,
+                json!({"rounds": 0}),
+                promote.clone(),
+            ),
+            (
+                "untested",
+                Some("devspace-rhel10-64"),
+                untested,
+                tested,
+                json!({"rounds": 0}),
+                (
+                    "continue",
+                    said(
+                        "description",
+                        "incomplete",
+                        ", so continuation round 1 of 2",
+                    ),
+                ),
+            ),
+            (
+                "a round finished it",
+                Some("hosted"),
+                untested,
+                tested,
+                newer.clone(),
+                promote.clone(),
+            ),
+            (
+                "a rebase after a finishing round",
+                Some("hosted"),
+                untested,
+                tested,
+                json!({"rounds": 0, "continued": 1, "rebased": 1, "rebasing": true, "sha": "older"}),
+                promote.clone(),
+            ),
+            (
+                "a fix round alone",
+                Some("hosted"),
+                untested,
+                "Fix clippy lint",
+                json!({"rounds": 1, "sha": "older"}),
+                (
+                    "continue",
+                    said(
+                        "description",
+                        "incomplete",
+                        ", so continuation round 1 of 2",
+                    ),
+                ),
+            ),
+            (
+                "a round left it untested",
+                Some("hosted"),
+                tested,
+                unrun,
+                newer.clone(),
+                (
+                    "continue",
+                    said(
+                        "head commit",
+                        "could not run",
+                        ", so continuation round 2 of 2",
+                    ),
+                ),
+            ),
+            (
+                "the rounds are used",
+                Some("hosted"),
+                tested,
+                unrun,
+                json!({"rounds": 0, "continued": 2, "continuing": true, "sha": "older"}),
+                (
+                    "needs-human",
+                    said(
+                        "head commit",
+                        "could not run",
+                        "; 2 of 2 continuation rounds used",
+                    ),
+                ),
+            ),
+        ] {
+            let mut p = pull("pull-470", json!({"isDraft": true, "body": body}));
+            p["commits"]["nodes"][0]["commit"]["message"] = message.into();
+            let mut cfg = config();
+            cfg.policy.no_merge = vec![REPO.to_owned()];
+            cfg.policy.continuation.untested = runner.map(str::to_owned);
+            let got = decide(
+                &cfg,
+                &p,
+                &classify_checks(&p, &required()),
+                &marker(state),
+                (None, None),
+                &Outages::Off,
+                now(),
+            );
+            assert_eq!((got.action, got.reason), (want.0, want.1), "{name}");
+        }
+
+        // Its round is dispatched on the named runner, with the synthetic
+        // checkpoint's notes; a checkpoint draft's keeps the default runner.
+        // An invalid runner name is refused.
+        for (body, runner, reason, line) in [
+            (
+                untested.to_owned(),
+                json!("devspace-rhel10-64"),
+                "reason: untested",
+                "an untested midstream draft",
+            ),
+            (
+                checkpointed("budget"),
+                Value::Null,
+                "reason: budget",
+                "its checkpoint says budget",
+            ),
+        ] {
+            let mut fake = github();
+            fake.pulls.insert(
+                470,
+                pull("pull-470", json!({"isDraft": true, "body": body})),
+            );
+            let dispatcher = Fake::default();
+            dispatcher.answers.borrow_mut().insert(
+                DISPATCHES.into(),
+                vec![(200, json!({"workflow_run_id": 1234}))],
+            );
+            let mut cfg = config();
+            cfg.policy.no_merge = vec![REPO.to_owned()];
+            cfg.policy.continuation =
+                Continuation::from_json(Some(&json!({"untested": "devspace-rhel10-64"}))).unwrap();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let writes = dispatcher.writes.borrow();
+            let inputs = &writes
+                .first()
+                .unwrap_or_else(|| panic!("no dispatch: {:?}", outcome.lines))
+                .1["inputs"];
+            assert_eq!(inputs["runner"], runner, "{reason}");
+            let task = inputs["task"].as_str().unwrap();
+            assert!(task.contains(reason), "{task}");
+            assert!(
+                outcome.lines.iter().any(|l| l.contains(line)),
+                "{:?}",
+                outcome.lines
+            );
+        }
+        for bad in [json!("../devspace"), json!(""), json!(true)] {
+            assert!(Continuation::from_json(Some(&json!({"untested": bad}))).is_err());
         }
     }
 
