@@ -8954,8 +8954,26 @@ fn apply_starts_once_and_reruns_start_nothing_twice() {
     );
     assert!(comments[0].contains("\"pool\": \"claude\""));
     assert!(comments[1].starts_with("<!-- agent-board-dispatch: "));
+    // The store's records: what the dispatch knew, then what a read adds.
+    let record = (line.split(" record=").nth(1))
+        .and_then(|l| l.split(' ').next())
+        .unwrap();
+    let started = first.records.borrow().dispatches[record].clone();
+    assert_eq!(started.item, "cgwalters-forge/tracker#446");
+    assert_eq!(
+        (
+            started.kind.as_deref(),
+            started.pool.as_deref(),
+            started.plan
+        ),
+        (Some("triage"), Some("claude"), None)
+    );
+    assert!(started.run.is_some());
     let second = apply(&forge, &config);
     assert_eq!(second.failures, 0, "{:#?}", second.lines);
+    let read = second.records.borrow().dispatches[record].clone();
+    assert_eq!((read.kind, read.run), (started.kind, started.run));
+    assert!(read.plan.is_some_and(|plan| plan.contains('@')));
     assert_eq!(
         forge.dispatches().len(),
         6,
@@ -10013,6 +10031,21 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         ))
         .unwrap();
         assert_eq!(second.failures, 0, "{name}: {:#?}", second.lines);
+        // The store indexes the verdict the line names, never a visitor's.
+        if let Some(said) = expected.split(": triage verdict ").nth(1) {
+            let said = said.split(',').next().unwrap();
+            let records = second.records.borrow();
+            assert!(
+                (records.verdicts.values())
+                    .any(|v| v.verdict == said && v.item == "cgwalters-forge/tracker#446"),
+                "{name}: {records:?}"
+            );
+        }
+        if name == "a visitor cannot request an issue through a verdict" {
+            let records = second.records.borrow();
+            let item = |v: &crate::store::Verdict| v.item == "cgwalters-forge/tracker#446";
+            assert!(!records.verdicts.values().any(item), "{name}");
+        }
         if expected.contains("controller: reconcile close") {
             for report in [&preview, &second] {
                 let entry = report
@@ -14729,6 +14762,13 @@ fn maintain_dispatches_only_a_public_digest() {
             .filter(|d| d == "cgwalters-forge/bot-ops#9")
             .count();
         assert_eq!(digests, usize::from(dispatched), "{name}");
+        // The store records the digest's dispatch as any other start's.
+        let records = report.records.borrow();
+        let digest = (records.dispatches.values())
+            .find(|d| d.item == "cgwalters-forge/bot-ops#9")
+            .map(|d| (d.kind.as_deref(), d.pool.as_deref(), d.plan.is_some()));
+        let expected_record = dispatched.then_some((Some("research"), Some("claude"), true));
+        assert_eq!(digest, expected_record, "{name}: {records:?}");
         let comments = forge.comments_on("cgwalters-forge/bot-ops", 9);
         let plans: Vec<Value> = (comments.iter())
             .filter_map(|c| plan::fenced_json(c, PLAN_FENCE).unwrap())
@@ -19522,6 +19562,15 @@ fn config_table() {
         (
             promote(json!({"policyRepository": "policy"})),
             "promote policyRepository: invalid repository \"policy\": expected OWNER/REPO",
+        ),
+        (json!({"store": ""}), "store must name a file"),
+        (
+            json!({"store": "s.json", "state": "s.json"}),
+            "store must differ from state and livingStatus",
+        ),
+        (
+            json!({"store": "s.db", "livingStatus": "s.db"}),
+            "store must differ from state and livingStatus",
         ),
     ] {
         let mut value = minimal.clone();
