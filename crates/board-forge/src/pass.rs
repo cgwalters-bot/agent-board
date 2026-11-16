@@ -792,7 +792,7 @@ pub struct Config {
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
     /// Off unless set: the SQLite store ([`crate::store`]) an applying pass
-    /// records its dispatch records and triage verdicts in.
+    /// records its dispatch records, triage verdicts, plans and holds in.
     pub store: Option<String>,
     /// Opt-in durable ledger path for one living status comment per issue.
     /// Retain it across runs; applying passes must still be serialized.
@@ -4140,8 +4140,9 @@ pub struct Report {
     pub accepted_plans: RefCell<BTreeMap<String, String>>,
     /// Suppressed candidates, by rule; absent from the summary when disabled.
     pub triage_skipped: RefCell<BTreeMap<String, u64>>,
-    /// The dispatch records and triage verdicts this pass made or read, for
-    /// [`Config::store`]; never read back for a decision.
+    /// The dispatch records, triage verdicts and accepted plans this pass
+    /// made or read, and its hold snapshot, for [`Config::store`]; never
+    /// read back for a decision.
     pub records: RefCell<crate::store::Records>,
     /// Confirmed effects only, independently of the step caps.
     pub effects: Effects,
@@ -8034,6 +8035,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .accepted_plans
             .borrow_mut()
             .insert(issue.display(), plan.kind.clone());
+        let accepted = crate::store::Plan {
+            id: id.clone(),
+            kind: plan.kind.clone(),
+        };
+        let mut records = self.report.records.borrow_mut();
+        records.plans.insert(key(issue), accepted);
+        drop(records);
         let past = self.past_cap(&facts, board, &plan);
         let past = match self.pr_pressure((&dest.repository, &plan.kind), past.as_deref()) {
             pressure::Pressure::Clear => String::new(),

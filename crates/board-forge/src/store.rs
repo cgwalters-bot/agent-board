@@ -2,10 +2,10 @@
 //! database the caller carries between applying passes, in the Actions
 //! cache with an artifact fallback (agent-board#1052).
 //!
-//! This first slice indexes the dispatch records and triage verdicts the
-//! pass makes or reads. The comments stay the source of every decision:
-//! the store is written, never read for one, so a lost, stale or forged
-//! database cannot change what the pass does. A missing or unusable
+//! It indexes the dispatch records, triage verdicts and accepted plans the
+//! pass makes or reads, and its latest hold snapshot. The comments stay the
+//! source of those decisions: they are written, never read for one, so a
+//! lost, stale or forged database cannot change them. A missing or unusable
 //! database is replaced by an empty one, which refills from the comments
 //! each later pass reads.
 use crate::github::DEFAULT_HOST;
@@ -17,7 +17,8 @@ use time::OffsetDateTime;
 
 /// The schema, one migration a version: `user_version` counts those
 /// applied. Append; never edit one that shipped.
-const MIGRATIONS: &[&str] = &["CREATE TABLE dispatches (
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE dispatches (
         record TEXT PRIMARY KEY,
         item TEXT NOT NULL,
         kind TEXT,
@@ -35,7 +36,22 @@ const MIGRATIONS: &[&str] = &["CREATE TABLE dispatches (
         at INTEGER NOT NULL,
         seen INTEGER NOT NULL
     ) STRICT;
-    CREATE INDEX verdicts_item ON verdicts (item);"];
+    CREATE INDEX verdicts_item ON verdicts (item);",
+    "CREATE TABLE plans (
+        item TEXT PRIMARY KEY,
+        plan TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        seen INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE holds (
+        item TEXT,
+        epic INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        operator INTEGER NOT NULL,
+        since TEXT NOT NULL
+    ) STRICT;",
+];
 
 /// The schema version this build writes.
 pub const STORE_SCHEMA: usize = MIGRATIONS.len();
@@ -71,11 +87,35 @@ pub struct Verdict {
     pub at: OffsetDateTime,
 }
 
-/// What one pass saw, keyed by comment URL; written by [`save`].
+/// A plan stage 4 accepted for an issue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plan {
+    /// The plan id ([`crate::plan::plan_id`]).
+    pub id: String,
+    pub kind: String,
+}
+
+/// One entry of the pass's hold snapshot ([`crate::pass::holds::Published`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hold {
+    /// `OWNER/REPO#N`; none for a hold of every new run.
+    pub item: Option<String>,
+    pub epic: bool,
+    pub kind: String,
+    pub reason: String,
+    pub operator: bool,
+    pub since: String,
+}
+
+/// What one pass saw, keyed by comment URL, plans by their issue's key;
+/// written by [`save`].
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Records {
     pub dispatches: BTreeMap<String, Dispatch>,
     pub verdicts: BTreeMap<String, Verdict>,
+    pub plans: BTreeMap<String, Plan>,
+    /// The pass's hold snapshot, which replaces the last; none leaves it.
+    pub holds: Option<Vec<Hold>>,
 }
 
 impl Records {
@@ -114,7 +154,10 @@ impl Records {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.dispatches.is_empty() && self.verdicts.is_empty()
+        self.dispatches.is_empty()
+            && self.verdicts.is_empty()
+            && self.plans.is_empty()
+            && self.holds.is_none()
     }
 }
 
@@ -142,6 +185,8 @@ pub struct Saved {
     pub rebuilt: Option<String>,
     pub dispatches: u64,
     pub verdicts: u64,
+    pub plans: u64,
+    pub holds: u64,
 }
 
 /// Record `records` at `now` in the database at `path`, migrating it to
@@ -199,8 +244,29 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
         )
         .context("record a verdict")?;
     }
+    for (item, p) in &records.plans {
+        tx.execute(
+            "INSERT INTO plans (item, plan, kind, seen) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (item) DO UPDATE SET plan = excluded.plan,
+               kind = excluded.kind, seen = excluded.seen",
+            params![item, p.id, p.kind, seen],
+        )
+        .context("record a plan")?;
+    }
+    if let Some(holds) = &records.holds {
+        tx.execute("DELETE FROM holds", [])
+            .context("replace the holds")?;
+        for h in holds {
+            tx.execute(
+                "INSERT INTO holds (item, epic, kind, reason, operator, since)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![h.item, h.epic, h.kind, h.reason, h.operator, h.since],
+            )
+            .context("record a hold")?;
+        }
+    }
     let expired = seen - STORE_RETENTION_DAYS * 24 * 60 * 60;
-    for table in ["dispatches", "verdicts"] {
+    for table in ["dispatches", "verdicts", "plans"] {
         tx.execute(&format!("DELETE FROM {table} WHERE seen < ?1"), [expired])
             .context("expire old rows")?;
     }
@@ -209,13 +275,15 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
         let count: i64 = tx.query_row(&sql, [], |row| row.get(0))?;
         Ok(count.unsigned_abs())
     };
-    let (dispatches, verdicts) = (count("dispatches")?, count("verdicts")?);
-    tx.commit().context("commit the store")?;
-    Ok(Saved {
+    let saved = Saved {
         rebuilt,
-        dispatches,
-        verdicts,
-    })
+        dispatches: count("dispatches")?,
+        verdicts: count("verdicts")?,
+        plans: count("plans")?,
+        holds: count("holds")?,
+    };
+    tx.commit().context("commit the store")?;
+    Ok(saved)
 }
 
 /// An existing, intact database of a schema this build knows, migrated.
@@ -414,6 +482,11 @@ mod tests {
         records.dispatch("https://github.com/o/r/issues/1#issuecomment-2", started);
         let url = "https://github.com/O/R/issues/1#issuecomment-3";
         records.verdict(url, "done", Some("no".into()), at(0));
+        let plan = Plan {
+            id: "9@2027".into(),
+            kind: "triage".into(),
+        };
+        records.plans.insert("o/r#1".into(), plan);
         records
     }
 
@@ -481,7 +554,9 @@ mod tests {
             Saved {
                 rebuilt: Some("no database".into()),
                 dispatches: 1,
-                verdicts: 1
+                verdicts: 1,
+                plans: 1,
+                holds: 0,
             }
         );
         let mut second = Records::default();
@@ -518,9 +593,9 @@ mod tests {
             ("evicted", Ok(Some("no database"))),
             ("damaged", Ok(Some("integrity check: "))),
             ("oversized", Ok(Some("larger than"))),
-            ("newer", Ok(Some("schema 99 is newer than this build's 1"))),
+            ("newer", Ok(Some("schema 99 is newer than this build's 2"))),
             ("tableless", Ok(Some("schema differs from version 1's"))),
-            ("trigger", Ok(Some("schema differs from version 1's"))),
+            ("trigger", Ok(Some("schema differs from version 2's"))),
             // A constraint that every row fails, slowly: refused by its
             // schema before an integrity check would evaluate it.
             ("constraint", Ok(Some("schema differs from version 1's"))),
@@ -533,7 +608,7 @@ mod tests {
             ("wal", Ok(Some("not a rollback-journal database"))),
             (
                 "partial page",
-                Ok(Some("28673 bytes is not a whole number")),
+                Ok(Some("40961 bytes is not a whole number")),
             ),
             (
                 "page count",
@@ -541,6 +616,8 @@ mod tests {
             ),
             // Version 0: an empty database from before any migration.
             ("older", Ok(None)),
+            // The first slice's, migrated in place.
+            ("version 1", Ok(None)),
             ("symlink", Ok(Some("not a regular file"))),
             (
                 "foreign",
@@ -591,6 +668,7 @@ mod tests {
                 }
                 "page count" => patch(28, &[0, 0, 0, 9]),
                 "older" => sql("VACUUM"),
+                "version 1" => migrate_to(&Connection::open(&path).unwrap(), 1).unwrap(),
                 "symlink" => std::os::unix::fs::symlink(&other, &path).unwrap(),
                 "foreign" => std::fs::write(&path, "{\"not\": \"sqlite\"}").unwrap(),
                 "directory" => std::fs::create_dir(&path).unwrap(),
@@ -606,7 +684,8 @@ mod tests {
                         why.starts_with(rebuilt.unwrap_or_default()),
                         "{name}: {why}"
                     );
-                    assert_eq!((saved.dispatches, saved.verdicts), (1, 1), "{name}");
+                    let counts = (saved.dispatches, saved.verdicts, saved.plans);
+                    assert_eq!(counts, (1, 1, 1), "{name}");
                 }
                 (Err(error), Err(got)) => assert!(got.starts_with(error), "{name}: {got}"),
                 (expected, got) => panic!("{name}: expected {expected:?}, got {got:?}"),
@@ -628,13 +707,41 @@ mod tests {
         save(&path, &records(), at(0)).unwrap();
         let day = 24 * 60 * 60;
         let kept = save(&path, &Records::default(), at(STORE_RETENTION_DAYS * day)).unwrap();
-        assert_eq!((kept.dispatches, kept.verdicts), (1, 1));
+        assert_eq!((kept.dispatches, kept.verdicts, kept.plans), (1, 1, 1));
         let gone = save(
             &path,
             &Records::default(),
             at(STORE_RETENTION_DAYS * day + 1),
         )
         .unwrap();
-        assert_eq!((gone.dispatches, gone.verdicts), (0, 0));
+        assert_eq!((gone.dispatches, gone.verdicts, gone.plans), (0, 0, 0));
+    }
+
+    /// A pass's hold snapshot replaces the last pass's; one without it
+    /// leaves the stored one.
+    #[test]
+    fn holds_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let hold = |item: Option<&str>| Hold {
+            item: item.map(Into::into),
+            epic: false,
+            kind: "needs-operator".into(),
+            reason: "why".into(),
+            operator: true,
+            since: "2027-01-15T08:00:00Z".into(),
+        };
+        for (holds, expected) in [
+            (Some(vec![hold(Some("o/r#1")), hold(None)]), 2),
+            (None, 2),
+            (Some(vec![hold(Some("o/r#2"))]), 1),
+            (Some(vec![]), 0),
+        ] {
+            let records = Records {
+                holds,
+                ..Default::default()
+            };
+            assert_eq!(save(&path, &records, at(0)).unwrap().holds, expected);
+        }
     }
 }

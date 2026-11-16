@@ -500,7 +500,8 @@ fn load_state(path: &str) -> State {
     }
 }
 
-/// Record the pass's dispatch records and triage verdicts in the store.
+/// Record the pass's dispatch records, triage verdicts, plans and holds in
+/// the store.
 /// No decision reads it yet, so a store that cannot be saved only warns:
 /// the pass's own writes are done, and the next pass rebuilds it.
 fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
@@ -511,8 +512,8 @@ fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
                 eprintln!("store: rebuilt {path} ({why}) from this pass's reads");
             }
             eprintln!(
-                "store: {} dispatch record(s), {} triage verdict(s)",
-                saved.dispatches, saved.verdicts
+                "store: {} dispatch record(s), {} triage verdict(s), {} plan(s), {} hold(s)",
+                saved.dispatches, saved.verdicts, saved.plans, saved.holds
             );
         }
         Err(error) => eprintln!("warning: store {path} not saved: {error:#}"),
