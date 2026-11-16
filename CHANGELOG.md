@@ -11,6 +11,12 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The pass's new GitHub-only `requestWindow` (off unless set, with
+  `requestShare`) spreads the token's remaining allowance over the passes
+  expected before the reset, at least a floor, and holds a pass that would
+  get less than the floor instead of running it starved; its limit also
+  stops GraphQL at that many points (agent-board#1042).
+
 - The pass's `reserveScheduling` keeps its stage shares under `requestShare`
   instead of being disabled by it, and stage 4 says once when the stages
   before it left less than a start takes. The new GitHub-only
