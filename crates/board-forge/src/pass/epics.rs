@@ -1025,6 +1025,9 @@ type Later = (Option<Project>, Option<(BTreeSet<u64>, Slots)>, Target);
 pub(super) struct Focus {
     /// The focus epic, once stage 3 has found it live.
     pub(super) live: Option<ItemRef>,
+    /// Whether stage 3 found it not live, which holds every start. Unread,
+    /// it is neither: the pass goes on without a focus.
+    pub(super) refused: bool,
     /// Its children among the candidates, which stage 4 takes first.
     pub(super) children: usize,
     /// Candidates stage 4 has reached.
@@ -1035,6 +1038,15 @@ pub(super) struct Focus {
     pub(super) started: usize,
     /// Whether the rest may start, once stage 4 has taken the children.
     pub(super) spillover: Option<bool>,
+}
+
+/// Stage 3's judgement of `epics.focus` ([`Scheduler::focus_live`]).
+enum FocusLive {
+    Live,
+    /// Not a live epic, or not an issue: the pass fails and starts nothing.
+    Refused(String),
+    /// Not known this pass: the pass goes on without a focus.
+    Unread(String),
 }
 
 /// The highest-Priority live epic stage 3 did not plan, only for the wait to
@@ -1371,32 +1383,45 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
     }
 
-    /// Why `epics.focus` is refused, where it is not one of the `live` epics
-    /// stage 3 listed of `repository`. The listing has every open epic of
-    /// that repository; the focus elsewhere, with `epics.inWorkRepositories`,
-    /// takes one read.
-    fn focus_refused(
+    /// Whether `epics.focus` is one of the `live` epics stage 3 listed of
+    /// `repository`. The listing has every open epic of that repository, so
+    /// one not in it is not live, and one in it whose liveness or sub-issues
+    /// could not be read (`unread`, by key) is unknown. The focus elsewhere,
+    /// with `epics.inWorkRepositories`, takes one read, unknown only where
+    /// the budget or the rate limit refused it: an issue that is not there
+    /// is refused, not passed over on every pass.
+    fn focus_live(
         &mut self,
         focus: &ItemRef,
         repository: &str,
         live: &[EpicFacts],
-    ) -> Option<String> {
-        if live.iter().any(|e| key(&e.issue) == key(focus)) {
-            return None;
+        unread: &BTreeMap<String, String>,
+    ) -> FocusLive {
+        let at = key(focus);
+        if live.iter().any(|e| key(&e.issue) == at) {
+            return FocusLive::Live;
         }
         let name = focus.display();
         let not_live = || {
-            Some(format!(
+            FocusLive::Refused(format!(
                 "{name} is not a live epic (open and labelled epic by the operator or the bot)"
             ))
         };
         if focus.repository.eq_ignore_ascii_case(repository) {
-            return not_live();
+            return unread
+                .get(&at)
+                .map_or_else(not_live, |why| FocusLive::Unread(why.clone()));
         }
         let read = (self.issue(ISSUE_QUERY, focus)).and_then(|node| Facts::from_node(&node));
         let facts = match read {
             Ok(facts) => facts,
-            Err(error) => return Some(format!("{name} could not be read: {error:#}")),
+            Err(error) => {
+                let why = format!("{name} could not be read: {error:#}");
+                return match budget_spent(&error) || error.is::<RateLimited>() {
+                    true => FocusLive::Unread(why),
+                    false => FocusLive::Refused(why),
+                };
+            }
         };
         let parent = Parent {
             issue: focus.clone(),
@@ -1405,9 +1430,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             labels_complete: facts.labels_complete,
         };
         match self.live(&parent) {
-            Ok(true) => None,
+            Ok(true) => FocusLive::Live,
             Ok(false) => not_live(),
-            Err(why) => Some(why),
+            Err(why) => FocusLive::Unread(why),
         }
     }
 
@@ -1428,10 +1453,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.focus_read = Some(focus::Read::new(&listed));
         }
         let mut live = Vec::new();
+        let mut unread = BTreeMap::new();
         for facts in listed {
             let facts = match facts {
                 Ok(facts) => facts,
                 Err((issue, error)) => {
+                    unread.insert(key(&issue), format!("{error:#}"));
                     self.record(Entry {
                         scope: Scope::Epic(issue),
                         hold: Hold::new(HoldKind::Unreadable, format!("{error:#}")),
@@ -1450,7 +1477,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             match self.live(&parent) {
                 Ok(true) => live.push(facts),
                 Ok(false) => {}
-                Err(why) => self.epic_held(&facts, Hold::new(HoldKind::Unreadable, why)),
+                Err(why) => {
+                    unread.insert(key(&facts.issue), why.clone());
+                    self.epic_held(&facts, Hold::new(HoldKind::Unreadable, why));
+                }
             }
         }
         *self.report.tally.1.live_epics.get_or_insert(0) += live.len();
@@ -1459,14 +1489,26 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             live.len()
         ));
         if let Some(focus) = self.config.focus() {
-            if let Some(why) = self.focus_refused(&focus, repository, &live) {
-                self.holds_whole = false;
-                self.report.failure(format!(
-                    "focus error: epics.focus: {why}; no epic is planned or applied and no new run starts until pass.json names a live epic or drops the setting"
-                ));
-                return Ok(());
+            let name = focus.display();
+            match self.focus_live(&focus, repository, &live, &unread) {
+                FocusLive::Live => self.focus.live = Some(focus),
+                FocusLive::Refused(why) => {
+                    self.holds_whole = false;
+                    self.focus.refused = true;
+                    self.report.failure(format!(
+                        "focus error: epics.focus: {why}; no epic is planned or applied and no new run starts until pass.json names a live epic or drops the setting"
+                    ));
+                    return Ok(());
+                }
+                // The next pass reads it again, so this one is not failed
+                // for it (agent-board#1045).
+                FocusLive::Unread(why) => {
+                    self.holds_whole = false;
+                    self.line(format!(
+                        "focus: epics.focus {name} is unread this pass, so nothing goes first: {why}"
+                    ));
+                }
             }
-            self.focus.live = Some(focus);
         }
         if live.is_empty() {
             return Ok(());

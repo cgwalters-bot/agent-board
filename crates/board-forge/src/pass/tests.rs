@@ -27074,7 +27074,7 @@ fn focus_epic_goes_first_and_the_rest_spill_over() {
             vec![],
             vec![
                 "focus error: epics.focus: cgwalters-forge/tracker#999 is not a live epic (open and labelled epic by the operator or the bot)",
-                "schedule: no new run starts: epics.focus cgwalters-forge/tracker#999 is not confirmed live",
+                "schedule: no new run starts: epics.focus cgwalters-forge/tracker#999 is not a live epic",
             ],
             1,
         ),
@@ -27104,6 +27104,17 @@ fn focus_epic_goes_first_and_the_rest_spill_over() {
             vec!["focus error: epics.focus: cgwalters-forge/review#135 is not a live epic"],
             1,
         ),
+        (
+            "a focus in a work repository whose read fails, not for the budget, is refused",
+            Box::new(|r, c| {
+                sub_issue(r, "cgwalters-forge/review", "cgwalters");
+                c["epics"] = json!({"repository": TRACKER, "inWorkRepositories": true,
+                    "focus": "cgwalters-forge/review#135"});
+            }),
+            vec![],
+            vec!["focus error: epics.focus: cgwalters-forge/review#135 could not be read: "],
+            1,
+        ),
     ];
     for (name, edit, starts, lines, failures) in cases {
         let mut replay = replay();
@@ -27125,6 +27136,64 @@ fn focus_epic_goes_first_and_the_rest_spill_over() {
             );
         }
         assert_eq!(report.failures, failures, "{name}: {:#?}", report.lines);
+    }
+}
+
+/// A pass held to its budget that leaves the live focus epic unread, in the
+/// epics repository or a work repository, is refused for nothing: it fails
+/// and starts as a pass without the focus would (agent-board#1045). Every
+/// budget is tried, as the share each stage keeps moves which read is
+/// refused.
+#[test]
+fn unread_focus_within_a_budget_is_not_refused() {
+    let in_tracker = |_: &mut Replay, c: &mut Value| focused(c, FOCUS_890);
+    let in_review = |r: &mut Replay, c: &mut Value| {
+        sub_issue(r, "cgwalters-forge/review", "cgwalters");
+        focus_read(r, "OPEN");
+        c["epics"] = json!({"repository": TRACKER, "inWorkRepositories": true,
+            "focus": "cgwalters-forge/review#135"});
+    };
+    type Edit<'a> = &'a dyn Fn(&mut Replay, &mut Value);
+    let cases: [(&str, Edit); 2] = [
+        (FOCUS_890, &in_tracker),
+        ("cgwalters-forge/review#135", &in_review),
+    ];
+    for (focus, edit) in cases {
+        let mut replay = replay();
+        only(&mut replay, &["cgwalters-forge/tracker#446"]);
+        let mut settings = json!({});
+        edit(&mut replay, &mut settings);
+        let with = config(settings.clone());
+        settings["epics"].as_object_mut().unwrap().remove("focus");
+        let without = config(settings);
+        let starts = |report: &Report| -> Vec<String> {
+            (report.lines.iter())
+                .filter(|l| l.starts_with("start "))
+                .cloned()
+                .collect()
+        };
+        let unread_line = format!("focus: epics.focus {focus} is unread this pass");
+        let mut unread = 0;
+        for limit in 1..=200 {
+            let report = preview_within(&with, &replay, limit);
+            let lines = &report.lines;
+            assert!(
+                !lines.iter().any(|l| l.starts_with("focus error")
+                    || l.starts_with("schedule: no new run starts: epics.focus")),
+                "{focus} within {limit}: {lines:#?}"
+            );
+            if !lines.iter().any(|l| l.starts_with(&unread_line)) {
+                continue;
+            }
+            unread += 1;
+            let plain = preview_within(&without, &replay, limit);
+            assert_eq!(starts(&report), starts(&plain), "{focus} within {limit}");
+            assert_eq!(
+                report.failures, plain.failures,
+                "{focus} within {limit}: {lines:#?}"
+            );
+        }
+        assert!(unread > 0, "no budget left {focus} unread");
     }
 }
 

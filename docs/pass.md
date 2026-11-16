@@ -3788,12 +3788,20 @@ whose listing stage 3 reads anyway. One in another work repository, which needs
 `epics.inWorkRepositories`, takes a read of its labels and state, and the read of
 its label's author that its children need anyway; stage 3 plans only
 `epics.repository`'s epics, so only such a focus's children go first. A focus that is not a live epic (closed, unlabelled, labelled by
-someone else, or unreadable) is refused, not ignored: `focus error: epics.focus:
+someone else, or not an issue) is refused, not ignored: `focus error: epics.focus:
 …`, a failed pass, and stages 3 and 4 plan, apply and start nothing until
 `pass.json` names a live epic or drops the setting, while stage 2 and the later
 stages go on. So a finished focus epic, once closed, by a person or by the pass with
 `epics.close`, stops new work until the setting moves: on purpose, since falling
-back would be silently ignoring it.
+back would be silently ignoring it. A focus whose liveness this pass did not
+read is unknown, not refused (agent-board#1045): a listed epic whose labels,
+label author or sub-issues could not be read, one in a work repository whose
+read the budget or the rate limit refused, or any focus once stage 3
+[stopped at its share](#order-and-effects) before judging it. The pass goes on as
+without a focus and fails nothing for it, saying `schedule: epics.focus
+OWNER/REPO#N is unread this pass; candidates start as without a focus`, after
+`focus: epics.focus OWNER/REPO#N is unread this pass, so nothing goes first: WHY`
+where stage 3 got that far; the next pass reads it again.
 `--replay` shows all of this: a config naming a live epic of the recording. The
 setting is refused at parse on a malformed value, on a repository that could
 never hold a live epic, and on a Forgejo board, whose stages do not read it yet.
