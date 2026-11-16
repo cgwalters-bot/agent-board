@@ -122,11 +122,12 @@ Cargo may fetch dependencies.
 Separate CI jobs run `just lint`'s shared workflow check and the ignored
 `forgejo_live` test (`just test-forgejo` locally; see [Live CI](forges.md#live-ci)).
 Their checkout, container and environment prerequisites are noted beside the
-recipes. The [site](../site/index.md) renders `docs/` in place, without copies,
-under its own landing page; the README points to it. Its workflow runs
-`just site-test`, `just site-build` and `just site-check`, then rebuilds on main
-with `just site-build-pages` and uploads Pages. See the recipes for Node/lychee
-requirements and the dependency-directory cleanup needed before workflow lint.
+recipes. The [site](../site/index.md) renders `docs/` with Zensical, staging
+copies at build time, under its own landing page; the README points to it. Its
+workflow runs `just site-test`, `just site-build` and `just site-check`, then
+rebuilds on main with `just site-build-pages` and uploads Pages. See the recipes
+for Python/lychee requirements and the dependency-directory cleanup needed
+before workflow lint.
 
 `just build-release` is the safe local build from the
 [live workflow](../live/board-test.yml). Do not run that workflow's `test project`

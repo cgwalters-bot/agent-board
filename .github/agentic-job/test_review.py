@@ -248,8 +248,13 @@ class ReviewContracts(unittest.TestCase):
             with self.subTest(job="deploy", forbidden=forbidden):
                 self.assertNotIn(forbidden, deploy)
         justfile = (ROOT / "Justfile").read_text()
-        self.assertIn("cd site && npm ci --ignore-scripts --no-audit --no-fund\n", justfile)
-        self.assertIn("node --test site/links.test.mjs\n", justfile)
+        self.assertIn(
+            "    site/.venv/bin/pip install --quiet --disable-pip-version-check"
+            " --require-hashes --only-binary :all: -r site/requirements.txt\n",
+            justfile,
+        )
+        self.assertEqual(justfile.count("pip install"), 1)
+        self.assertIn("cd site && .venv/bin/python -m unittest\n", justfile)
 
     def test_site_uses_the_reviewed_listener_correction_without_overrides(self):
         # tracker#1212: stop the unnecessary acpid listener upstream, rather

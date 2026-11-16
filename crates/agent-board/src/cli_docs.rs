@@ -14,8 +14,7 @@ pub const REGENERATE: &str = "just cli-docs";
 /// Arguments clap adds to every command; documenting them on each is noise.
 const BUILTIN_ARGS: &[&str] = &["help", "version"];
 
-/// The standard notice a generated document starts with, under its title
-/// (`LLM_NOTICE` in site/links.mjs, which turns it into the page banner):
+/// The standard notice a generated document starts with, under its title:
 /// the help strings this renders were written with LLMs.
 const LLM_NOTICE: &str = "> This text is LLM generated.";
 

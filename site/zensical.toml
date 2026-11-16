@@ -1,0 +1,61 @@
+# The documentation site, built by `just site-build` with the Zensical
+# release pinned in requirements.txt. It renders site/index.md and docs/*.md,
+# which site-build stages under pages/; repository_links.py rewrites their
+# links. site-build also sets site_url, from SITE_URL, in its copy of this
+# file: pages link each other relatively, but the 404 page needs the address.
+[project]
+site_name = "agent-board"
+site_description = "Coordinate coding agents through a forge's project board, its issues and their pull requests."
+docs_dir = "pages"
+site_dir = "dist"
+# No nav: the landing page, then every docs/ page in file order, so a new
+# page cannot be left out of it.
+
+# Zensical checks links in the source, where a link to a repository file
+# such as ../AGENTS.md is not yet the forge URL repository_links.py makes
+# of it. `just site-check` checks every built link and fragment instead.
+[project.validation]
+invalid_links = false
+
+[project.theme]
+language = "en"
+favicon = "favicon.svg"
+# System fonts: a page view requests nothing from a third party.
+font = false
+features = [
+  "content.code.copy",
+  "navigation.sections",
+  "navigation.top",
+  "search.highlight",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to light mode"
+
+# Close to the forge's Markdown: no typographic replacements (`--flag` in
+# prose stays) and the forge's heading anchors, so `page.md#anchor` links
+# written for the forge work here too.
+[project.markdown_extensions]
+admonition = {}
+attr_list = {}
+footnotes = {}
+md_in_html = {}
+tables = {}
+toc.permalink = true
+toc.slugify = { object = "pymdownx.slugs.slugify", kwds = { case = "lower" } }
+pymdownx.highlight.anchor_linenums = true
+pymdownx.inlinehilite = {}
+pymdownx.magiclink = {}
+pymdownx.superfences = {}
+pymdownx.tasklist = {}
+pymdownx.tilde = {}
+repository_links = {}

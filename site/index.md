@@ -1,12 +1,11 @@
 ---
 title: agent-board
 description: Coordinate coding agents through a forge's project board, its issues and their pull requests.
-template: splash
-hero:
-  tagline: The work board is the forge; the agent only proposes.
 ---
 
 > This text is LLM generated.
+
+*The work board is the forge; the agent only proposes.*
 
 agent-board coordinates coding agents through a project board: tooling for
 agent planning that keeps its whole record on the forge. People and agents put
