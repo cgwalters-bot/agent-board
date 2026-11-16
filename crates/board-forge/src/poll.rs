@@ -8681,9 +8681,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         {
             decision = self.recovery_step(repo, &pull, &marker, &comments, decision)?;
         }
+        // A ready head merges past older overlapping work, which then rebases
+        // onto it; only work that would fight the older PR waits (#1035).
         if matches!(
             decision.action,
-            "fix" | "rebase" | "continue" | "merge" | "update" | RUN_RERUN
+            "fix" | "rebase" | "continue" | "update" | RUN_RERUN
         ) && let Some(older) = self.pressure_ahead(repo, &pull)?
         {
             decision = step(
