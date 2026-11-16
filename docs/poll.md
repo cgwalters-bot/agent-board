@@ -1365,6 +1365,16 @@ in the pass's `pr.noMerge`, where a draft is the finished state: its fix
 and rebase rounds run as for any other (a conflict is rebased without the
 approval the review job never gives a draft), and once clean and green it
 waits with `a midstream draft, waiting for promotion`, unlabelled.
+`continuation.untested` (absent by default) is `hosted` or a runner profile,
+such as a devspace that can build what a sandbox cannot. With it, such a draft
+whose description, or once a continuation round ran the head commit's
+message, says `partial work`, `incomplete`, `untested`, `not tested` or that
+something could not be or was not run is continued instead, within
+`continuation.rounds`, as `continue: an untested midstream draft: its
+description says "WORD", so continuation round N of M`, dispatched on that
+runner; a rebase or fix round does not end what the description says. Other
+continuations keep their runner. A word match only starts bounded rounds on
+the bot's own draft, so a false one costs a round and a `needs-human` hold.
 `continuation.pools` (absent by default) names a pool for a `budget`,
 `runtime` or `cap` checkpoint, as pools are how a run gets more budget, time or a higher cap; the `cap` pool
 is used once a pull request. A changed continuation accepted as complete is
