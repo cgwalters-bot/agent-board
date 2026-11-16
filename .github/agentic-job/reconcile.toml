@@ -11,10 +11,10 @@ max_outputs = 5
 max_patch_bytes = 1024
 max_patch_files = 1
 
-[outputs]
+[github.outputs]
 close_issue = { max = 2 }
 
-[outputs.update_project]
+[github.outputs.update_project]
 max = 3
 projects = ["https://github.com/orgs/cgwalters-forge-stage/projects/2"]
 # The rules only ever set Status.
