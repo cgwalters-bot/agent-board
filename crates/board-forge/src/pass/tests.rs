@@ -18869,6 +18869,34 @@ fn config_table() {
         (json!({"requestShare": 0}), "requestShare is not 1 to 90"),
         (json!({"requestShare": 91}), "requestShare is not 1 to 90"),
         (json!({"requestShare": "50"}), "expected usize"),
+        (
+            json!({"requestWindow": {"passMinutes": 10, "floor": 900}}),
+            "requestWindow requires requestShare",
+        ),
+        (
+            json!({"requestShare": 50, "requestWindow": {"passMinutes": 0, "floor": 900}}),
+            "requestWindow passMinutes is not 1 to 60",
+        ),
+        (
+            json!({"requestShare": 50, "requestWindow": {"passMinutes": 61, "floor": 900}}),
+            "requestWindow passMinutes is not 1 to 60",
+        ),
+        (
+            json!({"requestShare": 50, "requestWindow": {"passMinutes": 10, "floor": 0}}),
+            "requestWindow floor is not 1 to 15000",
+        ),
+        (
+            json!({"requestShare": 50, "requestWindow": {"passMinutes": 10, "floor": 15001}}),
+            "requestWindow floor is not 1 to 15000",
+        ),
+        (
+            json!({"requestShare": 50, "requestWindow": {"passMinutes": 10}}),
+            "missing field `floor`",
+        ),
+        (
+            json!({"requestShare": 50, "requestWindow": {"passMinutes": 10, "floor": 9, "x": 1}}),
+            "unknown field `x`",
+        ),
         (json!({"triageReplans": 11}), "triageReplans is not 0 to 10"),
         (
             json!({"triageReplans": 1}),
@@ -20154,6 +20182,109 @@ fn request_share_sizes_the_budget_from_the_headroom() {
     ] {
         let error = Headroom::parse(&body).unwrap_err().to_string();
         assert_eq!(error, format!("rate_limit has no resources.{missing}"));
+    }
+}
+
+/// With `requestWindow`, the remaining allowance is spread over the passes
+/// expected before the reset, raised to the floor and capped at the share,
+/// and a pass whose share is under the floor is held at nothing; GraphQL
+/// points stop at the same limit. A standalone promotion has no window.
+#[test]
+fn request_window_spreads_the_budget_until_the_reset() {
+    // 2026-10-23T16:00:00Z: from the replay's 15:15:10, five 10-minute passes.
+    const RESET: u64 = 1792771200;
+    let pools = |(core, graphql): (u64, u64)| {
+        let pool = if graphql < core { "graphql" } else { "core" };
+        format!("{pool}; core {core}, graphql {graphql}")
+    };
+    let held = |percent: usize, left: (u64, u64), cap: usize| {
+        format!(
+            "budget: requestWindow holds the pass until 2026-10-23T16:00:00Z: {percent}% of the {} the token has left, {cap}, is under the floor of 900, so it spends nothing ({})",
+            left.0.min(left.1),
+            pools(left)
+        )
+    };
+    let kept = |limit: usize, left: (u64, u64), passes: u64, percent: usize, reset: &str| {
+        format!(
+            "budget: requestWindow keeps the pass to {limit} requests and GraphQL points: the {} the token has left until {reset} over {passes} passes of 10 minutes, at least 900 and at most {percent}% ({}); an estimate, not a retained-headroom guarantee",
+            left.0.min(left.1),
+            pools(left)
+        )
+    };
+    let next = "2026-10-23T16:00:00Z";
+    for (name, left, share, resets, limit, said) in [
+        (
+            "an even share",
+            (5000, 5000),
+            50,
+            (RESET, RESET),
+            1000,
+            kept(1000, (5000, 5000), 5, 50, next),
+        ),
+        (
+            "raised to the floor",
+            (3000, 3000),
+            50,
+            (RESET, RESET),
+            900,
+            kept(900, (3000, 3000), 5, 50, next),
+        ),
+        (
+            "the smaller graphql pool's reset counts the passes",
+            (5000, 4800),
+            50,
+            (RESET + 3600, RESET),
+            960,
+            kept(960, (5000, 4800), 5, 50, next),
+        ),
+        (
+            "held: the share is under the floor",
+            (1500, 1500),
+            50,
+            (RESET, RESET),
+            0,
+            held(50, (1500, 1500), 750),
+        ),
+        (
+            "held: a small share of plenty",
+            (5000, 5000),
+            10,
+            (RESET, RESET),
+            0,
+            held(10, (5000, 5000), 500),
+        ),
+        (
+            "a reset already past is one pass, capped at the share",
+            (2000, 2000),
+            90,
+            (RESET - 3600, RESET - 3600),
+            1800,
+            kept(1800, (2000, 2000), 1, 90, "2026-10-23T15:00:00Z"),
+        ),
+    ] {
+        let mut replay = replay();
+        replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}rate_limit")},
+            "answer": {"status": 200, "link": null, "body": {"resources": {
+                "core": {"remaining": left.0, "reset": resets.0},
+                "graphql": {"remaining": left.1, "reset": resets.1}}}}}));
+        let config = config(json!({"requestShare": share,
+            "requestWindow": {"passMinutes": 10, "floor": 900}}));
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        let mut lines = Vec::new();
+        size_request_share(&replay, &config, &bounds, Some(replay.now), &mut lines);
+        assert_eq!(lines, std::slice::from_ref(&said), "{name}");
+        assert_eq!(bounds.limit.get(), limit, "{name}");
+        assert_eq!(bounds.graphql_limit.get(), Some(limit as u64), "{name}");
+        // Without a pass's clock, requestShare alone sizes it.
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        size_request_share(&replay, &config, &bounds, None, &mut Vec::new());
+        let smaller = usize::try_from(left.0.min(left.1)).unwrap();
+        assert_eq!(bounds.limit.get(), smaller * share / 100, "{name}");
+        let report = preview_within(&config, &replay, PASS_REQUEST_LIMIT);
+        assert_eq!(report.lines.first(), Some(&said), "{name}");
+        assert!(report.spent.requests <= limit, "{name}: {}", report.spent);
     }
 }
 

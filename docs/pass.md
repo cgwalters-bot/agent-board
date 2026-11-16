@@ -3118,6 +3118,41 @@ Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` is to set
 after six passes in the ideal one-point-per-call case; the pull request names the
 setting, and no tracker settings are changed here.
 
+#### Spreading the budget over the window
+
+The concrete failure `requestWindow` stops is a pass that outspends the
+token's hourly allowance by itself: a full pass took 1,000 to 2,200 requests
+while `pass next` chained one every 10 to 15 minutes, so the first passes
+after a reset did the work and the later ones, held to a share of what was
+left, stopped epics and stage 4 part way and started nothing, still spending
+on Status (agent-board#1042). It is off by default, GitHub-only and requires
+`requestShare`.
+
+`requestWindow` (`{"passMinutes": 10, "floor": 1200}`) divides the smaller
+pool's remaining by the passes expected before that pool resets, this one
+included (the minutes to the reset over `passMinutes`, rounded up, at least
+one), raises it to `floor` and caps it at `requestShare`'s percentage. Where
+that percentage is under `floor`, the pass is held: its limit is 0, it
+spends nothing and says so (`budget: requestWindow holds the pass until
+2026-11-16T15:00:00Z: 50% of the 1400 the token has left, 700, is under the
+floor of 1200, so it spends nothing (…)`), its operations refused as with a
+token that has nothing left. `pass next` still starts the next pass at its
+interval, which reads the headroom again; after the reset it runs. The
+window also stops GraphQL at that many points, since the GraphQL pool counts
+points, not calls; the summary already reports a pass's points
+(`points ~N`). `passMinutes` is 1–60 and `floor` 1–15,000; set
+`passMinutes` to the caller's `pass next --wait-minutes` (a smaller value
+only holds earlier), and keep `floor` under `requestShare`'s percentage of
+the token's full hourly allowance, or every pass is held. Where the rate
+limit cannot be read, the fixed 650 holds as without the window. Standalone
+promotion is not a pass of the window, so `requestShare` alone sizes it.
+
+Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` is to set
+`requestShare` to `50` and `requestWindow` to
+`{"passMinutes": 10, "floor": 1200}`, its `pass next --wait-minutes`; with
+5,000 an hour that is three passes of 1,200, then holds until the reset.
+No tracker settings are changed here.
+
 ### Candidate admission
 
 There is one candidate set: open board issues in explicitly configured work
@@ -5680,6 +5715,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `epics.heldPlanHours` | GitHub only: where stage 4 held every candidate it read (the rest unread only for its budget) and a `planPools` pool is under pace, plan one unplanned live epic a pass whose last planning request is at least this many hours (0–168) old, see [what is built](#what-is-built); `0` (off) |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `requestShare` | GitHub only: estimate the request budget from 1–90% of the smaller remaining REST/GraphQL pool, read free from `GET /rate_limit` before any request; also stop GraphQL at its observed/estimated point share. Not a retained-headroom guarantee: a query can overshoot and missing costs are estimated. Where the read fails the fixed 650 holds, see [the request budget from the rate limit](#the-request-budget-from-the-rate-limit); absent (the fixed 650) |
+| `requestWindow` | GitHub only, with `requestShare`: `{"passMinutes": 1–60, "floor": 1–15000}` spreads the remaining allowance over the passes expected before the reset, at least `floor` and at most the share, and holds a pass at 0 requests where the share is under `floor`; see [spreading the budget over the window](#spreading-the-budget-over-the-window); absent (off) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |

@@ -48,6 +48,12 @@ pub const PASS_REQUEST_LIMIT: usize = 650;
 /// The most `requestShare` may target, leaving nominal headroom for other
 /// users, the poll and supervisor among them (not a point-cost guarantee).
 const REQUEST_SHARE_LIMIT: usize = 90;
+/// The longest `requestWindow` pass interval: GitHub's primary limits reset
+/// hourly, so a longer one expects no second pass in the window.
+const REQUEST_WINDOW_MINUTES: u64 = 60;
+/// The largest `requestWindow` floor, an outer bound: GitHub's largest
+/// hourly allowance (Enterprise Cloud's).
+const REQUEST_FLOOR_LIMIT: usize = 15_000;
 /// How long one pass may take before it defers what is left.
 pub const PASS_SECONDS_LIMIT: u64 = 15 * 60;
 /// How much longer than [`PASS_SECONDS_LIMIT`] what was under way may take
@@ -802,6 +808,11 @@ pub struct Config {
     /// sits unspent. This is not a retained-headroom guarantee: GraphQL
     /// costs are known only after execution, and missing costs are estimated.
     pub request_share: Option<usize>,
+    /// Off unless set, and only with `requestShare`: spread the token's
+    /// remaining allowance over the passes expected before it resets, and
+    /// hold a pass that would get less than a useful one needs
+    /// (agent-board#1042).
+    pub request_window: Option<RequestWindow>,
     #[serde(default)]
     pub pr: Pr,
     /// Off unless its `forks` are set: stage 4b, approved fork pull requests
@@ -1043,6 +1054,19 @@ impl<'de> Deserialize<'de> for BoardConfig {
                 .map_err(de::Error::custom)
         }
     }
+}
+
+/// `requestWindow`: the failure it stops is the first passes after a reset
+/// spending the allowance, `requestShare` of whatever is left, and the later
+/// ones running starved, refreshing Status and starting nothing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RequestWindow {
+    /// The minutes between passes, as `pass next --wait-minutes`.
+    pub pass_minutes: u64,
+    /// The fewest requests a useful pass takes: a pass gets at least this
+    /// where the share allows, and nothing, waiting for the reset, where not.
+    pub floor: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1543,6 +1567,20 @@ impl Config {
             ensure!(
                 (1..=REQUEST_SHARE_LIMIT).contains(&share),
                 "requestShare is not 1 to {REQUEST_SHARE_LIMIT}"
+            );
+        }
+        if let Some(window) = &self.request_window {
+            ensure!(
+                self.request_share.is_some(),
+                "requestWindow requires requestShare"
+            );
+            ensure!(
+                (1..=REQUEST_WINDOW_MINUTES).contains(&window.pass_minutes),
+                "requestWindow passMinutes is not 1 to {REQUEST_WINDOW_MINUTES}"
+            );
+            ensure!(
+                (1..=REQUEST_FLOOR_LIMIT).contains(&window.floor),
+                "requestWindow floor is not 1 to {REQUEST_FLOOR_LIMIT}"
             );
         }
         if self.work() && self.forgejo_board().is_none() {
@@ -3389,7 +3427,7 @@ pub(crate) fn promotion_reads<C: Rest + Transport>(
         Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
     );
     let mut lines = Vec::new();
-    size_request_share(client, config, &bounds, &mut lines);
+    size_request_share(client, config, &bounds, None, &mut lines);
     match read(
         &Budget {
             inner: client,
@@ -4314,7 +4352,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     let mut lines = Vec::new();
     // The budget first, before any request is spent of it: the read of the
     // headroom is free, so it goes around the bounds.
-    size_request_share(client, config, bounds, &mut lines);
+    size_request_share(client, config, bounds, Some(now), &mut lines);
     let resolved = config.resolve(
         &Budget {
             inner: client,
@@ -4613,20 +4651,33 @@ fn kept_shares(config: &Config, bounds: &Bounds) -> (usize, usize) {
     (bounds.share(AFTER_PULL_REQUESTS), bounds.share(AFTER_EPICS))
 }
 
+/// Sizes the budget from `requestShare`, and with `requestWindow` and a pass's
+/// clock `now` spreads it over the window; a standalone promotion has no
+/// window of passes, so it gives no `now`.
 fn size_request_share(
     client: &impl Rest,
     config: &Config,
     bounds: &Bounds,
+    now: Option<OffsetDateTime>,
     lines: &mut Vec<String>,
 ) {
     if let Some(share) = config.request_share {
+        let window = config.request_window.as_ref().zip(now);
         let sized = Headroom::read(client).and_then(|headroom| {
-            let limit = headroom.share(share);
+            let Some((window, now)) = window else {
+                let limit = headroom.share(share);
+                bounds.size(limit)?;
+                bounds
+                    .graphql_limit
+                    .set(Some(headroom.graphql.saturating_mul(share as u64) / 100));
+                return Ok(headroom.line(share, limit));
+            };
+            let (limit, line) = headroom.spread(share, window, now);
             bounds.size(limit)?;
-            bounds
-                .graphql_limit
-                .set(Some(headroom.graphql.saturating_mul(share as u64) / 100));
-            Ok(headroom.line(share, limit))
+            // The window bounds points too: they, not calls, are what the
+            // GraphQL pool counts. The limit is within the share's points.
+            bounds.graphql_limit.set(Some(limit as u64));
+            Ok(line)
         });
         lines.push(match sized {
             Ok(line) => format!("budget: {line}"),
@@ -4697,14 +4748,56 @@ impl Headroom {
     /// The pass's `budget:` line for `limit`, its share of the headroom.
     fn line(&self, percent: usize, limit: usize) -> String {
         let (remaining, pool) = self.remaining();
-        let reset = OffsetDateTime::from_unix_timestamp(self.reset)
-            .ok()
-            .and_then(|t| t.format(&Rfc3339).ok())
-            .unwrap_or_else(|| format!("epoch second {}", self.reset));
+        let reset = self.reset_text();
         format!(
             "requestShare keeps the pass to {limit} requests, {percent}% of the {remaining} the token has left until {reset} ({pool}; core {}, graphql {}); GraphQL share is an estimate, not a retained-headroom guarantee",
             self.core, self.graphql
         )
+    }
+
+    /// With `requestWindow`, the pass's limit and its `budget:` line: the
+    /// smaller pool's remaining over the passes expected before it resets
+    /// (this one included), raised to the floor and capped at `percent`. A
+    /// cap under the floor holds the pass at 0 until the reset rather than
+    /// run it starved.
+    fn spread(
+        &self,
+        percent: usize,
+        window: &RequestWindow,
+        now: OffsetDateTime,
+    ) -> (usize, String) {
+        let (remaining, pool) = self.remaining();
+        let interval = window.pass_minutes.saturating_mul(60);
+        let seconds = u64::try_from(self.reset.saturating_sub(now.unix_timestamp())).unwrap_or(0);
+        let passes = seconds.div_ceil(interval).max(1);
+        let even = usize::try_from(remaining / passes).unwrap_or(usize::MAX);
+        let cap = self.share(percent);
+        let reset = self.reset_text();
+        let pools = format!("{pool}; core {}, graphql {}", self.core, self.graphql);
+        if cap < window.floor {
+            return (
+                0,
+                format!(
+                    "requestWindow holds the pass until {reset}: {percent}% of the {remaining} the token has left, {cap}, is under the floor of {}, so it spends nothing ({pools})",
+                    window.floor
+                ),
+            );
+        }
+        let limit = even.max(window.floor).min(cap);
+        (
+            limit,
+            format!(
+                "requestWindow keeps the pass to {limit} requests and GraphQL points: the {remaining} the token has left until {reset} over {passes} passes of {} minutes, at least {} and at most {percent}% ({pools}); an estimate, not a retained-headroom guarantee",
+                window.pass_minutes, window.floor
+            ),
+        )
+    }
+
+    fn reset_text(&self) -> String {
+        OffsetDateTime::from_unix_timestamp(self.reset)
+            .ok()
+            .and_then(|t| t.format(&Rfc3339).ok())
+            .unwrap_or_else(|| format!("epoch second {}", self.reset))
     }
 }
 

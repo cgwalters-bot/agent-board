@@ -192,6 +192,7 @@
     "epics.close": {"verdict": "native", "forgejo": "PATCH state closed with a comment; no close reason"},
     "wip": {"verdict": "native", "forgejo": "complete caller run listings"},
     "requestShare": {"verdict": "refused", "reason": "GitHub rate limits only: sizes the pass's request budget from the token's rate-limit headroom, which Forgejo does not report"},
+    "requestWindow": {"verdict": "refused", "reason": "GitHub rate limits only: spreads requestShare's budget over the rate-limit window, which Forgejo does not report"},
     "triage": {"verdict": "native", "forgejo": "triage plans dispatched as below"},
     "planPools": {"verdict": "same"},
     "triagePools": {"verdict": "same"},
