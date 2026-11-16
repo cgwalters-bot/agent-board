@@ -1965,10 +1965,15 @@ fn candidate_read_gates() {
             )),
         ),
         (
-            "punctuated source line",
+            "source line ending a sentence",
             |r| pull(r)["body"] = json!(format!("{SOURCED}.")),
+            candidate(false),
+        ),
+        (
+            "punctuated source line",
+            |r| pull(r)["body"] = json!(format!("{SOURCED}!")),
             gate_hold(&format!(
-                "text references {REPO}, inside the midstream, which upstream readers cannot follow"
+                "source line not recognised; put `Part of https://github.com/{REPO}/issues/31` on a line of its own"
             )),
         ),
         (
