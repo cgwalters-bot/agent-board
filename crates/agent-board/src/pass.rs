@@ -416,7 +416,10 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                         );
                     }
                     // Only an applying pass writes the cache; a preview reads it.
-                    let state = config.state.as_deref().map(load_state).unwrap_or_default();
+                    let mut state = config.state.as_deref().map(load_state).unwrap_or_default();
+                    if let (true, Some(path)) = (config.change_sweep_hours > 0, &config.store) {
+                        state.changes = load_changes(path);
+                    }
                     let mode = match &own {
                         None => Mode::Preview,
                         Some(Some(own)) => Mode::Actions(own),
@@ -500,8 +503,21 @@ fn load_state(path: &str) -> State {
     }
 }
 
-/// Record the pass's dispatch records, triage verdicts, plans and holds in
-/// the store.
+/// The changes watermarks in the store, read only, for stage 0; none where
+/// there are none yet or the store cannot be read, which stage 2 walks in
+/// full.
+fn load_changes(path: &str) -> Option<board_forge::changes::diff::State> {
+    match board_forge::store::changes(std::path::Path::new(path)) {
+        Ok(changes) => changes,
+        Err(error) => {
+            eprintln!("warning: store {path}: no changes watermarks read: {error:#}");
+            None
+        }
+    }
+}
+
+/// Record the pass's dispatch records, triage verdicts, plans, holds and
+/// changes watermarks in the store.
 /// No decision reads it yet, so a store that cannot be saved only warns:
 /// the pass's own writes are done, and the next pass rebuilds it.
 fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
@@ -511,8 +527,12 @@ fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
             if let Some(why) = &saved.rebuilt {
                 eprintln!("store: rebuilt {path} ({why}) from this pass's reads");
             }
+            let watermarks = saved
+                .watermarks
+                .map(|n| format!(", {n} watermark(s)"))
+                .unwrap_or_default();
             eprintln!(
-                "store: {} dispatch record(s), {} triage verdict(s), {} plan(s), {} hold(s)",
+                "store: {} dispatch record(s), {} triage verdict(s), {} plan(s), {} hold(s){watermarks}",
                 saved.dispatches, saved.verdicts, saved.plans, saved.holds
             );
         }

@@ -3176,6 +3176,9 @@ state ([above](#persisting-conditional-responses)); they can move only once
 the store is restored the same way. The plan comments and the hold snapshot comment keep their fenced
 JSON: the job's claims name plan comments and review's `src/github/holds.ts`
 reads the snapshot, so those fences end only with a change on their side.
+The one exception is the changes diff's watermarks, which
+[`changeSweepHours`](#change-driven-pull-request-walk) reads; why a forged
+one does no more than delay a pull request is explained there.
 
 `store` names the file; it is off unless set and GitHub only. Only an applying
 pass writes it, after its other writes, and a failed save only warns. A
@@ -3192,9 +3195,64 @@ that is not a SQLite database is never replaced: a mistaken `store` path warns
 instead of deleting it. The schema is versioned by SQLite's `user_version` and
 migrated forward in place.
 Rows no pass has seen for 90 days are dropped, which keeps the file bounded;
-each published hold snapshot replaces the last.
+each published hold snapshot replaces the last, as each stage 0 read
+replaces the last watermarks.
 Each applying pass ends with `store: N dispatch record(s), M triage verdict(s),
-P plan(s), H hold(s)` on stderr.
+P plan(s), H hold(s)` on stderr, and `, W watermark(s)` where stage 0 ran.
+
+### Change-driven pull request walk
+
+The concrete failure `changeSweepHours` stops is stage 2 spending the pass's
+requests on pull requests that nothing has changed since the last pass
+(agent-board#1050). It is off at 0, GitHub only, at most 168, and needs
+`store` and `state`.
+
+With it, stage 0 runs the [changes diff](changes.md) of `follow` and the
+midstream forks (the forks read once, for stage 2 too; with `pr.actionFirst`
+only those in our own space, the ones its walk decides) since the watermarks
+in the store, one repository at a time, and says what it found: `changes: N
+item(s) changed in R repositories since their watermarks, Q request(s), V
+revalidated; …`. Stage 2 then visits, in each repository with a committed
+watermark, only the pull requests the diff lists, and counts the rest (`pull
+requests: changeSweepHours left N pull request(s) the changes diff did not
+list unvisited`). A repository without a watermark, one `authored` adds, and
+one whose diff cannot be read are walked whole; the last also loses its
+watermark, so that the next pass reads it from a first window rather than
+from an ever older one. Each repository's watermark moves to the diff's start
+only where stage 2 walked it to its end and held no step there (a start or
+write a cap held, or one turned down): a repository the request share cut,
+the envelope left out, or where a pull request's read failed is listed again
+by the next diff. Their holds and the narrowed repositories' holds are kept
+as last published, as for any repository stage 2 reads in part; so an ask on
+a pull request closed since stays until the next full walk.
+
+At least `changeSweepHours` after the last, a pass walks every pull
+request; an applying pass that walks every repository the diff read or has a
+watermark for to its end, held steps or not, records its time as `changes_swept` in `state`. What does not move a pull
+request's `updated_at` waits until then: a timer of its own (a stale draft, a
+fix run that ended without a push, a rerun window) or a base that moved under
+it. Checks that settle at the same head are not among them: the diff follows
+a running head's checks until they settle, as `checked`.
+
+The store comes from an Actions cache that unrelated default-branch jobs can
+write. A forged store can leave a pull request unvisited only until the next
+full walk, whose time is in the trusted `state`, never in the store. Nor can
+it make stage 0 read more than a fresh store does: a watermark or first
+window later than the pass's clock, or older than a first window (24 hours)
+and `changeSweepHours` before it, is read as none, and the repository walked
+whole (a watermark that old is one a held step kept back), numbers kept for a 304
+past the 99 a validated list holds are dropped, and pending checks are kept
+only for the repositories read, at most 100. A store that cannot be read is a
+warning, and the pass walks in full. A preview reads the store and narrows as
+an applying pass would, but writes neither the store nor `state`. Stage 0
+spends at most 10% of the pass's requests (65 of 650), so a busy or forged
+diff leaves stage 2 its share for the full walk; where it stops (`changes:
+the stage's request share is spent at R; …`), R and the repositories after
+it are walked whole. Epic replans are not narrowed yet: the diff does not say which epic a
+changed sub-issue belongs to.
+
+Caller: `cgwalters-forge/tracker`, `.github/pass.json`, set
+`changeSweepHours` (for example `6`) where `store` and `state` are set.
 
 ### Top-down discovery
 
@@ -5992,7 +6050,8 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `cost.hourUtc` | The hour (0–23 UTC) from which the pass [publishes](cost.md#publishing) each of the last seven days' cost reports missing from `epics.repository`'s `data` branch; needs `epics`; section absent (off) |
 | `cost.cache` | A directory keeping each read run summary by run id; absent, none |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
-| `store` | The [state store](#the-state-store)'s SQLite path, distinct from `state` and `livingStatus`, which an applying pass records its dispatch records, triage verdicts, plans and holds in; GitHub only; absent (off) |
+| `store` | The [state store](#the-state-store)'s SQLite path, distinct from `state` and `livingStatus`, which an applying pass records its dispatch records, triage verdicts, plans, holds and changes watermarks in; GitHub only; absent (off) |
+| `changeSweepHours` | Hours, 1–168, between full pull request walks; between them stage 2 visits only what the stage 0 changes diff lists ([change-driven walk](#change-driven-pull-request-walk)); needs `store` and `state`; GitHub only; 0 or absent (off) |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |
 | `pr.reviewDispatchRepositories` | Exact followed base repositories using ordinary `dispatch.yml` reviews and separate all-author intake; `[]` by default; needs `pr.reviewPools`; at most 50; GitHub only |

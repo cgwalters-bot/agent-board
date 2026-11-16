@@ -5,8 +5,9 @@
 `agent-board changes` lists what changed in the followed and midstream
 repositories since each one's watermark, read-only. It is the first step of
 a change-driven pass (agent-board#894): a pass that starts from the diff
-rather than from every open item again. Today it is a standalone command;
-nothing in the pass consumes it yet.
+rather than from every open item again. The pass runs the same diff as its
+stage 0 with [`changeSweepHours`](pass.md#change-driven-pull-request-walk),
+keeping its watermarks in the store rather than in `changes.json`.
 
 With `--since`, the command is instead the earlier list of what landed,
 closed, opened or changed hold on the live project, which
@@ -113,8 +114,8 @@ read. When its timeline exceeds 100 events, the command rereads that item's
 timeline with cursors, at most ten pages of 100 events each (up to ten extra
 requests). This keeps busy issues and PRs readable without an unbounded
 request loop; repeated or missing cursors and incomplete responses refuse
-the read too. No watermark advances on failure. This remains an explicit,
-read-only command, not an enabled pass stage or a new caller option.
+the read too. No watermark advances on failure. The command stays
+read-only; the pass's stage 0 is off unless `changeSweepHours` is set.
 
 ## Limits
 
@@ -122,6 +123,7 @@ read-only command, not an enabled pass stage or a new caller option.
   item on GitHub and so does not surface it; Status changes are listed only
   on items that changed otherwise.
 - A check result on a pull request the diff never saw pushed is not read.
-- Nothing consumes the diff yet: the pass's stages, the activity score of
-  per-repository sessions and the summary's `changes: … → actions` line of
-  agent-board#894 are later steps.
+- Only the pass's pull request walk consumes the diff: epic replans, the
+  activity score of per-repository sessions and the summary's `changes: … →
+  actions` line of agent-board#894 are later steps. The board read stays the
+  detector for a change to a Project field alone.

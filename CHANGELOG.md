@@ -11,6 +11,12 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The pass's new GitHub-only `changeSweepHours` (off at 0, needs `store`
+  and `state`) runs the changes diff as stage 0 from watermarks kept in the
+  store, and stage 2 then visits only the pull requests it lists, every one
+  at least that many hours apart; the store's schema goes to version 3 and
+  its stderr line counts watermarks too (agent-board#1050).
+
 - The pass's new GitHub-only `store` (off unless set) names a SQLite
   database in which an applying pass records the dispatch records, triage
   verdicts and accepted plans it makes or reads, and the holds of the
