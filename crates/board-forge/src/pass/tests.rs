@@ -3574,6 +3574,13 @@ fn overlap_setting_ignores_a_documentation_overlap() {
     );
     assert!(!report.lines.contains(&STARTED[4].to_owned()));
     assert_eq!(report.failures, 0);
+    // The store indexes the plan it accepted by its issue.
+    let accepted = &report.records.borrow().plans["cgwalters-forge/tracker#527"];
+    let id = "6332955694@2026-10-22T04:47:39Z";
+    assert_eq!(
+        (accepted.id.as_str(), accepted.kind.as_str()),
+        (id, "implement")
+    );
     let snapshot = holds::snapshot(&report.holds, String::new(), report.tally.clone());
     let published: Vec<Value> = (snapshot.holds.iter())
         .filter(|h| h.item.as_deref() == Some("cgwalters-forge/tracker#527"))
@@ -6193,6 +6200,19 @@ fn apply_publishes_the_holds() {
         };
         assert!(body.starts_with(holds::HOLDS_MARKER), "{body}");
         let snapshot = holds::parse(&body).unwrap();
+        // The store keeps every hold the pass published, before `fit`.
+        let records = report.records.borrow();
+        let stored: BTreeSet<_> = (records.holds.iter().flatten())
+            .map(|h| json!({"item": h.item, "kind": h.kind, "since": h.since}))
+            .map(|h| h.to_string())
+            .collect();
+        let published = snapshot["holds"].as_array().unwrap();
+        assert!(!published.is_empty(), "{line}");
+        for hold in published {
+            let hold = json!({"item": hold["item"], "kind": hold["kind"], "since": hold["since"]});
+            assert!(stored.contains(&hold.to_string()), "{line}: {hold}");
+        }
+        drop(records);
         let overhead = &snapshot["pass"]["overhead"]["today"];
         let factor = if found == Some("accumulate") { 2 } else { 1 };
         let starts: BTreeMap<_, _> = report

@@ -12,10 +12,11 @@ The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
 - The pass's new GitHub-only `store` (off unless set) names a SQLite
-  database in which an applying pass records the dispatch records and triage
-  verdicts it makes or reads. Nothing reads it for a decision yet. A missing
-  or unusable database is rebuilt from the comments later passes read
-  (agent-board#1052).
+  database in which an applying pass records the dispatch records, triage
+  verdicts and accepted plans it makes or reads, and the holds of the
+  snapshot it publishes, before they are fitted to the comment. Nothing reads
+  it for a decision yet. A missing or unusable database is rebuilt from the
+  comments later passes read (agent-board#1052).
 
 - The pass's new GitHub-only `requestWindow` (off unless set, with
   `requestShare`) spreads the token's remaining allowance over the passes

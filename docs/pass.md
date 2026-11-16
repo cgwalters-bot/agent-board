@@ -3133,17 +3133,24 @@ potentially private response data out of public logs and artifacts.
 Machine state is moving out of issue comments into a SQLite database
 (agent-board#1052): the caller restores it from the Actions cache under a
 rolling key, uploads it as an artifact of each applying pass, and restores the
-newest such artifact when the cache misses. This first slice records dispatch
-records (the pass's own, with their kind, pool and run, and those it reads,
-with their plan) and the triage verdicts the pass trusts (the bot's, unedited
-but by a writer), each keyed by its comment's URL. Plans, holds, leases and
-cursors follow, as does reading the store.
+newest such artifact when the cache misses. It records dispatch records (the
+pass's own, with their kind, pool and run, and those it reads, with their
+plan) and the triage verdicts the pass trusts (the bot's, unedited but by a
+writer), each keyed by its comment's URL; the plan stage 4 accepted for each
+issue, with its id and kind; and, where `holds` publishes a hold snapshot, its
+entries before they are fitted to the comment. Leases follow, as does reading
+the store.
 
 Until then the comments stay the source of every decision, and the store is
 written, never read for one. That is the answer to the concern above: an
 Actions cache that unrelated default-branch jobs can write could otherwise
 hand the pass a forged database. Before the store steers anything, a later
-slice must check its rows against what they index.
+slice must check its rows against what they index. For the same reason the
+pass's cursors stay in `state`, which the caller must supply as trusted
+state ([above](#persisting-conditional-responses)); they can move only once
+the store is restored the same way. The plan comments and the hold snapshot comment keep their fenced
+JSON: the job's claims name plan comments and review's `src/github/holds.ts`
+reads the snapshot, so those fences end only with a change on their side.
 
 `store` names the file; it is off unless set and GitHub only. Only an applying
 pass writes it, after its other writes, and a failed save only warns. A
@@ -3159,9 +3166,10 @@ extra issues are recorded once a pass reads them on their own issue. A file
 that is not a SQLite database is never replaced: a mistaken `store` path warns
 instead of deleting it. The schema is versioned by SQLite's `user_version` and
 migrated forward in place.
-Rows no pass has seen for 90 days are dropped, which keeps the file bounded.
-Each applying pass ends with `store: N dispatch record(s), M triage verdict(s)`
-on stderr.
+Rows no pass has seen for 90 days are dropped, which keeps the file bounded;
+each published hold snapshot replaces the last.
+Each applying pass ends with `store: N dispatch record(s), M triage verdict(s),
+P plan(s), H hold(s)` on stderr.
 
 ### Top-down discovery
 
@@ -5932,7 +5940,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `cost.hourUtc` | The hour (0–23 UTC) from which the pass [publishes](cost.md#publishing) each of the last seven days' cost reports missing from `epics.repository`'s `data` branch; needs `epics`; section absent (off) |
 | `cost.cache` | A directory keeping each read run summary by run id; absent, none |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
-| `store` | The [state store](#the-state-store)'s SQLite path, distinct from `state` and `livingStatus`, which an applying pass records its dispatch records and triage verdicts in; GitHub only; absent (off) |
+| `store` | The [state store](#the-state-store)'s SQLite path, distinct from `state` and `livingStatus`, which an applying pass records its dispatch records, triage verdicts, plans and holds in; GitHub only; absent (off) |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |
 | `pr.reviewDispatchRepositories` | Exact followed base repositories using ordinary `dispatch.yml` reviews and separate all-author intake; `[]` by default; needs `pr.reviewPools`; at most 50; GitHub only |

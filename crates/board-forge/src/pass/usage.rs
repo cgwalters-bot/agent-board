@@ -949,6 +949,15 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let considered = snapshot.pass.candidates.is_some();
         holds::carry(&mut snapshot, previous, (self.made_progress(), considered));
         holds::carry_epics(&mut snapshot, previous, &self.deferred_epics);
+        let stored = (snapshot.holds.iter()).map(|h| crate::store::Hold {
+            item: h.item.clone(),
+            epic: h.epic,
+            kind: h.kind.name().to_owned(),
+            reason: h.reason.clone(),
+            operator: h.operator,
+            since: h.since.clone(),
+        });
+        self.report.records.borrow_mut().holds = Some(stored.collect());
         let Some(at) = &self.config.holds else {
             return snapshot;
         };
