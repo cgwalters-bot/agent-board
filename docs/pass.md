@@ -125,16 +125,17 @@ next census. No extra credentials or mutation authority are introduced.
 
 The PR walk keeps oldest PR number order (GitHub creation order), retaining its
 resume cursor so parked older work cannot starve disjoint younger work. Fix/rebase,
-automatic fix retries, continuation, update and merge steps wait behind older open bot PRs with overlapping paths;
-disjoint PRs can proceed. The existing merge-queue overlap check also applies.
+automatic fix retries, continuation and update steps wait behind older open bot PRs with overlapping paths;
+disjoint PRs can proceed. A merge step does not wait: a ready head lands, and
+the older PR rebases onto it, which is cheaper than the reverse when the older
+one cannot land yet. The existing merge-queue overlap check also applies.
 The approved-first phase uses the same policy. Repository censuses and older-PR
 paths are read once and shared across these phases. Unread path coverage is
 conservative. The older-PR scan considers at most 100
 older PRs, within the poll's shared request/time budget; further older work holds
 the step. An older PR parked on a person does not hold younger work: one labelled
 `hold` or `needs-human`, or whose newest poll marker is a stop still held by an
-operator review request. Without this, a parked PR that will not land held every
-approved overlapping PR. It still counts toward the cap. Releasing the hold puts
+operator review request. It still counts toward the cap. Releasing the hold puts
 it back in the order; a stop marker that cannot be read counts as not parked.
 This setting does not automatically close PRs or
 grant more fix rounds. Explicit stage-4 `fixPlans` retain their existing policy.

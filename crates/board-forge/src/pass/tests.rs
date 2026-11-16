@@ -8458,7 +8458,7 @@ fn action_first_approved_search_decides_all_seventeen_despite_scheduling_reserve
 }
 
 #[test]
-fn open_pr_cap_applies_before_the_approved_search() {
+fn open_pr_cap_lets_the_approved_search_merge() {
     let repo = "cgwalters-forge/work";
     for cap in [None, Some(2)] {
         let mut forge = Forge::new(None, false);
@@ -8475,7 +8475,6 @@ fn open_pr_cap_applies_before_the_approved_search() {
                 entry["answer"]["body"] = json!([{"number":1,"user":{"login":"cgwalters-bot"}}, {"number":2,"user":{"login":"cgwalters-bot"}}]);
             }
         }
-        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{repo}/pulls/1/files?per_page=100")},"answer":{"status":200,"body":[{"filename":"README.md"}],"link":null}}));
         forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{repo}")},"answer":{"status":200,"body":{"allow_rebase_merge":true},"link":null}}));
         let mut cfg =
             config(json!({"follow":[repo],"pr":{"actionFirst":true,"fixPools":["claude"]}}));
@@ -8495,18 +8494,15 @@ fn open_pr_cap_applies_before_the_approved_search() {
         )
         .unwrap();
         assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
-        assert_eq!(
-            outcome.preview_merges,
-            usize::from(cap.is_none()),
-            "{:?}",
-            outcome.lines
-        );
-        assert_eq!(
-            outcome
+        // An approved head merges past the older overlapping PR (#1035).
+        assert_eq!(outcome.preview_merges, 1, "{:?}", outcome.lines);
+        assert!(
+            !outcome
                 .lines
                 .iter()
                 .any(|l| l.contains("open-pr-cap: land")),
-            cap.is_some()
+            "{:?}",
+            outcome.lines
         );
     }
 }

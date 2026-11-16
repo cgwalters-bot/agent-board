@@ -26,7 +26,8 @@ fn open_pr_cap_keeps_landing_work_and_serializes_oldest_paths() {
                 assert_eq!(out.errors, 0, "{cap:?}/{shared}/{action}: {:?}", out.lines);
                 assert_eq!(out.steps[0].number, 470);
                 assert_eq!(out.steps[0].action, action, "{cap:?}/{shared}: {:?}", out.lines);
-                let held = shared && cap.is_some_and(|cap| cap <= 2);
+                // A ready head merges past older overlapping work (#1035).
+                let held = shared && action != "merge" && cap.is_some_and(|cap| cap <= 2);
                 assert_eq!(out.steps[1].action, if held { "wait" } else { action }, "{cap:?}/{shared}/{action}: {:?}", out.lines);
                 if held { assert!(out.steps[1].reason.contains("open-pr-cap: land")); }
             }
