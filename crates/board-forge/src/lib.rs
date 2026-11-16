@@ -39,6 +39,7 @@ pub mod session;
 pub mod session_apply;
 pub mod stack;
 pub mod status;
+pub mod stop;
 pub mod store;
 pub mod supervise;
 pub mod upstream;

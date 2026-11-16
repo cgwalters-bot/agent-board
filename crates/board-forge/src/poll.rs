@@ -559,6 +559,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "notifications",
     "brokerOutage",
     "operatorAnswers",
+    "supervisorHolds",
     "operatorReviewFixes",
     "rebaseRounds",
     "pace",
@@ -661,6 +662,9 @@ pub struct PollPolicy {
     /// Prevent recovery/review work on a PR with unmet body dependencies.
     /// Off by default, bounded to ten distinct dependencies per PR.
     pub hold_dependencies: bool,
+    /// Route recognized infrastructure stops to the supervisor, not the operator.
+    /// Off by default; uses the existing pass write and request caps.
+    pub supervisor_holds: bool,
     /// Prevent upstream/draft reads from starving ready own-space merges.
     /// Off by default; discovery and actions retain the poll's request bounds.
     pub action_first: bool,
@@ -1126,6 +1130,8 @@ pub struct PrOptions {
     #[serde(default)]
     pub hold_dependencies: bool,
     #[serde(default)]
+    pub supervisor_holds: bool,
+    #[serde(default)]
     pub action_first: bool,
     /// On unless set to `false` (agent-board#1019).
     #[serde(default)]
@@ -1280,6 +1286,7 @@ impl PrOptions {
             queue_only_repository,
             hold_missing_data,
             hold_dependencies,
+            supervisor_holds,
             action_first,
             quiet_waits,
             check_reruns,
@@ -1304,6 +1311,7 @@ impl PrOptions {
         policy.hold_missing_data = hold_missing_data;
         policy.action_first = action_first;
         policy.quiet_waits = quiet_waits.unwrap_or(true);
+        policy.supervisor_holds = supervisor_holds;
         policy.check_reruns = check_reruns;
         policy.unstall = unstall;
         policy.direction_first = direction_first;
@@ -1401,6 +1409,7 @@ impl PollPolicy {
                 .transpose()?
                 .unwrap_or(false),
             operator_review_fixes: false,
+            supervisor_holds: false,
             rebase_rounds: get("rebaseRounds")?
                 .map(|r| {
                     r.as_u64()
@@ -3251,9 +3260,10 @@ fn labelled(pull: &Value) -> bool {
 /// GitHub's label names are case-insensitive.
 fn holds(labels: &[Value]) -> bool {
     labels.iter().any(|l| {
-        l["name"]
-            .as_str()
-            .is_some_and(|n| n.eq_ignore_ascii_case(HOLD_LABEL))
+        l["name"].as_str().is_some_and(|n| {
+            n.eq_ignore_ascii_case(HOLD_LABEL)
+                || n.eq_ignore_ascii_case(crate::stop::SUPERVISOR_LABEL)
+        })
     })
 }
 
@@ -3897,6 +3907,8 @@ pub struct Decision {
     pub queue: Option<QueueState>,
     /// Who advances a wait, and when the followed work began, where known.
     pub waiting: WaitReason,
+    /// Controller-owned category, never inferred from diagnostic prose.
+    pub infrastructure: Option<crate::stop::Cause>,
 }
 
 /// Wait semantics decided by the poll, independent of diagnostic wording.
@@ -3908,6 +3920,23 @@ pub enum WaitReason {
 }
 
 impl Decision {
+    fn infrastructure(mut self, cause: crate::stop::Cause) -> Self {
+        self.infrastructure = Some(cause);
+        self
+    }
+
+    /// An empty round is infrastructure only when the poll started it on its
+    /// own. An operator's answer or comments that pushed nothing is theirs,
+    /// whatever ended the run; so is a stale stop's round, whose close
+    /// ([`stale`]) needs the operator's label to stay on.
+    fn empty_round(self, marker: &Marker) -> Self {
+        if marker.answering || !marker.comments.is_empty() {
+            self
+        } else {
+            self.infrastructure(crate::stop::Cause::EmptyFix)
+        }
+    }
+
     fn followed(mut self, since: Option<OffsetDateTime>) -> Self {
         self.waiting = WaitReason::Followed { since };
         self
@@ -3943,6 +3972,7 @@ fn step(action: &'static str, reason: impl Into<String>) -> Decision {
         round: None,
         queue: None,
         waiting: WaitReason::Person,
+        infrastructure: None,
     }
 }
 
@@ -4144,7 +4174,8 @@ fn started(
                     "{round} is blocked: its run {url} ended ({conclusion}){again} and pushed no new head for {} ({why}){charged}",
                     short(head)
                 ),
-            );
+            )
+            .empty_round(marker);
         }
     }
     if marker.run.is_none() && older_than(now, marker.at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
@@ -4154,7 +4185,8 @@ fn started(
                 "the run of {round} for {} ended without changing the head ({why})",
                 short(head)
             ),
-        );
+        )
+        .empty_round(marker);
     }
     step("wait", format!("{round}{RUNNING}{}", short(head))).followed(since)
 }
@@ -4282,6 +4314,7 @@ pub fn decide(
                     round: Some(rounds + 1),
                     queue: None,
                     waiting: WaitReason::Person,
+                    infrastructure: None,
                 };
                 let refits = !config.policy.agent_recovery
                     && config.policy.unstall
@@ -4317,6 +4350,7 @@ pub fn decide(
                     round: Some(round),
                     queue: None,
                     waiting: WaitReason::Person,
+                    infrastructure: None,
                 };
             }
         }
@@ -4379,7 +4413,8 @@ pub fn decide(
                         "{rebases} rebase rounds used and {} still conflicts with {base}",
                         short(head)
                     ),
-                );
+                )
+                .infrastructure(crate::stop::Cause::StaleBase);
             }
             let round = marker.rebased + 1;
             return Decision {
@@ -4388,6 +4423,7 @@ pub fn decide(
                 round: Some(round),
                 queue: None,
                 waiting: WaitReason::Person,
+                infrastructure: None,
             };
         }
         // The diagnostic round is one more, counted in `rounds` as the next
@@ -4405,6 +4441,7 @@ pub fn decide(
                 round: Some(rounds + 1),
                 queue: None,
                 waiting: WaitReason::Person,
+                infrastructure: None,
             };
         }
         if marker.rounds >= rounds || marker.diagnosed {
@@ -4435,6 +4472,7 @@ pub fn decide(
             round: Some(marker.rounds + 1),
             queue: None,
             waiting: WaitReason::Person,
+            infrastructure: None,
         };
     }
     let unwritten = undescribed(pull);
@@ -4883,6 +4921,7 @@ pub enum Progress {
 impl Stepped {
     pub fn progress(&self) -> Progress {
         match self.action {
+            crate::stop::SUPERVISOR_LABEL => Progress::Waiting,
             "needs-human" => Progress::Person,
             "blocked" => Progress::Waiting,
             "skip" | "wait" => match self.waiting {
@@ -5640,6 +5679,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         reason: &str,
         excerpt: Option<&str>,
     ) -> Result<()> {
+        self.stop(repo, pull, marker, (reason, None), excerpt)
+    }
+
+    fn stop(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+        marker: &Marker,
+        (reason, cause): (&str, Option<crate::stop::Cause>),
+        excerpt: Option<&str>,
+    ) -> Result<()> {
         // Only on the bot's own pull request outside our own space, where a
         // round it may take there could not start ([`AUTHORED_STEPS`]): its
         // label or review request needs a maintainer's permissions, and a
@@ -5653,9 +5703,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             .context("pull request has no number")?;
         let head = text(pull, "/headRefOid");
         let rest = self.rest;
+        let cause = cause.filter(|_| self.config.policy.supervisor_holds);
+        let supervisor = cause.is_some();
+        let label = if supervisor {
+            crate::stop::SUPERVISOR_LABEL
+        } else {
+            LABEL
+        };
         // GitHub rejects review requests on drafts. Keep their existing label
         // hold rather than marking unfinished work ready or losing the stop.
-        let request_review = self.config.policy.assign_holds && pull["isDraft"] != true;
+        let request_review =
+            !supervisor && self.config.policy.assign_holds && pull["isDraft"] != true;
         if request_review {
             self.send(
                 rest,
@@ -5670,14 +5728,14 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             rest,
             "POST",
             &format!("repos/{repo}/labels"),
-            json!({"name": LABEL, "color": "d93f0b", "description": "The poll stopped here; a person decides what is next"}),
+            json!({"name": label, "color": "d93f0b", "description": if supervisor { "Infrastructure stop owned by the supervisor" } else { "The poll stopped here; a person decides what is next" }}),
             422,
         )?;
             self.send(
                 rest,
                 "POST",
                 &format!("repos/{repo}/issues/{number}/labels"),
-                json!({"labels": [LABEL]}),
+                json!({"labels": [label]}),
                 0,
             )?;
         }
@@ -5711,10 +5769,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             )
         };
         let mut text = format!("The poll stopped following this pull request: {reason}. {release}");
+        if let Some(cause) = cause {
+            text = format!(
+                "{}[{}] {reason}; tracking pending.",
+                crate::stop::SUPERVISOR_PREFIX,
+                cause.name()
+            );
+        }
         // CI output, fenced so that nothing in it renders, mentions or links;
         // without its backticks, it cannot close the fence either, and
         // without `<!--`, it cannot carry a marker or claim of the bot's.
-        if let Some(excerpt) = excerpt {
+        if let Some(excerpt) = excerpt.filter(|_| !supervisor) {
             text.push_str(&format!(
                 "\n\nThe failure as this head left it:\n\n```text\n{}\n```",
                 excerpt.replace('`', "'").replace("<!--", "<!- -")
@@ -6301,8 +6366,23 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             "update" => self.update(repo, pull, "not rebased: ").map(Some),
             "needs-human" => {
                 let excerpt = checks.diagnosis.as_deref();
-                self.needs_human(repo, pull, marker, &decision.reason, excerpt)?;
-                Ok(Some(self.human_wait(repo, pull)))
+                self.stop(
+                    repo,
+                    pull,
+                    marker,
+                    (&decision.reason, decision.infrastructure),
+                    excerpt,
+                )?;
+                Ok(Some(
+                    if self.config.policy.supervisor_holds
+                        && decision.infrastructure.is_some()
+                        && self.config.held_in(repo).is_none()
+                    {
+                        format!("labelled {}", crate::stop::SUPERVISOR_LABEL)
+                    } else {
+                        self.human_wait(repo, pull)
+                    },
+                ))
             }
             "triage" => self
                 .start_triage(repo, pull, (marker, read), &decision.reason)
@@ -8243,7 +8323,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             repository: repo.to_owned(),
             number,
             head: head.to_owned(),
-            kind: "needs-human",
+            kind: if reason == format!("labelled {}", crate::stop::SUPERVISOR_LABEL) {
+                crate::stop::SUPERVISOR_LABEL
+            } else {
+                "needs-human"
+            },
             reason: needs_you_reason(listed, reason),
             review_bucket: None,
             approval: None,
@@ -8252,7 +8336,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             repository: repo.to_owned(),
             number,
             head: head.to_owned(),
-            action: "skip",
+            action: if wait.kind == crate::stop::SUPERVISOR_LABEL {
+                crate::stop::SUPERVISOR_LABEL
+            } else {
+                "skip"
+            },
             reason: reason.to_owned(),
             ran: self.apply.is_none(),
             moved_at: moved_at(listed),
@@ -8438,6 +8526,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // labels here, or after them, so a new stop with no label reads them
         // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
         let mut pull = self.read_pull(owner, name, number)?;
+        if nodes(&pull, "/labels/nodes")
+            .iter()
+            .any(|l| text(l, "/name").eq_ignore_ascii_case(crate::stop::SUPERVISOR_LABEL))
+        {
+            let label = if labelled(&pull) {
+                LABEL
+            } else {
+                crate::stop::SUPERVISOR_LABEL
+            };
+            return Ok(self.labelled_skip(repo, number, merge_only, (&pull, label)));
+        }
         if self.config.policy.fix_plans
             && !self.config.ours(repo)
             && let Some(why) = self.planned_upstream(repo, number, &pull)
@@ -9113,7 +9212,19 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 (Some(_), None) => false,
             };
         let done = done.map(|d| format!(" -> {d}")).unwrap_or_default();
-        let (action, reason) = (decision.action, &decision.reason);
+        // As in `stop`, which labels nothing where the operator takes it.
+        let supervisor = self.config.policy.supervisor_holds
+            && decision.action == "needs-human"
+            && decision.infrastructure.is_some()
+            && self.config.held_in(repo).is_none();
+        let (action, reason) = (
+            if supervisor {
+                crate::stop::SUPERVISOR_LABEL
+            } else {
+                decision.action
+            },
+            &decision.reason,
+        );
         // A rerun's line leads with it, `review rerun OWNER/REPO#N …`.
         let line = if action == "merge" && reason.starts_with("approved by the operator at ") {
             format!("merge {repo}#{number}: {reason}{done}")
@@ -9166,7 +9277,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 repository: repo.to_owned(),
                 number,
                 head: head.to_owned(),
-                kind,
+                kind: if supervisor {
+                    crate::stop::SUPERVISOR_LABEL
+                } else {
+                    kind
+                },
                 reason: if approval_only {
                     "The review agent approved and checks are green; approve this head?".into()
                 } else {
@@ -9183,7 +9298,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             repository: repo.to_owned(),
             number,
             head: head.to_owned(),
-            action: decision.action,
+            action,
             reason: decision.reason.clone(),
             ran,
             moved_at: moved_at(&pull),
@@ -19980,6 +20095,173 @@ mod tests {
             assert!(task.contains("is not approved and cannot merge"), "{task}");
             assert!(!task.contains("was approved"), "{task}");
         }
+    }
+
+    #[test]
+    fn supervisor_holds_route_only_infrastructure_and_never_request_operator_review() {
+        use crate::stop::Cause;
+        for (enabled, reason, cause, label) in [
+            (false, "stale base", Some(Cause::StaleBase), LABEL),
+            (
+                true,
+                "stale base",
+                Some(Cause::StaleBase),
+                crate::stop::SUPERVISOR_LABEL,
+            ),
+            (
+                true,
+                "fix round pushed nothing",
+                Some(Cause::EmptyFix),
+                crate::stop::SUPERVISOR_LABEL,
+            ),
+            (true, "operator review requested", None, LABEL),
+            (true, "upstream posting", None, LABEL),
+            (true, "a check named stale base failed", None, LABEL),
+        ] {
+            let fake = github();
+            let mut cfg = config();
+            cfg.policy.supervisor_holds = enabled;
+            let mut pass = Pass::new(&fake, &fake, &cfg, now());
+            pass.apply = applying(&fake);
+            pass.stop(
+                REPO,
+                &pull("pull-470", json!({})),
+                &Marker::default(),
+                (reason, cause),
+                None,
+            )
+            .unwrap();
+            let writes = fake.writes.borrow();
+            assert_eq!(writes[0].1["name"], label, "{reason}");
+            assert_eq!(writes[1].1["labels"], json!([label]));
+            let body = writes[2].1["body"].as_str().unwrap();
+            assert_eq!(
+                body.contains(crate::stop::SUPERVISOR_PREFIX),
+                label == crate::stop::SUPERVISOR_LABEL
+            );
+            assert!(find_marker(&[json!({"id":99,"user":{"login":BOT},"body":body})], BOT).stopped);
+        }
+        // A supervisor hold is honored even if routing is later switched off.
+        let (outcome, fake, dispatcher) = applied_policy(
+            github(),
+            PollPolicy::default(),
+            json!({"labels":{"nodes":[{"name":crate::stop::SUPERVISOR_LABEL}]}}),
+            json!({}),
+        );
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(fake.writes.borrow().is_empty());
+        assert!(dispatcher.writes.borrow().is_empty());
+        assert_eq!(outcome.waits[0].kind, crate::stop::SUPERVISOR_LABEL);
+        // The dependency hold's label is not an infrastructure hold.
+        let (outcome, _, _) = applied_policy(
+            github(),
+            PollPolicy::default(),
+            json!({"labels":{"nodes":[{"name":"needs-supervisor"}]}}),
+            json!({}),
+        );
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(
+            outcome
+                .waits
+                .iter()
+                .all(|w| w.kind != crate::stop::SUPERVISOR_LABEL),
+            "{:?}",
+            outcome.lines
+        );
+    }
+
+    #[test]
+    fn supervisor_holds_route_real_conflict_and_empty_round_stops() {
+        for enabled in [false, true] {
+            for (change, state, cause) in [
+                (
+                    json!({"mergeable":CONFLICTING}),
+                    json!({"rounds":0,"rebased":2,"sha":"older"}),
+                    crate::stop::Cause::StaleBase,
+                ),
+                (
+                    json!({"contexts":{"ci":{"conclusion":"FAILURE"}}}),
+                    json!({"rounds":1,"sha":HEAD,"at":"2026-10-01T00:00:00Z"}),
+                    crate::stop::Cause::EmptyFix,
+                ),
+            ] {
+                let (outcome, fake, dispatcher) = applied_policy(
+                    github(),
+                    PollPolicy {
+                        supervisor_holds: enabled,
+                        rebase_rounds: 2,
+                        ..PollPolicy::default()
+                    },
+                    change,
+                    state,
+                );
+                assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                assert!(dispatcher.writes.borrow().is_empty());
+                let writes = fake.writes.borrow();
+                let label = if enabled {
+                    crate::stop::SUPERVISOR_LABEL
+                } else {
+                    LABEL
+                };
+                assert!(
+                    writes.iter().any(|(_, v)| v["labels"] == json!([label])),
+                    "{:?}",
+                    outcome.lines
+                );
+                let body = writes.iter().find_map(|(_, v)| v["body"].as_str()).unwrap();
+                assert_eq!(
+                    body.contains(&format!("[{}]", cause.name())),
+                    enabled,
+                    "{body}"
+                );
+            }
+        }
+        // Only the poll's own empty round is infrastructure.
+        for (why, answering, comments, cause) in [
+            ("fix", false, vec![], Some(crate::stop::Cause::EmptyFix)),
+            ("operator answer pending", true, vec!["9".into()], None),
+            ("the stale stop's round pending", true, vec![], None),
+            ("operator comments", false, vec!["9".into()], None),
+        ] {
+            let decision = started(
+                &config(),
+                &Marker {
+                    rounds: 1,
+                    sha: Some(HEAD.into()),
+                    at: Some("2026-10-01T00:00:00Z".into()),
+                    answering,
+                    comments,
+                    ..Marker::default()
+                },
+                (None, &Outages::Off),
+                HEAD,
+                why,
+                now(),
+            );
+            assert_eq!(decision.action, "needs-human", "{why}");
+            assert_eq!(decision.infrastructure, cause, "{why}");
+        }
+        // Free-text failures may mention infrastructure but cannot choose a cause.
+        let cfg = config();
+        let checks = Checks {
+            failed: vec![("[stale-base] missing runner".into(), None)],
+            ..Checks::default()
+        };
+        let decision = decide(
+            &cfg,
+            &pull("pull-470", json!({})),
+            &checks,
+            &Marker {
+                rounds: cfg.policy.fix_rounds(),
+                sha: Some("older".into()),
+                ..Marker::default()
+            },
+            (None, None),
+            &Outages::Off,
+            now(),
+        );
+        assert_eq!(decision.action, "needs-human");
+        assert_eq!(decision.infrastructure, None);
     }
 
     #[test]

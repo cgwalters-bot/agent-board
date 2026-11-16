@@ -198,6 +198,7 @@ const BUDGET_REACHED: &str = "weekly budget reached";
 /// Labels a person puts on an issue to keep runs off it.
 const HOLD_LABELS: &[(&str, HoldKind)] = &[
     (NEEDS_HUMAN, HoldKind::NeedsHuman),
+    (crate::stop::SUPERVISOR_LABEL, HoldKind::NeedsInfraFix),
     (NEEDS_DESIGN, HoldKind::NeedsDesign),
 ];
 /// Issues that are not work: epics, and questions to the operator.
