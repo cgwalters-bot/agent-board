@@ -6062,13 +6062,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.line("schedule: off (wip 0 or no workRepositories)".into());
             return Ok(());
         }
-        // Refused or unknown, which stage 3 said: never read as no focus.
+        // A refused focus holds every start, never read as no focus; an
+        // unread one is passed over this pass rather than idle the board.
         if let (Some(focus), None) = (config.focus(), &self.focus.live) {
             let focus = focus.display();
+            if self.focus.refused {
+                self.line(format!(
+                    "schedule: no new run starts: epics.focus {focus} is not a live epic"
+                ));
+                return Ok(());
+            }
             self.line(format!(
-                "schedule: no new run starts: epics.focus {focus} is not confirmed live"
+                "schedule: epics.focus {focus} is unread this pass; candidates start as without a focus"
             ));
-            return Ok(());
         }
         if self.apply {
             // Only a writer's plans count: another account's triage plan
