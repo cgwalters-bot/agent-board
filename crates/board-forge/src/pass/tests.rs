@@ -2610,7 +2610,7 @@ fn replay_idle_board_starts_work() {
     // classes and the causes: each started candidate's reads are its own,
     // the epics' theirs, and the rest the stage's.
     let spent = &report.spent;
-    assert_eq!(spent.by_stage, [0, 0, 0, 0, 16, 37, 3, 0, 0]);
+    assert_eq!(spent.by_stage, [0, 0, 0, 0, 0, 16, 37, 3, 0, 0]);
     assert_eq!(spent.by_stage.iter().sum::<usize>(), spent.requests);
     assert_eq!(spent.by_class.values().sum::<usize>(), spent.requests);
     assert_eq!(spent.by_cause.values().sum::<usize>(), spent.requests);
@@ -2675,30 +2675,30 @@ fn spent_names_each_stage_that_spent() {
             "requests 0, points 7",
         ),
         (
-            [1, 0, 0, 40, 0, 2, 0, 0, 0],
+            [1, 0, 0, 0, 40, 0, 2, 0, 0, 0],
             true,
             counts(&[]),
             counts(&[]),
             "requests 43 (setup 1, pull requests 40, schedule 2), points ~7",
         ),
         (
-            [0, 1, 2, 3, 4, 5, 6, 7, 8],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
             false,
             counts(&[]),
             counts(&[]),
-            "requests 36 (usage 1, maintain 2, pull requests 3, epics 4, schedule 5, status 6, holds 7, cost 8), points 7",
+            "requests 45 (changes 1, usage 2, maintain 3, pull requests 4, epics 5, schedule 6, status 7, holds 8, cost 9), points 7",
         ),
         // Most requests first, then by name; the stage's own reads are a
         // cause like a candidate's.
         (
-            [0, 0, 0, 0, 0, 6, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 6, 0, 0, 0],
             false,
             counts(&[("issues comments", 2), ("graphql repository.issue", 4)]),
             counts(&[("o/r#2", 2), ("schedule", 2), ("o/r#1", 2)]),
             r#"requests 6 (schedule 6), endpoints {"graphql repository.issue":4,"issues comments":2}, causes {"o/r#1":2,"o/r#2":2,"schedule":2}, points 7"#,
         ),
         (
-            [0, 0, 0, 0, 0, 24, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 24, 0, 0, 0],
             false,
             counts(&[("issues", 24)]),
             many.clone(),
@@ -3015,6 +3015,108 @@ fn pr_budget_is_derived_and_exhaustion_resumes_without_errors() {
     let whole = apply(&forge, &cfg);
     assert_eq!(whole.failures, 0, "{:#?}", whole.lines);
     assert_eq!(whole.state.unwrap().share_cursor, None);
+}
+
+/// `changeSweepHours`' stage 0 stops at its share, so a diff larger than
+/// it leaves stage 2 its requests: the due full walk still visits every
+/// repository and is recorded, and the next pass narrows those the diff
+/// read and walks the rest whole.
+#[test]
+fn a_changes_diff_past_its_share_leaves_the_walk_its_requests() {
+    let mut forge = Forge::new(None, false);
+    let now = forge.replay.now;
+    // Fifty repositories, follow's most, each diff a request, past the share
+    // of a pass of `LIMIT`.
+    const LIMIT: usize = 450;
+    let repositories: Vec<String> = (0..50).map(|n| format!("example/repo{n:02}")).collect();
+    // One open pull request, in the first repository; the rest have none.
+    followed(
+        &mut forge.replay,
+        (&repositories[0], 1),
+        json!({}),
+        json!([]),
+    );
+    let window = crate::changes::format_time(now - crate::changes::diff::FIRST_WINDOW).unwrap();
+    let watermark = crate::changes::format_time(now - crate::changes::diff::SKEW).unwrap();
+    forge
+        .replay
+        .requests
+        .push(json!({"request": {"get": format!("{API_ROOT}user")},
+        "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+    for (n, repo) in repositories.iter().enumerate() {
+        let mut lists: Vec<String> = [&window, &watermark]
+            .map(|since| {
+                format!("issues?state=all&sort=updated&direction=asc&since={since}&per_page=100")
+            })
+            .into();
+        if n > 0 {
+            lists.extend(["pulls?state=open&per_page=100", "events?per_page=100"].map(Into::into));
+        }
+        for path in lists {
+            forge.replay.requests.push(json!({
+                "request": {"get": format!("{API_ROOT}repos/{repo}/{path}")},
+                "answer": {"status": 200, "link": null, "body": []},
+            }));
+        }
+    }
+    let mut cfg = config(json!({
+        "wip": 0, "changeSweepHours": 6, "store": "s.db", "state": "s.json",
+        "follow": repositories, "pr": {"noMerge": repositories, "fixPools": ["claude"]}
+    }));
+    cfg.epics = None;
+    let run = |state| {
+        let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
+        let within = (state, Mode::Actions(&own()), Limits::default(), now);
+        let bounds = Bounds::new(LIMIT, admit_by);
+        block(run_within(&forge, &forge, &cfg, within, &bounds)).unwrap()
+    };
+    let has = |report: &Report, start: &str| report.lines.iter().any(|l| l.starts_with(start));
+    let first = run(State::default());
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    for line in [
+        "budget: changes stopped at its share",
+        "changes: the stage's request share is spent at example/repo",
+    ] {
+        assert!(has(&first, line), "{line}: {:#?}", first.lines);
+    }
+    let share = LIMIT * CHANGES_SHARE / 100;
+    let spent = first.spent.by_stage;
+    assert!(spent[Stage::Changes as usize] <= share, "{}", first.spent);
+    assert!(
+        spent[Stage::PullRequests as usize] >= repositories.len(),
+        "{}",
+        first.spent
+    );
+    let swept = now.format(&Rfc3339).unwrap();
+    let state = first.state.unwrap();
+    assert_eq!(state.changes_swept.as_ref(), Some(&swept));
+    let changes = first.records.borrow().changes.clone().unwrap();
+    let read = (changes.repositories.values())
+        .filter(|mark| mark.since.is_some())
+        .count();
+    assert!((1..repositories.len()).contains(&read), "{read}");
+    let mut state = State::from_json(&state.to_json()).unwrap();
+    state.changes = Some(changes);
+    let second = run(state);
+    assert_eq!(second.failures, 0, "{:#?}", second.lines);
+    let narrowed = format!("repositories narrowed to what changed; the last full walk at {swept}");
+    assert!(
+        second
+            .lines
+            .iter()
+            .any(|l| l.starts_with("changes: ") && l.ends_with(&narrowed)),
+        "{:#?}",
+        second.lines
+    );
+    let unvisited = "pull requests: changeSweepHours left 1 pull request(s) the changes diff did not list unvisited";
+    assert!(has(&second, unvisited), "{:#?}", second.lines);
+    let spent = second.spent.by_stage;
+    assert!(spent[Stage::Changes as usize] <= share, "{}", second.spent);
+    assert!(
+        spent[Stage::PullRequests as usize] >= repositories.len() - read,
+        "{}",
+        second.spent
+    );
 }
 
 #[test]
@@ -19603,6 +19705,18 @@ fn config_table() {
         (
             json!({"store": "s.db", "livingStatus": "s.db"}),
             "store must differ from state and livingStatus",
+        ),
+        (
+            json!({"changeSweepHours": 169, "store": "s.db", "state": "s.json"}),
+            "changeSweepHours is not 0 to 168",
+        ),
+        (
+            json!({"changeSweepHours": 6, "state": "s.json"}),
+            "changeSweepHours needs store and state",
+        ),
+        (
+            json!({"changeSweepHours": 6, "store": "s.db"}),
+            "changeSweepHours needs store and state",
         ),
     ] {
         let mut value = minimal.clone();

@@ -8,6 +8,12 @@
 //! lost, stale or forged database cannot change them. A missing or unusable
 //! database is replaced by an empty one, which refills from the comments
 //! each later pass reads.
+//!
+//! It also keeps the changes diff's watermarks ([`changes`]), which
+//! `changeSweepHours` reads to narrow the pull request walk: a forged one
+//! can only leave a pull request unvisited until the next full sweep, whose
+//! time the trusted `state` keeps.
+use crate::changes::diff;
 use crate::github::DEFAULT_HOST;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, params};
@@ -51,6 +57,7 @@ const MIGRATIONS: &[&str] = &[
         operator INTEGER NOT NULL,
         since TEXT NOT NULL
     ) STRICT;",
+    "CREATE TABLE changes (state TEXT NOT NULL) STRICT;",
 ];
 
 /// The schema version this build writes.
@@ -116,6 +123,9 @@ pub struct Records {
     pub plans: BTreeMap<String, Plan>,
     /// The pass's hold snapshot, which replaces the last; none leaves it.
     pub holds: Option<Vec<Hold>>,
+    /// The changes diff's state after stage 0, which replaces the last;
+    /// none leaves it.
+    pub changes: Option<diff::State>,
 }
 
 impl Records {
@@ -158,6 +168,7 @@ impl Records {
             && self.verdicts.is_empty()
             && self.plans.is_empty()
             && self.holds.is_none()
+            && self.changes.is_none()
     }
 }
 
@@ -187,6 +198,8 @@ pub struct Saved {
     pub verdicts: u64,
     pub plans: u64,
     pub holds: u64,
+    /// Repositories with a changes watermark, where this pass saved them.
+    pub watermarks: Option<u64>,
 }
 
 /// Record `records` at `now` in the database at `path`, migrating it to
@@ -265,6 +278,20 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
             .context("record a hold")?;
         }
     }
+    if let Some(changes) = &records.changes {
+        let state = serde_json::to_string(&changes.to_json()?)?;
+        tx.execute("DELETE FROM changes", [])
+            .context("replace the changes state")?;
+        tx.execute("INSERT INTO changes (state) VALUES (?1)", [state])
+            .context("record the changes state")?;
+    }
+    // Counted only as saved: decoding a row a cache planted would fail the
+    // save of everything else.
+    let watermarks = records.changes.as_ref().map(|changes| {
+        (changes.repositories.values())
+            .filter(|mark| mark.since.is_some())
+            .count() as u64
+    });
     let expired = seen - STORE_RETENTION_DAYS * 24 * 60 * 60;
     for table in ["dispatches", "verdicts", "plans"] {
         tx.execute(&format!("DELETE FROM {table} WHERE seen < ?1"), [expired])
@@ -281,9 +308,41 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
         verdicts: count("verdicts")?,
         plans: count("plans")?,
         holds: count("holds")?,
+        watermarks,
     };
     tx.commit().context("commit the store")?;
     Ok(saved)
+}
+
+/// The changes diff's state in the database at `path`, read only: none
+/// where the database has none yet, as one of an older schema. A database
+/// [`save`] would rebuild is an error, which the caller reads as none.
+pub fn changes(path: &Path) -> Result<Option<diff::State>> {
+    let (connection, version) = inspect(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if version < CHANGES_SCHEMA {
+        return Ok(None);
+    }
+    stored_changes(&connection)
+}
+
+/// The schema version that added the `changes` table.
+const CHANGES_SCHEMA: usize = 3;
+
+fn stored_changes(connection: &Connection) -> Result<Option<diff::State>> {
+    let mut statement = connection
+        .prepare("SELECT state FROM changes")
+        .context("read the changes state")?;
+    let rows: Vec<String> = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()
+        .context("read the changes state")?;
+    ensure!(rows.len() <= 1, "{} changes states", rows.len());
+    rows.first()
+        .map(|state| {
+            let value = serde_json::from_str(state).context("decode the changes state")?;
+            diff::State::from_json(&value)
+        })
+        .transpose()
 }
 
 /// An existing, intact database of a schema this build knows, migrated.
@@ -294,6 +353,14 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
 /// check evaluates the schema's expressions (a planted CHECK constraint's
 /// among them) on every row.
 fn open(path: &Path) -> Result<Connection> {
+    let (connection, _) = inspect(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    migrate(&connection)?;
+    Ok(connection)
+}
+
+/// [`open`]'s checks, the database opened with `flags` and not migrated,
+/// and its schema version.
+fn inspect(path: &Path, flags: OpenFlags) -> Result<(Connection, usize)> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!("no database"),
@@ -315,8 +382,7 @@ fn open(path: &Path) -> Result<Connection> {
         );
     }
     let version = header(path, metadata.len())?;
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .context("open the database")?;
+    let connection = Connection::open_with_flags(path, flags).context("open the database")?;
     // Exactly the migrations' tables and indexes at its version: no missing
     // column, and no trigger or constraint planted in a restored cache.
     let reference = Connection::open_in_memory().context("open a reference schema")?;
@@ -329,8 +395,7 @@ fn open(path: &Path) -> Result<Connection> {
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .context("check the database")?;
     ensure!(check == "ok", "integrity check: {check}");
-    migrate(&connection)?;
-    Ok(connection)
+    Ok((connection, version))
 }
 
 /// The schema version in the 100-byte header of the database file at
@@ -557,6 +622,7 @@ mod tests {
                 verdicts: 1,
                 plans: 1,
                 holds: 0,
+                watermarks: None,
             }
         );
         let mut second = Records::default();
@@ -593,9 +659,9 @@ mod tests {
             ("evicted", Ok(Some("no database"))),
             ("damaged", Ok(Some("integrity check: "))),
             ("oversized", Ok(Some("larger than"))),
-            ("newer", Ok(Some("schema 99 is newer than this build's 2"))),
+            ("newer", Ok(Some("schema 99 is newer than this build's 3"))),
             ("tableless", Ok(Some("schema differs from version 1's"))),
-            ("trigger", Ok(Some("schema differs from version 2's"))),
+            ("trigger", Ok(Some("schema differs from version 3's"))),
             // A constraint that every row fails, slowly: refused by its
             // schema before an integrity check would evaluate it.
             ("constraint", Ok(Some("schema differs from version 1's"))),
@@ -608,7 +674,7 @@ mod tests {
             ("wal", Ok(Some("not a rollback-journal database"))),
             (
                 "partial page",
-                Ok(Some("40961 bytes is not a whole number")),
+                Ok(Some("45057 bytes is not a whole number")),
             ),
             (
                 "page count",
@@ -743,5 +809,65 @@ mod tests {
             };
             assert_eq!(save(&path, &records, at(0)).unwrap().holds, expected);
         }
+    }
+
+    /// The changes state reads back as saved, read only; a pass without one
+    /// leaves it; an older schema, a missing database or two states read as
+    /// none or an error, never as a guess.
+    #[test]
+    fn changes_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        assert!(changes(&path).is_err());
+        save(&path, &Records::default(), at(0)).unwrap();
+        assert_eq!(changes(&path).unwrap(), None);
+        let mut state = diff::State::default();
+        let mark = diff::Watermark {
+            since: Some("2027-01-15T08:00:00Z".into()),
+            ..Default::default()
+        };
+        state.repositories.insert("o/r".into(), mark);
+        state
+            .repositories
+            .insert("o/new".into(), Default::default());
+        state.pending.insert("o/r#3".into());
+        for (records, watermarks) in [
+            (Some(state.clone()), Some(1)),
+            (None, None),
+            (Some(diff::State::default()), Some(0)),
+            (Some(state.clone()), Some(1)),
+        ] {
+            let records = Records {
+                changes: records,
+                ..Default::default()
+            };
+            assert_eq!(save(&path, &records, at(0)).unwrap().watermarks, watermarks);
+        }
+        assert_eq!(changes(&path).unwrap(), Some(state));
+        // Read only: a version-2 database is neither migrated nor read.
+        std::fs::remove_file(&path).unwrap();
+        migrate_to(&Connection::open(&path).unwrap(), 2).unwrap();
+        assert_eq!(changes(&path).unwrap(), None);
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        std::fs::remove_file(&path).unwrap();
+        save(&path, &Records::default(), at(0)).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for _ in 0..2 {
+            let empty = r#"{"schema":"agent-board/changes-state/v1"}"#;
+            connection
+                .execute("INSERT INTO changes (state) VALUES (?1)", [empty])
+                .unwrap();
+        }
+        drop(connection);
+        let error = format!("{:#}", changes(&path).unwrap_err());
+        assert_eq!(error, "2 changes states");
+        // Planted rows fail the read, never a save without the option.
+        let saved = save(&path, &records(), at(0)).unwrap();
+        assert_eq!((saved.dispatches, saved.watermarks), (1, None));
+        assert!(MIGRATIONS[CHANGES_SCHEMA - 1].contains("CREATE TABLE changes"));
     }
 }

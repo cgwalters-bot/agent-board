@@ -190,7 +190,7 @@ pub struct Watermark {
 }
 
 /// The caller's state between reads, keyed by lower-case repository.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
     #[serde(default)]
@@ -935,8 +935,18 @@ pub fn classify(node: &Value, repository: &str, since: &str, operator: &str) -> 
 impl Diff {
     /// Move every read repository's watermark to this read's time.
     pub fn commit(&self, state: &mut State) {
+        self.commit_where(state, |_| true);
+    }
+
+    /// Move the watermark of each read repository whose lower-case name
+    /// `consumed` takes to this read's time: a consumer that acted on part
+    /// of the diff leaves the rest to be listed again.
+    pub fn commit_where(&self, state: &mut State, consumed: impl Fn(&str) -> bool) {
         for repository in &self.repositories {
             let key = repository.repository.to_ascii_lowercase();
+            if !consumed(&key) {
+                continue;
+            }
             let mark = state.repositories.entry(key).or_default();
             mark.since = Some(self.now.clone());
             mark.start = None;

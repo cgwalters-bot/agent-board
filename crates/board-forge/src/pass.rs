@@ -121,6 +121,13 @@ const SCHEDULE_SHARE: usize = 60;
 
 const EPICS_SHARE: usize = 20;
 
+/// The percentage of the pass's requests stage 0's changes diff may spend,
+/// 65 of [`PASS_REQUEST_LIMIT`]: without it a busy diff spent the pass
+/// before stage 2 walked anything, and the full walk that bounds a forged
+/// store's delay never came. A repository it does not reach is walked
+/// whole.
+const CHANGES_SHARE: usize = 10;
+
 /// 304s a pass does not charge to its budget: GitHub does not count them
 /// against the rate limit, so a revalidated read that answers from the cache
 /// is free, but only this many, so that they still bound a runaway loop. A
@@ -795,6 +802,12 @@ pub struct Config {
     /// Off unless set: the SQLite store ([`crate::store`]) an applying pass
     /// records its dispatch records, triage verdicts, plans and holds in.
     pub store: Option<String>,
+    /// Off at 0: else stage 0 reads the changes diff since the watermarks in
+    /// `store`, and stage 2 visits only the pull requests it lists, every
+    /// one at least this many hours apart ([`changed`]); needs `store` and
+    /// `state`.
+    #[serde(default)]
+    pub change_sweep_hours: u64,
     /// Opt-in durable ledger path for one living status comment per issue.
     /// Retain it across runs; applying passes must still be serialized.
     pub living_status: Option<String>,
@@ -1735,6 +1748,7 @@ impl Config {
             self.replan_after_days == 0 || self.triage.is_some(),
             "replanAfterDays needs triage"
         );
+        changed::check(self)?;
         if let Some(revisit) = &self.revisit {
             revisit.check(self)?;
         }
@@ -2861,6 +2875,7 @@ fn top_priority(options: &[String], facts: &Facts) -> bool {
 enum Stage {
     /// The direction issue and the dispatch ref, before the stages.
     Setup,
+    Changes,
     Usage,
     Maintain,
     PullRequests,
@@ -2872,8 +2887,9 @@ enum Stage {
 }
 
 impl Stage {
-    const ALL: [Stage; 9] = [
+    const ALL: [Stage; 10] = [
         Stage::Setup,
+        Stage::Changes,
         Stage::Usage,
         Stage::Maintain,
         Stage::PullRequests,
@@ -2887,6 +2903,7 @@ impl Stage {
     fn name(self) -> &'static str {
         match self {
             Stage::Setup => "setup",
+            Stage::Changes => "changes",
             Stage::Usage => "usage",
             Stage::Maintain => "maintain",
             Stage::PullRequests => "pull requests",
@@ -4559,12 +4576,22 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         flights: RefCell::default(),
         focus_read: None,
         quiet: None,
+        changes: None,
     };
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
         Err(error) => {
             scheduler.report.error("direction", &error);
         }
+    }
+    // Stage 0: what changed since the last pass, which stage 2 walks,
+    // within its share.
+    let mut state = state;
+    let after_changes = (bounds.left.get()).saturating_sub(bounds.share(CHANGES_SHARE));
+    bounds.enter_keeping(Stage::Changes, after_changes);
+    scheduler.changes(&mut state);
+    if let Some(line) = bounds.share_line() {
+        scheduler.line(line);
     }
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
@@ -4575,7 +4602,6 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     }
     // The maintain digest, planned while it is due, which the later stages
     // leave its share for.
-    let mut state = state;
     if state.interval_seconds == 0 {
         state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
     }
@@ -5253,6 +5279,8 @@ struct Scheduler<'a, C> {
     /// The open board issues stage 4 read with nothing under way, for the
     /// epic focus ([`focus::quiet`]); `None` before it read the board.
     quiet: Option<BTreeSet<String>>,
+    /// Stage 0's changes diff, where `changeSweepHours` read it.
+    changes: Option<changed::Read>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -5702,9 +5730,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(midstream) = &config.midstream {
             let (owner, topic) = (&midstream.owner, &midstream.topic);
             // Unread, a midstream also in `follow` would be merged in.
-            match config
-                .resolved_midstreams
-                .clone()
+            // Stage 0 may have read them.
+            match (config.resolved_midstreams.clone())
+                .or_else(|| self.midstreams.clone())
                 .map(Ok)
                 .unwrap_or_else(|| midstream.read(&self.client))
             {
@@ -5820,6 +5848,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
         }
         poll.policy.notification_intake = routes.as_ref().map(|r| r.staging.clone());
+        poll.policy.changed = self.changed();
         poll.policy.midstreams = midstreams.clone();
         poll.policy.no_merge.extend(midstreams);
         // Read before the approved and intake turns where they run, whose
@@ -6049,6 +6078,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 // pass held there is kept.
                 outcome.undecided.extend(waiting);
                 outcome.state.authored_cursor = cursor;
+                self.changes_walked(&mut outcome);
                 self.finish_follow(outcome)
             }
             Err(error) if budget_spent(&error) => {
@@ -10417,6 +10447,7 @@ impl crate::github::GraphQl for Replay {
 mod active;
 pub mod authored;
 mod blockers;
+mod changed;
 mod cost;
 pub(crate) mod epics;
 mod focus;

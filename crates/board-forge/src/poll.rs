@@ -690,6 +690,11 @@ pub struct PollPolicy {
     /// Pass-only: the topic-admitted midstream forks stage 2 read, whose
     /// fix briefs get [`crate::promote::midstream_brief`]. Empty by default.
     pub midstreams: Vec<String>,
+    /// Pass-only `changeSweepHours`: followed repositories, lower case, whose
+    /// walk visits only these pull requests, the changes diff's; the rest
+    /// are left as unchanged ([`Outcome::unchanged`]). Empty (the default)
+    /// visits every one.
+    pub changed: BTreeMap<String, BTreeSet<u64>>,
     /// Pass-only promotion targets: authenticated publication CI feeds the
     /// original fork PR's existing bounded fix rounds. Empty by default.
     pub publication_forks: BTreeMap<String, crate::pass::promote::Fork>,
@@ -1452,6 +1457,7 @@ impl PollPolicy {
             head_owners: Vec::new(),
             no_merge: Vec::new(),
             midstreams: Vec::new(),
+            changed: BTreeMap::new(),
             operator_paths: Vec::new(),
             stale_days: 0,
             fix_rounds: None,
@@ -1850,6 +1856,14 @@ pub struct State {
     /// pass, not the poll, keeps, as `follow_cursor` is kept. Losing it only
     /// starts their round again.
     pub authored_cursor: Option<String>,
+    /// The pass's `changeSweepHours` ([`crate::pass`]): when its pull
+    /// request walk last visited every pull request. Here, in the trusted
+    /// state, rather than in the store with the watermarks, so that a forged
+    /// store cannot put the next full walk off. Losing it walks in full.
+    pub changes_swept: Option<String>,
+    /// The changes diff's watermarks, which the caller reads from the store
+    /// and never from this file: not serialized.
+    pub changes: Option<crate::changes::diff::State>,
 }
 
 impl State {
@@ -1900,6 +1914,7 @@ impl State {
                     "notify_before",
                     "maintain",
                     "authored_cursor",
+                    "changes_swept",
                     // Read no more: the pass reads the live epics itself.
                     "authored_priority"
                 ]
@@ -2119,6 +2134,7 @@ impl State {
         );
         let notify_since = time("notify_since")?;
         let notify_before = time("notify_before")?;
+        let changes_swept = time("changes_swept")?;
         let maintain = (object.get("maintain"))
             .map(crate::pass::maintain::Day::from_json)
             .transpose()?;
@@ -2150,6 +2166,8 @@ impl State {
             notify_before,
             maintain,
             authored_cursor,
+            changes_swept,
+            changes: None,
         })
     }
 
@@ -2224,6 +2242,9 @@ impl State {
         }
         if let Some(cursor) = &self.authored_cursor {
             state["authored_cursor"] = cursor.as_str().into();
+        }
+        if let Some(swept) = &self.changes_swept {
+            state["changes_swept"] = swept.as_str().into();
         }
         state
     }
@@ -4821,6 +4842,10 @@ pub struct Outcome {
     /// step for some pull request: outside its envelope, or a read that
     /// failed. Any of those may wait on the operator too.
     pub undecided: BTreeSet<String>,
+    /// The followed repositories, lower case, and how many of their pull
+    /// requests this pass left unvisited as unchanged
+    /// ([`PollPolicy::changed`]); unlike `undecided`, their walk finished.
+    pub unchanged: BTreeMap<String, usize>,
     /// The state to keep for the next pass; its interval is the next gap.
     pub state: State,
 }
@@ -9558,11 +9583,20 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             .iter()
             .filter_map(|p| Some((p["number"].as_u64()?, p)))
             .collect();
+        let config = self.config;
+        let changed = config.policy.changed.get(&repo.to_ascii_lowercase());
         for (number, merge_only) in numbers {
             if outcome
                 .decided
                 .contains(&(repo.to_ascii_lowercase(), number))
             {
+                continue;
+            }
+            if changed.is_some_and(|changed| !changed.contains(&number)) {
+                *outcome
+                    .unchanged
+                    .entry(repo.to_ascii_lowercase())
+                    .or_default() += 1;
                 continue;
             }
             // Decided from its listing, it costs no share.
@@ -9971,6 +10005,12 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
             }
         }
     }
+    let unchanged: usize = outcome.unchanged.values().sum();
+    if unchanged > 0 {
+        outcome.lines.push(format!(
+            "pull requests: changeSweepHours left {unchanged} pull request(s) the changes diff did not list unvisited"
+        ));
+    }
     if pass.quiet_replayed > 0 {
         outcome.lines.push(format!(
             "pull requests: quietWaits decided {} unchanged pull request(s) waiting on the operator from their listings",
@@ -10084,6 +10124,8 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         notify_before,
         maintain: None,
         authored_cursor: None,
+        changes_swept: None,
+        changes: None,
     };
     Ok(outcome)
 }
@@ -15928,6 +15970,96 @@ mod tests {
             }
         }
         assert!(dispatcher.writes.borrow().is_empty());
+    }
+
+    /// With the pass's `changeSweepHours`, a repository the changes diff
+    /// covers is walked only where the diff lists a pull request: the rest
+    /// are left unread and counted, and its walk still ends. A repository
+    /// the diff does not cover is walked whole.
+    #[test]
+    fn a_narrowed_walk_reads_only_the_changed() {
+        let pulls = format!("repos/{REPO}/pulls?state=open&per_page=100");
+        let listed: Vec<Value> = [470, 471]
+            .iter()
+            .map(|n| json!({"number": n, "user": {"login": BOT}, "head": {"sha": "abc"}}))
+            .collect();
+        let dispatcher = Fake::default();
+        let lower = REPO.to_ascii_lowercase();
+        for (name, changed, visited, unchanged) in [
+            ("not narrowed", None, vec![470, 471], None),
+            (
+                "other repository",
+                Some(("o/other", vec![470])),
+                vec![470, 471],
+                None,
+            ),
+            (
+                "one changed",
+                Some((lower.as_str(), vec![470])),
+                vec![470],
+                Some(1),
+            ),
+            (
+                "none changed",
+                Some((lower.as_str(), vec![9])),
+                vec![],
+                Some(2),
+            ),
+        ] {
+            let mut fake = github();
+            for n in [470, 471] {
+                let mut p = pull("pull-470", json!({}));
+                p["number"] = n.into();
+                fake.pulls.insert(n, p);
+            }
+            fake.page(&pulls, None, None, json!(listed));
+            let mut cfg = config();
+            if let Some((repo, numbers)) = changed {
+                let numbers = numbers.into_iter().collect();
+                cfg.policy.changed = [(repo.to_owned(), numbers)].into();
+            }
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            // Decided, or failed for want of a fixture: visited either way.
+            let decided: Vec<u64> = [470, 471]
+                .into_iter()
+                .filter(|n| {
+                    let at = format!("{REPO}#{n} ");
+                    outcome.lines.iter().any(|l| l.starts_with(&at))
+                })
+                .collect();
+            assert_eq!(decided, visited, "{name}: {:?}", outcome.lines);
+            assert_eq!(
+                outcome.undecided.is_empty(),
+                !visited.contains(&471),
+                "{name}"
+            );
+            let expected: BTreeMap<String, usize> =
+                unchanged.map(|n| (lower.clone(), n)).into_iter().collect();
+            assert_eq!(outcome.unchanged, expected, "{name}");
+            let line = unchanged.map(|n| {
+                format!(
+                    "pull requests: changeSweepHours left {n} pull request(s) the changes diff did not list unvisited"
+                )
+            });
+            assert_eq!(
+                outcome
+                    .lines
+                    .iter()
+                    .find(|l| l.contains("changeSweepHours")),
+                line.as_ref(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
