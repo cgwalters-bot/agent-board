@@ -599,6 +599,9 @@ const PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
+    /// CLI-only scope: prevents an on-demand PR pass from scheduling other work.
+    #[serde(skip)]
+    pub pull: Option<poll::PullSelector>,
     /// Org sources are kept separate from runtime policy. A pass resolves
     /// these and validates the concrete policy before taking any stage.
     #[serde(skip)]
@@ -4578,6 +4581,14 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         quiet: None,
         changes: None,
     };
+    if config.pull.is_some() {
+        // No refresh publication, maintenance, reaping, board reconciliation or
+        // scheduling: only the selected PR may receive a forge step. Pacing
+        // reads the existing snapshot; WIP/leases still use the full census.
+        bounds.enter(Stage::PullRequests);
+        scheduler.follow(state, &git_ref, 0);
+        return report;
+    }
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
         Err(error) => {
@@ -5795,7 +5806,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // Read before `authored`, which takes a named midstream's upstream
         // first.
         let mut routes = None;
-        if config.notifications {
+        if config.notifications && config.pull.is_none() {
             match midstream::routes(&self.client, &midstreams, &config.dispatch_repo) {
                 Ok(read) => {
                     let staged = read.staging.iter();
@@ -5851,6 +5862,66 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         poll.policy.changed = self.changed();
         poll.policy.midstreams = midstreams.clone();
         poll.policy.no_merge.extend(midstreams);
+        if let Some(pull) = &config.pull {
+            if !self
+                .follows
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(&pull.repository))
+            {
+                self.report
+                    .failure(format!("--pull: {} is not followed", pull.repository));
+                return 0;
+            }
+            poll.policy.pull = Some(pull.clone());
+            poll.policy.preview_fix_pools = Some(config.pr.fix_pools.clone());
+            poll.policy.action_first = false;
+            poll.policy.notification_intake = None;
+            poll.policy.operator_answers = false;
+            poll.policy.changed.clear();
+            poll.policy.quiet_waits = false;
+            poll.policy.wip = self.stage2_wip(git_ref, earlier);
+            if config.authored.is_some() && !config.pr.poll.review_pools.is_empty() {
+                match authored::read(&config.bot, &self.client) {
+                    Ok(repos) => {
+                        poll.policy.review_census = repos
+                            .into_iter()
+                            .filter(|repo| {
+                                !never(repo)
+                                    && !self.follows.iter().any(|r| r.eq_ignore_ascii_case(repo))
+                            })
+                            .collect();
+                    }
+                    Err(error) => {
+                        self.report.error("--pull review census", &error);
+                        return 0;
+                    }
+                }
+            }
+            let result = poll::run_capped_after_direction(
+                &self.client,
+                &self.client,
+                &poll,
+                state,
+                (&self.follows, &self.follows),
+                self.apply.then(|| poll::Apply {
+                    dispatcher: &self.dispatcher,
+                    workflow: config.dispatch_workflow.clone(),
+                    pools: config.pr.fix_pools.clone(),
+                    git_ref: Some(git_ref.to_owned()),
+                }),
+                Some(self.caps),
+                self.now,
+                None,
+                true,
+            );
+            return match result {
+                Ok(outcome) => self.finish_follow(outcome),
+                Err(error) => {
+                    self.report.error("--pull", &error);
+                    0
+                }
+            };
+        }
         // Read before the approved and intake turns where they run, whose
         // starts it bounds too; the walk counts theirs as its own, carried
         // with `direction`.

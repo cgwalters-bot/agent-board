@@ -654,6 +654,8 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// CLI-only selection, never authority to bypass the followed envelope.
+    pub pull: Option<PullSelector>,
     /// Pass-only opt-in repository backpressure; no new fix authority.
     pub open_pr_cap: Option<usize>,
     /// Avoid parking mechanical queue failures and exhausted work on the operator.
@@ -1402,6 +1404,7 @@ impl PollPolicy {
         .context("mergeQueue fixedFlakes")?;
         check_flake_fixes(&fixed_flakes)?;
         let mut policy = Self {
+            pull: None,
             publication_forks: BTreeMap::new(),
             unavailable_publication_forks: vec![],
             open_pr_cap: None,
@@ -1691,6 +1694,7 @@ pub trait Rest {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Turn {
     All,
+    Only(u64),
     From(u64),
     Before(u64),
 }
@@ -1699,9 +1703,36 @@ impl Turn {
     fn takes(self, number: u64) -> bool {
         match self {
             Turn::All => true,
+            Turn::Only(n) => number == n,
             Turn::From(n) => number >= n,
             Turn::Before(n) => number < n,
         }
+    }
+}
+
+/// An explicit GitHub PR identity, not a URL or an issue admission.
+#[derive(Clone, Debug)]
+pub struct PullSelector {
+    pub repository: String,
+    pub number: u64,
+}
+
+impl std::str::FromStr for PullSelector {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let (repository, number) = value.split_once('#').context("--pull needs OWNER/REPO#N")?;
+        validate_repository(repository)?;
+        ensure!(
+            !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()),
+            "--pull needs a positive PR number"
+        );
+        let number = number.parse::<u64>().context("--pull PR number")?;
+        ensure!(number > 0, "--pull needs a positive PR number");
+        Ok(Self {
+            repository: repository.to_owned(),
+            number,
+        })
     }
 }
 
@@ -7476,6 +7507,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             Ok(pool) => pool,
             Err(why) => return Ok(format!("not re-run: {why}")),
         };
+        if self.apply.is_none() {
+            if let Some(pool) = &pool {
+                self.rest.preview_pool_start(pool);
+            }
+            return Ok(RE_RUN.into());
+        }
         self.writable(&format!("repos/{repo}/"))?;
         self.spend()?;
         self.writes += 1;
@@ -8661,6 +8698,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // labels here, or after them, so a new stop with no label reads them
         // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
         let mut pull = self.read_pull(owner, name, number)?;
+        if self.config.policy.pull.is_some()
+            && (is_held(&pull) || labelled(&pull) || review_hold(self.config, &pull).is_some())
+        {
+            return Ok((
+                format!("{repo}#{number} skip: explicit selection does not release a hold"),
+                false,
+                None,
+                None,
+            ));
+        }
         if nodes(&pull, "/labels/nodes")
             .iter()
             .any(|l| text(l, "/name").eq_ignore_ascii_case(crate::stop::SUPERVISOR_LABEL))
@@ -9291,8 +9338,21 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             (Some(_), None, _) if decision.action == CHECK_RERUN => self
                 .rerun_checks(repo, &pull, &marker, &comments, &check_reruns)
                 .map(Some),
-            (Some(apply), None, _) if decision.action == RUN_RERUN => {
-                let (dispatcher, fix) = (apply.dispatcher, apply.pools.clone());
+            (_, None, _)
+                if decision.action == RUN_RERUN
+                    && (self.apply.is_some() || self.config.policy.pull.is_some()) =>
+            {
+                let (dispatcher, fix) = match &self.apply {
+                    Some(apply) => (apply.dispatcher, apply.pools.clone()),
+                    None => (
+                        self.rest,
+                        self.config
+                            .policy
+                            .preview_fix_pools
+                            .clone()
+                            .unwrap_or_default(),
+                    ),
+                };
                 let run = marker.run.context("a run rerun without its run")?;
                 let caller = self.config.dispatch_repo.clone();
                 let pool = marker.pool.clone().filter(|p| !p.is_empty());
@@ -9332,8 +9392,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
             (None, _, _) => Ok(None),
         };
+        let selection_refused = self.config.policy.pull.is_some()
+            && done
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .is_some_and(|d| d.starts_with("not "));
         if let Some((caps, kind)) = caps
             && !capped
+            && !selection_refused
             && (self.apply.is_none() || self.writes > before)
         {
             caps.count(kind);
@@ -9341,6 +9408,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let done = done?;
         // Taken, or in a preview to be taken: not held, nor turned down.
         let ran = !capped
+            && !selection_refused
             && match (&self.apply, &done) {
                 (None, _) => true,
                 (Some(_), Some(done)) => !done.starts_with("not "),
@@ -9497,7 +9565,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             "{repo} is outside this pass's envelope"
         );
         let first = match turn {
-            Turn::From(n) => Some(n),
+            Turn::From(n) | Turn::Only(n) => Some(n),
             Turn::All | Turn::Before(_) => None,
         };
         if !self.share_allows(repo, first) {
@@ -9520,6 +9588,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let open: Vec<Value> = (open.into_iter())
             .filter(|p| p["number"].as_u64().is_some_and(|n| turn.takes(n)))
             .collect();
+        if let Turn::Only(number) = turn {
+            ensure!(
+                open.len() == 1,
+                "{repo}#{number} is not a known open pull request (unknown, closed, or an issue)"
+            );
+        }
         self.follow_open(repo, open, outcome)
     }
 
@@ -9844,6 +9918,22 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     shared_budget: bool,
 ) -> Result<Outcome> {
     let policy = &config.policy;
+    if let Some(pull) = &policy.pull {
+        ensure!(
+            follow
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(&pull.repository)),
+            "{} is not followed",
+            pull.repository
+        );
+        ensure!(
+            !policy.action_first
+                && policy.notification_intake.is_none()
+                && policy.notifications.is_none()
+                && policy.operator_comments.is_empty(),
+            "single-PR selection cannot run unrelated discovery"
+        );
+    }
     ensure!(
         !caps.is_some_and(caps::Caps::limited)
             || (policy.operator_comments.is_empty()
@@ -9893,6 +9983,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     for repo in &repositories {
         validate_repository(repo)?;
     }
+    let selected_state = policy.pull.as_ref().map(|_| state.clone());
     let mut cursors = Cursors::new(config, &mut state);
     let mut pass = Pass {
         pressure: direction
@@ -9966,6 +10057,19 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     }
     let follow: BTreeSet<&String> = follow.iter().collect();
     pass.review_census(follow.iter().copied(), &mut outcome);
+    if let Some(pull) = &policy.pull {
+        // A selection changes only the walk, not its census or decision/start
+        // machinery. Keep unrelated cursors and receipts for the hosted pass.
+        pass.follow_turn(&pull.repository, Turn::Only(pull.number), &mut outcome)?;
+        pass.rest.under_way(true);
+        pass.start_reviews(&mut outcome);
+        pass.rest.under_way(false);
+        outcome.dispatched = pass.dispatched;
+        outcome.merged = pass.merged;
+        outcome.reviewing = pass.reviewing;
+        outcome.state = selected_state.unwrap_or(state);
+        return Ok(outcome);
+    }
     // What the operator asks the bot is answered within the pass: before the
     // followed repositories' reads, whose share would otherwise leave the
     // intake nothing pass after pass (agent-board#840).
