@@ -757,6 +757,77 @@ Caller activation: in `cgwalters-forge/tracker`, `.github/pass.json`, set
 `issueIntake` to `true` after updating the agent-board revision. No deployed
 configuration is changed here.
 
+### Open-issue project backfill
+
+Missing old issues hide work from the project; reusing enrollment's Todo
+initialization for them could overwrite a human hold, and trusting an empty
+issue-side `projectItems` can duplicate a membership GitHub hides from that read.
+`projectIndexBackfill: true` enables the default-off project index.
+It requires a GitHub board, `state` and nonempty `workRepositories`, not
+`issueIntake`, `follow`, triage, available WIP or scheduling eligibility.
+It adds every missing open issue in those already-admitted work repositories,
+including old, session and needs-human issues. It does not expand any follow,
+target, plan or dispatch admission rule, or use the SQLite store for decisions.
+
+Just before stage 5 it visits one repository per pass, in case-insensitive sorted
+round-robin order, reading at most 20 issues in creation order. The census uses
+opaque per-edge cursors rather than update-time watermarks, so old issues are not
+excluded. Its request allowance is 15% of the pass limit or 24 requests for a
+small pass, whichever is larger, inside the remaining pass budget and the
+existing time and `--max-writes` limits. A repository that fails still gives its neighbors
+a turn. After its last page, its next turn starts a new census, also discovering
+reopened issues. No claim of an atomic cross-pass census is made: GitHub's open
+issue connection can change between pages. Repeated sweeps repair that drift.
+
+The configured project must already have **Plan**, **Verdict target** and **Run**
+text fields and a **Verdict** single-select field, with exactly these options:
+`done`, `obsolete`, `needs-design`, `needs-operator`, `needs-issue`, `partly`,
+`not-done`, `follow-through`. The pass reports missing or incompatible schema
+before writing and does not create fields or replace legacy options.
+
+Complete project-side open-issue membership is read before interpreting absence,
+and again before each addition; `issue.projectItems` is not used. The issue's
+repository, number, node ID and open state are rechecked before an add. An add
+or field mutation consumes one write, including failed or lost-reply attempts.
+The index does not initialize Status or change Priority.
+
+Each census visit reads the whole issue comment thread with edit evidence. Plan
+is `<comment-id>@<last-change> <kind>` for the newest authenticated, valid plan
+comment for the issue and an admitted work repository. A session plan must be
+the operator's own. Verdict is the newest authenticated triage verdict and
+Verdict target is its comment URL. Before replacing a target the pass clears
+the old verdict, so interrupted writes cannot attribute it to the new target.
+An interrupted pair is repaired on retry with fresh evidence. Run is the canonical URL of
+the latest dispatch receipt linked to a readable revision of an accepted plan,
+when GitHub confirms its run ID, dispatch event, caller workflow and job target.
+A dispatch with no verified run does not erase a previous Run. A deleted plan,
+untrusted edit or absent verdict does not clear the last known value either;
+these fields are for navigation, not assertions of current authority. Failed or
+incomplete reads are errors, not evidence of absence.
+
+An edge advances `state.issue_backfill` once membership is handled. A failed
+projection is retried on the next sweep, so a permanently unreadable thread does
+not strand later memberships. Membership errors and budget exhaustion retain
+the unprocessed edge. Cap, request-share and time exhaustion defer work without
+failing the pass. Earlier processed edges on that page remain saved. On retry, fresh project
+membership and field values distinguish lost replies from writes that did not
+take effect. Preview charges its proposed writes but changes neither the board
+nor the saved position. A changed project ID resets positions; removed work
+repositories are discarded. Losing state repeats the bounded census, not dispatches.
+
+Stage 5 can derive Done for an idle open issue from a fresh authenticated `done`
+verdict; later thread direction, body/title edits or a reopen invalidate it.
+Existing human holds and active work take precedence. An unvisited or unread
+thread does not release Done to Todo; a subsequent complete visit that finds no
+current completion can release it. The pass rechecks the thread and issue before
+writing a completion-based Status change. Board edits and store rows never
+authorize a plan, a dispatch, or completion.
+
+Tracker follow-up: separately review project schema provisioning and the revision
+update. Then preview `cgwalters-forge/tracker`'s `.github/pass.json` with
+`projectIndexBackfill: true` before authorizing apply. This does not provision
+the project, activate the caller setting, or switch scheduling to board-first reads.
+
 ## Action-first pull requests (GitHub)
 
 The concrete failure this prevents is spending the PR stage's share on upstream

@@ -1887,6 +1887,27 @@ impl<T: Transport> GitHub<T> {
         Ok(())
     }
 
+    /// Clear one validated field and check that GitHub reports it as unset.
+    pub(crate) fn clear_field(
+        &self,
+        project: &str,
+        item: &str,
+        field: &str,
+        name: &str,
+    ) -> Result<()> {
+        let data = self.diagnostic().graphql(
+            "mutation($project:ID!,$item:ID!,$field:ID!,$name:String!){clearProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field}){projectV2Item{id fieldValueByName(name:$name){__typename}}}}",
+            json!({"project":project,"item":item,"field":field,"name":name}),
+        )?;
+        let receipt = &data["clearProjectV2ItemFieldValue"]["projectV2Item"];
+        ensure!(
+            receipt["id"].as_str() == Some(item)
+                && receipt.get("fieldValueByName") == Some(&Value::Null),
+            "{name} clear receipt mismatch"
+        );
+        Ok(())
+    }
+
     /// Create one project field; single-select options are created in the given order.
     pub fn create_field(
         &self,

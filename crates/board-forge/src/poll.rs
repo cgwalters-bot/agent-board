@@ -1894,6 +1894,8 @@ pub struct State {
     pub scan_cursor: Option<String>,
     /// Repository updated-issue watermarks; discovery only, never authority.
     pub issue_intake: BTreeMap<String, String>,
+    /// Project-scoped discovery position, never a plan or scheduling decision.
+    pub issue_backfill: Option<crate::pass::IssueBackfill>,
     /// Optional holds descendant context left unread at the publication share.
     /// Reporting only; these item names never authorize work.
     pub holds_pending: Vec<String>,
@@ -1969,6 +1971,7 @@ impl State {
                     "action_first_positions",
                     "scan_cursor",
                     "issue_intake",
+                    "issue_backfill",
                     "holds_pending",
                     "holds_summary_cursor",
                     "notify_since",
@@ -2182,6 +2185,14 @@ impl State {
                     .context("poll state holds_summary_cursor is not an issue")
             })
             .transpose()?;
+        let issue_backfill: Option<crate::pass::IssueBackfill> = object
+            .get("issue_backfill")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("decode issue backfill position")?;
+        if let Some(position) = &issue_backfill {
+            position.validate()?;
+        }
         let holds_pending: Vec<String> = object
             .get("holds_pending")
             .map(|v| serde_json::from_value(v.clone()))
@@ -2224,6 +2235,7 @@ impl State {
             action_first_positions,
             scan_cursor,
             issue_intake,
+            issue_backfill,
             holds_pending,
             holds_summary_cursor,
             notify_since,
@@ -2296,6 +2308,9 @@ impl State {
         }
         if !self.issue_intake.is_empty() {
             state["issue_intake"] = json!(self.issue_intake);
+        }
+        if let Some(position) = &self.issue_backfill {
+            state["issue_backfill"] = json!(position);
         }
         if !self.holds_pending.is_empty() {
             state["holds_pending"] = json!(self.holds_pending);
@@ -10483,6 +10498,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         // The pass's, kept by the pass ([`crate::pass::run`]).
         scan_cursor: None,
         issue_intake: BTreeMap::new(),
+        issue_backfill: None,
         holds_pending: Vec::new(),
         holds_summary_cursor: None,
         notify_since,

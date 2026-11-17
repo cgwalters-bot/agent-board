@@ -8,6 +8,86 @@ const SHARE: usize = 15;
 const LOOKBACK_DAYS: i64 = 2;
 const DONE: &str = "Done";
 
+/// Bound the census independently of the pass's request/time/write budgets.
+const BACKFILL_PAGE: usize = 20;
+// Enough to get through the fixed reads and one ordinary card on a small
+// pass. The pass-wide time, request and write bounds still apply.
+const BACKFILL_MIN_REQUESTS: usize = 20 + WRITE_RESERVE;
+const CURSOR_LIMIT: usize = 1024;
+
+/// Only pagination state. Losing it repeats reads, never authorizes a write.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueBackfill {
+    pub project: String,
+    pub next_repository: Option<String>,
+    pub positions: BTreeMap<String, String>,
+}
+
+impl IssueBackfill {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(valid_cursor(&self.project), "invalid backfill project id");
+        ensure!(
+            self.positions.len() <= poll::POLL_REPOSITORY_LIMIT,
+            "too many backfill repositories"
+        );
+        if let Some(repo) = &self.next_repository {
+            poll::validate_repository(repo).context("backfill next repository")?;
+        }
+        for (repo, cursor) in &self.positions {
+            poll::validate_repository(repo).context("backfill repository")?;
+            ensure!(valid_cursor(cursor), "invalid backfill cursor");
+        }
+        Ok(())
+    }
+}
+
+fn valid_cursor(value: &str) -> bool {
+    !value.is_empty() && value.len() <= CURSOR_LIMIT && !value.chars().any(char::is_control)
+}
+
+pub(super) fn backfill_query() -> String {
+    format!(
+        r#"query($owner: String!, $name: String!, $cursor: String) {{
+      repository(owner: $owner, name: $name) {{
+        issues(first: {BACKFILL_PAGE}, after: $cursor, orderBy: {{field: CREATED_AT, direction: ASC}}, states: OPEN) {{
+          edges {{ cursor node {{ id number state repository {{ nameWithOwner }} }} }}
+          pageInfo {{ hasNextPage endCursor }}
+        }}
+      }}
+    }}"#
+    )
+}
+
+pub(super) const BACKFILL_FRESH: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) { id number state updatedAt repository { nameWithOwner } }
+  }
+}"#;
+
+pub(super) fn backfill_identity(node: &Value, repo: &str) -> Result<(ItemRef, String)> {
+    let number = node["number"]
+        .as_u64()
+        .context("backfill issue number missing")?;
+    let issue = ItemRef {
+        host: crate::github::DEFAULT_HOST.into(),
+        repository: text(node, "/repository/nameWithOwner").into(),
+        number,
+    };
+    issue.validate()?;
+    ensure!(
+        issue.repository.eq_ignore_ascii_case(repo),
+        "backfill returned another repository"
+    );
+    ensure!(
+        matches!(node["state"].as_str(), Some("OPEN" | "CLOSED")),
+        "backfill issue state missing"
+    );
+    let id = text(node, "/id");
+    ensure!(!id.is_empty(), "backfill issue id missing");
+    Ok((issue, id.into()))
+}
+
 pub(super) fn query(assigned: bool) -> String {
     let facts = if assigned {
         FACTS.replacen("labels(first: 50)", BOARD_ASSIGNEES, 1)
@@ -30,6 +110,200 @@ pub(super) fn query(assigned: bool) -> String {
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
+    /// Missing old issues are a visibility gap, not permission to start work.
+    /// Return only this turn's fresh completion observations for stage 5.
+    pub(super) fn backfill(&mut self) -> project_index::Completions {
+        let bounds = self.client.bounds;
+        let kept = bounds.kept.get();
+        let share = bounds
+            .share(SHARE)
+            .max(BACKFILL_MIN_REQUESTS)
+            .min(bounds.available());
+        bounds
+            .kept
+            .set(bounds.left.get().saturating_sub(share).max(kept));
+        let mut completions = BTreeMap::new();
+        let result = self.backfill_within(&mut completions);
+        bounds.kept.set(kept);
+        match result {
+            Ok(()) => {}
+            Err(error) if budget_spent(&error) || error.is::<project_index::IndexMoved>() => self
+                .line(format!(
+                    "project backfill deferred; unprocessed positions retained: {error:#}"
+                )),
+            Err(error) => self
+                .report
+                .error("project backfill; unprocessed positions retained", &error),
+        }
+        completions
+    }
+
+    fn backfill_within(&mut self, completions: &mut project_index::Completions) -> Result<()> {
+        let config = self.config;
+        let board = config.github_board().context("no backfill board")?;
+        let github = crate::github::GitHub {
+            transport: Budget {
+                inner: self.client.inner,
+                bounds: self.client.bounds,
+            },
+            owner: board.owner.clone(),
+            number: board.project,
+        };
+        let (project, _, fields) = github.schema()?;
+        let schema = project_index::Schema::read(&fields)?;
+        // A partial project-side read cannot establish absence. Never trust
+        // issue.projectItems here: GitHub can return [] for an existing member.
+        let mut members = self.index_members(&project)?;
+        let repos: Vec<_> = config
+            .work_repositories
+            .iter()
+            .map(|r| r.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut position = self
+            .report
+            .issue_backfill
+            .clone()
+            .filter(|p| p.project == project)
+            .unwrap_or(IssueBackfill {
+                project: project.clone(),
+                next_repository: None,
+                positions: BTreeMap::new(),
+            });
+        position.positions.retain(|repo, _| repos.contains(repo));
+        let repo = position
+            .next_repository
+            .as_ref()
+            .and_then(|next| repos.iter().find(|r| *r >= next))
+            .or_else(|| repos.first())
+            .context("no backfill repositories")?
+            .clone();
+        let next = repos
+            .iter()
+            .position(|r| *r == repo)
+            .context("backfill repository disappeared")?;
+        // Give a failing repository another turn only after its neighbors;
+        // its own cursor never skips the unprocessed issue.
+        position.next_repository = Some(repos[(next + 1) % repos.len()].clone());
+        if self.apply {
+            self.report.issue_backfill = Some(position.clone());
+        }
+        let (owner, name) = repo.split_once('/').context("backfill repository")?;
+        let cursor = position.positions.get(&repo);
+        let data = self.client.graphql(
+            &backfill_query(),
+            json!({"owner":owner,"name":name,"cursor":cursor}),
+        )?;
+        let connection = &data["repository"]["issues"];
+        let edges = connection["edges"]
+            .as_array()
+            .context("backfill edges missing")?;
+        ensure!(
+            edges.len() <= BACKFILL_PAGE,
+            "backfill page exceeds {BACKFILL_PAGE}"
+        );
+        let more = connection["pageInfo"]["hasNextPage"]
+            .as_bool()
+            .context("backfill pageInfo missing")?;
+        ensure!(
+            !more || !edges.is_empty(),
+            "empty nonterminal backfill page"
+        );
+        // Validate the whole page before its first write, including cursor
+        // progress. Per-edge commits below make interrupted writes resumable.
+        let mut seen = BTreeSet::new();
+        let mut identities = BTreeSet::new();
+        for edge in edges {
+            let at = edge["cursor"].as_str().context("backfill cursor missing")?;
+            ensure!(
+                valid_cursor(at) && cursor.map(String::as_str) != Some(at) && seen.insert(at),
+                "backfill cursor did not advance"
+            );
+            let (issue, _) = backfill_identity(&edge["node"], &repo)?;
+            ensure!(
+                edge["node"]["state"] == "OPEN",
+                "backfill listing returned a closed issue"
+            );
+            ensure!(identities.insert(key(&issue)), "duplicate backfill issue");
+        }
+        if let Some(last) = edges.last() {
+            ensure!(
+                connection["pageInfo"]["endCursor"] == last["cursor"],
+                "backfill end cursor mismatch"
+            );
+        }
+        let mut added = 0;
+        for edge in edges {
+            let (issue, id) = backfill_identity(&edge["node"], &repo)?;
+            let fresh = self.index_issue(&issue)?;
+            ensure!(fresh.id == id, "backfill issue identity changed");
+            if fresh.open {
+                let mut item = members.get(&key(&issue)).cloned();
+                if item.is_none() {
+                    // Refresh complete project-side membership at the write
+                    // boundary. A concurrent auto-add or a lost add reply must
+                    // not cause a second addition on retry.
+                    members = self.index_members(&project)?;
+                    item = members.get(&key(&issue)).cloned();
+                    if item.is_none() {
+                        if self.apply {
+                            self.index_recheck(&issue, &fresh)?;
+                        }
+                        self.index_write_slot()?;
+                        if self.apply {
+                            item = Some(github.add_item(&project, &id)?);
+                        }
+                        self.line(format!(
+                            "project backfill {}: {}add membership",
+                            issue.display(),
+                            if self.apply { "" } else { "would " }
+                        ));
+                        added += 1;
+                    }
+                }
+                match self.index_fields(
+                    (&github, &project, &schema),
+                    item.as_deref(),
+                    &issue,
+                    fresh,
+                ) {
+                    Ok(read) => {
+                        completions.insert(key(&issue), read);
+                    }
+                    Err(error) if budget_spent(&error) => return Err(error),
+                    // Membership is handled; the next complete sweep retries
+                    // this projection. A bad thread must not strand later issues.
+                    Err(error) if error.is::<project_index::IndexMoved>() => self.line(format!(
+                        "project index {} deferred: {error:#}",
+                        issue.display()
+                    )),
+                    Err(error) => self.report.error(
+                        &format!("project index {}; retry on next sweep", issue.display()),
+                        &error,
+                    ),
+                }
+            }
+            if self.apply {
+                position.positions.insert(
+                    repo.clone(),
+                    edge["cursor"].as_str().context("backfill cursor")?.into(),
+                );
+                self.report.issue_backfill = Some(position.clone());
+            }
+        }
+        if self.apply && !more {
+            position.positions.remove(&repo);
+            self.report.issue_backfill = Some(position);
+        }
+        self.line(format!(
+            "project backfill {repo}: {} issue(s) read, {added} membership(s) {}",
+            edges.len(),
+            if self.apply { "added" } else { "planned" }
+        ));
+        Ok(())
+    }
+
     /// At most one changed-issue listing per configured followed repository,
     /// inside 15% of the pass's requests. Oldest watermarks go first so an
     /// exhausted share does not always exclude the last repository. The

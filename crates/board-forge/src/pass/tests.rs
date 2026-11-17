@@ -10,6 +10,771 @@ const CONFIG: &str = include_str!("../../../../fixtures/pass/config.json");
 /// appended by hand, finding none ([`merged`] gives tracker#468's one).
 const BOARD: &str = include_str!("../../../../fixtures/pass/board-2026-10-23.json");
 
+/// Scenario edits of the recorded pass, not a new live observation. The old
+/// issue is deliberately ineligible for scheduling; census admission is only
+/// the already-resolved work repository list.
+fn backfill_fixture() -> Replay {
+    let mut fixture = intake_fixture();
+    let fields = fixture
+        .requests
+        .iter_mut()
+        .find_map(|e| {
+            e["answer"]
+                .pointer_mut("/data/node/fields/nodes")
+                .and_then(Value::as_array_mut)
+        })
+        .unwrap();
+    fields.retain(|field| {
+        !matches!(
+            field["name"].as_str(),
+            Some("Plan" | "Verdict" | "Verdict target" | "Run")
+        )
+    });
+    for name in ["Plan", "Verdict target", "Run"] {
+        fields.push(json!({"name":name,"id":name,"dataType":"TEXT"}));
+    }
+    fields.push(
+        json!({"name":"Verdict","id":"Verdict","dataType":"SINGLE_SELECT",
+        "options":project_index::VERDICTS.map(|v| json!({"name":v,"id":v}))}),
+    );
+    fixture.requests.push(json!({
+        "request":graphql_key(project_index::MEMBERS,&json!({"owner":"cgwalters-forge","number":1,"cursor":null})),
+        "answer":{"data":{"repositoryOwner":{"projectV2":{"id":INDEX_PROJECT,"items":{
+            "nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}
+    }));
+    let mut node = fixture
+        .requests
+        .iter()
+        .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
+        .unwrap()["answer"]["data"]["repository"]["issues"]["nodes"][0]
+        .clone();
+    node["createdAt"] = json!("2020-01-01T00:00:00Z");
+    node["labels"] = json!({"nodes":[{"name":"needs-human"},{"name":"session"}],"totalCount":2});
+    fixture.requests.push(json!({
+        "request":graphql_key(&intake::backfill_query(), &json!({"owner":"cgwalters-forge","name":"tracker","cursor":null})),
+        "answer":{"data":{"repository":{"issues":{"edges":[{"cursor":"edge-459","node":node}],"pageInfo":{"hasNextPage":false,"endCursor":"edge-459"}}}}}
+    }));
+    fixture.requests.push(json!({
+        "request":graphql_key(intake::BACKFILL_FRESH, &json!({"owner":"cgwalters-forge","name":"tracker","number":459})),
+        "answer":{"data":{"repository":{"issue":node}}}
+    }));
+    index_thread(&mut fixture, 459, json!([]));
+    fixture
+}
+
+const INDEX_PROJECT: &str = "PVT_kwDOE9oHIs4BlJLc";
+
+fn index_thread(fixture: &mut Replay, issue: u64, nodes: Value) {
+    let request = graphql_key(
+        &plan::fresh_issue_comments_query(),
+        &json!({"owner":"cgwalters-forge","name":"tracker","number":issue,"after":null}),
+    );
+    fixture.requests.retain(|e| e["request"] != request);
+    fixture.requests.push(
+        json!({"request":request,"answer":{"data":{"repository":{"issue":{"comments":{
+        "nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}}),
+    );
+}
+
+fn index_item(fixture: &mut Replay, content: &Value, item: &str) {
+    fixture.requests.push(
+        json!({"request":graphql_key(project_index::ITEM, &json!({"item":item})),
+        "answer":{"data":{"node":{"id":item,"project":{"id":INDEX_PROJECT},"content":content,
+            "plan":null,"verdict":null,"target":null,"run":null}}}}),
+    );
+}
+
+fn index_comment(id: u64, author: &str, created: &str, body: String) -> Value {
+    json!({"url":format!("https://github.com/cgwalters-forge/tracker/issues/459#issuecomment-{id}"),
+        "author":{"login":author},"editor":null,"lastEditedAt":null,"createdAt":created,"body":body})
+}
+
+#[test]
+fn project_backfill_indexes_only_trusted_current_observations() {
+    let cfg = backfill_config();
+    let start = "2026-10-20T00:00:00Z";
+    let later = "2026-10-21T00:00:00Z";
+    let run_url = format!("https://github.com/{}/actions/runs/123", cfg.dispatch_repo);
+    let author = &cfg.bot;
+    for (verdict, foreign_plan_edit, missing_run, bad_run, batch, cross_issue) in
+        project_index::VERDICTS
+            .into_iter()
+            .map(|v| (v, false, false, false, false, false))
+            .chain([
+                ("partly", true, false, false, false, false),
+                ("partly", false, true, false, false, false),
+                ("partly", false, false, true, false, false),
+                ("partly", false, false, false, true, false),
+                ("partly", false, false, false, false, true),
+            ])
+    {
+        let mut fixture = backfill_fixture();
+        let content = fixture
+            .requests
+            .iter()
+            .find(|e| e["request"]["graphql"] == fnv(intake::BACKFILL_FRESH))
+            .unwrap()["answer"]["data"]["repository"]["issue"]
+            .clone();
+        index_item(&mut fixture, &content, "new-item");
+        let mut source = index_comment(
+            1,
+            author,
+            start,
+            plan_body(
+                "Plan",
+                &json!({
+                    "schema":plan::JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":if cross_issue { 460 } else { 459 },
+                    "kind":"implement","runner":"hosted","brief":"Make this change"
+                }),
+            ),
+        );
+        if foreign_plan_edit {
+            source["editor"] = json!({"login":"visitor"});
+            source["lastEditedAt"] = json!(later);
+        }
+        let record = index_comment(
+            2,
+            author,
+            later,
+            if missing_run {
+                format!(
+                    "<!-- {}: 1@{start} -->\nDispatch outcome unknown",
+                    plan::DISPATCH_MARKER
+                )
+            } else {
+                let (header, named) = if batch {
+                    (
+                        "\n<!-- agent-board-batch: cgwalters-forge/tracker#460 -->",
+                        " with cgwalters-forge/tracker#460",
+                    )
+                } else {
+                    ("", "")
+                };
+                format!(
+                    "<!-- {}: 1@{start} -->{header}\nDispatched the plan in {}{named}: [run]({run_url}). Run independently: no documents overlap.",
+                    plan::DISPATCH_MARKER,
+                    source["url"].as_str().unwrap()
+                )
+            },
+        );
+        let answer = index_comment(
+            3,
+            author,
+            later,
+            format!("```schedule-triage\n{{\"verdict\":\"{verdict}\"}}\n```"),
+        );
+        // A newer operator comment invalidates Done for Status but does not
+        // replace the latest authenticated triage answer in the index.
+        let direction = index_comment(
+            4,
+            &cfg.operator,
+            "2026-10-22T00:00:00Z",
+            "New direction".into(),
+        );
+        index_thread(
+            &mut fixture,
+            459,
+            json!([source, record, answer, direction]),
+        );
+        fixture.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{}/actions/runs/123",cfg.dispatch_repo)},
+            "answer":{"status":200,"body":{"id":123,"html_url":run_url,"event":"workflow_dispatch",
+                "path":format!(".github/workflows/{}",cfg.dispatch_workflow),
+                 "display_title":if bad_run { "implement other/repo#459 (openai)" } else if batch || cross_issue { "implement cgwalters-forge/tracker#460 (openai)" } else { "implement cgwalters-forge/tracker#459 (openai)" }},"link":null}}));
+        let previewed = preview(&cfg, &fixture);
+        assert_eq!(
+            previewed.failures,
+            usize::from(bad_run),
+            "{:?}",
+            previewed.lines
+        );
+        let proposed = |value: &str| previewed.lines.iter().any(|line| line.ends_with(value));
+        assert_eq!(
+            proposed(&format!("Plan=1@{start} implement")),
+            !foreign_plan_edit
+        );
+        assert!(proposed(&format!("Verdict={verdict}")));
+        assert_eq!(
+            proposed(&format!("Run={run_url}")),
+            !foreign_plan_edit && !missing_run && !bad_run
+        );
+        assert!(
+            !previewed
+                .lines
+                .iter()
+                .any(|line| line.starts_with("start "))
+        );
+        assert!(previewed.issue_backfill.is_none());
+    }
+}
+
+#[test]
+fn project_backfill_refuses_unprovisioned_index_before_writing() {
+    for problem in [
+        "missing field",
+        "wrong type",
+        "legacy options",
+        "duplicate option",
+    ] {
+        let mut fixture = backfill_fixture();
+        let fields = fixture
+            .requests
+            .iter_mut()
+            .find_map(|e| {
+                e["answer"]
+                    .pointer_mut("/data/node/fields/nodes")
+                    .and_then(Value::as_array_mut)
+            })
+            .unwrap();
+        if problem == "missing field" {
+            fields.retain(|field| field["name"] != "Plan");
+        } else {
+            let verdict = fields
+                .iter_mut()
+                .find(|field| field["name"] == "Verdict")
+                .unwrap();
+            match problem {
+                "wrong type" => verdict["dataType"] = json!("TEXT"),
+                "legacy options" => verdict["options"][0]["name"] = json!("keep"),
+                _ => verdict["options"][0]["id"] = verdict["options"][1]["id"].clone(),
+            }
+        }
+        let report = preview(&backfill_config(), &fixture);
+        assert_eq!(report.failures, 1, "{problem}: {:?}", report.lines);
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.contains("would add membership"))
+        );
+    }
+}
+
+#[test]
+fn project_backfill_lost_field_reply_retries_only_changed_values() {
+    let mut fixture = backfill_fixture();
+    let cfg = backfill_config();
+    let answer = index_comment(
+        19,
+        &cfg.bot,
+        "2026-10-21T00:00:00Z",
+        "```schedule-triage\n{\"verdict\":\"obsolete\"}\n```".into(),
+    );
+    index_thread(&mut fixture, 459, json!([answer]));
+    let content = fixture
+        .requests
+        .iter()
+        .find(|e| e["request"]["graphql"] == fnv(intake::BACKFILL_FRESH))
+        .unwrap()["answer"]["data"]["repository"]["issue"]
+        .clone();
+    index_item(&mut fixture, &content, "existing-card");
+    fixture
+        .requests
+        .iter_mut()
+        .find(|e| e["request"]["graphql"] == fnv(project_index::MEMBERS))
+        .unwrap()["answer"]["data"]["repositoryOwner"]["projectV2"]["items"]["nodes"] =
+        json!([{"id":"existing-card","content":content}]);
+    let mut inner = Forge::new(None, false);
+    inner.replay = fixture;
+    let mut forge = IntakeForge {
+        forge: inner,
+        enrollment: RefCell::default(),
+        fail_field: true,
+        fail_add: false,
+    };
+    let apply = |forge: &IntakeForge, state| {
+        block(run(
+            forge,
+            forge,
+            &cfg,
+            state,
+            (
+                Mode::Local,
+                Limits {
+                    writes: Some(2),
+                    ..Limits::default()
+                },
+            ),
+            forge.forge.replay.now,
+        ))
+        .unwrap()
+    };
+    let lost = apply(&forge, State::default());
+    assert_eq!(lost.failures, 1, "{:?}", lost.lines);
+    assert_eq!(forge.enrollment.borrow().len(), 1);
+    assert_eq!(forge.enrollment.borrow()[0]["name"], "Verdict target");
+    let state = lost.state.unwrap();
+    assert!(state.issue_backfill.as_ref().unwrap().positions.is_empty());
+    for target_present in [true, false] {
+        let card = &mut forge
+            .forge
+            .replay
+            .requests
+            .iter_mut()
+            .find(|e| e["request"]["graphql"] == fnv(project_index::ITEM))
+            .unwrap()["answer"]["data"]["node"];
+        card["target"] = if target_present {
+            json!({"__typename":"ProjectV2ItemFieldTextValue","field":{"id":"Verdict target"},"text":answer["url"]})
+        } else {
+            Value::Null
+        };
+        forge.fail_field = false;
+        forge.enrollment.borrow_mut().clear();
+        let retry = apply(&forge, state.clone());
+        assert_eq!(retry.failures, 0, "{:?}", retry.lines);
+        let writes = forge.enrollment.borrow();
+        assert_eq!(writes.len(), if target_present { 1 } else { 2 });
+        assert_eq!(writes.last().unwrap()["name"], "Verdict");
+    }
+}
+
+#[test]
+fn project_backfill_status_consumes_only_current_authenticated_done() {
+    let cfg = backfill_config();
+    for (status, scenario, expected) in [
+        (
+            "Todo",
+            "trusted",
+            Some("Todo -> Done (current authenticated done verdict)"),
+        ),
+        ("Done", "trusted", None),
+        ("Done", "new direction", Some("Done -> Todo")),
+        ("Done", "foreign edit", Some("Done -> Todo")),
+        ("Done", "partial", None),
+        ("Done", "missing state", None),
+    ] {
+        let mut fixture = backfill_fixture();
+        let content = &mut fixture
+            .requests
+            .iter_mut()
+            .find(|e| e["request"]["graphql"] == fnv(intake::BACKFILL_FRESH))
+            .unwrap()["answer"]["data"]["repository"]["issue"];
+        content["labels"] = json!({"nodes":[],"totalCount":0,"pageInfo":{"hasNextPage":false}});
+        content["assignees"] = json!({"nodes":[],"pageInfo":{"hasNextPage":false}});
+        content["closedAt"] = Value::Null;
+        content["title"] = json!("An idle issue");
+        let content = content.clone();
+        index_item(&mut fixture, &content, "existing-card");
+        for entry in &mut fixture.requests {
+            let first_page = entry["request"]["variables"]["cursor"].is_null();
+            if let Some(items) =
+                entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items")
+            {
+                items["nodes"] = if first_page {
+                    json!([{"id":"existing-card","content":content,"status":{"name":status}}])
+                } else {
+                    json!([])
+                };
+            }
+            if let Some(items) = entry["answer"].pointer_mut("/data/node/items") {
+                items["nodes"] = json!([{"id":"existing-card","content":content,"fieldValues":{
+                    "nodes":[{"__typename":"ProjectV2ItemFieldSingleSelectValue","field":{"name":"Status"},"name":status,
+                        "optionId":if status == "Done" { "cf73fcce" } else { "8911aadd" }}],"pageInfo":{"hasNextPage":false}}}]);
+            }
+        }
+        let at = "2026-10-21T00:00:00Z";
+        let mut answer = index_comment(
+            5,
+            &cfg.bot,
+            at,
+            "```schedule-triage\n{\"verdict\":\"done\"}\n```".into(),
+        );
+        if scenario == "foreign edit" {
+            answer["lastEditedAt"] = json!("2026-10-22T00:00:00Z");
+            answer["editor"] = json!({"login":"visitor"});
+        }
+        if scenario == "partial" {
+            answer.as_object_mut().unwrap().remove("editor");
+        }
+        let mut comments = vec![answer];
+        if scenario == "new direction" {
+            comments.push(index_comment(
+                6,
+                &cfg.operator,
+                "2026-10-22T00:00:00Z",
+                "Revisit this".into(),
+            ));
+        }
+        index_thread(&mut fixture, 459, json!(comments));
+        let mut issue = json!({"url":"https://github.com/cgwalters-forge/tracker/issues/459",
+            "state":"OPEN","createdAt":"2020-01-01T00:00:00Z","lastEditedAt":null,"body":"Context",
+            "locks":{"nodes":[]},"unlocks":{"nodes":[]},"renames":{"nodes":[]},"reopens":{"nodes":[]}});
+        if scenario == "missing state" {
+            issue.as_object_mut().unwrap().remove("state");
+        }
+        fixture.requests.push(json!({"request":graphql_key(CLOSE_QUERY,&json!({"owner":"cgwalters-forge","name":"tracker","number":459})),
+            "answer":{"data":{"repository":{"issue":issue}}}}));
+        let report = preview(&cfg, &fixture);
+        let actual = report
+            .lines
+            .iter()
+            .find_map(|line| line.strip_prefix("status cgwalters-forge/tracker#459: "));
+        assert_eq!(
+            report.failures,
+            usize::from(matches!(scenario, "partial" | "missing state")),
+            "{scenario}: {:?}",
+            report.lines
+        );
+        assert_eq!(
+            actual.is_some(),
+            expected.is_some(),
+            "{scenario}: {:?}",
+            report.lines
+        );
+        if let Some(expected) = expected {
+            assert!(
+                actual.unwrap().starts_with(expected),
+                "{scenario}: {:?}",
+                report.lines
+            );
+        }
+    }
+}
+
+fn backfill_config() -> Config {
+    config(
+        json!({"projectIndexBackfill":true,"state":"state.json","wip":0,
+        "follow":[],"workRepositories":["cgwalters-forge/tracker"]}),
+    )
+}
+
+#[test]
+fn project_backfill_preview_is_independent_of_eligibility_and_does_not_save_progress() {
+    let fixture = backfill_fixture();
+    let cfg = backfill_config();
+    let report = preview(&cfg, &fixture);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .contains(&"project backfill cgwalters-forge/tracker#459: would add membership".into()),
+        "{:?}",
+        report.lines
+    );
+    assert!(report.issue_backfill.is_none());
+    assert!(report.records.borrow().plans.is_empty());
+    assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
+    let mut off = cfg;
+    off.project_index_backfill = false;
+    assert!(
+        !preview(&off, &fixture)
+            .lines
+            .iter()
+            .any(|l| l.starts_with("project backfill"))
+    );
+}
+
+#[test]
+fn project_backfill_refuses_partial_or_misidentified_pages() {
+    for (pointer, value) in [
+        (
+            "/edges/0/node/repository/nameWithOwner",
+            json!("other/repo"),
+        ),
+        ("/edges/0/node/number", json!(0)),
+        ("/edges/0/node/id", Value::Null),
+        ("/edges/0/node/state", json!("CLOSED")),
+        ("/edges/0/cursor", json!("")),
+        ("/pageInfo/hasNextPage", Value::Null),
+        ("/pageInfo/endCursor", json!("other")),
+    ] {
+        let mut fixture = backfill_fixture();
+        let entry = fixture
+            .requests
+            .iter_mut()
+            .find(|e| e["request"]["graphql"] == fnv(&intake::backfill_query()))
+            .unwrap();
+        *entry["answer"]["data"]["repository"]["issues"]
+            .pointer_mut(pointer)
+            .unwrap() = value;
+        let report = preview(&backfill_config(), &fixture);
+        assert!(report.failures > 0, "{pointer}: {:?}", report.lines);
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.contains("would add membership")),
+            "{pointer}"
+        );
+        assert!(report.issue_backfill.is_none());
+    }
+}
+
+#[test]
+fn project_backfill_state_roundtrip_and_validation() {
+    let state = State {
+        interval_seconds: poll::MIN_INTERVAL_SECONDS,
+        issue_backfill: Some(IssueBackfill {
+            project: "project-id".into(),
+            next_repository: Some("o/r".into()),
+            positions: BTreeMap::from([("o/r".into(), "edge".into())]),
+        }),
+        ..State::default()
+    };
+    assert_eq!(
+        State::from_json(&state.to_json()).unwrap().issue_backfill,
+        state.issue_backfill
+    );
+    for bad in [
+        json!({"project":"","next_repository":null,"positions":{}}),
+        json!({"project":"id","next_repository":"../r","positions":{}}),
+        json!({"project":"id","next_repository":null,"positions":{"o/r":""}}),
+        json!({"project":"id","next_repository":null,"positions":{},"authority":true}),
+    ] {
+        let mut value = state.to_json();
+        value["issue_backfill"] = bad;
+        assert!(State::from_json(&value).is_err());
+    }
+    for setting in [json!(true), json!(false)] {
+        assert!(forgejo::check_options(&json!({"projectIndexBackfill":setting})).is_err());
+    }
+}
+
+#[test]
+fn project_backfill_complete_project_membership_beats_empty_issue_memberships() {
+    for partial in [false, true] {
+        let mut fixture = backfill_fixture();
+        let content = fixture
+            .requests
+            .iter()
+            .find(|e| e["request"]["graphql"] == fnv(&intake::backfill_query()))
+            .unwrap()["answer"]["data"]["repository"]["issues"]["edges"][0]["node"]
+            .clone();
+        assert_eq!(content["projectItems"]["nodes"], json!([]));
+        for entry in &mut fixture.requests {
+            if let Some(project) = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2")
+                && project.get("items").is_some()
+            {
+                project["items"]["nodes"] =
+                    json!([{"id":"existing-card","content":content,"status":{"name":"Blocked"}}]);
+                if partial {
+                    project["items"]["pageInfo"] =
+                        json!({"hasNextPage":true,"endCursor":"unrecorded-page"});
+                }
+            }
+        }
+        let report = preview(&backfill_config(), &fixture);
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.contains("would add membership")),
+            "{:?}",
+            report.lines
+        );
+        assert_eq!(report.failures > 0, partial, "{:?}", report.lines);
+    }
+}
+
+#[test]
+fn project_backfill_apply_caps_and_resumes_only_processed_edges() {
+    for (max_writes, unreadable) in [(0, false), (1, false), (2, false), (2, true)] {
+        let mut fixture = backfill_fixture();
+        // Two old held issues, on a nonterminal page, so a one-write cap
+        // must save the first edge rather than the page's end cursor.
+        let entry = fixture
+            .requests
+            .iter_mut()
+            .find(|e| e["request"]["graphql"] == fnv(&intake::backfill_query()))
+            .unwrap();
+        let first = entry["answer"]["data"]["repository"]["issues"]["edges"][0].clone();
+        let mut second = first.clone();
+        second["node"]["number"] = json!(460);
+        second["node"]["id"] = json!("second-issue");
+        second["cursor"] = json!("edge-460");
+        entry["answer"]["data"]["repository"]["issues"] =
+            json!({"edges":[first,second],"pageInfo":{"hasNextPage":true,"endCursor":"edge-460"}});
+        fixture.requests.push(json!({"request":graphql_key(intake::BACKFILL_FRESH,&json!({"owner":"cgwalters-forge","name":"tracker","number":460})),"answer":{"data":{"repository":{"issue":second["node"]}}}}));
+        index_thread(&mut fixture, 460, json!([]));
+        if unreadable {
+            index_thread(&mut fixture, 459, Value::Null);
+        }
+        let mut inner = Forge::new(None, false);
+        inner.replay = fixture;
+        let forge = IntakeForge {
+            forge: inner,
+            enrollment: RefCell::default(),
+            fail_field: false,
+            fail_add: false,
+        };
+        let cfg = backfill_config();
+        let report = block(run(
+            &forge,
+            &forge,
+            &cfg,
+            State::default(),
+            (
+                Mode::Local,
+                Limits {
+                    writes: Some(max_writes),
+                    ..Limits::default()
+                },
+            ),
+            forge.forge.replay.now,
+        ))
+        .unwrap();
+        assert_eq!(
+            report.failures,
+            usize::from(unreadable),
+            "{:?}",
+            report.lines
+        );
+        assert_eq!(
+            forge.enrollment.borrow().len(),
+            max_writes,
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            forge
+                .enrollment
+                .borrow()
+                .iter()
+                .all(|v| v.get("issue").is_some()),
+            "membership only; never write Status or Priority"
+        );
+        let state = report.state.unwrap();
+        let position = state.issue_backfill.as_ref().unwrap();
+        assert_eq!(
+            position
+                .positions
+                .get("cgwalters-forge/tracker")
+                .map(String::as_str),
+            match max_writes {
+                0 => None,
+                1 => Some("edge-459"),
+                _ => Some("edge-460"),
+            }
+        );
+        let mut resumed = forge;
+        let entry = resumed
+            .forge
+            .replay
+            .requests
+            .iter_mut()
+            .find(|e| e["request"]["graphql"] == fnv(&intake::backfill_query()))
+            .unwrap();
+        entry["request"] = graphql_key(
+            &intake::backfill_query(),
+            &json!({"owner":"cgwalters-forge","name":"tracker","cursor":position.positions.get("cgwalters-forge/tracker")}),
+        );
+        let edges = entry["answer"]["data"]["repository"]["issues"]["edges"]
+            .as_array()
+            .unwrap()[max_writes..]
+            .to_vec();
+        entry["answer"]["data"]["repository"]["issues"] = json!({"edges":edges,"pageInfo":{"hasNextPage":false,"endCursor":edges.last().map(|e| &e["cursor"])}});
+        resumed.enrollment.borrow_mut().clear();
+        let retry = block(run(
+            &resumed,
+            &resumed,
+            &cfg,
+            state,
+            (
+                Mode::Local,
+                Limits {
+                    writes: Some(2),
+                    ..Limits::default()
+                },
+            ),
+            resumed.forge.replay.now,
+        ))
+        .unwrap();
+        assert_eq!(retry.failures, 0, "{:?}", retry.lines);
+        assert_eq!(resumed.enrollment.borrow().len(), 2 - max_writes);
+        assert!(
+            retry
+                .state
+                .unwrap()
+                .issue_backfill
+                .unwrap()
+                .positions
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn project_backfill_lost_add_reply_retries_from_project_membership() {
+    let mut inner = Forge::new(None, false);
+    inner.replay = backfill_fixture();
+    let mut forge = IntakeForge {
+        forge: inner,
+        enrollment: RefCell::default(),
+        fail_field: false,
+        fail_add: true,
+    };
+    let cfg = backfill_config();
+    let first = block(run(
+        &forge,
+        &forge,
+        &cfg,
+        State::default(),
+        (
+            Mode::Local,
+            Limits {
+                writes: Some(1),
+                ..Limits::default()
+            },
+        ),
+        forge.forge.replay.now,
+    ))
+    .unwrap();
+    assert_eq!(first.failures, 1, "{:?}", first.lines);
+    assert_eq!(forge.enrollment.borrow().len(), 1);
+    let state = first.state.unwrap();
+    assert!(state.issue_backfill.as_ref().unwrap().positions.is_empty());
+    // Either the add failed before taking effect, or only its reply was lost.
+    // Both retain the edge. A fresh membership read distinguishes the retry.
+    for applied in [false, true] {
+        forge.forge.replay = backfill_fixture();
+        if applied {
+            let content = forge
+                .forge
+                .replay
+                .requests
+                .iter()
+                .find(|e| e["request"]["graphql"] == fnv(&intake::backfill_query()))
+                .unwrap()["answer"]["data"]["repository"]["issues"]["edges"][0]["node"]
+                .clone();
+            for entry in &mut forge.forge.replay.requests {
+                if let Some(project) =
+                    entry["answer"].pointer_mut("/data/repositoryOwner/projectV2")
+                    && project.get("items").is_some()
+                {
+                    project["items"]["nodes"] = json!([{"id":"existing-card","content":content}]);
+                }
+            }
+        }
+        forge.fail_add = false;
+        forge.enrollment.borrow_mut().clear();
+        let retry = block(run(
+            &forge,
+            &forge,
+            &cfg,
+            state.clone(),
+            (
+                Mode::Local,
+                Limits {
+                    writes: Some(1),
+                    ..Limits::default()
+                },
+            ),
+            forge.forge.replay.now,
+        ))
+        .unwrap();
+        assert_eq!(retry.failures, 0, "{:?}", retry.lines);
+        assert_eq!(forge.enrollment.borrow().len(), usize::from(!applied));
+        assert!(
+            retry
+                .state
+                .unwrap()
+                .issue_backfill
+                .unwrap()
+                .positions
+                .is_empty()
+        );
+    }
+}
+
 /// Move an existing unplanned issue out of the project and into the next
 /// incremental repository listing. Its existing comment fixture is unchanged.
 fn intake_fixture() -> Replay {
@@ -179,6 +944,7 @@ fn issue_intake_refuses_unverified_discovery_and_preserves_preview_state() {
             forge,
             enrollment: RefCell::default(),
             fail_field: false,
+            fail_add: false,
         };
         let now = forge.forge.replay.now;
         let limits = Limits {
@@ -236,6 +1002,7 @@ struct IntakeForge {
     forge: Forge,
     enrollment: RefCell<Vec<Value>>,
     fail_field: bool,
+    fail_add: bool,
 }
 
 impl Rest for IntakeForge {
@@ -277,14 +1044,30 @@ impl Transport for IntakeForge {
         }
         if query.starts_with("mutation") && query.contains("addProjectV2ItemById") {
             self.enrollment.borrow_mut().push(variables);
+            ensure!(!self.fail_add, "add reply lost");
             return Ok(json!({"addProjectV2ItemById":{"item":{"id":"new-item"}}}));
         }
         if query.starts_with("mutation") && query.contains("updateProjectV2ItemFieldValue") {
             self.enrollment.borrow_mut().push(variables.clone());
             ensure!(!self.fail_field, "field write refused");
+            let field = if let Some(option) = variables["value"].get("singleSelectOptionId") {
+                json!({"optionId":option})
+            } else {
+                json!({"text":variables["value"]["text"]})
+            };
             return Ok(json!({"updateProjectV2ItemFieldValue":{"projectV2Item":{
-                "id":variables["item"],"fieldValueByName":{"optionId":variables["value"]["singleSelectOptionId"]}
+                "id":variables["item"],"fieldValueByName":field
             }}}));
+        }
+        if query == project_index::ITEM {
+            let mut data = Transport::graphql(&self.forge, query, variables.clone())?;
+            if let Some(target) = self.enrollment.borrow().iter().rev().find(|write| {
+                write["item"] == variables["item"] && write["name"] == "Verdict target"
+            }) {
+                data["node"]["target"] = json!({"__typename":"ProjectV2ItemFieldTextValue",
+                    "field":{"id":"Verdict target"},"text":target["value"]["text"]});
+            }
+            return Ok(data);
         }
         Transport::graphql(&self.forge, query, variables)
     }
@@ -313,6 +1096,7 @@ fn issue_intake_apply_counts_writes_and_retains_failed_enrollments() {
             forge,
             enrollment: RefCell::default(),
             fail_field,
+            fail_add: false,
         };
         let limits = Limits {
             dispatch: Some(1),
@@ -465,6 +1249,7 @@ fn issue_intake_initial_priority_repair_and_reopen() {
             forge,
             enrollment: RefCell::default(),
             fail_field: false,
+            fail_add: false,
         };
         let report = block(run(
             &forge,

@@ -622,6 +622,10 @@ pub struct Config {
     /// Off by default: enroll updated issues from followed repositories.
     #[serde(default)]
     pub issue_intake: bool,
+    /// Off by default: resume a bounded census of open work-repository issues,
+    /// enrolling missing issues and projecting authenticated thread evidence.
+    #[serde(default)]
+    pub project_index_backfill: bool,
     /// Off unless set: stage 2 also follows up to this many repositories a
     /// pass where the bot has an open pull request, besides those the live
     /// epics name, which it follows first, and never merges in those it
@@ -1568,6 +1572,20 @@ impl Config {
             ensure!(
                 self.state.is_some(),
                 "issueIntake needs state for incremental reads"
+            );
+        }
+        if self.project_index_backfill {
+            ensure!(
+                self.github_board().is_some(),
+                "projectIndexBackfill needs a GitHub board"
+            );
+            ensure!(
+                self.state.is_some(),
+                "projectIndexBackfill needs state for resumable reads"
+            );
+            ensure!(
+                !self.work_repositories.is_empty(),
+                "projectIndexBackfill needs workRepositories"
             );
         }
         if let Some(board) = self.forgejo_board() {
@@ -4158,6 +4176,7 @@ pub struct Report {
     /// This pass's bounded upstream issue reads, keyed by the fork issue.
     pub upstreams: RefCell<crate::upstream::Observations>,
     pub issue_intake: BTreeMap<String, String>,
+    pub issue_backfill: Option<IssueBackfill>,
     /// Library projection of facts already read; never rendered by the CLI.
     observation: Option<decision::Observation>,
     /// The existing publication builder's unencoded projection, where reached.
@@ -4477,6 +4496,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         state.pass_responses = bounds.next_responses.take();
         state.scan_cursor = report.scan_cursor.clone();
         state.issue_intake = report.issue_intake.clone();
+        state.issue_backfill = report.issue_backfill.clone();
         state.holds_pending = bounds.publication_pending.take();
         state.holds_summary_cursor = bounds.publication_summary_cursor.take();
     }
@@ -4500,6 +4520,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         // Kept as it was by a pass whose stage 4 scans nothing.
         scan_cursor: state.scan_cursor.clone(),
         issue_intake: state.issue_intake.clone(),
+        issue_backfill: state.issue_backfill.clone(),
         ..Report::default()
     };
     if config.skip_active_work {
@@ -4675,7 +4696,12 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // No start comes after stage 4, so it and the holds spend what is left.
     bounds.reserve.set(0);
     bounds.enter(Stage::Status);
-    if let Err(error) = scheduler.status(&git_ref).await {
+    let index = if scheduler.config.project_index_backfill {
+        scheduler.backfill()
+    } else {
+        BTreeMap::new()
+    };
+    if let Err(error) = scheduler.status(&git_ref, &index).await {
         scheduler.report.error("status", &error);
     }
     for notice in bounds.handoff_notices.borrow().iter() {
@@ -10713,6 +10739,8 @@ pub mod holds;
 
 pub mod decision;
 mod intake;
+mod project_index;
+pub use intake::IssueBackfill;
 pub mod lease;
 mod living;
 pub mod maintain;

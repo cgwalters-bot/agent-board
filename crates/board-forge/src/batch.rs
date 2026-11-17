@@ -351,6 +351,23 @@ pub(crate) fn batch_line(primary: &ItemRef) -> String {
     format!("<!-- {BATCH_MARKER}: {} -->", primary.display())
 }
 
+/// The primary named in the header of a writer-authenticated extra receipt.
+pub(crate) fn recorded_primary(record: &str, issue: &ItemRef) -> Option<ItemRef> {
+    let named = record
+        .lines()
+        .nth(1)?
+        .trim_end()
+        .strip_prefix(&format!("<!-- {BATCH_MARKER}: "))?
+        .strip_suffix(" -->")?;
+    let (repo, number) = named.rsplit_once('#')?;
+    validate_repository(repo).ok()?;
+    Some(ItemRef {
+        repository: repo.into(),
+        number: number.parse().ok()?,
+        ..issue.clone()
+    })
+}
+
 /// The records of `plan` on `issue` that still hold it, oldest first.
 ///
 /// An extra's record is released once the batch's primary issue is closed
@@ -369,19 +386,7 @@ pub(crate) fn held<'a, T: Transport>(
 ) -> Result<Vec<(u64, &'a Comment)>> {
     let mut out = Vec::new();
     for record in crate::plan::records(comments, writers, plan) {
-        let primary = record.1.body.lines().nth(1).and_then(|line| {
-            let named = line
-                .trim_end()
-                .strip_prefix(&format!("<!-- {BATCH_MARKER}: "))?
-                .strip_suffix(" -->")?;
-            let (repo, number) = named.rsplit_once('#')?;
-            validate_repository(repo).ok()?;
-            Some(ItemRef {
-                repository: repo.into(),
-                number: number.parse().ok()?,
-                ..issue.clone()
-            })
-        });
+        let primary = recorded_primary(&record.1.body, issue);
         let released = match primary {
             Some(primary) if primary != *issue => {
                 closed(transport, &primary)? && !open_pull(transport, issue)?

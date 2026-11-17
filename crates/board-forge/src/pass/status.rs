@@ -183,7 +183,11 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
     /// Stage 5: reads the whole board, derives each item's Status from it,
     /// the runs in flight and the open issues' pull requests, and writes each
     /// change; or, past `--max-status-changes`, refuses them all.
-    pub(super) async fn status(&mut self, git_ref: &str) -> Result<()> {
+    pub(super) async fn status(
+        &mut self,
+        git_ref: &str,
+        completions: &project_index::Completions,
+    ) -> Result<()> {
         let config = self.config;
         let Some(board) = config.github_board() else {
             self.line("status: off (no board)".into());
@@ -245,17 +249,27 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
             stale_before: (days > 0).then(|| self.now - time::Duration::days(days as i64)),
         };
         let assigned = config.assign_holds.then_some(config.operator.as_str());
-        let mut changes: Vec<(&Item, Change)> = Vec::new();
+        let mut changes = Vec::new();
         let mut kept = 0;
         for item in &snapshot.items {
             let mut facts = item_facts(item, busy.as_ref(), open.as_ref(), &ours);
             facts.assigned = waits_by_assignment(item, assigned);
             kept += usize::from(!facts.complete);
-            if let Some(change) = derive(&facts) {
-                changes.push((item, change));
+            let indexed = config.project_index_backfill
+                && !facts.pull_request
+                && facts.open
+                && config.works_in(&item.identity.repository);
+            let completion = completions.get(&key(&item.identity));
+            let change = if indexed {
+                index_change(&facts, completion.map(|read| read.done))
+            } else {
+                derive(&facts).map(|change| (change, false))
+            };
+            if let Some((change, recheck)) = change {
+                changes.push((item, change, completion.filter(|_| recheck)));
             }
         }
-        changes.sort_by_key(|(item, _)| {
+        changes.sort_by_key(|(item, _, _)| {
             let at = &item.identity;
             (at.repository.to_ascii_lowercase(), at.number)
         });
@@ -274,12 +288,12 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
                 "status: refused, {} changes are more than --max-status-changes {bound}; nothing is written. Check them, then pass a higher cap once",
                 changes.len()
             ));
-            for (item, change) in &changes {
+            for (item, change, _) in &changes {
                 self.line(format!("refused: {}", line(&item.identity, change)));
             }
             return Ok(());
         }
-        for (n, (item, change)) in changes.iter().enumerate() {
+        for (n, (item, change, version)) in changes.iter().enumerate() {
             let said = line(&item.identity, change);
             // An applying change needs a read and a write: past the budget or
             // the time bound the rest wait for the next pass, a line for all.
@@ -314,12 +328,18 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
                 self.line(said);
                 continue;
             }
-            match self.write(&github, board, item, change, &write) {
+            match self.write(&github, board, item, change, &write, *version) {
                 Ok(Wrote::Done) => self.line(said),
                 Ok(Wrote::Changed(now)) => self.line(format!(
                     "status {}: changed to {now} since the board was read; left for the next pass",
                     item.identity.display()
                 )),
+                Err(error)
+                    if version.is_some()
+                        && (error.is::<project_index::IndexMoved>() || budget_spent(&error)) =>
+                {
+                    self.line(format!("status deferred: {said}: {error:#}"));
+                }
                 Err(error) => {
                     self.report.error(&said, &error);
                 }
@@ -346,12 +366,16 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
         item: &Item,
         change: &Change,
         write: &crate::github::FieldWrite,
+        completion: Option<&project_index::Completion>,
     ) -> Result<Wrote> {
         let issue = &item.identity;
         let id = item
             .project_item
             .as_deref()
             .with_context(|| format!("{}'s board item has no id", issue.display()))?;
+        if let Some(completion) = completion {
+            self.index_recheck_completion(issue, completion)?;
+        }
         let data = self.client.graphql(ITEM_QUERY, json!({"item": id}))?;
         let node = &data["node"];
         ensure!(
@@ -372,6 +396,39 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
         github.set_field(project, id, write)?;
         Ok(Wrote::Done)
     }
+}
+
+/// An unread thread cannot release Done. A fresh done verdict can take the
+/// idle fallback's place, but cannot outrank a hold or work in flight.
+fn index_change(facts: &ItemFacts, done: Option<bool>) -> Option<(Change, bool)> {
+    let fallback = derive(facts);
+    if done == Some(true)
+        && facts.complete
+        && facts.runs_read
+        && facts.pulls_read
+        && facts.run.is_none()
+        && facts.pulls.is_empty()
+        && !facts.needs_human
+        && !facts.assigned
+        && !matches!(
+            facts.status,
+            Some(Status::Blocked | Status::Backlog | Status::Cancelled | Status::Done)
+        )
+    {
+        return Some((
+            Change {
+                from: facts.status.clone(),
+                to: Status::Done,
+                reason: "current authenticated done verdict".into(),
+            },
+            true,
+        ));
+    }
+    let change = fallback?;
+    if change.from == Some(Status::Done) && change.to == Status::Todo {
+        return (done == Some(false)).then_some((change, true));
+    }
+    Some((change, false))
 }
 
 /// What the snapshot, the runs in flight and the open issues' pull requests
@@ -464,6 +521,47 @@ fn updated(item: &Item) -> Option<OffsetDateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_backfill_done_observation_keeps_status_stable_without_overriding_holds() {
+        for (status, done, active, held, expected) in [
+            (Status::Todo, Some(true), false, false, Some(Status::Done)),
+            (Status::Done, Some(true), false, false, None),
+            (Status::Done, None, false, false, None),
+            (Status::Done, Some(false), false, false, Some(Status::Todo)),
+            (
+                Status::Done,
+                Some(true),
+                true,
+                false,
+                Some(Status::InProgress),
+            ),
+            (
+                Status::Todo,
+                Some(true),
+                false,
+                true,
+                Some(Status::NeedsHuman),
+            ),
+            (Status::Blocked, Some(true), false, false, None),
+            (Status::Backlog, Some(true), false, false, None),
+        ] {
+            let facts = ItemFacts {
+                status: Some(status),
+                open: true,
+                complete: true,
+                runs_read: true,
+                pulls_read: true,
+                run: active.then(|| "run in flight".into()),
+                needs_human: held,
+                ..ItemFacts::default()
+            };
+            assert_eq!(
+                index_change(&facts, done).map(|(change, _)| change.to),
+                expected
+            );
+        }
+    }
     use crate::caps::Limits;
     use crate::pass::tests::block;
     use Status::{Backlog, Blocked, Done, Draft, InProgress, InReview, NeedsHuman, Todo};

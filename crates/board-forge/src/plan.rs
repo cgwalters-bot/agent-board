@@ -749,6 +749,27 @@ pub(crate) fn issue_comments_with_edit_evidence<T: Transport>(
     comments(transport, issue, COMMENTS_QUERY, "issue", "an issue", true)
 }
 
+/// Use a separate operation from the pass's REST/ETag-backed plan read. A
+/// projection recheck needs GitHub's current last editor, not cached evidence
+/// tied to a REST representation that does not name the editor.
+pub(crate) fn fresh_issue_comments_query() -> String {
+    COMMENTS_QUERY.replacen("query(", "query FreshIssueComments(", 1)
+}
+
+pub(crate) fn fresh_issue_comments<T: Transport>(
+    transport: &T,
+    issue: &ItemRef,
+) -> Result<Vec<Comment>> {
+    comments(
+        transport,
+        issue,
+        &fresh_issue_comments_query(),
+        "issue",
+        "an issue",
+        true,
+    )
+}
+
 /// Every comment on a pull request, in order, with the same bounds and
 /// refusals as [`issue_comments`]; an issue is refused.
 pub fn pull_request_comments<T: Transport>(transport: &T, pull: &ItemRef) -> Result<Vec<Comment>> {
@@ -857,6 +878,32 @@ fn marker_line(plan: &str) -> String {
     format!("<!-- {DISPATCH_MARKER}: {plan} -->")
 }
 
+pub(crate) fn recorded_plan(record: &str) -> Option<&str> {
+    record
+        .lines()
+        .next()?
+        .trim_end()
+        .strip_prefix(&format!("<!-- {DISPATCH_MARKER}: "))?
+        .strip_suffix(" -->")
+}
+
+fn dispatch_run_prefix(plan_url: &str, primary: Option<&ItemRef>) -> String {
+    let batch = primary.map_or_else(String::new, |issue| format!(" with {}", issue.display()));
+    format!("Dispatched the plan in {plan_url}{batch}: [run](")
+}
+
+/// Read the link for this exact plan from a dispatch receipt. Overlap and
+/// stacking notes can follow the link on the same line.
+pub(crate) fn recorded_run<'a>(
+    body: &'a str,
+    plan_url: &str,
+    primary: Option<&ItemRef>,
+) -> Option<&'a str> {
+    let prefix = dispatch_run_prefix(plan_url, primary);
+    body.lines()
+        .find_map(|line| Some(line.strip_prefix(&prefix)?.split_once(").")?.0))
+}
+
 /// The hash of the operator's direction a dispatch record carries on its
 /// own hidden line, where the pass wrote the plan's brief with it.
 pub(crate) fn recorded_direction(record: &str) -> Option<&str> {
@@ -878,14 +925,13 @@ pub(crate) fn records<'a>(
     logins: &[&str],
     plan: &str,
 ) -> Vec<(u64, &'a Comment)> {
-    let marker = marker_line(plan);
     comments
         .iter()
         .filter(|c| {
             c.author
                 .as_deref()
                 .is_some_and(|a| logins.iter().any(|l| l.eq_ignore_ascii_case(a)))
-                && c.body.lines().next().map(str::trim_end) == Some(marker.as_str())
+                && recorded_plan(&c.body) == Some(plan)
         })
         // A record without an id is taken for the earliest: it blocks the plan.
         .map(|c| (comment_id(&c.url).unwrap_or(0), c))
@@ -1471,14 +1517,10 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
                     issue.display()
                 )
             }
-            (None, Some(run)) if n > 0 => format!(
-                "Dispatched the plan in {} with {}: [run]({run}).",
-                record.plan_url,
-                issue.display()
+            (None, Some(run)) => format!(
+                "{}{run}).",
+                dispatch_run_prefix(&record.plan_url, (n > 0).then_some(issue))
             ),
-            (None, Some(run)) => {
-                format!("Dispatched the plan in {}: [run]({run}).", record.plan_url)
-            }
             (None, None) => format!(
                 "Dispatched the plan in {}{} to {} {}; GitHub did not name the run.",
                 record.plan_url,
