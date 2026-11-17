@@ -1589,6 +1589,56 @@ mod tests {
         assert_eq!(replies(&fake).len(), 1);
     }
 
+    /// GitHub's `mentions:` does not find a mention made only in a review or
+    /// inline review comment on an upstream pull request (agent-board#1093):
+    /// the reviews search does, and only the operator's mention stages it.
+    #[test]
+    fn search_intake_stages_mentions_in_the_operators_reviews() {
+        const AT: &str = "2026-10-16T10:00:00Z";
+        for (reviewer, review, inline, expected) in [
+            (OPERATOR, "", "@worker verify this and diff it", 1),
+            (OPERATOR, "@worker verify this and diff it", "", 1),
+            (OPERATOR, "", "worker, verify this", 0),
+            ("someone", "", "@worker verify this and diff it", 0),
+        ] {
+            let fake = intake_github(OTHER, true, "mention", OPERATOR);
+            reword(&fake, OTHER, "Thanks, looks right.");
+            // The operator's bare approval lists the thread whoever mentioned
+            // the bot, so that admission, not the search, decides.
+            fake.page(
+                &format!("repos/{OTHER}/pulls/2/reviews?per_page=100"),
+                json!([{"id": 29, "user": {"login": OPERATOR}, "state": "APPROVED",
+                    "submitted_at": AT, "body": ""},
+                    {"id": 30, "user": {"login": reviewer}, "state": "COMMENTED",
+                    "submitted_at": AT, "body": review}]),
+            );
+            let comments = match inline {
+                "" => json!([]),
+                body => json!([{"id": 31, "user": {"login": reviewer}, "created_at": AT,
+                    "pull_request_review_id": 30, "body": body}]),
+            };
+            fake.page(
+                &format!("repos/{OTHER}/pulls/2/comments?per_page=100"),
+                comments,
+            );
+            let config = search_intake(&fake, OTHER);
+            let outcome = pass(&fake, &config, State::default(), true);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let inputs = dispatches(&fake);
+            assert_eq!(inputs.len(), expected, "{reviewer}: {review}{inline}");
+            if expected == 1 {
+                assert_eq!(inputs[0]["repo"], "upstream/midstream");
+                assert!(text(&inputs[0], "/task").contains("verify this and diff it"));
+            }
+            let log = fake.log.borrow();
+            assert!(
+                (log.iter()).any(|line| line.contains("search/issues?q=reviewed-by%3Aop+")
+                    && line.contains("%22worker%22")),
+                "{log:?}"
+            );
+        }
+    }
+
     #[test]
     fn upstream_association_excludes_prs_and_fallback_trackers() {
         for (pull, fallback) in [(true, false), (false, true)] {
