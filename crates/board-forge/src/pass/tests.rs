@@ -8358,6 +8358,130 @@ fn epics_census_at_its_share_is_deferred() {
     );
 }
 
+/// Only consideration-share deferral may publish: a failed or unfinished
+/// census must not replace the previous holds with a partial snapshot.
+#[test]
+fn epics_share_holds_publication_replay() {
+    const SINCE: &str = "2026-10-22T00:00:00Z";
+    const EPIC: &str = "cgwalters-forge/tracker#596";
+    const FAILURE: &str = "injected epic census failure";
+    let said = |report: &Report, prefix: &str| {
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(prefix)),
+            "missing {prefix:?}: {:?}",
+            report.lines
+        );
+    };
+    for case in ["consideration share", "census share", "stage failure"] {
+        let bounds = std::rc::Rc::new(Bounds::new(
+            PASS_REQUEST_LIMIT,
+            Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
+        ));
+        let mut forge = Forge::new(None, false);
+        forge.replay = replay();
+        let mut destination = forge.holds_destination(true);
+        destination["needsYou"] = json!(true);
+        let config = config(json!({"holds": destination}));
+        let held = holds::Entry {
+            scope: holds::Scope::Epic(ItemRef {
+                host: DEFAULT_HOST.into(),
+                repository: "cgwalters-forge/tracker".into(),
+                number: 596,
+            }),
+            hold: holds::Hold::new(holds::HoldKind::Other, "previous epic hold"),
+            priority: None,
+            why: None,
+        };
+        let previous = holds::snapshot(&[held], SINCE.into(), Default::default());
+        forge.previous_holds(holds::render(&previous).unwrap());
+        let census = std::rc::Rc::new(Cell::new(false));
+        let observed = census.clone();
+        let injected = bounds.clone();
+        forge.racing = Some(Box::new(move |query, data| {
+            if query != epics::EPICS_QUERY {
+                return;
+            }
+            observed.set(true);
+            assert!(
+                !data["repository"]["issues"]["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            if case == "census share" {
+                // Force another census page, but leave only the later stages'
+                // share and write reserve: the census cannot finish reading.
+                data["repository"]["issues"]["pageInfo"] =
+                    json!({"hasNextPage": true, "endCursor": "next-epics-page"});
+                injected.left.set(injected.kept.get() + WRITE_RESERVE);
+            }
+        }));
+        if case == "stage failure" {
+            let listing = forge
+                .replay
+                .requests
+                .iter_mut()
+                .find(|e| e["request"]["graphql"] == fnv(epics::EPICS_QUERY))
+                .unwrap();
+            listing["answer"] = json!({"error": FAILURE});
+        }
+        let injected = bounds.clone();
+        let deferred = std::rc::Rc::new(Cell::new(false));
+        let observed = deferred.clone();
+        forge.on_get = Some(Box::new(move |_, _| {
+            if case == "consideration share" && injected.stage.get() == Stage::Epics {
+                // The census has completed. Spend just stage 3's share at its
+                // runs-in-flight read, leaving scheduling/publication headroom.
+                assert!(injected.kept.get() >= START_REQUESTS);
+                injected.left.set(injected.kept.get());
+                observed.set(true);
+            }
+        }));
+        let within = (
+            State::default(),
+            Mode::Actions(&own()),
+            Limits {
+                dispatch: Some(0),
+                ..Limits::default()
+            },
+            forge.replay.now,
+        );
+        let report = block(run_within(&forge, &forge, &config, within, &bounds)).unwrap();
+        let publication = forge.holds_publication();
+        if case == "consideration share" {
+            assert!(census.get() && deferred.get(), "{case}: {:?}", report.lines);
+            assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
+            said(&report, "budget: epics stopped at its share,");
+            said(&report, "holds: published ");
+            let body = publication.unwrap_or_else(|| panic!("{case}: {:?}", report.lines));
+            let snapshot = holds::parse(&body).unwrap();
+            let held = snapshot["holds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["item"] == EPIC && h["epic"] == true)
+                .unwrap();
+            assert_eq!(held["reason"], "previous epic hold");
+            assert_eq!(held["since"], SINCE);
+            assert_eq!(snapshot["needs_you"]["sources"]["epics"], "partial");
+        } else {
+            assert!(publication.is_none(), "{case}: {publication:?}");
+            said(&report, "holds: not published");
+            if case == "census share" {
+                assert!(census.get());
+                said(
+                    &report,
+                    "budget: epics stopped at its share; the live epics wait",
+                );
+                assert!(!report.lines.iter().any(|l| l.starts_with("epics error")));
+            } else {
+                said(&report, &format!("epics error: {FAILURE}"));
+                assert_eq!(report.failures, 1, "{case}: {:?}", report.lines);
+            }
+        }
+    }
+}
+
 /// Stage 2's search for the bot's pull requests that meets its share defers
 /// them to the next pass rather than failing as a `follow error`
 /// (agent-board#800).
