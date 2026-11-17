@@ -68,10 +68,15 @@ work, each with an implement job plan. Rescope or close sub-issues that no longe
 fit. Include this repository's `AGENTS.md` in child job briefs. These planning
 norms are specific to agent-board.
 
-A feature that ships off (a new option in `POLL_OPTIONS`, `SUPERVISOR_OPTIONS` or
-`AGENT_OPTIONS`) does nothing until the caller's config names it. Its PR and the
-issue's closing comment name that setting; open the caller-side change in tracker
-or file an issue there. The supervisor's `unset` check lists the option until then.
+A live-problem fix defaults on only when safe within existing authority and
+bounds. Otherwise, an off-by-default feature (including pass options and those in
+`POLL_OPTIONS`, `SUPERVISOR_OPTIONS` or `AGENT_OPTIONS`) does nothing until the
+caller enables it. Its PR and the issue's closing comment name the setting and
+link the caller enablement PR or tracked deployment dependency before calling it
+deployed. Reuse existing follow-ups; when cross-repository writes are unavailable,
+end the PR body with `Caller settings` naming repository, file, key and value.
+The pass's supported-feature diagnostic and supervisor's `unset` check expose
+unconfigured settings; neither authorizes enabling them or relaxing gates.
 
 One task becomes one PR with one commit. Use an imperative subject, optionally
 path-prefixed, and explain why in the commit body rather than restating the diff.

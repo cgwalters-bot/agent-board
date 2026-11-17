@@ -602,6 +602,8 @@ pub struct Config {
     /// CLI-only scope: prevents an on-demand PR pass from scheduling other work.
     #[serde(skip)]
     pub pull: Option<poll::PullSelector>,
+    #[serde(skip)]
+    off_features: features::Off,
     /// Org sources are kept separate from runtime policy. A pass resolves
     /// these and validates the concrete policy before taking any stage.
     #[serde(skip)]
@@ -1483,7 +1485,13 @@ impl Config {
                 );
             }
         }
+        config.off_features = features::classify(&value)?;
         Ok(config)
+    }
+
+    /// Names only, from the supported feature catalog; never caller values.
+    pub fn off_feature_summary(&self) -> String {
+        self.off_features.summary()
     }
 
     /// Resolve a source configuration afresh. The returned policy is fully
@@ -10564,3 +10572,5 @@ pub use usage::{Broker, HttpBroker};
 
 #[cfg(test)]
 mod tests;
+
+mod features;

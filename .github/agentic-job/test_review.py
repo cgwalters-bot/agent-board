@@ -149,7 +149,7 @@ class ReviewContracts(unittest.TestCase):
         script = ROOT / "workflow/decision-diff.cjs"
         for args, code, expected in (
             ([ROOT, ROOT], 0, ("base: exit 0, summary: dispatched", "head: exit 0, summary: dispatched", "no change in ")),
-            ([ROOT, ROOT, "fixtures/pass/config.json", "missing.json"], 0, ("head: exit 1, no summary line", "head output, last 2 line(s):\n  pass: preview\n  error: read ")),
+            ([ROOT, ROOT, "fixtures/pass/config.json", "missing.json"], 0, ("head: exit 1, no summary line", "head output, last 3 line(s):\n  pass: preview\n  features off: ", "]\n  error: read ")),
             ([ROOT], 1, ("usage: node workflow/decision-diff.cjs BASE HEAD",)),
         ):
             with self.subTest(args=len(args)):

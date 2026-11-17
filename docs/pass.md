@@ -115,6 +115,88 @@ The supervisor's capped `supervisor_hold` action edits that comment with the bug
 link and removes only its infrastructure label after verifying a merged fix.
 See [supervisor holds](supervisor-requests.md#infrastructure-holds).
 
+## Supported features left off
+
+The concrete failure this diagnostic exposes is a supported live-problem fix
+merging but never being enabled by its caller. Each pass prints exactly one
+stderr line, in preview, apply and replay:
+`features off: unconfigured [NAME, ...]; disabled [NAME, ...]`.
+Each list is lexicographically sorted; an empty list says `none`. Only catalog
+names are printed, never config values, paths, identities or endpoint addresses.
+`--check-config` is validation, not a pass, and prints no feature diagnostic.
+This is advisory: no additional forge reads, activation, scheduling changes,
+recovery rounds, writes or approval authority.
+
+The deterministic catalog is in `pass/features.rs`. It includes behavioral
+opt-ins, not every optional key. The GitHub catalog consists of:
+
+- Boolean switches: `notifications`, `issueIntake`, `reserveScheduling`,
+  `poolHeadroom`, `skipActiveWork`, `idleReplan`, `existingChildPlans`,
+  `researchPlans`, `fixPlans`, `sessionPlans`, `triageClose`, `replanInvalid`, `operatorQuestionsOnly`,
+  `reserveOperator`, `assignHolds`, `readFreeHolds`, `bodyPlans`, `leases`,
+  `reruns`, `reapOverdueRuns`, `cleanupHistory`, `topDown`, `usage.probe`,
+  `holds.needsYou`, `holds.approvalEvidence`, `holds.actNow`, `holds.passView`,
+  `holds.today`, `holds.epicFocus`, `epics.close`, `epics.inWorkRepositories`,
+  `sessions.apply`, `promote.onApproval`,
+  `revisit.repairQuestions`, and the false-default boolean fields of the shared
+  `PrOptions` metadata (including `pr.agentRecovery`). `pr.directionFirst` is
+  excluded because it no longer changes a pass. Missing is unconfigured;
+  explicit false is disabled; true is enabled.
+- Positive-value activators: `authored`, `openPrCap`, `triageFollowUpDays`,
+  `triageReplans`, `replanAfterDays`, `changeSweepHours`, `epics.heldPlanHours`,
+  `pr.rebaseRounds`, `pr.staleDays`. Zero disables where accepted; `openPrCap`
+  instead rejects zero and accepts only 1–100; `authored` also rejects zero.
+  Missing is unconfigured.
+- Nonempty collections: `mix`, `follow`, `pr.reviewPools`,
+  `pr.reviewDispatchRepositories`, `pr.draftReviewRepositories`,
+  `pr.operatorPaths`. Explicit empty collections are disabled, not unconfigured.
+- Presence activators: `midstream`, `revisit`, `sweep`, `sessions`, `maintain`,
+  `overlap`, `holds`, `holds.patExpiry`, `holds.proposals`, `holds.drafts`,
+  `decisions`, `starts`, `direction`, `cost`, `requestShare`, `requestWindow`,
+  `epics`, `epics.focus`, `store`, `livingStatus`, `sessions.compareAfter`,
+  `pr.mergeQueue`. A valid object, including an accepted empty object such as
+  `overlap: {}`, enables the feature with its defaults. Missing is unconfigured.
+- `triage`: missing is unconfigured, false is disabled, true or a valid scope
+  object enables it (an empty object selects epic scope).
+
+Explicit null is rejected everywhere by the pass parser, not classified as an
+off setting. The classifier treats absent/null as unconfigured defensively;
+it does not make null acceptable. Existing types, prerequisites and negative
+validation still apply. Enabled here means configured on, not that dependencies,
+current work, budget or approvals permit an action this pass. Nested features
+are listed even if their parent is absent, so they remain discoverable.
+
+Working-default tuning such as `pr.fixRounds` and default-on `pr.quietWaits`,
+required identities, destination/pool preferences, ordinary caps, state-cache
+paths, legacy `promote.forks` hints, standalone-only `promote.publish` and policy data are not opt-in features in
+this catalog. Forgejo uses only its implemented subset: `triage`,
+`triageFollowUpDays`, `triageClose`, `leases`, `reruns`, `revisit`, `sweep`,
+`holds`, `holds.needsYou`, `epics`, `epics.close`,
+`epics.inWorkRepositories`, plus its native `forgejoIntake` presence activator.
+GitHub never lists `forgejoIntake`; Forgejo never advertises GitHub PR recovery
+or other unsupported capabilities. Extend the catalog when adding a feature.
+
+### Caller rollout
+
+Follow the existing caller follow-up rule in [AGENTS.md](../AGENTS.md): a fix
+for a live problem defaults on only when safe within existing authority and
+bounds. Otherwise name its setting and link a caller enablement PR or tracked
+deployment dependency before calling the fix deployed. Do not bypass wrapper,
+recovery, write or approval gates to make a diagnostic disappear.
+
+On 2026-11-17 the caller's
+[configuration at 0a8206d](https://github.com/cgwalters-forge/tracker/blob/0a8206d8692a4d1af08d383b5fc3fac1d9113874/.github/pass.json)
+already sets `openPrCap: 6` and omits `pr.agentRecovery`. The
+[merged recovery route](https://github.com/cgwalters-forge/tracker/pull/1709)
+explicitly deferred activation until wrapper support. The
+[existing deployment follow-up](https://github.com/cgwalters-forge/tracker/issues/1729)
+tracks the wrapper refusal and caller pin update; its historical claim that
+recovery is enabled is not the current config. Keep activation gated: caller
+repository `cgwalters-forge/tracker`, file `.github/pass.json`, key
+`pr.agentRecovery`, value `true`, only after the wrapper supports the scoped
+route and its reviewed caller pin is updated. This diagnostic does not deploy
+that recovery fix or complete its rollout.
+
 ## Local configuration defaults
 
 From the root of a trusted caller checkout, `agent-board pass` reads

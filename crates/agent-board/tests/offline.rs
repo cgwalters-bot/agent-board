@@ -578,7 +578,15 @@ fn setup_credential_free_rehearsal() {
             assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 1);
             assert!(text.contains("held by --max-dispatch: start "), "{text}");
             assert!(text.ends_with(&format!("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":1}}\n")), "{text}");
-            assert!(output.stderr.is_empty(), "{line}");
+            let expected = board_forge::pass::Config::parse(include_str!(
+                "../../../fixtures/pass/config.json"
+            ))
+            .unwrap()
+            .off_feature_summary();
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                format!("{expected}\n")
+            );
         }
         count += 1;
     }
@@ -3143,6 +3151,20 @@ fn pass_replay_previews_without_credentials() {
         .clone();
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.starts_with("pass: preview\n"), "{text}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let diagnostics: Vec<_> = stderr
+        .lines()
+        .filter(|l| l.starts_with("features off:"))
+        .collect();
+    assert_eq!(diagnostics.len(), 1, "{stderr}");
+    let expected =
+        board_forge::pass::Config::parse(include_str!("../../../fixtures/pass/config.json"))
+            .unwrap()
+            .off_feature_summary();
+    assert_eq!(diagnostics[0], expected);
+    assert!(!text.contains("features off:"));
+    assert!(diagnostics[0].contains("openPrCap"));
+    assert!(diagnostics[0].contains("pr.agentRecovery"));
     // The recording's stuck run (agent-board#376) is old enough to have its
     // jobs read; none are recorded, so it keeps its slot. tracker#596's
     // sub-issues are all closed: it is asked about, three writes, not planned.
@@ -3168,6 +3190,117 @@ fn pass_replay_previews_without_credentials() {
     let output = command().args(unknown).current_dir(root).assert().code(1);
     let error = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
+}
+
+#[test]
+fn pass_feature_diagnostic_modes() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let dir = std::env::temp_dir().join(format!("agent-board-features-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.json");
+    let base: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    for (edit, fragment) in [
+        (serde_json::json!({}), "pr.agentRecovery"),
+        (
+            serde_json::json!({"pr": {"agentRecovery": false}}),
+            "disabled [pr.agentRecovery]",
+        ),
+        (serde_json::json!({"openPrCap": 6}), "pr.agentRecovery"),
+        (
+            serde_json::json!({"mix": {}, "follow": []}),
+            "disabled [follow, mix]",
+        ),
+        (
+            serde_json::json!({"triageReplans": 0}),
+            "disabled [triageReplans]",
+        ),
+    ] {
+        let mut config = base.clone();
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        std::fs::write(&path, config.to_string()).unwrap();
+        let expected = board_forge::pass::Config::parse(&config.to_string())
+            .unwrap()
+            .off_feature_summary();
+        assert!(expected.contains(fragment), "{expected}");
+        for flags in [
+            vec![],
+            vec!["--apply"],
+            vec!["--replay", "fixtures/pass/board-2026-10-23.json"],
+        ] {
+            let output = command()
+                .current_dir(root)
+                .args(["pass", "--config"])
+                .arg(&path)
+                .args(["--max-dispatch", "0", "--max-writes", "0"])
+                .args(&flags)
+                .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .env_remove("DISPATCH_TOKEN")
+                .env_remove("GITHUB_ACTIONS")
+                .env("PATH", "")
+                .output()
+                .unwrap();
+            // Live modes stop at credential lookup, never contact a forge.
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            if flags.first() == Some(&"--replay") {
+                assert!(output.status.success(), "{stderr}");
+                assert!(
+                    stdout.contains("summary: dispatched 0/0, writes 0/0"),
+                    "{stdout}"
+                );
+            } else {
+                assert_eq!(output.status.code(), Some(4), "{stderr}");
+                assert!(stderr.contains("authentication required"), "{stderr}");
+            }
+            let diagnostics: Vec<_> = stderr
+                .lines()
+                .filter(|l| l.starts_with("features off:"))
+                .collect();
+            assert_eq!(diagnostics, [expected.as_str()], "{flags:?}: {stderr}");
+            assert!(!stdout.contains("features off:"));
+        }
+        command()
+            .current_dir(root)
+            .args(["pass", "--check-config", "--config"])
+            .arg(&path)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env("PATH", "")
+            .assert()
+            .success()
+            .stderr("");
+    }
+    let forgejo = serde_json::json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller",
+        "dispatchWorkflow": "dispatch.yml", "board": {"forge": "forgejo",
+        "url": "https://forge.example/", "tokenEnv": "AGENT_BOARD_FEATURE_TEST_TOKEN",
+        "repositories": ["o/r"], "membership": "open", "recorders": [1, 2]}});
+    std::fs::write(&path, forgejo.to_string()).unwrap();
+    let output = command()
+        .current_dir(root)
+        .args(["pass", "--config"])
+        .arg(&path)
+        .env_remove("AGENT_BOARD_FEATURE_TEST_TOKEN")
+        .env("PATH", "")
+        .assert()
+        .code(4)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| l.starts_with("features off:"))
+            .collect::<Vec<_>>(),
+        [
+            "features off: unconfigured [epics, epics.close, epics.inWorkRepositories, forgejoIntake, holds, holds.needsYou, leases, reruns, revisit, sweep, triage, triageClose, triageFollowUpDays]; disabled [none]"
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
