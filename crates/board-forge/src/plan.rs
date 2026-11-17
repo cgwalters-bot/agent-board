@@ -1511,6 +1511,179 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     })
 }
 
+/// `plan` after `intro`, as a comment the pass or a planless dispatch posts.
+pub(crate) fn plan_body(intro: &str, plan: &Value) -> String {
+    format!(
+        "{intro}\n\n```{PLAN_FENCE}\n{plan:#}\n```\n\n{}",
+        crate::Footer::default()
+    )
+}
+
+/// Posts `plan` on `issue` after `intro`, as the plan writer the token is,
+/// and returns the posted plan's id ([`plan_id`]).
+pub(crate) fn post_plan<R: Rest>(
+    client: &R,
+    issue: &ItemRef,
+    intro: &str,
+    plan: &Value,
+) -> Result<String> {
+    let body = plan_body(intro, plan);
+    let comments = format!(
+        "{API_ROOT}repos/{}/issues/{}/comments",
+        issue.repository, issue.number
+    );
+    let (_, posted) = send(client, "POST", &comments, &json!({"body": body}), 0)?;
+    let field = |key: &str| {
+        posted[key]
+            .as_str()
+            .with_context(|| format!("posted plan has no {key}"))
+    };
+    let created = OffsetDateTime::parse(field("created_at")?, &Rfc3339)
+        .context("posted plan's created_at")?;
+    plan_id(&Comment {
+        url: field("html_url")?.into(),
+        body,
+        author: None,
+        edited: false,
+        editor: None,
+        created,
+        changed: created,
+    })
+}
+
+/// Kinds a planless dispatch builds a plan of (agent-board#1083): only
+/// what a fully specified issue asks for.
+pub const PLANLESS_KINDS: &[&str] = &["implement"];
+
+/// What the plan a planless dispatch posts says first.
+pub const PLANLESS_INTRO: &str = "`agent-board dispatch` was asked to start this issue without a plan comment; this is the plan it built, which its dispatch record names.";
+
+/// The plan a planless dispatch builds for `issue` (agent-board#1083):
+/// hosted, working in the issue's own repository, and validated as a plan
+/// comment's is, so it is held to the same bounds. Its JSON block, as
+/// posted, comes with it.
+pub fn planless(issue: &ItemRef, kind: &str, pool: &str, brief: &str) -> Result<(JobPlan, Value)> {
+    ensure!(
+        PLANLESS_KINDS.contains(&kind),
+        "a planless dispatch's kind is one of {}",
+        PLANLESS_KINDS.join(", ")
+    );
+    let block = json!({
+        "schema": JOB_PLAN_SCHEMA,
+        "repo": issue.repository,
+        "item": issue.number,
+        "kind": kind,
+        "runner": "hosted",
+        "pool": pool,
+        "brief": brief,
+    });
+    let plan = JobPlan::from_json(&block).context("planless dispatch")?;
+    Ok((plan, block))
+}
+
+/// `issue`'s body as a planless dispatch's brief. Weighed as a plan comment
+/// is: a writer's own text, edited by no one else since, so a visitor's
+/// issue text never becomes a task a writer's token starts.
+pub fn body_brief<T: Transport>(client: &T, issue: &ItemRef, writers: &[&str]) -> Result<String> {
+    let (owner, name) = issue
+        .repository
+        .split_once('/')
+        .context("invalid repository")?;
+    let data = client.graphql(
+        crate::pass::BODY_QUERY,
+        json!({"owner": owner, "name": name, "number": issue.number}),
+    )?;
+    let node = data
+        .pointer("/repository/issue")
+        .filter(|n| n.is_object())
+        .with_context(|| format!("{} is not an issue", issue.display()))?;
+    let body = comment(node)?;
+    ensure!(
+        trusted(writers, &body.author) && !foreign_edit(&body, writers),
+        "the body of {} was not written, or was last edited, by a plan writer; give the task with --task",
+        issue.display()
+    );
+    Ok(body.body)
+}
+
+/// Refuses a planless dispatch of an issue whose `comments` hold a writer's
+/// dispatch record, of a run that started or may have, or a writer's plan,
+/// which a dispatch without `--kind` starts.
+pub fn planless_check(comments: &[Comment], writers: &[&str]) -> Result<()> {
+    let marker = format!("<!-- {DISPATCH_MARKER}: ");
+    if let Some(record) = comments
+        .iter()
+        .find(|c| trusted(writers, &c.author) && c.body.starts_with(&marker))
+    {
+        bail!(
+            "a run is recorded for this issue already, {}; it is not started again",
+            record.url
+        );
+    }
+    if let Some(plan) = comments.iter().find(|c| weighed(c, writers, PLAN_FENCE)) {
+        bail!("{} holds a plan; dispatch it without --kind", plan.url);
+    }
+    Ok(())
+}
+
+/// Start a `kind` run of `issue` with `brief` on `pool` without a plan
+/// comment (agent-board#1083): checked by [`planless_check`], the plan
+/// [`planless`] builds is posted as the token's, then [`dispatch_with`]
+/// starts exactly that plan, so its record, read back and edited as any
+/// plan's, tells a later pass the issue was started. The plan is removed
+/// where the dispatch waits or is refused before sending.
+pub fn dispatch_planless<C: Transport + Rest, D: Rest>(
+    client: &C,
+    dispatcher: &D,
+    (issue, kind, pool, brief): (&ItemRef, &str, &str, &str),
+    writers: &[&str],
+    target: &Target,
+    (bot, collaborators): (Option<&str>, Option<crate::input::Rule>),
+) -> Result<Dispatched> {
+    target.validate()?;
+    let (_, block) = planless(issue, kind, pool, brief)?;
+    planless_check(&issue_comments(client, issue)?, writers)?;
+    // Checked before the plan is posted, which only a writer's may be.
+    let login = viewer(client)?;
+    ensure!(
+        writers.iter().any(|w| w.eq_ignore_ascii_case(&login)),
+        "{login} is not a plan writer; dispatch with the operator's or the planner's token"
+    );
+    if let Some(rule) = collaborators {
+        check_inputs(client, issue, issue, &[], rule)?;
+    }
+    let id = post_plan(client, issue, PLANLESS_INTRO, &block)?;
+    let scheduled = Scheduled {
+        plan: Some(&id),
+        ..Default::default()
+    };
+    let done = dispatch_with(
+        client,
+        dispatcher,
+        issue,
+        writers,
+        target,
+        (0, bot, collaborators, scheduled),
+    );
+    // Where nothing was sent, the plan goes too: left, it would be started
+    // as any plan, without `--kind`'s lease.
+    let why = match &done {
+        Ok(Dispatched { record: None, .. }) => "it waits".to_owned(),
+        Err(error) if error.is::<Refused>() => format!("{error:#}"),
+        _ => return done,
+    };
+    let comment = id
+        .split_once('@')
+        .map_or(id.as_str(), |(comment, _)| comment);
+    let url = format!(
+        "{API_ROOT}repos/{}/issues/comments/{comment}",
+        issue.repository
+    );
+    send(client, "DELETE", &url, &Value::Null, 404)
+        .with_context(|| format!("not dispatched ({why}), and its plan was not removed"))?;
+    done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2154,6 +2327,9 @@ mod tests {
         /// merged pull requests ([`crate::stack::resolve`]); null when none
         /// is expected.
         stack: Value,
+        /// The issue's own text for [`body_brief`], as a comment node;
+        /// null when none is expected.
+        body: Value,
     }
 
     const ISSUE: &str = "https://github.com/cgwalters-forge/tracker/issues/540";
@@ -2185,6 +2361,7 @@ mod tests {
                 overlap: Value::Null,
                 checked: Default::default(),
                 stack: Value::Null,
+                body: Value::Null,
             }
         }
 
@@ -2251,6 +2428,11 @@ mod tests {
                 );
             }
             let number = variables["number"].as_u64().unwrap();
+            if query == crate::pass::BODY_QUERY {
+                assert!(!self.body.is_null(), "unexpected body read");
+                let issue = Some(&self.body).filter(|b| *b != "none");
+                return Ok(json!({"repository": {"issue": issue}}));
+            }
             if query.contains("{ title body }") {
                 // The task text is the issue's own.
                 assert_eq!((&variables["name"], number), (&json!("tracker"), 540));
@@ -2387,7 +2569,8 @@ mod tests {
                 let id = self.post(self.viewer, text);
                 return Ok((
                     201,
-                    json!({"id": id, "html_url": format!("{ISSUE}#issuecomment-{id}")}),
+                    json!({"id": id, "html_url": format!("{ISSUE}#issuecomment-{id}"),
+                        "created_at": "2026-10-14T09:00:00Z"}),
                 ));
             }
             let other = url
@@ -2415,6 +2598,17 @@ mod tests {
                 }
                 let (id, url) = post(self.viewer, text);
                 return Ok((201, json!({"id": id, "html_url": url})));
+            }
+            if let (Some(id), "DELETE") = (url.strip_prefix(edits), method) {
+                // A blank tombstone, so that later comments' ids stay unique.
+                let suffix = format!("#issuecomment-{id}");
+                let mut comments = self.comments.borrow_mut();
+                let node = comments
+                    .iter_mut()
+                    .find(|c| c["url"].as_str().unwrap().ends_with(&suffix))
+                    .unwrap();
+                (node["body"], node["author"]) = (json!(""), Value::Null);
+                return Ok((204, Value::Null));
             }
             if let (Some(id), "PATCH") = (url.strip_prefix(edits), method) {
                 if self.twist == "cleanup fails" && text.contains("A later dispatch may take it") {
@@ -2459,6 +2653,182 @@ mod tests {
                 bail!("dispatch answer lost");
             }
             Ok(self.answers.borrow_mut().remove(0))
+        }
+    }
+
+    #[test]
+    fn planless_dispatch_posts_its_plan_and_starts_the_issue_once() {
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        let writers = [OPERATOR, PLANNER];
+        let start = |forge: &Forge, kind: &str, pool: &str, brief: &str| {
+            let job = (&issue, kind, pool, brief);
+            dispatch_planless(forge, forge, job, &writers, &target(), (None, None))
+        };
+        let forge = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
+        let done = start(&forge, "implement", "claude", "Fix the thing.").unwrap();
+        let run = "https://github.com/cgwalters-forge/tracker/actions/runs/99";
+        assert_eq!(done.run.as_deref(), Some(run));
+        let sent = forge.dispatches.borrow()[0].clone();
+        assert_eq!(sent["ref"], "main");
+        let inputs = &sent["inputs"];
+        assert_eq!(
+            (
+                &inputs["repo"],
+                &inputs["item"],
+                &inputs["kind"],
+                &inputs["pool"]
+            ),
+            (
+                &json!("cgwalters-forge/tracker"),
+                &json!("540"),
+                &json!("implement"),
+                &json!("claude")
+            )
+        );
+        assert!(
+            inputs["task"]
+                .as_str()
+                .unwrap()
+                .starts_with("Fix the thing.")
+        );
+        assert!(inputs.get("runner").is_none(), "{inputs}");
+        // The posted plan, then its record, which names it and the run.
+        let bodies = forge.bodies();
+        assert_eq!(bodies.len(), 2, "{bodies:#?}");
+        assert!(bodies[0].starts_with(PLANLESS_INTRO), "{}", bodies[0]);
+        let comments = issue_comments(&forge, &issue).unwrap();
+        let (posted, from) = newest_plan(&comments, &writers).unwrap();
+        let from = plan_id(from).unwrap();
+        assert_eq!(
+            (posted.runner.as_str(), posted.brief.as_str()),
+            ("hosted", "Fix the thing.")
+        );
+        assert!(bodies[1].starts_with(&marker_line(&from)), "{}", bodies[1]);
+        assert!(bodies[1].contains(run), "{}", bodies[1]);
+        // A run is recorded: never started again, by either path.
+        let again = start(&forge, "implement", "claude", "Fix the thing.").unwrap_err();
+        assert!(
+            format!("{again:#}").contains("a run is recorded for this issue already"),
+            "{again:#}"
+        );
+        let planned = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None, None);
+        assert!(
+            planned
+                .unwrap_err()
+                .to_string()
+                .contains("dispatch record already")
+        );
+        assert_eq!(
+            (forge.dispatches.borrow().len(), forge.bodies().len()),
+            (1, 2)
+        );
+
+        // Outside a plan's bounds, or past a writer's plan: nothing is posted.
+        let fenced = format!("```{PLAN_FENCE}\n{}\n```", plan());
+        let long = "x".repeat(PLAN_BRIEF_LIMIT + 1);
+        for (kind, pool, brief, comments, refused) in [
+            ("fix", "claude", "Fix it.", vec![], "kind is one of"),
+            ("research", "claude", "Fix it.", vec![], "kind is one of"),
+            ("implement", "tier-fast", "Fix it.", vec![], "names a tier"),
+            (
+                "implement",
+                "Claude",
+                "Fix it.",
+                vec![],
+                "plan pool must be",
+            ),
+            ("implement", "", "Fix it.", vec![], "plan pool must be"),
+            ("implement", "claude", " ", vec![], "brief is empty"),
+            ("implement", "claude", &long, vec![], "brief exceeds"),
+            (
+                "implement",
+                "claude",
+                "Fix it.",
+                vec![node(7, PLANNER, "2026-10-13T10:00:00Z", &fenced)],
+                "holds a plan; dispatch it without --kind",
+            ),
+            (
+                "implement",
+                "claude",
+                "Fix it.",
+                vec![node(
+                    7,
+                    OPERATOR,
+                    "2026-10-13T10:00:00Z",
+                    &record("1@2026-10-13T09:00:00Z"),
+                )],
+                "a run is recorded for this issue already",
+            ),
+        ] {
+            let forge = Forge::new(comments, vec![]);
+            let before = forge.bodies();
+            let error = start(&forge, kind, pool, brief).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(refused),
+                "{kind}/{pool}: {error:#}"
+            );
+            assert_eq!(forge.bodies(), before);
+            assert!(forge.dispatches.borrow().is_empty());
+        }
+        // A visitor's copied record blocks nothing.
+        let visitor = node(
+            7,
+            "visitor",
+            "2026-10-13T10:00:00Z",
+            &record("1@2026-10-13T09:00:00Z"),
+        );
+        assert!(planless_check(&[super::comment(&visitor).unwrap()], &writers).is_ok());
+
+        // Lease admission refuses before sending: the record is released
+        // and the plan removed, so a retry with --kind takes a lease again.
+        let mut forge = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
+        forge.twist = "refused";
+        let error = start(&forge, "implement", "claude", "Fix it.").unwrap_err();
+        assert!(error.is::<Refused>(), "{error:#}");
+        let bodies = forge.bodies();
+        assert!(
+            !bodies.iter().any(|b| b.contains(PLAN_FENCE)),
+            "{bodies:#?}"
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains(DISPATCH_MARKER)),
+            "{bodies:#?}"
+        );
+        assert!(forge.dispatches.borrow().is_empty());
+        forge.twist = "";
+        let done = start(&forge, "implement", "claude", "Fix it.").unwrap();
+        assert_eq!(done.run.as_deref(), Some(run));
+        assert_eq!(forge.dispatches.borrow().len(), 1);
+    }
+
+    #[test]
+    fn planless_body_brief_is_only_a_writers_own_text() {
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        let writers = [OPERATOR, PLANNER];
+        let text = |author: &str, editor: Option<&str>| {
+            let mut node = node(1, author, "2026-10-13T10:00:00Z", "Do the thing.");
+            node["url"] = ISSUE.into();
+            if let Some(editor) = editor {
+                node["lastEditedAt"] = json!("2026-10-13T11:00:00Z");
+                node["editor"] = json!({"login": editor});
+            }
+            node
+        };
+        for (body, expected) in [
+            (text(PLANNER, None), Some("Do the thing.")),
+            (text(PLANNER, Some(OPERATOR)), Some("Do the thing.")),
+            (text("visitor", None), None),
+            (text(OPERATOR, Some("visitor")), None),
+            // A pull request's number reads as no issue.
+            (json!("none"), None),
+        ] {
+            let mut forge = Forge::new(vec![], vec![]);
+            forge.body = body.clone();
+            let read = body_brief(&forge, &issue, &writers);
+            match expected {
+                Some(text) => assert_eq!(read.unwrap(), text),
+                None => assert!(read.is_err(), "{body}"),
+            }
         }
     }
 

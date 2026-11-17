@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 use board_core::{Item, ItemRef, Snapshot, Status, Turn};
 use board_forge::github::{GitHub, Transport};
 use board_forge::overlap::{self, Decision};
+use board_forge::pass::lease;
 use board_forge::poll::Rest;
 use board_forge::{
     batch, input, is_github_login, parse_github_item, plan, validate_github_project,
@@ -28,7 +29,7 @@ pub struct Dispatch {
     kind: String,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub struct FromPlan {
     /// Issue whose newest accepted plan comment to dispatch: URL, OWNER/REPO#N, or N with --repo. A runner profile name is forwarded unchanged; only the caller resolves it. Hosted keeps the existing default request.
     issue: String,
@@ -68,6 +69,59 @@ pub struct FromPlan {
     /// With --collaborators-only, also admit issue comments that the GitHub App with this id posted as its bot: the status app (docs/apps.md). From the caller's configuration.
     #[arg(long, value_name = "ID", requires = "collaborators_only")]
     status_app_id: Option<u64>,
+    /// Start the issue without a plan comment, as a run of this kind: dispatch builds a hosted plan of --task or --task-from-body on --pool, held to a plan's bounds, posts it as the token's own and dispatches it as any plan, admitted by --config's leases with GH_TOKEN; where nothing is sent, the plan is removed. Refused where a writer's plan or dispatch record is on the issue (docs/job-plans.md#without-a-plan-comment).
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(plan::PLANLESS_KINDS), requires_all = ["pool", "config"], conflicts_with = "dispatch_routing")]
+    kind: Option<String>,
+    /// With --kind, the task the run gets.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        requires = "kind",
+        conflicts_with = "task_from_body"
+    )]
+    task: Option<String>,
+    /// With --kind, the issue's body as the task: only a plan writer's own text, edited by no one else.
+    #[arg(long, requires = "kind")]
+    task_from_body: bool,
+    /// With --kind, the inference pool: one of --config's pools.
+    #[arg(long, value_name = "POOL", requires = "kind")]
+    pool: Option<String>,
+    /// With --kind, the pass configuration (docs/pass.md) from a trusted default-branch checkout: its leases, which must be on, admit the run under the pass's wip and pacing.
+    #[arg(long, value_name = "FILE", requires = "kind")]
+    config: Option<std::path::PathBuf>,
+}
+
+/// What `--kind` asks for: the kind, its pool, the pass configuration and
+/// the task, where it was given; none without `--kind`.
+type Planless<'a> = (&'a str, &'a str, board_forge::pass::Config, Option<&'a str>);
+
+impl FromPlan {
+    /// Checks the planless options before anything is read: one task, no
+    /// batch, and a configuration whose leases admit the start.
+    fn planless(&self) -> Result<Option<Planless<'_>>> {
+        let Some(kind) = &self.kind else {
+            return Ok(None);
+        };
+        ensure!(
+            self.task.is_some() != self.task_from_body,
+            "--kind needs --task or --task-from-body"
+        );
+        ensure!(
+            self.batch == 0,
+            "a planless dispatch runs the issue alone; --batch is unsupported"
+        );
+        let (Some(pool), Some(path)) = (&self.pool, &self.config) else {
+            anyhow::bail!("--kind needs --pool and --config");
+        };
+        let config = crate::lease::config(path)?;
+        let target = plan::Target {
+            caller: self.caller.clone(),
+            workflow: self.workflow.clone(),
+            git_ref: self.git_ref.clone(),
+        };
+        board_forge::pass::lease::check_outside(&config, &target, pool)?;
+        Ok(Some((kind, pool, config, self.task.as_deref())))
+    }
 }
 
 #[derive(Args, Default, Clone)]
@@ -439,28 +493,51 @@ pub fn from_plan<T: Transport + Rest>(
             anyhow::Ok(routing)
         })
         .transpose()?;
+    let planless = args.planless()?;
     let client = transport()?;
     let collaborators = args.collaborators_only.then_some(input::Rule {
         status_app: args.status_app_id,
     });
+    // A planless run's task: given, or the issue's body.
+    let brief = |task: Option<&str>| match task {
+        Some(task) => Ok(task.to_owned()),
+        None => plan::body_brief(&client, &issue, &writers),
+    };
     if args.apply {
         let dispatcher = dispatcher();
-        let done = plan::dispatch_with(
-            &client,
-            dispatcher.as_ref().unwrap_or(&client),
-            &issue,
-            &writers,
-            &target,
-            (
-                args.batch.into(),
-                args.bot.as_deref(),
-                collaborators,
-                plan::Scheduled {
-                    routing: routing.as_ref(),
-                    ..Default::default()
-                },
-            ),
-        )?;
+        let dispatcher = dispatcher.as_ref().unwrap_or(&client);
+        let done = match &planless {
+            Some((kind, pool, config, task)) => {
+                let brief = brief(*task)?;
+                let now = time::OffsetDateTime::now_utc();
+                let admitted =
+                    lease::Dispatch::new((&client, dispatcher), config, (&issue, pool), now);
+                plan::dispatch_planless(
+                    &client,
+                    &admitted,
+                    (&issue, kind, pool, &brief),
+                    &writers,
+                    &target,
+                    (args.bot.as_deref(), collaborators),
+                )?
+            }
+            None => plan::dispatch_with(
+                &client,
+                dispatcher,
+                &issue,
+                &writers,
+                &target,
+                (
+                    args.batch.into(),
+                    args.bot.as_deref(),
+                    collaborators,
+                    plan::Scheduled {
+                        routing: routing.as_ref(),
+                        ..Default::default()
+                    },
+                ),
+            )?,
+        };
         for note in &done.notes {
             eprintln!("Not batched: {note}");
         }
@@ -486,6 +563,26 @@ pub fn from_plan<T: Transport + Rest>(
         return Ok(());
     }
     let comments = plan::issue_comments(&client, &issue)?;
+    if let Some((kind, pool, _, task)) = &planless {
+        let (job, _) = plan::planless(&issue, kind, pool, &brief(*task)?)?;
+        plan::planless_check(&comments, &writers)?;
+        if let Some(rule) = collaborators {
+            plan::check_inputs(&client, &issue, &issue, &[], rule)?;
+        }
+        let what = format!("a planless {kind} run of {}", issue.display());
+        if let Some(bot) = args.bot.as_deref() {
+            let decision = overlap::decide(&client, &issue, &issue, &job.brief, bot, &target);
+            eprintln!("{}", decision.sentence());
+            if let Decision::Wait(..) = decision {
+                eprintln!("Dry run: {what} would wait; nothing was sent.");
+                return Ok(());
+            }
+        }
+        serde_json::to_writer(&mut *out, &job.dispatch_request(&target, None)?)?;
+        writeln!(out)?;
+        eprintln!("Dry run: request for {what}; nothing was sent.");
+        return Ok(());
+    }
     let (plan, from) = plan::newest_plan(&comments, &writers)?;
     let routed = routing
         .as_ref()
@@ -1362,6 +1459,7 @@ mod tests {
                 bot: None,
                 collaborators_only: false,
                 status_app_id: None,
+                ..Default::default()
             };
             let mut block = json!({"schema": plan::JOB_PLAN_SCHEMA, "repo": "bootc-dev/bootc", "item": 8,
                 "kind": "research", "runner": "hosted", "brief": "No mutation."});
@@ -1461,11 +1559,82 @@ mod tests {
             bot: None,
             collaborators_only: false,
             status_app_id: None,
+            kind: None,
+            task: None,
+            task_from_body: false,
+            pool: None,
+            config: None,
         };
         let issue = "https://github.com/cgwalters-forge/tracker/issues/540";
         let tracker = "cgwalters-forge/tracker";
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/pass/config.json"
+        );
+        let mut leased: Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+        leased["leases"] = true.into();
+        let leased_path =
+            std::env::temp_dir().join(format!("planless-{}.json", std::process::id()));
+        std::fs::write(&leased_path, leased.to_string()).unwrap();
+        let planless = |config: &std::path::Path, task: Option<&str>| FromPlan {
+            kind: Some("implement".into()),
+            task: task.map(Into::into),
+            pool: Some("claude".into()),
+            config: Some(config.into()),
+            ..args(issue, true, tracker, None)
+        };
         // Arguments, comment author, reads made, then output inputs or error.
         for (args, author, reads, expected) in [
+            // A visitor's plan does not count: the issue is planless.
+            (
+                planless(&leased_path, Some("Fix it.")),
+                "visitor",
+                1,
+                Ok(("implement", "540", "claude")),
+            ),
+            (
+                planless(&leased_path, Some("Fix it.")),
+                "cgwalters",
+                1,
+                Err("holds a plan; dispatch it without --kind"),
+            ),
+            (
+                planless(&leased_path, Some(" ")),
+                "visitor",
+                1,
+                Err("plan brief is empty"),
+            ),
+            (
+                planless(&leased_path, None),
+                "visitor",
+                0,
+                Err("--kind needs --task or --task-from-body"),
+            ),
+            (
+                FromPlan {
+                    batch: 1,
+                    ..planless(&leased_path, Some("Fix it."))
+                },
+                "visitor",
+                0,
+                Err("--batch is unsupported"),
+            ),
+            (
+                planless(fixture.as_ref(), Some("Fix it.")),
+                "visitor",
+                0,
+                Err("needs leases on"),
+            ),
+            (
+                FromPlan {
+                    pool: Some("nowhere".into()),
+                    ..planless(&leased_path, Some("Fix it."))
+                },
+                "visitor",
+                0,
+                Err("nowhere is not in pools"),
+            ),
             (
                 FromPlan {
                     dispatch_routing: Some(
@@ -1479,7 +1648,7 @@ mod tests {
                 },
                 "cgwalters",
                 1,
-                Ok("research"),
+                Ok(("research", "3665", "")),
             ),
             (
                 FromPlan {
@@ -1494,13 +1663,13 @@ mod tests {
                 args(issue, true, tracker, Some("cgwalters-bot")),
                 "cgwalters-bot",
                 1,
-                Ok("research"),
+                Ok(("research", "3665", "")),
             ),
             (
                 args("540", true, tracker, None),
                 "cgwalters",
                 1,
-                Ok("research"),
+                Ok(("research", "3665", "")),
             ),
             (
                 args(issue, true, tracker, None),
@@ -1562,11 +1731,11 @@ mod tests {
             );
             assert_eq!(transport.1.get(), reads);
             match (result, expected) {
-                (Ok(()), Ok(kind)) => {
+                (Ok(()), Ok((kind, item, pool))) => {
                     let request: Value = serde_json::from_slice(&out).unwrap();
                     assert_eq!(request["body"]["inputs"]["kind"], kind);
-                    assert_eq!(request["body"]["inputs"]["pool"], "");
-                    assert_eq!(request["body"]["inputs"]["item"], "3665");
+                    assert_eq!(request["body"]["inputs"]["pool"], pool);
+                    assert_eq!(request["body"]["inputs"]["item"], item);
                 }
                 (Err(error), Err(expected)) => {
                     assert!(format!("{error:#}").contains(expected), "{error:#}");
@@ -1575,6 +1744,7 @@ mod tests {
                 (result, expected) => panic!("{result:?} != {expected:?}"),
             }
         }
+        std::fs::remove_file(leased_path).unwrap();
     }
 
     #[test]

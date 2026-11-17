@@ -255,6 +255,34 @@ impl Rest for Starter {
 }
 
 #[test]
+fn starts_outside_the_pass_need_its_leases_workflow_and_pool() {
+    let on = config(json!({"leases": true}));
+    let target = |caller: &str, workflow: &str| Target {
+        caller: caller.into(),
+        workflow: workflow.into(),
+        git_ref: "main".into(),
+    };
+    let ours = target(&on.dispatch_repo, &on.dispatch_workflow);
+    check_outside(&on, &ours, "claude").unwrap();
+    let upper = target(&on.dispatch_repo.to_uppercase(), &on.dispatch_workflow);
+    check_outside(&on, &upper, "claude").unwrap();
+    let off = config(json!({}));
+    let (caller, workflow) = (
+        target("other/caller", &on.dispatch_workflow),
+        target(&on.dispatch_repo, "other.yml"),
+    );
+    for (config, target, pool, refused) in [
+        (&off, &ours, "claude", "needs leases on"),
+        (&on, &caller, "claude", "the leases count runs of"),
+        (&on, &workflow, "claude", "the leases count runs of"),
+        (&on, &ours, "nowhere", "nowhere is not in pools"),
+    ] {
+        let error = check_outside(config, target, pool).unwrap_err();
+        assert!(error.to_string().contains(refused), "{error:#}");
+    }
+}
+
+#[test]
 fn pass_reservations_race_with_admission_and_bind_only_the_named_run() {
     // Whether a peer takes the slot first, and the run a rerun restarts,
     // whose accepted answer names none.

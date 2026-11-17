@@ -200,6 +200,41 @@ unless [`researchPlans`](pass.md#one-configuration-file) or
 Even then a `session` plan starts only as the operator's own, written and last
 edited by them: a run over a whole repository is never an agent's to start.
 
+### Without a plan comment
+
+A fully specified issue need not wait for triage and planning
+([#1083](https://github.com/cgwalters-forge/agent-board/issues/1083)):
+
+```sh
+agent-board dispatch "$ISSUE" --apply --kind implement --task-from-body \
+  --pool "$POOL" --config "$PASS_CONFIG" \
+  --caller "$CALLER" --workflow "$WORKFLOW" --operator "$OPERATOR" --planner "$PLANNER"
+```
+
+builds a hosted `implement` plan for the issue itself, with `--task TEXT` or
+the issue's body as its brief, validated as a plan comment is, so it has the
+same bounds. The body counts only when a
+writer wrote it and no one else edited it since, as for a plan. Dispatch posts
+that plan as the token's own comment and then starts exactly it by the
+protocol above: the same record, read back and edited, and the same overlap
+and collaborator checks. A later pass sees a recorded plan and does not start
+the issue again; the [state store](pass.md#the-state-store) indexes the record
+when a pass reads it, as any other.
+
+It refuses an issue with a writer's plan (dispatch that without `--kind`) or
+any writer's dispatch record. The threat is a start outside the pass skipping
+its WIP limit and pacing, so `--config`, the pass configuration, must have
+[`leases`](pass.md#leases) on and name `--caller` and `--workflow` as its
+`dispatchRepo` and `dispatchWorkflow`, and `--pool` must be one of its pools:
+the send takes a lease, with `GH_TOKEN`, as the pass's own starts do. Where
+the lease is refused, or the run waits on overlap, nothing is sent: the
+record is released and the posted plan removed, so neither a retry nor a pass
+starts it without a lease. Two planless dispatches of one issue at the same
+moment can each post and start a plan; run them one at a time. `--dry-run`
+checks the arguments, the plan and the issue's comments and prints the
+request, but takes no lease and does not ask whose the token is. Batching and
+routing are not supported.
+
 ## Collaborator input
 
 `--collaborators-only` (off by default; from the caller's configuration)
