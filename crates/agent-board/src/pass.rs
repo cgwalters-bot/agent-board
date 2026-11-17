@@ -264,6 +264,9 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         "unsupported_capability: --pull: GitHub-only"
     );
     config.pull = args.pull.clone();
+    if !args.check_config {
+        eprintln!("{}", config.off_feature_summary());
+    }
     let limits = Limits {
         dispatch: args.max_dispatch.or(config.max_dispatch),
         writes: args.max_writes.or(config.max_writes),

@@ -19200,6 +19200,76 @@ fn v1_representative_config() {
 fn config_table() {
     let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
     let parsed = Config::parse(&minimal.to_string()).unwrap();
+    for (edit, feature, state) in [
+        (json!({}), "openPrCap", "unconfigured"),
+        (json!({"openPrCap": 6}), "openPrCap", "enabled"),
+        (json!({}), "pr.agentRecovery", "unconfigured"),
+        (
+            json!({"pr": {"agentRecovery": false}}),
+            "pr.agentRecovery",
+            "disabled",
+        ),
+        (
+            json!({"pr": {"agentRecovery": true}}),
+            "pr.agentRecovery",
+            "enabled",
+        ),
+        (
+            json!({"triageFollowUpDays": 0}),
+            "triageFollowUpDays",
+            "disabled",
+        ),
+        (json!({"authored": 1}), "authored", "enabled"),
+        (json!({"mix": {}}), "mix", "disabled"),
+        (json!({"follow": []}), "follow", "disabled"),
+        (json!({"follow": ["o/r"]}), "follow", "enabled"),
+        (json!({"triage": false}), "triage", "disabled"),
+        (json!({"overlap": {}}), "overlap", "enabled"),
+        (
+            json!({"pr": {"quietWaits": false}}),
+            "pr.quietWaits",
+            "enabled",
+        ),
+        (json!({"pr": {"fixRounds": 1}}), "pr.fixRounds", "enabled"),
+    ] {
+        let mut settings = minimal.clone();
+        settings
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        let config = Config::parse(&settings.to_string()).unwrap();
+        let summary = config.off_feature_summary();
+        let (unconfigured, disabled) = summary.split_once("; disabled [").unwrap();
+        let has = |part: &str| part.split(['[', ']', ',', ' ']).any(|s| s == feature);
+        assert_eq!(
+            has(unconfigured),
+            state == "unconfigured",
+            "{edit}: {summary}"
+        );
+        assert_eq!(has(disabled), state == "disabled", "{edit}: {summary}");
+        for part in [unconfigured.split_once('[').unwrap().1, disabled] {
+            let names: Vec<_> = part.trim_end_matches(']').split(", ").collect();
+            assert!(names.windows(2).all(|pair| pair[0] < pair[1]), "{summary}");
+        }
+    }
+    // No relaxation of null, type, range or unknown-field validation.
+    for edit in [
+        json!({"openPrCap": null}),
+        json!({"openPrCap": 0}),
+        json!({"authored": 0}),
+        json!({"pr": {"agentRecovery": null}}),
+        json!({"pr": {"agentRecovery": 0}}),
+        json!({"triage": null}),
+        json!({"mix": []}),
+        json!({"madeUpFeature": true}),
+    ] {
+        let mut settings = minimal.clone();
+        settings
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        assert!(Config::parse(&settings.to_string()).is_err(), "{edit}");
+    }
     assert!(!parsed.work() && parsed.triage.is_none() && parsed.follow.is_empty());
     assert!(parsed.pr.poll.no_merge.is_empty());
     assert!(!parsed.pr.poll.check_reruns && !parsed.poll(None).policy.check_reruns);
