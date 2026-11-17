@@ -15,10 +15,10 @@ fn run(id: u64, minutes: i64, conclusion: &str) -> Value {
     let created = iso(now() - minutes * 60_000);
     match conclusion {
         "queued" | "in_progress" | "waiting" => {
-            json!({"id": id, "created_at": created, "status": conclusion, "conclusion": null})
+            json!({"id": id, "created_at": created, "status": conclusion, "conclusion": null, "path": ".github/workflows/poll-apply.yml", "head_branch": "main"})
         }
         _ => {
-            json!({"id": id, "created_at": created, "status": "completed", "conclusion": conclusion})
+            json!({"id": id, "created_at": created, "status": "completed", "conclusion": conclusion, "path": ".github/workflows/poll-apply.yml", "head_branch": "main"})
         }
     }
 }
@@ -27,6 +27,7 @@ fn restarted(after: u64) -> Option<Record> {
     Some(Record {
         after,
         escalated: false,
+        created_at: now() - 60 * 60_000,
     })
 }
 
@@ -34,6 +35,7 @@ fn escalated(after: u64) -> Option<Record> {
     Some(Record {
         after,
         escalated: true,
+        created_at: now() - 60 * 60_000,
     })
 }
 
@@ -87,10 +89,7 @@ fn decisions() {
             "restart started nothing",
             vec![run(5, 93, "failure")],
             restarted(5),
-            escalate(
-                5,
-                "no poll run started after the restart, 93 minutes ago or more",
-            ),
+            escalate(5, "no poll run started after the restart, 60 minutes ago"),
         ),
         (
             "restarted pass failed",
@@ -169,7 +168,7 @@ fn records_round_trip_and_refuse_other_text() {
     for record in [restarted(5), escalated(12)] {
         let record = record.unwrap();
         let body = format!("{}\nmore text", record.line());
-        assert_eq!(Record::parse(&body), Some(record));
+        assert_eq!(Record::parse(&body, record.created_at), Some(record));
     }
     for body in [
         "",
@@ -178,7 +177,7 @@ fn records_round_trip_and_refuse_other_text() {
         "<!-- agent-board-pass-restart restarted after=5",
         "text\n<!-- agent-board-pass-restart restarted after=5 -->",
     ] {
-        assert_eq!(Record::parse(body), None, "{body:?}");
+        assert_eq!(Record::parse(body, now()), None, "{body:?}");
     }
 }
 
@@ -212,9 +211,9 @@ impl Fake {
     }
 }
 
-const RUNS: &str = "/repos/example/control/actions/workflows/poll.yml/runs?branch=main&exclude_pull_requests=true&per_page=100";
+const RUNS: &str = "/repos/example/control/actions/workflows/poll-apply.yml/runs?branch=main&exclude_pull_requests=true&per_page=100";
 const LOG: &str = "/repos/example/operator/issues/7/comments";
-const DISPATCH: &str = "/repos/example/control/actions/workflows/poll.yml/dispatches";
+const DISPATCH: &str = "/repos/example/control/actions/workflows/poll-apply.yml/dispatches";
 
 impl Api for Fake {
     fn get(&self, path: &str) -> Result<Value> {
@@ -247,7 +246,7 @@ impl Api for Fake {
 
 fn configured() -> Settings {
     let mut cfg = supervisor();
-    cfg[OPTION] = json!({"staleMinutes": 25, "inputs": {"apply": "true"}});
+    cfg[OPTION] = json!({"staleMinutes": 25, "inputs": {"apply": "true"}, "applyingWorkflow": "poll-apply.yml"});
     Settings::from_json(&board(), &cfg, None).unwrap()
 }
 
@@ -258,10 +257,226 @@ fn comment(login: &str, body: String) -> Value {
 const RUN_URL: &str = "https://github.com/example/control/actions/runs/77";
 
 #[test]
+fn two_ticks_with_delayed_listing_and_dispatch_errors() {
+    for (name, dispatch_fails, elapsed, visible, expected_writes, expected) in [
+        (
+            "delayed listing",
+            false,
+            5,
+            false,
+            0,
+            "waiting for visibility",
+        ),
+        (
+            "visibility grace expires",
+            false,
+            25,
+            false,
+            1,
+            "no poll run started after the restart, 25 minutes ago",
+        ),
+        (
+            "run becomes visible",
+            false,
+            5,
+            true,
+            0,
+            "poll run 6 is queued",
+        ),
+        (
+            "definite dispatch failure",
+            true,
+            5,
+            false,
+            0,
+            "the operator was told",
+        ),
+    ] {
+        let mut first = Fake::new(vec![run(5, 93, "failure")], vec![]);
+        first.dispatch_fails = dispatch_fails;
+        let line = super::run(&first, &configured(), "main", RUN_URL, now()).unwrap();
+        let writes = first.writes.borrow();
+        assert_eq!(writes.len(), if dispatch_fails { 3 } else { 2 }, "{name}");
+        assert_eq!(writes[0].0, LOG, "record before dispatch: {name}");
+        assert_eq!(writes[1].0, DISPATCH, "{name}");
+        if dispatch_fails {
+            assert!(
+                line.starts_with("escalated: starting it failed"),
+                "{name}: {line}"
+            );
+        }
+        let comments = writes.iter().filter(|(path, _)| path == LOG).map(|(_, body)| {
+            json!({"user": {"login": "worker"}, "created_at": NOW, "body": body["body"]})
+        }).collect();
+        let runs = if visible {
+            vec![run(6, 0, "queued"), run(5, 93, "failure")]
+        } else {
+            vec![run(5, 93, "failure")]
+        };
+        let second = Fake::new(runs, comments);
+        let line = super::run(
+            &second,
+            &configured(),
+            "main",
+            RUN_URL,
+            now() + elapsed * 60_000,
+        )
+        .unwrap();
+        assert!(line.contains(expected), "{name}: {line}");
+        assert_eq!(second.writes.borrow().len(), expected_writes, "{name}");
+        assert!(
+            second
+                .writes
+                .borrow()
+                .iter()
+                .all(|(path, _)| path != DISPATCH),
+            "never retry: {name}"
+        );
+    }
+}
+
+#[test]
+fn mixed_preview_and_apply_use_workflow_contract_not_titles() {
+    for (name, applying, record, expected) in [
+        (
+            "preview activity cannot hide stall",
+            vec![run(5, 93, "failure")],
+            None,
+            "started poll-apply.yml after poll run 5",
+        ),
+        (
+            "preview success cannot recover",
+            vec![run(5, 93, "failure")],
+            restarted(5),
+            "escalated: no poll run started",
+        ),
+        (
+            "applying activity counts",
+            vec![run(6, 1, "queued"), run(5, 93, "failure")],
+            restarted(5),
+            "poll run 6 is queued",
+        ),
+        (
+            "only applying chain recovers",
+            vec![
+                run(7, 30, "failure"),
+                run(6, 40, "success"),
+                run(5, 93, "failure"),
+            ],
+            restarted(5),
+            "started poll-apply.yml after poll run 7",
+        ),
+    ] {
+        let mut runs = vec![
+            run(10, 0, "in_progress"),
+            run(9, 30, "success"),
+            run(8, 40, "success"),
+        ];
+        for run in &mut runs {
+            run["path"] = json!(".github/workflows/poll.yml");
+            // A mutable apply-looking title is not trusted mode evidence.
+            run["display_title"] = json!("pass (apply)");
+        }
+        runs.extend(applying.into_iter().map(|mut run| {
+            run["display_title"] = json!("preview");
+            run
+        }));
+        let comments = record
+            .into_iter()
+            .map(|r| comment("worker", r.line()))
+            .collect();
+        let fake = Fake::new(runs, comments);
+        let line = super::run(&fake, &configured(), "main", RUN_URL, now()).unwrap();
+        assert!(line.starts_with(expected), "{name}: {line}");
+    }
+}
+
+#[test]
+fn legacy_records_keep_authenticated_creation_time() {
+    for (name, login, created, body, expected) in [
+        (
+            "legacy restarted",
+            "worker",
+            now() - 5 * 60_000,
+            "<!-- agent-board-pass-restart restarted after=5 -->",
+            "waiting for visibility",
+        ),
+        (
+            "legacy escalated",
+            "worker",
+            now() - 5 * 60_000,
+            "<!-- agent-board-pass-restart escalated after=5 -->",
+            "the operator was told",
+        ),
+        (
+            "legacy expired",
+            "worker",
+            now() - RECORD_LOOKBACK_MS - 1,
+            "<!-- agent-board-pass-restart restarted after=5 -->",
+            "started poll-apply.yml",
+        ),
+        (
+            "foreign recent record",
+            "someone",
+            now(),
+            "<!-- agent-board-pass-restart restarted after=5 -->",
+            "started poll-apply.yml",
+        ),
+    ] {
+        let fake = Fake::new(
+            vec![run(5, 93, "failure")],
+            vec![json!({
+                "user": {"login": login}, "created_at": iso(created), "updated_at": NOW, "body": body
+            })],
+        );
+        let line = super::run(&fake, &configured(), "main", RUN_URL, now()).unwrap();
+        assert!(line.contains(expected), "{name}: {line}");
+        if name == "legacy restarted" {
+            assert_eq!(
+                newest_record(&fake, &configured(), now())
+                    .unwrap()
+                    .unwrap()
+                    .created_at,
+                created
+            );
+        }
+    }
+}
+
+#[test]
+fn ambiguous_mode_never_writes_and_full_history_can_restart() {
+    for value in [
+        json!({"staleMinutes": 25}),
+        json!({"staleMinutes": 25, "applyingWorkflow": null}),
+    ] {
+        let mut cfg = supervisor();
+        cfg[OPTION] = value;
+        let settings = Settings::from_json(&board(), &cfg, None).unwrap();
+        assert!(
+            settings
+                .unset
+                .contains(&"restartPass.applyingWorkflow".into())
+        );
+        let fake = Fake::new(vec![run(5, 93, "success")], vec![]);
+        let line = super::run(&fake, &settings, "main", RUN_URL, now()).unwrap();
+        assert!(line.contains("applying recovery is unknown"), "{line}");
+        assert!(fake.bodies().is_empty());
+    }
+    let runs = (1..=RUN_PAGE as u64)
+        .rev()
+        .map(|id| run(id, 93 + (RUN_PAGE as i64 - id as i64) * 10, "failure"))
+        .collect();
+    let fake = Fake::new(runs, vec![]);
+    let line = super::run(&fake, &configured(), "main", RUN_URL, now()).unwrap();
+    assert_eq!(line, "started poll-apply.yml after poll run 100");
+    assert_eq!(fake.writes.borrow().len(), 2);
+}
+
+#[test]
 fn restarts_a_stalled_pass_once_and_records_it_first() {
     let fake = Fake::new(vec![run(5, 93, "failure")], vec![]);
     let line = super::run(&fake, &configured(), "main", RUN_URL, now()).unwrap();
-    assert_eq!(line, "started poll.yml after poll run 5");
+    assert_eq!(line, "started poll-apply.yml after poll run 5");
     let bodies = fake.bodies();
     assert_eq!(bodies.len(), 2, "{bodies:?}");
     assert!(
@@ -362,6 +577,7 @@ fn settings() {
         Some(RestartPass {
             stale_minutes: 25,
             inputs: [("apply".into(), "true".into())].into_iter().collect(),
+            applying_workflow: Some("poll-apply.yml".into()),
         })
     );
     assert!(!s.unset.contains(&OPTION.to_owned()));
@@ -379,6 +595,9 @@ fn settings() {
         json!({"staleMinutes": 1441}),
         json!({"staleMinutes": "25"}),
         json!({"staleMinutes": 25, "branch": "other"}),
+        json!({"staleMinutes": 25, "applyingWorkflow": true}),
+        json!({"staleMinutes": 25, "applyingWorkflow": "../poll.yml"}),
+        json!({"staleMinutes": 25, "applyingWorkflow": ""}),
         json!({"staleMinutes": 25, "inputs": ["apply"]}),
         json!({"staleMinutes": 25, "inputs": {"apply": true}}),
         json!({"staleMinutes": 25, "inputs": {"a b": "x"}}),

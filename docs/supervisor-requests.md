@@ -439,16 +439,29 @@ size bound. Do not pass agent-written text as this argument.
 most runs of a frequent cron, so the chain lives on each applying pass's
 [`pass next`](pass.md#the-next-pass); when a GitHub incident outlasted that
 step's tries, nothing started the next pass for 90 minutes (agent-board#715).
-Off unless the supervisor's file sets `restartPass`. It reads the newest 100
-runs of `pollWorkflow` on the default branch (`DEFAULT_BRANCH`) and the bot's
+Off unless the supervisor's file sets `restartPass.applyingWorkflow`. The
+concrete threat is preview activity hiding a stopped applying chain, or preview
+success clearing a restart's no-retry record. The REST listing does not expose
+dispatch inputs, and mutable run titles are not mode evidence. This one trusted
+caller setting names an **apply-only** workflow in `dispatchRepo`: every run on
+the default branch must apply, regardless of event or inputs. Do not point it at
+a mixed preview/apply workflow. Without it, applying recovery is unknown and
+restart reads and writes nothing; `unset` names `restartPass.applyingWorkflow`
+when `restartPass` is configured but this contract is absent.
+
+It reads the newest 100 runs of that workflow on the default branch (`DEFAULT_BRANCH`),
+checks their workflow path and branch, and reads the bot's
 records on `agent.log` from the last day, then:
 
-- While any listed run is unfinished, or the newest started less than
+- While any applying run is unfinished, or the newest started less than
   `staleMinutes` ago, it does nothing.
 - Otherwise, without a record, it posts its record on the log issue, then
-  dispatches `pollWorkflow` once on the default branch with `restartPass`'s
+  dispatches `applyingWorkflow` once on the default branch with `restartPass`'s
   `inputs` (such as `apply=true`). A dispatch that fails is escalated at once.
-- With a record, the restart has not taken unless a run after it succeeded
+- With a record, it allows `staleMinutes` from the authenticated comment's
+  `created_at` for delayed run visibility, not from the old stalled run. This
+  does not delay reporting a dispatch error. With a lost reply it never retries.
+  The restart has not taken unless an applying run after it succeeded
   and another started after that one. Then it posts one escalation on the log
   issue, mentioning the `operator`, with the error: the failed dispatch, the
   restarted run's conclusion, or that none started. With an escalation
@@ -461,7 +474,17 @@ comments, starting `<!-- agent-board-pass-restart restarted after=ID -->` or
 `... escalated after=ID -->` (ID the stalled run), by `bot` only. GH_TOKEN, the
 bot's, needs `actions: write` on `dispatchRepo` and to comment on the log
 issue; run it in the serialized execute job, as two at once may both restart.
+Legacy marker bodies remain supported without rewriting them: their authenticated
+comment creation time supplies the same grace, and an escalated marker still
+prevents another attempt. Reads remain bounded to ten comment pages.
 It prints what it did on stdout; a failed read fails it without a write.
+
+Deployment follow-up (not activated here): in `cgwalters-forge/tracker`, provide
+an apply-only `.github/workflows/poll-apply.yml` whose successor dispatches also
+target that workflow, then set `.github/supervisor/config.json` key
+`restartPass.applyingWorkflow` to `"poll-apply.yml"`. Its current `poll.yml`
+accepts preview dispatches, so it cannot satisfy this contract. Keep the setting
+absent until the caller enforces the apply-only behavior.
 
 ### Hand-back
 
@@ -758,10 +781,12 @@ while it is left out, so a dropped or misspelled key is seen:
   The health pass reads `passConfig` too: the `held` check leaves out a draft
   pull request whose base repository is in its `pr.noMerge`, the operator's
   promote queue; a file that does not read leaves `held` unavailable.
-- `restartPass`: `{"staleMinutes": 25, "inputs": {"apply": "true"}}`, the
+- `restartPass`: `{"staleMinutes": 25, "inputs": {"apply": "true"}, "applyingWorkflow": "poll-apply.yml"}`, the
   [pass restart](#pass-restart). `staleMinutes` is an integer from 20 to
   1440; `inputs`, at most 10 string inputs of at most 256 bytes, defaults to
-  none. Other keys are refused. It needs `agent`, whose log issue holds its
+  none. `applyingWorkflow` is an optional workflow filename (at most 100 bytes),
+  absent/null by default; it asserts the apply-only caller contract above and is
+  required before restart can act. Other keys are refused. It needs `agent`, whose log issue holds its
   record. Absent or null, `supervise restart` reads and writes nothing, and
   `unset` names it.
 
