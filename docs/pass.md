@@ -1295,11 +1295,11 @@ counted as one failure (an unreadable snapshot is counted once, by its own
 `usage.url` the line says pacing reads the published snapshot. Unlike
 `usage.cjs`, a pool the broker has no current week for (after a broker
 restart) is held (`no-reading`), not carried from the previous snapshot; and
-the snapshot has no `windows`, `workers` or Mistral allowance (the review app
+the snapshot has no `windows`, `workers` or Mistral allowance (the control app
 reads that from the pools file). Every pool's entry carries the pass's
 decision, `hold` and a `reason` (null unless held), and a paced one its
 `limit_percent`, `min(allowed_percent + burst, target_percent)`, past which it
-holds, so the review app shows that rather than its own. A recording keeps the
+holds, so the control app shows that rather than its own. A recording keeps the
 broker's answer under no address.
 
 #### Banked reset pacing (draft)
@@ -1351,7 +1351,7 @@ still no reading, or without a count, stays held, and the published snapshot
 holds it either way (`no-reading`).
 
 With `holds` set (off unless set; agent-board#307), the pass also publishes
-the holds of stages 3 and 4, so that the review app renders the pass's
+the holds of stages 3 and 4, so that the control app renders the pass's
 verdicts rather than deriving its own from labels. Each hold is decided as a
 typed value, a kind, a reason and whether it waits on the operator, and its
 `hold …` line is made from that
@@ -1390,7 +1390,7 @@ snapshot has one entry per such parent instead of one per child: the
 parent's `item` and `url`, `epic` true, the highest Priority among its held
 children, a reason that counts them and names up to three at the board's
 first two Priority options (P0 and P1), and `operator` true only where there
-is one, so that the review app asks the operator once to label the epic.
+is one, so that the control app asks the operator once to label the epic.
 The other kinds are `closed`, `needs-design` (labelled so: a parked design,
 which still blocks dispatch but asks the operator nothing), `needs-close`
 (an enabled triage close refused for news since its verdict, waiting on the
@@ -1499,7 +1499,7 @@ PR and plan work is never carried as current across an unread pass. The
 enclosing snapshot's `at` is the observation clock. If the comment cannot
 fit, this optional section is omitted before any existing hold or operator
 inbox detail is evicted; absence means unavailable, not zero work. Unchanged
-work alone causes no publication. Forgejo and the review app renderer are
+work alone causes no publication. Forgejo and the control app renderer are
 not implemented by this extension.
 
 The recovery and queue rules are in [PR follow-up](poll.md#dispatching-machine-work).
@@ -1548,7 +1548,7 @@ With `holds.today: true` (off by default; GitHub only), an applying pass adds
 `today` to the existing private holds snapshot, not the public `data` branch.
 The [fixture](../fixtures/today.json) is the `agent-board/today/v1` consumer
 contract. It contains no item titles, links, model names or per-run records.
-The Today UI is a separate change in the review app; this publishes its data.
+The Today UI is a separate change in the control app; this publishes its data.
 
 `day` is the injected pass clock's UTC calendar date and `observed_at` is its
 RFC 3339 time. `changes` counts `landed`, `closed` and `opened` from 00:00 UTC
@@ -1600,7 +1600,7 @@ publication off unless public spend has separately been approved.
 #### Pass view
 
 With `holds.passView` set (off unless set; GitHub only; agent-board#726), the snapshot
-also has `pass_view`, what the review app's pass view reads (review
+also has `pass_view`, what the control app's pass view reads (review
 `src/github/passview.ts`), so the operator can see what the poller is doing:
 
 ```json
@@ -1638,7 +1638,7 @@ whole. The pass's line says `holds: published URL, with the pass view`.
 #### Epic focus
 
 With `holds.epicFocus: true` (off by default; needs `epics` and a GitHub
-board; agent-board#813), the snapshot also has `epic_focus`, what review's
+board; agent-board#813), the snapshot also has `epic_focus`, what the control app's
 Focus view (review#298) reads: a card for each open epic of
 `epics.repository` whose board Priority is `P0`. The
 [fixture](../fixtures/epic-focus.json) is the consumer contract; its test
@@ -1720,7 +1720,7 @@ needed for callers already publishing holds.
 
 With `holds.needsYou` set (off unless set; tracker#976), the snapshot also
 has `needs_you`, after `pass` and any `leases`: the ranked list of what waits
-on the operator, for review's needs-you view, so that review need not work
+on the operator, for the control app's needs-you view, so that the control app need not work
 out its own. It goes only where the hold snapshot goes, the bot's own
 comment in a private repository, and is made from the published holds and
 from what the pass read of its followed pull requests, proposals and
@@ -1759,7 +1759,7 @@ The asks come from five sources, each named by an item's `source`:
    action, the earliest wait, and optional `group: {"reason", "numbers"}`
    metadata with sorted PR numbers. Its `target` links the repository's open
    PR list (drafts only for draft groups); that list may include other PRs,
-   but also includes stops not yet labelled. Existing v2 readers, including review's
+   but also includes stops not yet labelled. Existing v2 readers, including the control app's
    `src/github/holds.ts`, ignore the optional field and still open the
    representative PR via `action`; group-aware readers can show the full list.
   What the poll goes on with by itself is not listed: a run, check, review,
@@ -1847,7 +1847,7 @@ the ranked lightweight inventory, each entry with `key`, `item`,
 `topEpic`. It is published compact, leaving out what is derivable or default:
 `key` where it is `item` in lower case, `detail_key` where it is `key`, `topEpic`
 where it is `epic`, `priority` where there is none (null) and `carried` where false.
-The pass reads back the compact and the earlier full form alike. Review's
+The pass reads back the compact and the earlier full form alike. The control app's
 `src/github/holds.ts` does not read `identities` yet.
 `count` is the number of decisions; normally it is the inventory's length.
 `items` is the detailed projection joined by
@@ -1929,7 +1929,7 @@ grouped or moved-head rows neither consume the cap nor add to `omitted`; freed
 slots are filled from this pass's existing observations, without another read.
 The identity inventory, counts and order are unchanged by it. The schema
 is versioned inside the extension; needs-you stays v2, and readers that do not
-know it, including review's current `src/github/holds.ts`, ignore it.
+know it, including the control app's current `src/github/holds.ts`, ignore it.
 `observed_at` is this pass's clock, and alone neither moves `changed_at` nor
 forces a write. No request, write, action or permission is added: stage 2's
 existing pull request query now also asks for `additions` and `deletions`, and
@@ -1942,7 +1942,7 @@ evidence itself from pull request reads.
 #### Act now (optional v2 extension)
 
 With `holds.actNow` (off unless set; needs `holds.needsYou` and
-`holds.approvalEvidence`, GitHub only; agent-board#760), the list also has `act_now`, the shortlist review's Act now
+`holds.approvalEvidence`, GitHub only; agent-board#760), the list also has `act_now`, the shortlist the control app's Act now
 section shows above the rest. The threat it stops is the app showing as the
 operator's to act on what waits on CI, an agent or an upstream author, or
 guessing from prose what one decision unblocks: the pass picks the records
@@ -1990,7 +1990,7 @@ card by `key`; multiple distinct decisions can describe one combined legacy card
 New readers identify decisions by `identity` plus `revision`, not by card key;
 `requests.length` counts decisions and `count` still counts legacy cards. Each
 descriptor includes its own clipped question and recommendation. It adds no fields to the strict v2 `Ask` record: old consumers,
-including review's `src/github/holds.ts`, can keep reading `items`, `action` and
+including the control app's `src/github/holds.ts`, can keep reading `items`, `action` and
 `source_ref`. Existing grouping, summary parsing, cache validation and request/time
 caps remain in force. Descriptors derive only from existing reads; the publication
 size cap cuts descriptors with their detail card, preserving inventory identities
@@ -2040,15 +2040,15 @@ approval wait, not checks or merge policy. The concrete threat avoided is treati
 stale digest/bot prose or a done verdict as operator authorization for a changed
 head or an unresolved human hold. No option, endpoint, credential or write is added.
 
-Caller/review compatibility: publication stays off by default behind existing
-`holds.needsYou`; deployments already using it need no config change. Review can
+Caller/control app compatibility: publication stays off by default behind existing
+`holds.needsYou`; deployments already using it need no config change. The control app can
 adopt descriptors independently, must retain legacy rendering when absent, show
 quality diagnostics, and re-read targets before acting. No caller option is added.
 Replay tests cover generic holds, digest/live equivalence, distinct proposal
 comments, changed heads and answered waits. Authorized live
 `cgwalters-forge/bot-ops` data was inaccessible (HTTP 404) during implementation;
 acceptance uses existing synthetic/redacted offline fixtures, not a saved live
-publication or authenticated review rendering. Live parity checks, including the
+publication or authenticated control app rendering. Live parity checks, including the
 #621 done-verdict-held-for-human pattern, remain unverified.
 
 #### Decisions and review-draft inbox sources
@@ -2116,7 +2116,7 @@ alone do not change `changed_at` or force a write, or a step's checks would
 write every pass; a source read or unread, or a pool that starts or stops
 holding, does, and hourly confirmation still refreshes the rest.
 
-`fixtures/needs-you-real-2026-11-03.json` is review's redacted copy of the
+`fixtures/needs-you-real-2026-11-03.json` is the control app's redacted copy of the
 real 3 November publication and holds, spend removed. `real_publication_replay`
 replays it: Priority/age order, canonical counts, fitting, an unchanged pass
 that keeps `changed_at` while `validated_at` advances, and one source read and
@@ -2136,8 +2136,8 @@ descriptors, and a `pr.operatorPaths` approval ranked last. The test
 `approvals_survive_fitting_the_174_decision_board` builds it from stage 2's
 waits, fits it past the cap and checks that every approval keeps its card,
 head, descriptor and source record, that the totals stay, and that the same
-board next pass writes nothing. Review can replay the fixture with its parser;
-this repository does not run review's parser.
+board next pass writes nothing. The control app can replay the fixture with its parser;
+this repository does not run the control app's parser.
 `fixtures/needs-you-chains-sanitized.json` is an explicitly representative
 model, not a historical API recording. It asserts the reported
 `composefs-rs#33` → `tracker#160` assignment and synthetic cross-repository
@@ -2155,7 +2155,7 @@ separate poll config), and `holds.drafts = "cgwalters-forge/tracker"`;
 keep `holds.needsYou = true`. Its `.github/workflows/poll.yml`
 `env.AGENT_BOARD_REV` must advance to the reviewed commit containing this
 change, not a moving branch. A producer merge alone is not deployment or
-acceptance; compare the private publication with review's authenticated
+acceptance; compare the private publication with the control app's authenticated
 rendering after that caller change.
 
 `sources` says how much of each source the pass read: `complete`;
@@ -2250,7 +2250,7 @@ rather than a mix of two. That can happen while a pass writes, or if
 someone edits a comment. Unused parts are left as they are, so the issue
 holds at most 6 part comments. A publication that would add a comment past
 the first 100 is refused before any write. The pass reads only the first page of 100 comments on
-the holds issue, as the review app does, and past it publishes nothing
+the holds issue, as the control app does, and past it publishes nothing
 (`holds error: …more than 1 pages of comments`). Its needs-you list carries
 over only where the bot last edited the first comment and every part used.
 The pass's line adds `, compressed across N comments`
@@ -2285,7 +2285,7 @@ decisions within the cap. Each card costs about 3,000 characters with its
 descriptor and source record, about 1,000 of them the descriptor's fixed
 action reasons and resolution text, so that few cards fit beside a large
 inventory and many operator holds. Sharing that text between descriptors
-would need a new contract with review, so it is not done here.
+would need a new contract with the control app, so it is not done here.
 Should the inventory and protected holds still not
 fit once every detail card is gone, a last resort leaves out, in order, the
 source carry records no card is left for, then the lowest ranked identities,
@@ -3174,7 +3174,7 @@ slice must check its rows against what they index. For the same reason the
 pass's cursors stay in `state`, which the caller must supply as trusted
 state ([above](#persisting-conditional-responses)); they can move only once
 the store is restored the same way. The plan comments and the hold snapshot comment keep their fenced
-JSON: the job's claims name plan comments and review's `src/github/holds.ts`
+JSON: the job's claims name plan comments and the control app's `src/github/holds.ts`
 reads the snapshot, so those fences end only with a change on their side.
 The one exception is the changes diff's watermarks, which
 [`changeSweepHours`](#change-driven-pull-request-walk) reads; why a forged
@@ -4745,7 +4745,7 @@ that `--max-dispatch` did not hold (stages 2 to 4, `started` above), applied an 
 a pull request or added it to a merge queue; otherwise the published
 one's, or `at` where there is none. A time that does not parse, or is later than
 `at`, carries nothing over. Either alarm is one more entry of kind
-`stalled`, with `operator` true so that the review app shows it as the
+`stalled`, with `operator` true so that the control app shows it as the
 operator's, and a `stall …` line in the pass's log:
 
 - **The same hold too long.** A hold of kind `other`, `unreadable` or
@@ -4777,7 +4777,7 @@ operator's, and a `stall …` line in the pass's log:
   waiting on another is no stall. Past a hold of every new run (`pools`
   partway through, say) only those held for a reason that stalls count. The log is the
   GitHub Actions run of the pass that first said so (none outside one),
-  kept while the alarm stands, since the review app links only an
+  kept while the alarm stands, since the control app links only an
   item's own issue.
 
 Neither reason counts the hours gone by, so a snapshot that stays stalled
@@ -5380,7 +5380,7 @@ reviewed, still counts for its day, but acknowledges no heads.
 The digest comment is a markdown summary, then one fenced block with the info
 string `agent-board-maintain-digest` holding one JSON object,
 `agent-board/maintain-digest/v1`. The pass reads only its `schema`, `date`
-and each group's `pr` and `head`, to acknowledge heads ([step 2](#maintain)); review's Maintain
+and each group's `pr` and `head`, to acknowledge heads ([step 2](#maintain)); the control app's Maintain
 view reads it all ([review#186](https://github.com/cgwalters-forge/review/pull/186),
 `src/github/maintain.ts`), and this is its schema.
 `fixtures/pass/maintain-digest.md` is the example the brief shows, for
@@ -5548,7 +5548,7 @@ nothing.
 ## Leases
 
 The pass's WIP limit and pacing bound only what the pass starts; a run
-dispatched by hand, by a peer agent or by the review app skips them
+dispatched by hand, by a peer agent or by the control app skips them
 (agent-board#382). A lease is a slot of the runs' capacity that a run takes
 before any inference, whoever started it. `agent-board admit --config FILE
 --pool P --item OWNER/REPO#N --run ID` takes one with GH_TOKEN, and exits
@@ -6027,7 +6027,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `usage.url` | Broker usage endpoint; absent reads the published snapshot instead of refreshing |
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
-| `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
+| `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the control app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
 | `holds.needsYou` | Add the ranked [needs-you list](#what-is-built) (`agent-board/needs-you/v2`) to the hold snapshot; needs `holds`; `false` |
 | `holds.proposals` | `{"repository", "label", "repositories", "org"?}`: list in the needs-you list the operator-action proposals on that repository's open issues with that label, checked as `action check` would with those `repositories` and `org`; needs `holds.needsYou`; absent (off) |
 | `holds.drafts` | Repository whose open `review-draft` issues the needs-you list reads with review-send's source rules; needs `holds.needsYou`, GitHub only; absent (off) |

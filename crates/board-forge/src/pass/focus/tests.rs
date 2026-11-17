@@ -163,7 +163,7 @@ fn blockers(card: &Value) -> Vec<(String, Value)> {
         .collect()
 }
 
-/// The focus of [`world`] is the synthetic wire fixture review's Focus view
+/// The focus of [`world`] is the synthetic wire fixture the control app's Focus view
 /// reads (`fixtures/epic-focus.json`).
 #[test]
 fn focus_matches_the_wire_fixture() {

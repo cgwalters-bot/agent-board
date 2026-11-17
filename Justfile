@@ -65,7 +65,7 @@ decision-diff base:
 cli-docs:
     cargo run --locked -q -p agent-board -- help-markdown > docs/cli.md
 
-# NODE_PATH must provide Ajv 8, the review site's JSON Schema validator.
+# NODE_PATH must provide Ajv 8, the control app's JSON Schema validator.
 test-action-schema:
     node tests/operator-actions.cjs
 

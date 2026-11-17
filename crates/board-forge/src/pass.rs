@@ -172,7 +172,7 @@ const PULL_PAGES: usize = 3;
 /// Comment pages of the usage or holds issue read to find the bot's snapshot.
 const USAGE_PAGES: usize = 10;
 /// The pages of 100 comments read on the holds issue: every part of the
-/// snapshot is read, and the review app reads no more.
+/// snapshot is read, and the control app reads no more.
 const HOLDS_PAGES: usize = 1;
 /// The comments a page of an issue's lists, as `per_page` asks.
 const COMMENTS_PER_PAGE: usize = 100;
@@ -1240,7 +1240,7 @@ pub struct Usage {
 }
 
 /// Where an applying pass publishes its holds ([`holds::HOLDS_SCHEMA`]) for
-/// the review app: the bot's own comment on `issue`, in a private
+/// the control app: the bot's own comment on `issue`, in a private
 /// repository, as the usage snapshot is.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -7046,7 +7046,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn hold_comments(&self, on: (&str, u64)) -> Result<HoldComments> {
         let markers = [holds::HOLDS_MARKER, holds::PART_MARKER];
         let what = (markers.as_slice(), "hold snapshot");
-        // Within the reads kept for it, as the review app reads only the
+        // Within the reads kept for it, as the control app reads only the
         // first page.
         let read = (false, HOLDS_PAGES);
         let (found, seen) = bot_comments(&self.client, &self.config.bot, on, what, read)?;

@@ -4,7 +4,7 @@
 //! each open pull request of the bot in the followed ones, and say when the
 //! next pass is due. It previews unless the caller passes an [`Apply`].
 //!
-//! GET requests go through one response cache, as the review app's does
+//! GET requests go through one response cache, as the control app's does
 //! (cgwalters-forge/review `src/github/api.ts`): each is revalidated with
 //! `If-None-Match`, or `If-Modified-Since` where GitHub sent no ETag, and a 304
 //! (which costs no rate budget) reuses the stored body. The cache lives in a

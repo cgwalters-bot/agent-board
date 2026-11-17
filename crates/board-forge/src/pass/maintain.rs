@@ -570,7 +570,7 @@ fn brief(
 }
 
 /// The digest of made-up pull requests the brief shows for the day `date`:
-/// the schema review's Maintain view reads (cgwalters-forge/review#186),
+/// the schema the control app's Maintain view reads (cgwalters-forge/review#186),
 /// with each of its four groups.
 fn example(date: time::Date) -> Value {
     let head = |digit: char| digit.to_string().repeat(40);
