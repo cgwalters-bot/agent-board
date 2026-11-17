@@ -36,6 +36,7 @@ struct Fake {
     responses: RefCell<serde_json::Map<String, Value>>,
     apply: bool,
     writes: RefCell<Vec<String>>,
+    trees: RefCell<Vec<(String, Value)>>,
     /// Who posts the comments, and when, where a listing of them is recorded.
     bot: String,
     now: String,
@@ -74,6 +75,7 @@ impl Api for Fake {
         if method != "GET" {
             assert!(self.apply, "a preview wrote: {method} {path}");
             if path.ends_with("/git/trees") {
+                self.trees.borrow_mut().push((path.into(), body.clone()));
                 let responses = self.responses.borrow();
                 if let Some(expected) = responses
                     .get("expectedTreeContent")
@@ -98,6 +100,27 @@ impl Api for Fake {
             let mut writes = self.writes.borrow_mut();
             writes.push(format!("{method} {path}"));
             let id = writes.len();
+            if method == "POST" && path.ends_with("/pulls") {
+                let fork = writes
+                    .iter()
+                    .rev()
+                    .find_map(|w| w.strip_prefix("POST /repos/")?.strip_suffix("/git/commits"))
+                    .unwrap();
+                let repo = path
+                    .strip_prefix("/repos/")
+                    .unwrap()
+                    .strip_suffix("/pulls")
+                    .unwrap();
+                let head = body["head"].as_str().unwrap();
+                let branch = head.split_once(':').unwrap().1;
+                let pr = json!({"state": "open", "merged_at": null, "html_url": format!("https://example/{id}"),
+                    "created_at": self.now, "head": {"ref": branch, "repo": {"full_name": fork}},
+                    "base": {"ref": body["base"], "repo": {"full_name": repo, "default_branch": body["base"]}}});
+                for state in ["all", "open"] {
+                    let key = format!("/repos/{repo}/pulls?state={state}&head={head}&per_page=100");
+                    self.responses.borrow_mut().insert(key, json!([pr]));
+                }
+            }
             let listing = format!("{path}?per_page=100");
             if let Some(Value::Array(comments)) = self.responses.borrow_mut().get_mut(&listing) {
                 comments.push(json!({"id": id, "user": {"login": self.bot},
@@ -417,6 +440,7 @@ fn replay(fixture: &Value, apply: bool) -> Result<String, String> {
         responses: RefCell::new(fixture["responses"].as_object().unwrap().clone()),
         apply,
         writes: RefCell::default(),
+        trees: RefCell::default(),
         bot: config.bot.clone(),
         now: fixture["now"].as_str().unwrap().into(),
     };
@@ -433,6 +457,7 @@ fn replay(fixture: &Value, apply: bool) -> Result<String, String> {
 #[test]
 fn previews_print_what_train_cjs_printed() {
     for (name, _, expected) in CASES {
+        println!("recorded preview {name}:\n{expected}");
         assert_eq!(
             replay(&fixture(name), false).as_deref(),
             Ok(*expected),
@@ -829,6 +854,9 @@ fn config_refuses_what_it_cannot_use() {
             "callers": []})
     };
     assert!(Config::from_json(&valid()).is_ok());
+    let mut omitted = valid();
+    omitted.as_object_mut().unwrap().remove("callers");
+    assert!(Config::from_json(&omitted).unwrap().callers.is_empty());
     // A pointer into the configuration, its value, then the error.
     for (pointer, value, expected) in [
         (
@@ -858,6 +886,606 @@ fn config_refuses_what_it_cannot_use() {
             format!("{error:#}").contains(expected),
             "{pointer}: {error:#}"
         );
+    }
+}
+
+const OWNER_REPOS: &str =
+    "/orgs/cgwalters-forge/repos?type=all&sort=full_name&direction=asc&per_page=100&page=1";
+const BOT_REPOS: &str =
+    "/user/repos?affiliation=owner&visibility=all&sort=full_name&direction=asc&per_page=100&page=1";
+const CALLER_HEAD: &str = "1111111111111111111111111111111111111111";
+const WRAPPER_MERGE: &str = "2222222222222222222222222222222222222222";
+const CALLER_WORKFLOW: &str = ".github/workflows/review.yml";
+
+/// The historical recording lacks inventory/tree reads and never reached the
+/// callers. Extend it explicitly, not by treating missing reads as empty lists.
+fn discovery_fixture(current: bool) -> Value {
+    let mut f = fixture("wrappers-887");
+    let mut wrapper_pr = f["responses"]["/repos/cgwalters-forge/agentic-job/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100"][0].clone();
+    wrapper_pr["head"]["repo"]["full_name"] = json!("cgwalters-bot/actions-1");
+    wrapper_pr["base"]["repo"]["full_name"] = json!("cgwalters-forge/actions");
+    wrapper_pr["merge_commit_sha"] = json!(WRAPPER_MERGE);
+    let r = &mut f["responses"];
+    r["/repos/cgwalters-forge/actions/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100"] =
+        json!([wrapper_pr]);
+    r[format!("/repos/cgwalters-forge/actions/compare/main...{WRAPPER_MERGE}")] =
+        json!({"status": "behind"});
+    r["/user"] = json!({"login": "cgwalters-bot", "public_repos": 4, "owned_private_repos": 0});
+    r["/users/cgwalters-forge"] = json!({"type": "Organization"});
+    r["/orgs/cgwalters-forge"] = json!({"public_repos": 6, "owned_private_repos": 0});
+    let names = [
+        "tracker",
+        "agent-board",
+        "cgwalters-forge.github.io",
+        "archived",
+        "fork",
+        "unrelated",
+    ];
+    r[OWNER_REPOS] = json!(
+        names
+            .iter()
+            .map(
+                |name| json!({"full_name": format!("cgwalters-forge/{name}"),
+        "archived": *name == "archived", "fork": *name == "fork", "default_branch": "main"})
+            )
+            .collect::<Vec<_>>()
+    );
+    let forks = ["tracker", "agent-board", "renamed-site", "wrong-parent"];
+    r[BOT_REPOS] = json!(
+        forks
+            .iter()
+            .map(|name| json!({"full_name": format!("cgwalters-bot/{name}"), "fork": true}))
+            .collect::<Vec<_>>()
+    );
+    for (name, parent) in [
+        ("tracker", "tracker"),
+        ("agent-board", "agent-board"),
+        ("renamed-site", "cgwalters-forge.github.io"),
+        ("wrong-parent", "other"),
+    ] {
+        r[format!("/repos/cgwalters-bot/{name}")] =
+            json!({"parent": {"full_name": format!("cgwalters-forge/{parent}")}});
+    }
+    let pin = if current { WRAPPER_MERGE } else { CALLER_HEAD };
+    let reference = format!("cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@{pin}");
+    for name in [
+        "tracker",
+        "agent-board",
+        "cgwalters-forge.github.io",
+        "unrelated",
+    ] {
+        let repo = format!("cgwalters-forge/{name}");
+        r[format!("/repos/{repo}")] = json!({"default_branch": "main"});
+        r[format!("/repos/{repo}/commits/main")] =
+            json!({"sha": CALLER_HEAD, "commit": {"tree": {"sha": CALLER_HEAD}}});
+        r[format!("/repos/{repo}/git/trees/{CALLER_HEAD}?recursive=1")] = json!({"truncated": false, "tree": [
+            {"path": CALLER_WORKFLOW, "type": "blob", "mode": "100644"},
+            {"path": "src/not-a-workflow.yml", "type": "blob", "mode": "100644"}
+        ]});
+        let content = if name == "unrelated" {
+            format!(
+                "jobs:\n  review:\n    uses: unrelated/actions/.github/workflows/cgwalters-review.yml@{pin}\n"
+            )
+        } else {
+            format!("jobs:\n  review:\n    uses: {reference} # agentic-job v0.6.3\n")
+        };
+        r[format!("/repos/{repo}/contents/{CALLER_WORKFLOW}?ref={CALLER_HEAD}")] =
+            json!({"encoding": "base64", "content": base64(&content)});
+        r[format!(
+            "/repos/{repo}/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100"
+        )] = json!([]);
+        r[format!(
+            "/repos/{repo}/pulls?state=open&head=cgwalters-bot:release-train/v0.6.4&per_page=100"
+        )] = json!([]);
+    }
+    for (repo, path) in [
+        ("tracker", ".github/poll/poll.test.cjs"),
+        ("agent-board", ".github/agentic-job/test_review.py"),
+    ] {
+        r[format!("/repos/cgwalters-forge/{repo}/contents/{path}?ref={CALLER_HEAD}")] = json!({"encoding": "base64", "content": base64(&format!("assert pin == '{reference}'\n"))});
+    }
+    f
+}
+
+#[test]
+fn discovery_finds_the_unlisted_site_and_adds_fixture_exceptions() {
+    for apply in [false, true] {
+        let f = discovery_fixture(false);
+        let out = replay(&f, apply).unwrap();
+        if !apply {
+            println!("synthetic discovery preview (historical recording extended):\n{out}");
+        }
+        assert!(out.contains("v0.6.4: callers\n"), "{out}");
+        for repo in ["agent-board", "cgwalters-forge.github.io", "tracker"] {
+            assert!(out.contains(&format!("caller cgwalters-forge/{repo} {CALLER_WORKFLOW} .github/workflows/cgwalters-review.yml {CALLER_HEAD}")), "{out}");
+            assert_eq!(
+                out.matches(&format!("open a PR on cgwalters-forge/{repo} "))
+                    .count(),
+                1,
+                "{out}"
+            );
+        }
+        assert!(out.contains("from cgwalters-bot/renamed-site:"));
+        assert!(
+            out.contains(
+                "changing .github/agentic-job/test_review.py, .github/workflows/review.yml"
+            )
+        );
+        assert!(!out.contains("caller cgwalters-forge/unrelated"));
+        assert!(!out.contains("caller cgwalters-forge/archived"));
+        assert!(!out.contains("caller cgwalters-forge/fork "));
+    }
+    // Empty and omitted exceptions discover workflows without hand-kept lists.
+    for omitted in [false, true] {
+        let mut f = discovery_fixture(false);
+        if omitted {
+            f["config"].as_object_mut().unwrap().remove("callers");
+        } else {
+            f["config"]["callers"] = json!([]);
+        }
+        let out = replay(&f, false).unwrap();
+        assert!(out.contains("from cgwalters-bot/renamed-site:"));
+        assert!(!out.contains("test_review.py"));
+    }
+}
+
+#[test]
+fn workflow_references_are_exact_and_commit_pinned() {
+    let wrappers = config().wrappers;
+    let reference = format!("example/actions/.github/workflows/review.yml@{CALLER_HEAD}");
+    for (text, count, valid) in [
+        (
+            format!("jobs: {{review: {{uses: '{reference}'}}}}"),
+            1,
+            true,
+        ),
+        (
+            format!(
+                "jobs:\n  a:\n    uses: {reference}\n  b:\n    uses: example/actions/.github/workflows/review.yml@{WRAPPER_MERGE}\n"
+            ),
+            2,
+            true,
+        ),
+        (format!("# uses: {reference}\njobs: {{}}"), 0, true),
+        (
+            format!("jobs: {{build: {{steps: [{{run: 'uses: {reference}'}}]}}}}"),
+            0,
+            true,
+        ),
+        (
+            format!("jobs: {{review: {{uses: 'other/{reference}'}}}}"),
+            0,
+            true,
+        ),
+        (
+            format!(
+                "jobs: {{review: {{uses: '{}'}}}}",
+                reference.replace("review.yml", "review-other.yml")
+            ),
+            0,
+            true,
+        ),
+        (
+            format!(
+                "jobs: {{review: {{uses: '{}'}}}}",
+                reference.replace(CALLER_HEAD, "v1.2.3")
+            ),
+            0,
+            false,
+        ),
+        (
+            format!(
+                "jobs: {{review: {{uses: '{}'}}}}",
+                reference.replace(CALLER_HEAD, &"a".repeat(39))
+            ),
+            0,
+            false,
+        ),
+        (
+            format!("jobs: {{review: {{uses: '{}a'}}}}", reference),
+            0,
+            false,
+        ),
+        (
+            format!(
+                "jobs: {{review: {{uses: '{}'}}}}",
+                reference.replace(CALLER_HEAD, &"g".repeat(40))
+            ),
+            0,
+            false,
+        ),
+    ] {
+        let result = caller_pins(&text, &wrappers, false);
+        assert_eq!(result.is_ok(), valid, "{text}: {result:?}");
+        if valid {
+            assert_eq!(result.unwrap().len(), count, "{text}");
+        }
+    }
+    let files = vec![
+        (
+            CALLER_WORKFLOW.into(),
+            format!(
+                "jobs: {{a: {{uses: '{reference}'}}, b: {{uses: 'example/actions/.github/workflows/review.yml@{WRAPPER_MERGE}'}}}}"
+            ),
+        ),
+        ("tests/pin.txt".into(), format!("'{reference}'")),
+    ];
+    let to = Pin {
+        pin: WRAPPER_MERGE.into(),
+        version: "0.6.4".into(),
+    };
+    let moved = repin_caller(&files, &wrappers, "tool", &to).unwrap();
+    assert_eq!(moved.len(), 2);
+    assert!(moved.iter().all(|(_, t)| !t.contains(CALLER_HEAD)));
+    assert!(
+        repin_caller(&moved, &wrappers, "tool", &to)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn discovery_refuses_missing_ambiguous_wrong_parent_and_incomplete_reads() {
+    for (path, value, reason) in [
+        (
+            BOT_REPOS.to_owned(),
+            json!([]),
+            "incomplete repository inventory",
+        ),
+        (
+            "/repos/cgwalters-bot/renamed-site".into(),
+            json!({"parent": {"full_name": "cgwalters-forge/wrong"}}),
+            "missing or ambiguous bot fork",
+        ),
+        (
+            format!("/repos/cgwalters-forge/tracker/git/trees/{CALLER_HEAD}?recursive=1"),
+            json!({"truncated": true, "tree": []}),
+            "truncated tree",
+        ),
+        (
+            OWNER_REPOS.into(),
+            json!({"incomplete_results": true}),
+            "listing is not a list",
+        ),
+        (OWNER_REPOS.into(), Value::Null, "HTTP 404"),
+        (
+            "/user".into(),
+            json!({"login": "someone-else"}),
+            "configured bot identity",
+        ),
+    ] {
+        let mut f = discovery_fixture(false);
+        f["responses"][path] = value;
+        let error = replay(&f, true).unwrap_err();
+        assert!(error.contains(reason), "{error}");
+    }
+    let mut f = discovery_fixture(false);
+    f["responses"][BOT_REPOS]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"full_name": "cgwalters-bot/second-site", "fork": true}));
+    f["responses"]["/repos/cgwalters-bot/second-site"] =
+        json!({"parent": {"full_name": "cgwalters-forge/cgwalters-forge.github.io"}});
+    f["responses"]["/user"]["public_repos"] = json!(5);
+    assert!(replay(&f, true).unwrap_err().contains("2 candidates"));
+    f["config"]["callers"].as_array_mut().unwrap().push(json!({"repository": "cgwalters-forge/cgwalters-forge.github.io", "fork": "cgwalters-bot/renamed-site", "files": []}));
+    assert!(
+        replay(&f, false)
+            .unwrap()
+            .contains("from cgwalters-bot/renamed-site:")
+    );
+    f["config"]["callers"][2]["fork"] = json!("cgwalters-bot/wrong-parent");
+    assert!(replay(&f, true).unwrap_err().contains("is not a fork of"));
+}
+
+#[test]
+fn complete_discovery_controls_preview_and_apply_stages() {
+    let site_pull = "/repos/cgwalters-forge/cgwalters-forge.github.io/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100";
+    for apply in [false, true] {
+        for (current, state, merged, expected) in [
+            (false, None, false, "v0.6.4: callers"),
+            (true, None, false, "v0.6.4: done"),
+            (true, Some("open"), false, "v0.6.4: wait"),
+            (true, Some("closed"), false, "v0.6.4: stall"),
+            (true, Some("closed"), true, "v0.6.4: done"),
+        ] {
+            let mut f = discovery_fixture(current);
+            if let Some(state) = state {
+                let mut pr = f["responses"]["/repos/cgwalters-forge/actions/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100"][0].clone();
+                pr["state"] = json!(state);
+                pr["merged_at"] = if merged {
+                    json!("2026-10-23T12:00:00Z")
+                } else {
+                    Value::Null
+                };
+                pr["head"]["repo"]["full_name"] = json!("cgwalters-bot/renamed-site");
+                pr["base"]["repo"]["full_name"] =
+                    json!("cgwalters-forge/cgwalters-forge.github.io");
+                f["responses"][site_pull] = json!([pr]);
+            }
+            let first = replay(&f, apply).unwrap();
+            assert!(first.contains(expected), "{first}");
+            assert_eq!(first, replay(&f, apply).unwrap(), "repeated pass drift");
+            if current {
+                assert!(!first.contains("/git/trees"));
+            }
+        }
+    }
+}
+
+#[test]
+fn inventories_paginate_and_never_accept_partial_coverage() {
+    let page2 = OWNER_REPOS.replace("&page=1", "&page=2");
+    for (second, expected) in [
+        (Some(json!([])), None),
+        (
+            Some(
+                json!([{"full_name": "cgwalters-forge/archived-0", "fork": false, "archived": true}]),
+            ),
+            Some("duplicate"),
+        ),
+        (None, Some("HTTP 404")),
+    ] {
+        let mut f = discovery_fixture(false);
+        // Full first page of excluded repositories must still read page two.
+        f["responses"][OWNER_REPOS] = json!((0..100).map(|i| json!({"full_name": format!("cgwalters-forge/archived-{i}"), "fork": false, "archived": true})).collect::<Vec<_>>());
+        if let Some(second) = second {
+            f["responses"][&page2] = second;
+        }
+        f["responses"]["/orgs/cgwalters-forge"]["public_repos"] = json!(100);
+        let result = replay(&f, false);
+        if let Some(expected) = expected {
+            assert!(result.unwrap_err().contains(expected));
+        } else {
+            // Explicit extras survive even when the owner's inventory is empty.
+            assert!(result.unwrap().contains("v0.6.4: callers"));
+        }
+    }
+    // A real caller only on page two must not be omitted.
+    let mut f = discovery_fixture(false);
+    let original = f["responses"][OWNER_REPOS].clone();
+    f["responses"][OWNER_REPOS] = json!((0..100).map(|i| json!({"full_name": format!("cgwalters-forge/archived-{i}"), "fork": false, "archived": true})).collect::<Vec<_>>());
+    f["responses"][&page2] = original;
+    f["responses"]["/orgs/cgwalters-forge"]["public_repos"] = json!(106);
+    assert!(
+        replay(&f, false)
+            .unwrap()
+            .contains("from cgwalters-bot/renamed-site:")
+    );
+
+    struct Endless(std::cell::Cell<u32>);
+    impl Api for Endless {
+        fn request(&self, _: &str, _: &str, _: &Value) -> Result<Value> {
+            let page = self.0.get();
+            self.0.set(page + 1);
+            Ok(json!(
+                (0..100)
+                    .map(|i| json!({"full_name": format!("example/repo-{page}-{i}")}))
+                    .collect::<Vec<_>>()
+            ))
+        }
+    }
+    let api = Endless(std::cell::Cell::new(0));
+    let config = config();
+    let mut cache = crate::prune::Cache::default();
+    let mut out = vec![];
+    let mut pass = Pass {
+        api: &api,
+        config: &config,
+        apply: false,
+        now: parse_time("2026-10-23T14:00:00Z").unwrap(),
+        out: &mut out,
+        requests: REQUEST_LIMIT - 1,
+        reads: &mut cache,
+        used_reads: BTreeSet::new(),
+        read_bytes: 0,
+        callers: vec![],
+    };
+    assert!(
+        pass.inventory("/orgs/example/repos?type=all")
+            .unwrap_err()
+            .to_string()
+            .contains("budget exhausted")
+    );
+    assert_eq!(api.0.get(), 1);
+}
+
+#[test]
+fn cached_discovery_revalidates_and_never_authorizes_a_fork_write() {
+    use std::cell::Cell;
+    struct Cached {
+        inner: Fake,
+        identity: Cell<u32>,
+        validations: Cell<u32>,
+        hits: Cell<u32>,
+    }
+    impl Api for Cached {
+        fn request(&self, method: &str, path: &str, body: &Value) -> Result<Value> {
+            self.inner.request(method, path, body)
+        }
+        fn cache_context(&self) -> Option<String> {
+            Some(format!("test-identity-{}", self.identity.get()))
+        }
+        fn discovery_get(&self, path: &str, previous: Option<&Value>) -> Result<Value> {
+            self.validations.set(self.validations.get() + 1);
+            let body = self.inner.request("GET", path, &Value::Null)?;
+            if previous.is_some_and(|entry| entry["body"] == body) {
+                self.hits.set(self.hits.get() + 1);
+            }
+            Ok(json!({"body": body, "etag": "fixture"}))
+        }
+    }
+    let f = discovery_fixture(true);
+    let config = Config::from_json(&f["config"]).unwrap();
+    let api = Cached {
+        inner: Fake {
+            responses: RefCell::new(f["responses"].as_object().unwrap().clone()),
+            apply: false,
+            writes: RefCell::new(vec![]),
+            trees: RefCell::new(vec![]),
+            bot: config.bot.clone(),
+            now: f["now"].as_str().unwrap().into(),
+        },
+        identity: Cell::new(0),
+        validations: Cell::new(0),
+        hits: Cell::new(0),
+    };
+    let now = parse_time(f["now"].as_str().unwrap()).unwrap();
+    let mut cache = crate::prune::Cache::default();
+    let mut first = vec![];
+    pass_with_cache(&api, &config, false, now, &mut first, &mut cache).unwrap();
+    let mut second = vec![];
+    pass_with_cache(&api, &config, false, now, &mut second, &mut cache).unwrap();
+    assert_eq!(first, second);
+    assert!(api.hits.get() > 0);
+    let hits = api.hits.get();
+    api.identity.set(1);
+    pass_with_cache(&api, &config, false, now, &mut vec![], &mut cache).unwrap();
+    assert_eq!(api.hits.get(), hits, "another identity consumed the cache");
+    // Same branch name, new head/tree: no reuse of the old representation.
+    let mut r = api.inner.responses.borrow_mut();
+    let repo = "cgwalters-forge/cgwalters-forge.github.io";
+    r.insert(
+        format!("/repos/{repo}/commits/main"),
+        json!({"sha": "3".repeat(40)}),
+    );
+    r.insert(
+        format!("/repos/{repo}/git/trees/{}?recursive=1", "3".repeat(40)),
+        json!({"truncated": true, "tree": []}),
+    );
+    drop(r);
+    let error = pass_with_cache(&api, &config, false, now, &mut vec![], &mut cache).unwrap_err();
+    assert!(error.to_string().contains("truncated tree"));
+    // Restoring the head does not restore write authority from a cached fork.
+    api.inner.responses.borrow_mut().insert(
+        format!("/repos/{repo}/commits/main"),
+        json!({"sha": CALLER_HEAD}),
+    );
+    api.inner.responses.borrow_mut().insert(
+        "/repos/cgwalters-bot/tracker".into(),
+        json!({"parent": {"full_name": "elsewhere/wrong"}}),
+    );
+    assert!(
+        pass_with_cache(&api, &config, false, now, &mut vec![], &mut cache)
+            .unwrap_err()
+            .to_string()
+            .contains("is not a fork of")
+    );
+    assert!(api.inner.writes.borrow().is_empty());
+}
+
+#[test]
+fn partial_visibility_is_not_complete_coverage() {
+    for metadata in [
+        json!({"public_repos": 6}),
+        json!({"public_repos": 6, "owned_private_repos": 1}),
+        json!({"public_repos": 7, "owned_private_repos": 0}),
+    ] {
+        let mut f = discovery_fixture(true);
+        f["responses"]["/orgs/cgwalters-forge"] = metadata;
+        let error = replay(&f, true).unwrap_err();
+        assert!(error.contains("complete repository"), "{error}");
+    }
+}
+
+#[test]
+fn apply_is_idempotent_and_edits_only_actual_workflow_scalars() {
+    let mut f = discovery_fixture(false);
+    let repo = "cgwalters-forge/cgwalters-forge.github.io";
+    let reference =
+        format!("cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@{CALLER_HEAD}");
+    let workflow = format!(
+        "jobs:\n  review:\n    uses: {reference}\n  build:\n    runs-on: ubuntu-26.04\n    steps:\n      - run: echo '{reference}'\n"
+    );
+    f["responses"][format!("/repos/{repo}/contents/{CALLER_WORKFLOW}?ref={CALLER_HEAD}")] =
+        json!({"encoding": "base64", "content": base64(&workflow)});
+    let second_file = ".github/workflows/second.yaml";
+    f["responses"][format!("/repos/{repo}/git/trees/{CALLER_HEAD}?recursive=1")]["tree"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"path": second_file, "type": "blob", "mode": "100644"}));
+    f["responses"][format!("/repos/{repo}/contents/{second_file}?ref={CALLER_HEAD}")] = json!({"encoding": "base64", "content": base64(&format!("jobs: {{review: {{uses: '{reference}'}}}}"))});
+    let config = Config::from_json(&f["config"]).unwrap();
+    let fake = Fake {
+        responses: RefCell::new(f["responses"].as_object().unwrap().clone()),
+        apply: true,
+        writes: RefCell::new(vec![]),
+        trees: RefCell::new(vec![]),
+        bot: config.bot.clone(),
+        now: f["now"].as_str().unwrap().into(),
+    };
+    let now = parse_time(&fake.now).unwrap();
+    let mut first = vec![];
+    pass(&fake, &config, true, now, &mut first).unwrap();
+    assert!(
+        String::from_utf8(first)
+            .unwrap()
+            .contains("v0.6.4: callers")
+    );
+    let first_writes = fake.writes.borrow().clone();
+    assert_eq!(
+        first_writes
+            .iter()
+            .filter(|w| w.ends_with("/pulls"))
+            .count(),
+        3
+    );
+    let trees = fake.trees.borrow();
+    let (_, site) = trees
+        .iter()
+        .find(|(p, _)| p.contains("/renamed-site/"))
+        .unwrap();
+    assert_eq!(site["tree"].as_array().unwrap().len(), 2);
+    let content = site["tree"][0]["content"].as_str().unwrap();
+    assert!(content.contains(&format!(
+        "uses: cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@{WRAPPER_MERGE}"
+    )));
+    assert!(
+        content.contains(&format!("run: echo '{reference}'")),
+        "{content}"
+    );
+    let (_, tracker) = trees.iter().find(|(p, _)| p.contains("/tracker/")).unwrap();
+    assert_eq!(tracker["tree"].as_array().unwrap().len(), 2);
+    assert!(
+        tracker["tree"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(WRAPPER_MERGE)
+    );
+    drop(trees);
+    let mut second = vec![];
+    pass(&fake, &config, true, now, &mut second).unwrap();
+    assert!(String::from_utf8(second).unwrap().contains("v0.6.4: wait"));
+    assert_eq!(
+        *fake.writes.borrow(),
+        first_writes,
+        "second pass wrote despite existing PRs"
+    );
+}
+
+#[test]
+fn discovered_stalls_persist_the_existing_halt_protocol() {
+    for wrappers_off_default in [false, true] {
+        let mut f = discovery_fixture(false);
+        if wrappers_off_default {
+            f["responses"]
+                [format!("/repos/cgwalters-forge/actions/compare/main...{WRAPPER_MERGE}")] =
+                json!({"status": "diverged"});
+        } else {
+            let mut pr = f["responses"]["/repos/cgwalters-forge/actions/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100"][0].clone();
+            pr["head"]["repo"]["full_name"] = json!("cgwalters-bot/tracker");
+            pr["base"]["repo"]["full_name"] = json!("cgwalters-forge/tracker");
+            f["responses"]["/repos/cgwalters-forge/tracker/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100"] =
+                json!([pr]);
+        }
+        for apply in [false, true] {
+            let out = replay(&f, apply).unwrap();
+            assert!(out.contains(
+                "label https://github.com/cgwalters-forge/tracker/issues/880 needs-human"
+            ));
+            assert!(out.contains("Halted:"));
+            assert!(!out.contains("/git/trees"));
+        }
     }
 }
 
