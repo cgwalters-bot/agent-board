@@ -23177,6 +23177,17 @@ fn no_merge_preserves_followed_rounds_and_holds() {
     }
 }
 
+/// The intake's searches from `since`, in order, URL-encoded: the mention
+/// search, the bot's own items and the operator's reviews naming the bot.
+fn intake_queries(since: &str) -> [String; 3] {
+    [
+        format!("commenter:cgwalters updated:>={since} mentions:cgwalters-bot"),
+        format!("commenter:cgwalters updated:>={since} author:cgwalters-bot"),
+        format!("reviewed-by:cgwalters updated:>={since} \"cgwalters-bot\""),
+    ]
+    .map(|query| url::form_urlencoded::byte_serialize(query.as_bytes()).collect())
+}
+
 /// The first intake search reaches back the lookback and its lag, never
 /// to before 1970, which GitHub's search refuses with HTTP 422; a search
 /// that fails is a warning, retried next pass, not a failure of the pass.
@@ -23194,12 +23205,7 @@ fn notifications_run_without_followed_repositories_and_report_denied_reads() {
             403 => json!({"message": "Resource not accessible by integration"}),
             _ => json!({"message": "Validation Failed"}),
         };
-        // The mention search first, then the one of the bot's own items.
-        for qualifier in ["mentions:cgwalters-bot", "author:cgwalters-bot"] {
-            let query: String = url::form_urlencoded::byte_serialize(
-                format!("commenter:cgwalters updated:>={since} {qualifier}").as_bytes(),
-            )
-            .collect();
+        for query in intake_queries(&since) {
             recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page=1")},
                 "answer": {"status": status, "link": null, "body": body}}));
         }
@@ -23241,11 +23247,7 @@ fn operator_action_answer_precedes_prs_with_a_nearly_spent_budget() {
             .unwrap()
             .format(&Rfc3339)
             .unwrap();
-        for qualifier in ["mentions:cgwalters-bot", "author:cgwalters-bot"] {
-            let query: String = url::form_urlencoded::byte_serialize(
-                format!("commenter:cgwalters updated:>={since} {qualifier}").as_bytes(),
-            )
-            .collect();
+        for query in intake_queries(&since) {
             forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page=1")},
                 "answer": {"status": 200, "link": null, "body": {"items": [issue], "total_count": 1, "incomplete_results": false}}}));
         }
@@ -23404,15 +23406,9 @@ fn an_oversized_waiting_history_leaves_the_intake_turn_its_discovery() {
             .unwrap()
             - lag;
         let since = since.format(&Rfc3339).unwrap();
-        let starts = [state.operator_page, state.intake_page].map(|p| p.unwrap_or(1));
-        for (qualifier, start) in ["mentions:cgwalters-bot", "author:cgwalters-bot"]
-            .into_iter()
-            .zip(starts)
-        {
-            let query: String = url::form_urlencoded::byte_serialize(
-                format!("commenter:cgwalters updated:>={since} {qualifier}").as_bytes(),
-            )
-            .collect();
+        let starts =
+            [state.operator_page, state.intake_page, state.review_page].map(|p| p.unwrap_or(1));
+        for (query, start) in intake_queries(&since).into_iter().zip(starts) {
             forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page={start}")},
                 "answer": {"status": 200, "link": null, "body": {"items": [issue], "total_count": 1, "incomplete_results": false}}}));
         }

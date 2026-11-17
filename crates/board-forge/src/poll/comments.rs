@@ -49,8 +49,8 @@ const THREADS_PAGE: usize = 20;
 const SEARCH_PAGES: u64 = 3;
 /// The searches a pass makes from the cursor, each with its own page: the
 /// operator's comments mentioning the bot, and with the pass's intake those
-/// on the bot's own items too.
-pub const SEARCHES: usize = 2;
+/// on the bot's own items and the operator's reviews naming the bot too.
+pub const SEARCHES: usize = 3;
 /// The last page a search gives: it finds at most 1000 results.
 pub const OPERATOR_PAGE_LIMIT: u64 = (1000 / THREADS_PAGE) as u64;
 /// The most threads the pass's intake search keeps to retry while their
@@ -730,16 +730,23 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let scopes = &self.config.policy.operator_comments;
         let (operator, bot) = (&self.config.operator, &self.config.bot);
         let since = stamp(cursor - lag)?;
-        // The intake's two searches (agent-board#840): the operator's comments
+        // The intake's first two searches (agent-board#840): the operator's comments
         // mentioning the bot anywhere, and their comments on the bot's own
         // items, mentioned or not. Each reads its own pages from the shared
         // cursor, so that the operator's unrelated conversation, which the
         // second would list without its `author:`, cannot take the first's.
+        // GitHub's `mentions:` does not index inline review comments, which
+        // its text search does (agent-board#1093), but the text search misses
+        // some issue-comment mentions `mentions:` finds: so a third search
+        // lists the pull requests the operator reviewed that name the bot.
         let mut queries = vec![format!("commenter:{operator} updated:>={since}")];
         if intake {
             queries[0].push_str(&format!(" mentions:{bot}"));
             queries.push(format!(
                 "commenter:{operator} updated:>={since} author:{bot}"
+            ));
+            queries.push(format!(
+                "reviewed-by:{operator} updated:>={since} \"{bot}\""
             ));
         }
         for scope in scopes {
@@ -2500,25 +2507,46 @@ pub(super) mod tests {
                 .insert(format!("{API_ROOT}{path}"), body);
         }
 
-        /// Whether a search hit's thread mentions `login`, as GitHub's
-        /// `mentions:` qualifier finds: in its body, or in a comment, review
-        /// or review comment of its recorded first pages.
-        fn mentioned(&self, hit: &Value, login: &str) -> bool {
+        /// What a search hit's thread has posted on its recorded first pages:
+        /// issue comments, reviews and review comments, as `pages` selects.
+        fn posted(&self, hit: &Value, pages: [bool; 3]) -> Vec<Value> {
             let repo = text(hit, "/repository_url")
                 .strip_prefix(&format!("{API_ROOT}repos/"))
                 .unwrap_or("");
             let number = hit["number"].as_u64().unwrap_or_default();
             let rest = self.rest.borrow();
-            let pages = [
+            [
                 format!("{API_ROOT}repos/{repo}/issues/{number}/comments?per_page=100"),
                 format!("{API_ROOT}repos/{repo}/pulls/{number}/reviews?per_page=100"),
                 format!("{API_ROOT}repos/{repo}/pulls/{number}/comments?per_page=100"),
-            ];
-            let posted = (pages.iter().filter_map(|page| rest.get(page)))
-                .flat_map(|page| page.as_array().cloned().unwrap_or_default())
-                .map(|c| text(&c, "/body").to_owned());
-            (std::iter::once(text(hit, "/body").to_owned()).chain(posted))
-                .any(|body| mentions(&body, login))
+            ]
+            .iter()
+            .zip(pages)
+            .filter(|(_, read)| *read)
+            .filter_map(|(page, _)| rest.get(page))
+            .flat_map(|page| page.as_array().cloned().unwrap_or_default())
+            .collect()
+        }
+
+        /// Whether a search hit's thread mentions `login`, as GitHub's
+        /// `mentions:` qualifier finds: in its body or an issue comment, not
+        /// a review or review comment (agent-board#1093).
+        fn mentioned(&self, hit: &Value, login: &str) -> bool {
+            (std::iter::once(hit.clone()).chain(self.posted(hit, [true, false, false])))
+                .any(|c| mentions(text(&c, "/body"), login))
+        }
+
+        /// Whether a search hit's thread holds `phrase`, as GitHub's text
+        /// search finds it: in its body or anything posted on it.
+        fn phrased(&self, hit: &Value, phrase: &str) -> bool {
+            (std::iter::once(hit.clone()).chain(self.posted(hit, [true; 3])))
+                .any(|c| text(&c, "/body").contains(phrase))
+        }
+
+        /// Whether `login` reviewed a search hit's pull request.
+        fn reviewed(&self, hit: &Value, login: &str) -> bool {
+            (self.posted(hit, [false, true, false]).iter())
+                .any(|r| text(r, "/user/login").eq_ignore_ascii_case(login))
         }
     }
 
@@ -2625,11 +2653,16 @@ pub(super) mod tests {
                 let since = qualifier("updated:>=").unwrap();
                 let author = qualifier("author:");
                 let mentions = qualifier("mentions:");
+                let reviewer = qualifier("reviewed-by:");
+                let phrase = (q.split_whitespace())
+                    .find_map(|term| term.strip_prefix('"')?.strip_suffix('"'));
                 let mut items = found["items"].as_array().unwrap().clone();
                 items.retain(|hit| {
                     text(hit, "/updated_at") >= since
                         && author.is_none_or(|a| text(hit, "/user/login").eq_ignore_ascii_case(a))
                         && mentions.is_none_or(|m| self.mentioned(hit, m))
+                        && reviewer.is_none_or(|r| self.reviewed(hit, r))
+                        && phrase.is_none_or(|p| self.phrased(hit, p))
                 });
                 found["total_count"] = items.len().into();
                 found["items"] = items
@@ -4687,6 +4720,7 @@ pub(super) mod tests {
             operator_cursor: Some("2026-10-16T12:00:00Z".into()),
             operator_page: Some(3),
             intake_page: Some(2),
+            review_page: Some(4),
             intake_waiting: BTreeMap::from([("other/place#2".into(), UPDATED.into())]),
             ..State::default()
         };
@@ -4700,6 +4734,8 @@ pub(super) mod tests {
             ("operator_page", json!(OPERATOR_PAGE_LIMIT + 1)),
             ("intake_page", json!(1)),
             ("intake_page", json!(OPERATOR_PAGE_LIMIT + 1)),
+            ("review_page", json!(1)),
+            ("review_page", json!(OPERATOR_PAGE_LIMIT + 1)),
             ("intake_waiting", json!({"other/place": UPDATED})),
             ("intake_waiting", json!({"other#2": UPDATED})),
             ("intake_waiting", json!({"other/place#0": UPDATED})),

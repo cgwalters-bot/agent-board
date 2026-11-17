@@ -1842,6 +1842,9 @@ pub struct State {
     /// The pass's intake: as `operator_page`, of the cursor's search of the
     /// bot's own items ([`comments::SEARCHES`]).
     pub intake_page: Option<u64>,
+    /// The pass's intake: as `operator_page`, of the cursor's search of the
+    /// operator's reviews naming the bot ([`comments::SEARCHES`]).
+    pub review_page: Option<u64>,
     /// The pass's intake: searched threads whose operator direction waits
     /// for a midstream fork, `OWNER/REPO#N` to the `updated_at` it read,
     /// retried each pass ([`comments::INTAKE_WAITING_LIMIT`]). Losing them
@@ -1954,6 +1957,7 @@ impl State {
                     "operator_cursor",
                     "operator_page",
                     "intake_page",
+                    "review_page",
                     "intake_waiting",
                     "intake_refused",
                     "operator_direction",
@@ -2047,6 +2051,7 @@ impl State {
         };
         let operator_page = page("operator_page")?;
         let intake_page = page("intake_page")?;
+        let review_page = page("review_page")?;
         let intake_waiting: BTreeMap<String, String> = match object.get("intake_waiting") {
             None => BTreeMap::new(),
             Some(waiting) => serde_json::from_value(waiting.clone())
@@ -2207,6 +2212,7 @@ impl State {
             operator_cursor,
             operator_page,
             intake_page,
+            review_page,
             intake_waiting,
             intake_refused,
             operator_direction,
@@ -2254,6 +2260,9 @@ impl State {
         }
         if let Some(page) = self.intake_page {
             state["intake_page"] = page.into();
+        }
+        if let Some(page) = self.review_page {
+            state["review_page"] = page.into();
         }
         if !self.intake_waiting.is_empty() {
             state["intake_waiting"] = json!(self.intake_waiting);
@@ -10448,6 +10457,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         operator_cursor,
         operator_page,
         intake_page,
+        review_page,
         intake_waiting,
         notify_since,
         notify_before,
@@ -10460,6 +10470,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         operator_cursor,
         operator_page,
         intake_page,
+        review_page,
         intake_waiting,
         intake_refused: pass.intake_refused,
         operator_direction: pass.operator_direction,
@@ -10491,6 +10502,7 @@ struct Cursors {
     operator_cursor: Option<String>,
     operator_page: Option<u64>,
     intake_page: Option<u64>,
+    review_page: Option<u64>,
     intake_waiting: BTreeMap<String, String>,
     notify_since: Option<String>,
     notify_before: Option<String>,
@@ -10552,6 +10564,7 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
     state.operator_cursor = cursors.operator_cursor;
     state.operator_page = cursors.operator_page;
     state.intake_page = cursors.intake_page;
+    state.review_page = cursors.review_page;
     state.intake_waiting = cursors.intake_waiting;
     state.notify_since = cursors.notify_since;
     state.notify_before = cursors.notify_before;
@@ -10577,6 +10590,7 @@ impl Cursors {
             operator_page: state.operator_page.take(),
             // As the cursor; without the pass's intake they are dropped.
             intake_page: state.intake_page.take().filter(|_| intake),
+            review_page: state.review_page.take().filter(|_| intake),
             intake_waiting: match intake {
                 true => std::mem::take(&mut state.intake_waiting),
                 false => BTreeMap::new(),
@@ -10608,15 +10622,17 @@ fn read_direction<R: Rest, G: Transport>(
             [
                 cursors.operator_page.unwrap_or(1),
                 cursors.intake_page.unwrap_or(1),
+                cursors.review_page.unwrap_or(1),
             ],
         );
         pass.intaking = config.policy.notification_intake.is_some();
         let mut waiting = cursors.intake_waiting.clone();
         match pass.operator_comments(follow, at, &mut waiting, outcome) {
-            Ok((cursor, [page, intake_page])) if pass.apply.is_some() => {
+            Ok((cursor, [page, intake_page, review_page])) if pass.apply.is_some() => {
                 cursors.operator_cursor = Some(cursor);
                 cursors.operator_page = Some(page).filter(|p| *p > 1);
                 cursors.intake_page = Some(intake_page).filter(|p| *p > 1);
+                cursors.review_page = Some(review_page).filter(|p| *p > 1);
                 cursors.intake_waiting = waiting;
             }
             Ok(_) => {}
@@ -10626,6 +10642,11 @@ fn read_direction<R: Rest, G: Transport>(
             // also `operatorComments`', which a caller turned on as a step,
             // its failure stays an error.
             Err(error) if crate::pass::budget_spent(&error) => {
+                // The cursor stays, but the threads an earlier search left
+                // waiting are kept: a later search ran out, not their reads.
+                if pass.apply.is_some() {
+                    cursors.intake_waiting = waiting;
+                }
                 outcome
                     .lines
                     .push(format!("operator comments deferred: {error:#}"));

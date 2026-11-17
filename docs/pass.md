@@ -478,14 +478,19 @@ conversation into work, or thread text choosing a repository the bot may write.
 `notifications: true` opts the GitHub pass into bounded search-backed intake
 in stage 2, even with no `follow` entries. The historical setting name is retained.
 It is off by default, needs `triagePools` or `planPools`, and uses the pass token;
-it needs no new credential or notifications scope. It makes two queries, each
+it needs no new credential or notifications scope. It makes three queries, each
 sorted by update oldest first: `commenter:OPERATOR updated:>=LAST mentions:BOT`
-finds the threads where the operator addressed the bot anywhere, and
-`commenter:OPERATOR updated:>=LAST author:BOT` the bot's own issues and pull
+finds the threads where the operator addressed the bot in a body or issue
+comment, and `commenter:OPERATOR updated:>=LAST author:BOT` the bot's own issues and pull
 requests the operator commented on, a draft the poll stopped following
 included (agent-board#840). The second is its own search so that the
 operator's unrelated conversation, which a query without the `author:`
 qualifier would list, cannot take the mention search's pages.
+GitHub's `mentions:` does not index inline review comments, so
+`reviewed-by:OPERATOR updated:>=LAST "BOT"` lists the pull requests the
+operator reviewed whose text names the bot (agent-board#1093). Text search
+alone is not enough: it misses some issue-comment mentions that `mentions:`
+finds. Its hits get the same history read and admission as the others.
 Search is discovery, not authority: the pass loads each thread and reads its
 complete comment history before routing it; one GitHub answers for another
 (its repository or number differ from the hit's, as after a transfer) is left
@@ -556,10 +561,10 @@ still needs the normal checked plan/scheduling path; its fork must also be in
 `workRepositories` for stage 4 to schedule that plan.
 
 The reader reuses the operator-comment search's bounds (three pages of 20 per
-pass for each of the two queries, at most 1,000 searchable hits each),
+pass for each of the three queries, at most 1,000 searchable hits each),
 request/time budget and resumable page cursor: one time cursor is shared, and
-each query keeps its own page of it (the poll state's `operator_page` and
-`intake_page`), resumed where that query's own next read is the earliest, else
+each query keeps its own page of it (the poll state's `operator_page`,
+`intake_page` and `review_page`), resumed where that query's own next read is the earliest, else
 from its first page again.
 It overlaps the cursor by ten minutes for search-index lag. First use, with
 no cursor saved, searches from two days back, as the operator-comment search
