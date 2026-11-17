@@ -5581,6 +5581,12 @@ mod tests {
             ask.kind = "review-promote".into();
             asks.push(ask);
         }
+        // One that says it is untested is not ready to promote: it stays
+        // apart, under its own kind and reason.
+        let untested = "a midstream draft that says it is untested, waiting for the operator";
+        let mut ask = stopped("o/bootc", 51, untested);
+        ask.kind = "review-untested".into();
+        asks.push(ask);
         asks[0].waiting_since = "2026-10-20T09:00:00Z".into();
         asks[0].priority = Some("P1".into());
         let listed = own_listed(
@@ -5589,12 +5595,18 @@ mod tests {
             (collected(Read::Complete, asks, &[]), Collected::off()),
             None,
         );
-        assert_eq!(listed.count, 50);
-        assert_eq!(listed.items.len(), 5);
+        assert_eq!(listed.count, 51);
+        assert_eq!(listed.items.len(), 6);
         let promote = listed.items.iter().find(|a| a.key == "o/bootc#49").unwrap();
         assert_eq!(promote.ask, "bootc: 2 drafts waiting for promotion");
         assert_eq!(promote.kind, "review-promote");
         assert_eq!(promote.group.as_ref().unwrap().numbers, [49, 50]);
+        let unfinished = listed.items.iter().find(|a| a.key == "o/bootc#51").unwrap();
+        assert_eq!(
+            (unfinished.ask.as_str(), unfinished.kind.as_str()),
+            (untested, "review-untested")
+        );
+        assert!(unfinished.group.is_none());
         assert!(promote.target.ends_with("draft%3Atrue"));
         let group = listed.items.iter().find(|a| a.key == "o/bootc#1").unwrap();
         assert_eq!(group.ask, "bootc: 44 drafts to inspect and promote");
@@ -5618,8 +5630,8 @@ mod tests {
             (collected(Read::Unread, vec![], &[]), Collected::off()),
             Some(&previous),
         );
-        assert_eq!(carried.count, 50);
-        assert_eq!(carried.items.len(), 5);
+        assert_eq!(carried.count, 51);
+        assert_eq!(carried.items.len(), 6);
         for identity in &listed.identities {
             let kept = carried
                 .identities

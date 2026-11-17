@@ -289,6 +289,10 @@ const WITHHELD_WAIT: &str =
 /// Why the bot's clean, green draft on a `pr.noMerge` base waits: a draft
 /// is the finished state there, and only the operator promotes it.
 const PROMOTE_WAIT: &str = "a midstream draft, waiting for promotion";
+/// Why the bot's midstream draft whose own words say it is unfinished or
+/// untested ([`untested`]) waits with `continuation.untested` off: it is not
+/// ready to promote, and nothing continues it until the operator does.
+const UNTESTED_WAIT: &str = "a midstream draft that says it is untested, waiting for the operator";
 /// How a round outside the caller's fix bounds is skipped: the operator
 /// takes it, labelled or not.
 pub(crate) const LEFT_TO_OPERATOR: &str = "left to the operator: ";
@@ -2907,6 +2911,9 @@ pub struct Marker {
     pub continued: u64,
     /// Whether the run `sha` and `run` name is a continuation, not a fix.
     pub continuing: bool,
+    /// Whether a continuation round ran on this branch before its counts
+    /// were last reset ([`Marker::reset`]), as `continued` says after.
+    pub continued_before: bool,
     /// Whether the `cap` pool was used: it raises the cap once.
     pub raised: bool,
     /// Whether the run `sha` and `run` name is the one that raised it, so
@@ -3082,6 +3089,9 @@ impl Marker {
         if self.continuing {
             state["continuing"] = true.into();
         }
+        if self.continued_before {
+            state["continued_before"] = true.into();
+        }
         if self.raised {
             state["raised"] = true.into();
         }
@@ -3144,6 +3154,22 @@ impl Marker {
             marker.diagnosed = false;
         }
         marker
+    }
+
+    /// Whether a continuation round ran on this branch, counted now or before
+    /// a reset: its head commit's message then says whether the work is
+    /// finished, not the description ([`untested`]).
+    fn continued_here(&self) -> bool {
+        self.continued > 0 || self.continued_before
+    }
+
+    /// The marker an operator reset starts from: fresh counts, keeping only
+    /// whether a continuation ran here, which the reset does not undo.
+    fn reset(&self) -> Marker {
+        Marker {
+            continued_before: self.continued_here(),
+            ..Marker::default()
+        }
     }
 
     /// The round of the run the marker names, as a decision line says it.
@@ -3237,6 +3263,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
                 .as_u64()
                 .map_or(0, |c| c.min(CONTINUATION_ROUNDS_LIMIT)),
             continuing: state["continuing"].as_bool().unwrap_or(false),
+            continued_before: state["continued_before"].as_bool().unwrap_or(false),
             raised: state["raised"].as_bool().unwrap_or(false),
             raising: state["raising"].as_bool().unwrap_or(false),
             answering: state["answering"].as_bool().unwrap_or(false),
@@ -3279,7 +3306,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
         if latest.stopped && queue_reset_from.is_some() && queue_reset_from == latest.id {
             latest = Marker {
                 id: latest.id,
-                ..Marker::default()
+                ..latest.reset()
             };
         }
         if !latest.stopped {
@@ -3467,7 +3494,7 @@ fn undescribed(pull: &Value) -> Vec<&'static str> {
 
 /// Words by which a hand-back says its work is unfinished or unverified, as
 /// implement runs word it where they could not build or test (agent-board#1058).
-/// Lower case; matched in the lower-cased text.
+/// Lower case; matched as whole words ([`says_untested`]).
 const UNTESTED_WORDS: &[&str] = &[
     "partial work",
     "incomplete",
@@ -3479,13 +3506,46 @@ const UNTESTED_WORDS: &[&str] = &[
     "was not run",
 ];
 
-/// Why a midstream draft is unfinished or untested by its own words, with
-/// `continuation.untested` on: the description's, or once a continuation ran,
-/// the head commit's message, as the round could not change the description.
-/// A rebase or fix round alone does not end the description's say. Only the
-/// matched word of [`UNTESTED_WORDS`] is repeated, not the bot's text.
-fn untested(config: &Config, pull: &Value, continued: bool) -> Option<String> {
-    config.policy.continuation.untested.as_ref()?;
+/// Words that, among the two before one of [`UNTESTED_WORDS`] in its clause,
+/// say the opposite: "no longer incomplete", "nothing untested".
+const UNTESTED_NEGATED_BY: &[&str] = &["no", "not", "nothing", "none", "never"];
+
+/// Words that, right before one of [`UNTESTED_WORDS`], say the code was the
+/// unfinished thing, as a subject does: "Fix incomplete decoding".
+const UNTESTED_FIXED_BY: &[&str] = &["fix", "fixes", "fixed"];
+
+/// The first of [`UNTESTED_WORDS`] that `text` says as whole words, neither
+/// negated ([`UNTESTED_NEGATED_BY`]) nor fixed ([`UNTESTED_FIXED_BY`]) in its
+/// clause, which punctuation or a line ends. A false positive costs at most a
+/// wait or the continuation rounds; a missed one, a promotion wait.
+fn says_untested(text: &str) -> Option<&'static str> {
+    let text = text.to_lowercase();
+    text.split(['.', ',', ';', ':', '!', '?', '\n'])
+        .find_map(|clause| {
+            let words: Vec<&str> = clause
+                .split(|c: char| !c.is_alphanumeric() && c != '\'')
+                .filter(|w| !w.is_empty())
+                .collect();
+            UNTESTED_WORDS.iter().copied().find(|phrase| {
+                let phrase: Vec<&str> = phrase.split(' ').collect();
+                words.windows(phrase.len()).enumerate().any(|(at, window)| {
+                    let before = &words[at.saturating_sub(2)..at];
+                    window == phrase.as_slice()
+                        && !before.iter().any(|w| UNTESTED_NEGATED_BY.contains(w))
+                        && !before.last().is_some_and(|w| UNTESTED_FIXED_BY.contains(w))
+                })
+            })
+        })
+}
+
+/// Why a midstream draft is unfinished or untested by its own words: the
+/// description's, or once a continuation ran on its branch (`continued`, kept
+/// through resets, [`Marker::continued_here`]), the head commit's message,
+/// as the round could not change the description. A rebase or fix round
+/// alone does not end the description's say, but its commit, as the head,
+/// is the message read after a continuation. Only the matched word of
+/// [`UNTESTED_WORDS`] is repeated, not the bot's text.
+fn untested(pull: &Value, continued: bool) -> Option<String> {
     let (what, words) = if continued {
         (
             "its head commit",
@@ -3494,8 +3554,7 @@ fn untested(config: &Config, pull: &Value, continued: bool) -> Option<String> {
     } else {
         ("its description", text(pull, "/body"))
     };
-    let words = words.to_lowercase();
-    let word = UNTESTED_WORDS.iter().find(|w| words.contains(*w))?;
+    let word = says_untested(words)?;
     Some(format!("an untested midstream draft: {what} says {word:?}"))
 }
 
@@ -4365,8 +4424,9 @@ pub fn decide(
     // Only the bot's own marker is read, and taking a label off needs triage
     // access, so it is not a visitor's to ask for.
     let reset = marker.stopped;
-    let fresh = Marker::default();
+    let fresh = marker.reset();
     let marker = if reset { &fresh } else { marker };
+    let continued_here = marker.continued_here();
     // The answer may say to close this PR. Its old green head is not evidence
     // that the instruction was carried out. Even a changed head must wait for
     // the recorded run to succeed; no run id waits until timeout, then stops.
@@ -4640,11 +4700,15 @@ pub fn decide(
     // On a midstream fork every pull request stays a draft, and only the
     // operator promotes it; its rounds above run as anywhere else, and a
     // clean, green one waits for that promotion rather than a label, which
-    // would stop its later rounds (agent-board#628). With
-    // `continuation.untested`, one that says it is unfinished or untested is
-    // continued instead, as a checkpoint draft is, within the same rounds.
+    // would stop its later rounds (agent-board#628). One that says it is
+    // unfinished or untested is not ready to promote: with
+    // `continuation.untested` it is continued, as a checkpoint draft is,
+    // within the same rounds; without, it waits for the operator.
     if midstream {
-        if let Some(why) = untested(config, pull, marker.continued > 0) {
+        if let Some(why) = untested(pull, continued_here) {
+            if config.policy.continuation.untested.is_none() {
+                return step("wait", UNTESTED_WAIT);
+            }
             if marker.sha.as_deref() == Some(head) {
                 return started(config, marker, (fix_run, outages), head, &why, now);
             }
@@ -5012,7 +5076,8 @@ impl Outcome {
 /// A followed pull request that waits on the operator, at the head the
 /// pass read: `approve` (its approval of the head, under
 /// [`OPERATOR_APPROVAL_LABEL`]), `withheld` (the review job withheld its
-/// approval), `promote` (a clean, green midstream draft, [`PROMOTE_WAIT`])
+/// approval), `promote` (a clean, green midstream draft, [`PROMOTE_WAIT`]),
+/// `untested` (a midstream draft that says it is untested, [`UNTESTED_WAIT`])
 /// or `needs-human` (labelled so, stopped by this step, or a round outside
 /// the fix bounds left to the operator).
 #[derive(Clone, Debug, PartialEq)]
@@ -5152,6 +5217,7 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
             Some("approve")
         }
         "wait" if decision.reason == PROMOTE_WAIT => Some("promote"),
+        "wait" if decision.reason == UNTESTED_WAIT => Some("untested"),
         _ => None,
     }
 }
@@ -5904,6 +5970,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             sha: Some(head.to_owned()),
             stopped: true,
             missing_data_run: marker.missing_data_run,
+            continued_before: marker.continued_here(),
             queue: marker.queue.as_ref().map(|q| QueueState {
                 seen: q.seen.clone(),
                 ..QueueState::default()
@@ -6114,7 +6181,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             .context("no fix pools for round")?;
         // After a reset, the counts start again as decide read them.
         let carried = if marker.stopped {
-            Marker::default()
+            marker.reset()
         } else {
             marker.clone()
         };
@@ -6306,6 +6373,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             queue: marker.queue.clone(),
             continued: if continuing { round } else { carried.continued },
             continuing,
+            continued_before: carried.continued_before,
             raised,
             raising,
             comments: Vec::new(),
@@ -6444,7 +6512,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                         let mut next = if marker.stopped {
                             Marker {
                                 queue: Some(queue.clone()),
-                                ..Marker::default()
+                                ..marker.reset()
                             }
                         } else {
                             marker.clone()
@@ -10647,7 +10715,7 @@ fn planned_round(
 ) -> std::result::Result<Marker, String> {
     let (bot, rounds) = (config.bot.as_str(), config.policy.fix_rounds());
     let carried = if marker.stopped {
-        Marker::default()
+        marker.reset()
     } else {
         marker.clone()
     };
@@ -16083,21 +16151,56 @@ mod tests {
         }
     }
 
+    /// Untested words count as whole words, not negated before them nor
+    /// right after a fix verb, which names the code (agent-board#1058).
+    #[test]
+    fn untested_words_match_whole_and_unnegated() {
+        for (text, want) in [
+            ("This is an incomplete draft.", Some("incomplete")),
+            (
+                "Partial work: the build could not run here",
+                Some("partial work"),
+            ),
+            ("The fix is incomplete.", Some("incomplete")),
+            ("Fixed but untested.", Some("untested")),
+            ("Fixed, but not tested", Some("not tested")),
+            ("Nothing here is untested.", Some("untested")),
+            ("The importer is no longer incomplete.", None),
+            ("Nothing untested remains.", None),
+            ("It is not incomplete.", None),
+            ("Fix incomplete decoding", None),
+            ("This fixes incomplete decoding.", None),
+            ("The incompleteness check passes; retested.", None),
+            ("Verified with make check.", None),
+        ] {
+            assert_eq!(says_untested(text), want, "{text}");
+        }
+    }
+
     /// With `continuation.untested`, a clean midstream draft whose own words
     /// say it is unfinished or untested is continued within the continuation
     /// rounds rather than waiting for promotion (agent-board#1058); after a
     /// round left a new head, that head's message is read, not the description
-    /// the round could not change. Off, or a draft that says neither, waits.
+    /// the round could not change, through an operator reset too. Off, it
+    /// waits for the operator, not for promotion; one that says neither, or
+    /// says it only negated or of the code, waits for promotion.
     #[test]
     fn an_untested_midstream_draft_is_continued() {
         let untested = "Switch decoding.\n\nThis is an incomplete draft: no build was run.";
         let tested = "Switch decoding.\n\nVerified with make check.";
+        let negated = "Switch decoding.\n\nNothing untested remains, as the importer is no \
+            longer incomplete. This fixes incomplete decoding; the incompleteness check passes.";
+        let subject = "Fix incomplete decoding\n\nVerified with make check.";
         let unrun = "importer: Decode\n\nThe full build and make check could not run here.";
         let promote = ("wait", PROMOTE_WAIT.to_owned());
         let said = |what: &str, word: &str, rest: &str| {
             format!("an untested midstream draft: its {what} says \"{word}\"{rest}")
         };
         let newer = json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older"});
+        // A reset after a round that continued it, and one before any did.
+        let reset_after =
+            json!({"stopped": true, "rounds": 2, "continued_before": true, "sha": "older"});
+        let reset_before = json!({"stopped": true, "rounds": 2, "sha": "older"});
         for (name, runner, body, message, state, want) in [
             (
                 "off",
@@ -16105,7 +16208,100 @@ mod tests {
                 untested,
                 tested,
                 json!({"rounds": 0}),
+                ("wait", UNTESTED_WAIT.to_owned()),
+            ),
+            (
+                "off and tested",
+                None,
+                tested,
+                tested,
+                json!({"rounds": 0}),
                 promote.clone(),
+            ),
+            (
+                "off after a round left it untested",
+                None,
+                tested,
+                unrun,
+                newer.clone(),
+                ("wait", UNTESTED_WAIT.to_owned()),
+            ),
+            (
+                "negated or of the code",
+                Some("hosted"),
+                negated,
+                tested,
+                json!({"rounds": 0}),
+                promote.clone(),
+            ),
+            (
+                "its subject names the code",
+                Some("hosted"),
+                untested,
+                subject,
+                newer.clone(),
+                promote.clone(),
+            ),
+            (
+                "a one-line head commit says it",
+                Some("hosted"),
+                tested,
+                "Partial work: tests could not run",
+                newer.clone(),
+                (
+                    "continue",
+                    said(
+                        "head commit",
+                        "partial work",
+                        ", so continuation round 2 of 2",
+                    ),
+                ),
+            ),
+            (
+                "a reset after a finishing round",
+                Some("hosted"),
+                untested,
+                tested,
+                reset_after.clone(),
+                promote.clone(),
+            ),
+            (
+                "a fix round after that reset",
+                Some("hosted"),
+                untested,
+                "Fix clippy lint",
+                json!({"rounds": 1, "continued_before": true, "sha": "older"}),
+                promote.clone(),
+            ),
+            (
+                "a reset after a round left it untested",
+                Some("hosted"),
+                tested,
+                unrun,
+                reset_after,
+                (
+                    "continue",
+                    said(
+                        "head commit",
+                        "could not run",
+                        ", so continuation round 1 of 2",
+                    ),
+                ),
+            ),
+            (
+                "a reset before any round",
+                Some("hosted"),
+                untested,
+                tested,
+                reset_before,
+                (
+                    "continue",
+                    said(
+                        "description",
+                        "incomplete",
+                        ", so continuation round 1 of 2",
+                    ),
+                ),
             ),
             (
                 "tested",
@@ -16208,6 +16404,59 @@ mod tests {
             );
             assert_eq!((got.action, got.reason), (want.0, want.1), "{name}");
         }
+        // A reset keeps only that a continuation ran, as written and read back.
+        for (state, want) in [
+            (
+                json!({"rounds": 1, "continued": 2, "sha": "older"}),
+                json!({"rounds": 0, "continued_before": true}),
+            ),
+            (
+                json!({"stopped": true, "rounds": 2, "sha": "older"}),
+                json!({"rounds": 0}),
+            ),
+        ] {
+            let read = marker(state.clone());
+            let reset = read.reset();
+            assert_eq!(reset.state(), want);
+            assert_eq!(marker(want.clone()).state(), want);
+            // So does every other path that starts the counts again.
+            let stopped = Marker {
+                stopped: true,
+                ..read.clone()
+            };
+            let planned = planned_round(&stopped, &[], &config(), "newer").unwrap();
+            let granted = recovery::granted(&read);
+            for kept in [planned, granted] {
+                assert_eq!(kept.continued_before, reset.continued_before, "{state}");
+                assert_eq!((kept.rounds, kept.continued), (0, 0), "{state}");
+            }
+        }
+        // Off, it is listed as an untested wait on the operator, unlabelled
+        // and not continued.
+        let mut fake = github();
+        fake.pulls.insert(
+            470,
+            pull("pull-470", json!({"isDraft": true, "body": untested})),
+        );
+        let mut cfg = config();
+        cfg.policy.no_merge = vec![REPO.to_owned()];
+        let dispatcher = Fake::default();
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &[REPO.into()],
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        let kinds: Vec<_> = outcome.waits.iter().map(|w| w.kind).collect();
+        assert_eq!(kinds, ["untested"], "{:?}", outcome.lines);
+        assert!(fake.writes.borrow().is_empty());
+        assert!(dispatcher.writes.borrow().is_empty());
 
         // Its round is dispatched on the named runner, with the synthetic
         // checkpoint's notes; a checkpoint draft's keeps the default runner.

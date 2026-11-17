@@ -51,6 +51,7 @@ pub(super) fn exhausted(config: &Config, reason: String) -> Decision {
 
 pub(super) fn granted(marker: &Marker) -> Marker {
     let mut next = marker.clone();
+    next.continued_before = marker.continued_here();
     next.rounds = 0;
     next.diagnosed = false;
     next.continued = 0;
