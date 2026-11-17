@@ -3262,9 +3262,17 @@ by the next diff. Their holds and the narrowed repositories' holds are kept
 as last published, as for any repository stage 2 reads in part; so an ask on
 a pull request closed since stays until the next full walk.
 
-At least `changeSweepHours` after the last, a pass walks every pull
-request; an applying pass that walks every repository the diff read or has a
-watermark for to its end, held steps or not, records its time as `changes_swept` in `state`. What does not move a pull
+At least `changeSweepHours` after the last, stage 2 walks every pull
+request again. A full walk can span request-share-limited applying passes:
+`changes_sweep` in trusted `state` accumulates the followed and midstream
+repositories actually walked to their end, held steps or not. A cursor wrap
+alone is not coverage: failed reads, unread repositories and those outside
+the envelope do not count. Once all are covered, `changes_swept` records the
+round's **start** time, so finishing a slow round does not postpone the next
+due walk. Configuration or resolved repository scope changes, missing or
+corrupt progress, and a clock earlier than the last observation reset it
+conservatively to a full walk. Unread midstream membership cannot complete
+a round. What does not move a pull
 request's `updated_at` waits until then: a timer of its own (a stale draft, a
 fix run that ended without a push, a rerun window) or a base that moved under
 it. Checks that settle at the same head are not among them: the diff follows
@@ -3272,7 +3280,7 @@ a running head's checks until they settle, as `checked`.
 
 The store comes from an Actions cache that unrelated default-branch jobs can
 write. A forged store can leave a pull request unvisited only until the next
-full walk, whose time is in the trusted `state`, never in the store. Nor can
+full walk, whose time and coverage are in the trusted `state`, never in the store. Nor can
 it make stage 0 read more than a fresh store does: a watermark or first
 window later than the pass's clock, or older than a first window (24 hours)
 and `changeSweepHours` before it, is read as none, and the repository walked

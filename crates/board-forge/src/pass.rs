@@ -10518,7 +10518,7 @@ impl crate::github::GraphQl for Replay {
 mod active;
 pub mod authored;
 mod blockers;
-mod changed;
+pub(crate) mod changed;
 mod cost;
 pub(crate) mod epics;
 mod focus;

@@ -3178,6 +3178,120 @@ fn a_changes_diff_past_its_share_leaves_the_walk_its_requests() {
 }
 
 #[test]
+fn change_sweep_accumulates_across_request_share_cuts() {
+    let mut forge = Forge::new(None, false);
+    let now = forge.replay.now;
+    let repositories: Vec<String> = (0..6).map(|n| format!("example/repo{n:02}")).collect();
+    for repo in &repositories {
+        followed(&mut forge.replay, (repo, 1), json!({}), json!([]));
+    }
+    forge
+        .replay
+        .requests
+        .push(json!({"request": {"get": format!("{API_ROOT}user")},
+        "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+    let due = now + time::Duration::hours(6);
+    for clock in [now, due] {
+        for since in [
+            clock - crate::changes::diff::FIRST_WINDOW,
+            now - crate::changes::diff::SKEW,
+            due - crate::changes::diff::SKEW,
+        ] {
+            let since = crate::changes::format_time(since).unwrap();
+            for repo in &repositories {
+                forge.replay.requests.push(json!({
+                    "request": {"get": format!("{API_ROOT}repos/{repo}/issues?state=all&sort=updated&direction=asc&since={since}&per_page=100")},
+                    "answer": {"status": 200, "link": null, "body": []},
+                }));
+            }
+        }
+    }
+    let mut cfg = config(json!({
+        "wip": 0, "changeSweepHours": 6, "store": "s.db", "state": "s.json",
+        "follow": repositories, "pr": {"noMerge": repositories, "fixPools": ["claude"]}
+    }));
+    cfg.epics = None;
+    // Inject a small total budget, hence a small stage-2 request share;
+    // production percentages and all other caps remain unchanged.
+    let run = |state, clock| {
+        let bounds = Bounds::new(
+            160,
+            Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
+        );
+        block(run_within(
+            &forge,
+            &forge,
+            &cfg,
+            (state, Mode::Actions(&own()), Limits::default(), clock),
+            &bounds,
+        ))
+        .unwrap()
+    };
+    let mut state = State::default();
+    let mut visited = BTreeSet::new();
+    let mut passes = 0;
+    loop {
+        passes += 1;
+        let report = run(state, now);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        for repo in &repositories {
+            if report
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&format!("{repo}#1 ")))
+            {
+                visited.insert(repo.clone());
+            }
+        }
+        state = State::from_json(&report.state.unwrap().to_json()).unwrap();
+        state.changes = report.records.borrow().changes.clone();
+        if state.changes_swept.is_some() {
+            break;
+        }
+        assert!(passes < 3, "{:#?}", report.lines);
+    }
+    assert!((2..=3).contains(&passes), "{passes}");
+    assert_eq!(visited, repositories.iter().cloned().collect());
+    assert_eq!(state.changes_swept, Some(now.format(&Rfc3339).unwrap()));
+    let narrowed = run(state, now);
+    assert_eq!(narrowed.failures, 0, "{:#?}", narrowed.lines);
+    assert!(
+        narrowed
+            .lines
+            .iter()
+            .any(|l| l.contains("repositories narrowed to what changed")),
+        "{:#?}",
+        narrowed.lines
+    );
+    assert!(
+        narrowed
+            .lines
+            .iter()
+            .any(|l| l.contains("changeSweepHours left")),
+        "{:#?}",
+        narrowed.lines
+    );
+    let mut state = State::from_json(&narrowed.state.unwrap().to_json()).unwrap();
+    state.changes = narrowed.records.borrow().changes.clone();
+    let full = run(state, due);
+    assert_eq!(full.failures, 0, "{:#?}", full.lines);
+    assert!(
+        full.lines
+            .iter()
+            .any(|l| l.contains("a full walk, the last at")),
+        "{:#?}",
+        full.lines
+    );
+    assert!(
+        !full
+            .lines
+            .iter()
+            .any(|l| l.contains("changeSweepHours left"))
+    );
+    assert!(full.lines.iter().any(|l| l.contains("#1 ")));
+}
+
+#[test]
 fn scheduling_reserve_is_opt_in_and_github_only() {
     assert!(!config(json!({})).reserve_scheduling);
     assert!(!config(json!({"reserveScheduling": false})).reserve_scheduling);
