@@ -3179,11 +3179,78 @@ fn a_changes_diff_past_its_share_leaves_the_walk_its_requests() {
 
 #[test]
 fn change_sweep_accumulates_across_request_share_cuts() {
+    change_sweep_walk(false, false, true, 160);
+    for action_first in [false, true] {
+        for quiet_waits in [false, true] {
+            // The smaller share stops between drafts in a fork; the larger
+            // walks every fork in one pass. Neither changes production caps.
+            for limit in [if action_first { 200 } else { 170 }, 1000] {
+                change_sweep_walk(true, action_first, quiet_waits, limit);
+            }
+        }
+    }
+}
+
+fn change_sweep_walk(midstream: bool, action_first: bool, quiet_waits: bool, limit: usize) {
     let mut forge = Forge::new(None, false);
     let now = forge.replay.now;
-    let repositories: Vec<String> = (0..6).map(|n| format!("example/repo{n:02}")).collect();
+    let owner = if midstream {
+        "cgwalters-forge"
+    } else {
+        "example"
+    };
+    let repositories: Vec<String> = (0..6).map(|n| format!("{owner}/repo{n:02}")).collect();
     for repo in &repositories {
-        followed(&mut forge.replay, (repo, 1), json!({}), json!([]));
+        let change = if midstream {
+            json!({"isDraft": true, "isCrossRepository": false,
+                "headRepositoryOwner": {"login": owner}})
+        } else {
+            json!({})
+        };
+        let count = if midstream { 3 } else { 1 };
+        for number in 1..=count {
+            followed(&mut forge.replay, (repo, number), change.clone(), json!([]));
+        }
+        let listing: Vec<Value> = (1..=count)
+            .map(|number| {
+                json!({"number": number,
+            "user": {"login": "cgwalters-bot"}, "head": {"sha": "abc"},
+            "updated_at": now.format(&Rfc3339).unwrap(), "labels": []})
+            })
+            .collect();
+        for entry in &mut forge.replay.requests {
+            if entry["request"]["get"]
+                == format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100")
+            {
+                entry["answer"]["body"] = json!(listing);
+            }
+        }
+        if action_first {
+            let (_, name) = repo.split_once('/').unwrap();
+            let nodes: Vec<Value> = (1..=count)
+                .map(|number| {
+                    json!({"number": number,
+                "isDraft": true, "author": {"login": "cgwalters-bot"},
+                "headRefOid": "abc", "updatedAt": now.format(&Rfc3339).unwrap(),
+                "labels": {"nodes": []}})
+                })
+                .collect();
+            forge.replay.requests.push(json!({
+                "request": graphql_key(poll::action_first::SCREEN, &json!({"owner": owner, "name": name})),
+                "answer": {"data": {"repository": {"pullRequests": {
+                    "pageInfo": {"hasNextPage": false}, "nodes": nodes}}}},
+            }));
+        }
+    }
+    if midstream {
+        let forks: Vec<Value> = repositories
+            .iter()
+            .map(|repo| json!({"full_name": repo, "topics": ["bot-midstream"]}))
+            .collect();
+        forge.replay.requests.push(json!({
+            "request": {"get": format!("{API_ROOT}orgs/{owner}/repos?per_page=100")},
+            "answer": {"status": 200, "link": null, "body": forks},
+        }));
     }
     forge
         .replay
@@ -3191,11 +3258,13 @@ fn change_sweep_accumulates_across_request_share_cuts() {
         .push(json!({"request": {"get": format!("{API_ROOT}user")},
         "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
     let due = now + time::Duration::hours(6);
-    for clock in [now, due] {
+    for clock in (0..12)
+        .map(|n| now + time::Duration::minutes(n))
+        .chain([due])
+    {
         for since in [
             clock - crate::changes::diff::FIRST_WINDOW,
-            now - crate::changes::diff::SKEW,
-            due - crate::changes::diff::SKEW,
+            clock - crate::changes::diff::SKEW,
         ] {
             let since = crate::changes::format_time(since).unwrap();
             for repo in &repositories {
@@ -3206,16 +3275,31 @@ fn change_sweep_accumulates_across_request_share_cuts() {
             }
         }
     }
-    let mut cfg = config(json!({
+    let mut settings = json!({
         "wip": 0, "changeSweepHours": 6, "store": "s.db", "state": "s.json",
-        "follow": repositories, "pr": {"noMerge": repositories, "fixPools": ["claude"]}
-    }));
+        "follow": repositories, "pr": {"noMerge": repositories, "fixPools": ["claude"], "headOwners": [owner]}
+    });
+    if midstream {
+        settings["follow"] = json!([]);
+        settings["pr"]["noMerge"] = json!([]);
+        settings["midstream"] = json!({"owner": owner, "topic": "bot-midstream"});
+    }
+    let mut cfg = config(settings);
+    cfg.pr.poll.action_first = action_first;
+    cfg.pr.poll.quiet_waits = Some(quiet_waits);
+    if action_first {
+        forge.replay.requests.push(json!({
+            "request": {"get": format!("{API_ROOT}{}", poll::action_first::approved_path(&cfg.poll(None)))},
+            "answer": {"status": 200, "link": null,
+                "body": {"incomplete_results": false, "total_count": 0, "items": []}},
+        }));
+    }
     cfg.epics = None;
     // Inject a small total budget, hence a small stage-2 request share;
     // production percentages and all other caps remain unchanged.
-    let run = |state, clock| {
+    let run = |state, clock, budget| {
         let bounds = Bounds::new(
-            160,
+            budget,
             Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
         );
         block(run_within(
@@ -3230,10 +3314,37 @@ fn change_sweep_accumulates_across_request_share_cuts() {
     let mut state = State::default();
     let mut visited = BTreeSet::new();
     let mut passes = 0;
+    let mut cut_within_fork = false;
     loop {
+        let cursor = state.share_cursor.clone();
+        let clock = now + time::Duration::minutes(passes);
         passes += 1;
-        let report = run(state, now);
+        // A cut is incomplete, not stalled coverage: give the resumed fork
+        // enough room for both its suffix and its deferred prefix.
+        let budget = if midstream && passes > 1 { 1000 } else { limit };
+        let report = run(state, clock, budget);
         assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert!(report.spent.requests <= budget, "{}", report.spent);
+        if let Some(cursor) = cursor {
+            let first = report
+                .lines
+                .iter()
+                .find(|l| l.starts_with(owner) && l.contains('#'))
+                .unwrap();
+            assert!(first.starts_with(&cursor), "{first}; cursor {cursor}");
+        }
+        if midstream {
+            for line in report
+                .lines
+                .iter()
+                .filter(|l| l.starts_with(owner) && l.contains('#'))
+            {
+                assert!(
+                    line.contains("wait: a midstream draft, waiting for promotion"),
+                    "{line}"
+                );
+            }
+        }
         for repo in &repositories {
             if report
                 .lines
@@ -3245,15 +3356,39 @@ fn change_sweep_accumulates_across_request_share_cuts() {
         }
         state = State::from_json(&report.state.unwrap().to_json()).unwrap();
         state.changes = report.records.borrow().changes.clone();
+        if let Some(cursor) = &state.share_cursor {
+            let (repo, number) = cursor.rsplit_once('#').unwrap_or((cursor, ""));
+            cut_within_fork |= midstream && !number.is_empty() && number != "1";
+            if passes == 1 {
+                assert!(
+                    !state.to_json()["changes_sweep"]["covered"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(repo)),
+                    "cut repository counted: {cursor}"
+                );
+            }
+        }
         if state.changes_swept.is_some() {
             break;
         }
-        assert!(passes < 3, "{:#?}", report.lines);
+        assert!(
+            passes < 12,
+            "midstream={midstream} actionFirst={action_first} quietWaits={quiet_waits} limit={limit}: {:#?}\n{:?}",
+            report.lines,
+            state.changes_sweep
+        );
     }
-    assert!((2..=3).contains(&passes), "{passes}");
+    assert_eq!(passes == 1, limit == 1000, "{passes}");
+    if midstream && limit < 1000 {
+        assert!(
+            cut_within_fork,
+            "no cut within a fork: actionFirst={action_first} quietWaits={quiet_waits}"
+        );
+    }
     assert_eq!(visited, repositories.iter().cloned().collect());
     assert_eq!(state.changes_swept, Some(now.format(&Rfc3339).unwrap()));
-    let narrowed = run(state, now);
+    let narrowed = run(state, now + time::Duration::minutes(passes), 1000);
     assert_eq!(narrowed.failures, 0, "{:#?}", narrowed.lines);
     assert!(
         narrowed
@@ -3273,7 +3408,7 @@ fn change_sweep_accumulates_across_request_share_cuts() {
     );
     let mut state = State::from_json(&narrowed.state.unwrap().to_json()).unwrap();
     state.changes = narrowed.records.borrow().changes.clone();
-    let full = run(state, due);
+    let full = run(state, due, limit);
     assert_eq!(full.failures, 0, "{:#?}", full.lines);
     assert!(
         full.lines
