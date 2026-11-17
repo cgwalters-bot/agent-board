@@ -43,6 +43,7 @@ fn refusals_precede_credentials_and_auxiliary_files() {
     let base = config("http://127.0.0.1:1/forge/");
     std::fs::write(&path, base.to_string()).unwrap();
     for (flags, refused) in [
+        (vec!["--pull", "example/work#1"], "--pull"),
         (vec!["--fix-bounds", "does-not-exist"], "--fix-bounds"),
         (
             vec![

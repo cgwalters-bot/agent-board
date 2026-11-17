@@ -153,6 +153,34 @@ This first defaults slice does not change explicit state paths or detailed outpu
 Default cache state, short summaries, `--caller`, SQLite/history and interval runs
 remain separate work.
 
+## One pull request on demand (GitHub)
+
+The concrete risk is an on-demand fix started by raw workflow dispatch bypassing
+the pass's policy. The optional `--pull OWNER/REPO#N` selects one open PR through
+the existing stage-2 decision and start path; without the flag nothing changes.
+It previews by default, and may propose a wait, merge, review or bounded round,
+not necessarily a fix:
+
+```sh
+agent-board pass --config .github/pass.json --pull 'OWNER/REPO#123'
+agent-board pass --config .github/pass.json --pull 'OWNER/REPO#123' --apply --max-dispatch 1 --max-writes 3
+```
+
+The repository must be in the trusted followed set (explicit `follow` or resolved
+midstream topic membership); selection does not enroll authored repositories.
+Unknown or closed targets and issue numbers are refused, as are unsupported
+forges. Selection skips rotation, activity, intake, maintenance, epic planning,
+scheduling, Status and publication. It still reads other PRs' paths and runs when
+needed for overlap and the full review-run census. Those reads authorize no steps
+on other PRs. Existing pacing (from the published usage snapshot), budget, WIP,
+leases, current-head reviews, fix bounds and request/time/dispatch/write caps
+remain in force. It never releases a human hold or resets round budgets. Local
+apply still needs explicit dispatch and write caps and is not serialized against
+the scheduled pass: use a trusted checkout and avoid concurrent appliers.
+
+This is a CLI invocation, not a persistent pass configuration key. A controller
+must replace raw dispatch with this command; no workflow or credentials change.
+
 ## Repository PR backpressure
 
 The concrete failure is new independent implementations accumulating faster than

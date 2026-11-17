@@ -17,6 +17,9 @@ pub struct Pass {
     /// The pass configuration (docs/pass.md), from a trusted default-branch checkout [default: .github/pass.json in the current directory]. Credentials come from GH_TOKEN, GITHUB_TOKEN or gh auth token (in that order), never the file; DISPATCH_TOKEN overrides the token for starts.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
+    /// Decide only this open GitHub PR through stage 2, skipping all other scheduling and publication. Preview by default; --apply retains pacing, holds, overlap, leases, WIP, bounds and caps. The repository must be followed by the trusted config. Example: agent-board pass --pull 'OWNER/REPO#123'; apply locally with --apply --max-dispatch 1 --max-writes 3.
+    #[arg(long, value_name = "OWNER/REPO#N", conflicts_with = "check_config")]
+    pub pull: Option<board_forge::poll::PullSelector>,
     /// The caller's agentic-job bounds file for its `fix` kind (such as .github/agentic-job/fix.toml), from the same trusted checkout, never a dispatched head or workflow input: a pull request whose repository is outside its `repos` (unless push_to_pull_request_branch's `own_author` is the pull request's author), or whose head branch is outside its push_to_pull_request_branch `branches`, gets no fix, rebase or continuation round and is left to the operator. Repeatable: a pull request is inside where any one file admits both its repository and its head branch. The policy step stays the boundary.
     #[arg(long, value_name = "FILE")]
     pub fix_bounds: Vec<PathBuf>,
@@ -256,6 +259,11 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     let path = args.config.as_ref().unwrap_or(&default_path);
     let mut config =
         Config::parse_sources(&read(path)?).with_context(|| format!("{}", path.display()))?;
+    ensure!(
+        args.pull.is_none() || config.forgejo_board().is_none(),
+        "unsupported_capability: --pull: GitHub-only"
+    );
+    config.pull = args.pull.clone();
     let limits = Limits {
         dispatch: args.max_dispatch.or(config.max_dispatch),
         writes: args.max_writes.or(config.max_writes),
@@ -555,6 +563,33 @@ fn print_report(report: &Report, out: &mut impl Write, verbose: bool) -> Result<
 mod next_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn pull_selection_is_explicit_preview_and_keeps_local_apply_caps() {
+        #[derive(Parser)]
+        struct Args {
+            #[command(flatten)]
+            pass: Pass,
+        }
+        let args = Args::try_parse_from(["pass", "--pull", "owner/repo#12"]).unwrap();
+        assert!(!args.pass.apply);
+        assert_eq!(args.pass.pull.unwrap().number, 12);
+        for target in [
+            "owner/repo",
+            "owner/repo#0",
+            "owner/repo#-1",
+            "owner/repo#1#2",
+            "https://github.com/owner/repo#1",
+        ] {
+            assert!(
+                Args::try_parse_from(["pass", "--pull", target]).is_err(),
+                "{target}"
+            );
+        }
+        assert!(
+            Args::try_parse_from(["pass", "--pull", "owner/repo#1", "--check-config"]).is_err()
+        );
+    }
 
     #[cfg(unix)]
     #[test]

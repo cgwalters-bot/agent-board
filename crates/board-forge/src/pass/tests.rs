@@ -21425,6 +21425,187 @@ fn approval_evidence_combined_transport_replay() {
 /// open pull request there, as stage 2 reads it once `repo` is followed:
 /// mergeable, unreviewed, with no checks, committed when the recording was
 /// made and with its fields replaced by `change`, and `comments` on it.
+#[test]
+fn single_pull_preview_apply_replay() {
+    const REPO: &str = "cgwalters-forge/agentic-job";
+    for applying in [false, true] {
+        for case in [
+            "merge",
+            "fix",
+            "unknown",
+            "issue",
+            "unfollowed",
+            "hold",
+            "human",
+            "stale review",
+            "dispatch cap",
+            "write cap",
+            "pool held",
+            "pool capped",
+            "bounds",
+            "overlap",
+            "wip",
+            "lease",
+            "rerun",
+            "rerun pool held",
+            "rerun pool capped",
+            "rerun wip",
+        ] {
+            let mut forge = Forge::new(None, false);
+            let rerun = case.starts_with("rerun");
+            let fix = matches!(
+                case,
+                "fix"
+                    | "dispatch cap"
+                    | "pool held"
+                    | "pool capped"
+                    | "bounds"
+                    | "overlap"
+                    | "wip"
+                    | "lease"
+            );
+            let review = if fix || rerun {
+                "CHANGES_REQUESTED"
+            } else {
+                "APPROVED"
+            };
+            let head = if case == "stale review" { "old" } else { "abc" };
+            let mut change = json!({"reviews":{"nodes":[{"state":review,"author":{"__typename":"User","login":"cgwalters"},"commit":{"oid":head},"submittedAt":"2026-10-23T00:00:00Z","body":"Review"}],"pageInfo":{"hasPreviousPage":false}}});
+            if matches!(case, "hold" | "human") {
+                change["labels"] = json!({"nodes":[{"name":if case == "hold" {"hold"} else {"needs-human"}}],"pageInfo":{"hasNextPage":false}});
+            }
+            let comments = if rerun {
+                let at = (forge.replay.now - time::Duration::hours(1))
+                    .format(&Rfc3339)
+                    .unwrap();
+                forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/actions/runs/77")},"answer":{"status":200,"link":null,"body":{"id":77,"status":"completed","conclusion":"failure","run_attempt":1,"created_at":at,"updated_at":at}}}));
+                json!([{"id":77,"user":{"login":"cgwalters-bot"},"body":format!("<!-- tracker-poll: {{\"rounds\":1,\"sha\":\"abc\",\"run\":77,\"pool\":\"claude\",\"at\":\"{at}\"}} -->\nFix round")}])
+            } else {
+                json!([])
+            };
+            followed(&mut forge.replay, (REPO, 2), change, comments);
+            // Both an unrelated PR in the same repository and another followed
+            // repository would be eligible. Neither may receive a decision.
+            answer(&mut forge.replay, &format!("repos/{REPO}/pulls?"))["body"] = json!([
+                {"number":1,"user":{"login":"cgwalters-bot"}},
+                {"number":2,"user":{"login":"cgwalters-bot"}}
+            ]);
+            forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}user")},"answer":{"status":200,"link":null,"body":{"login":"cgwalters-bot"}}}));
+            forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{REPO}")},"answer":{"status":200,"link":null,"body":{"allow_rebase_merge":true}}}));
+            let mut cfg = config(
+                json!({"follow":[REPO,"cgwalters-forge/unrelated"],"pr":{"fixPools":["claude"],"actionFirst":true}}),
+            );
+            cfg.pull = Some(
+                format!(
+                    "{}#{}",
+                    if case == "unfollowed" {
+                        "other/repo"
+                    } else {
+                        REPO
+                    },
+                    if matches!(case, "unknown" | "issue") {
+                        99
+                    } else {
+                        2
+                    }
+                )
+                .parse()
+                .unwrap(),
+            );
+            cfg.reruns = rerun;
+            if case == "bounds" {
+                cfg.fix_bounds = poll::bounds::FixBoundsSet::new(vec![poll::bounds::FixBounds::parse("repos = [\"other/repo\"]\n[outputs.push_to_pull_request_branch]\nbranches = [\"dispatch/**\"]").unwrap()]);
+            }
+            if case == "overlap" {
+                cfg.open_pr_cap = Some(1);
+                forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{REPO}/pulls/1/files?per_page=100")},"answer":{"status":200,"link":null,"body":[{"filename":"README.md"}]}}));
+            }
+            if matches!(case, "wip" | "lease" | "rerun wip") {
+                cfg.wip = 1;
+                if case == "lease" {
+                    cfg.leases = true;
+                }
+            }
+            if matches!(
+                case,
+                "pool held" | "pool capped" | "rerun pool held" | "rerun pool capped"
+            ) {
+                let mut snapshot = usage(&mut forge.replay);
+                if case.ends_with("pool held") {
+                    snapshot["pools"]["claude"]["hold"] = json!(true);
+                } else {
+                    snapshot["pools"]["claude"]["used_percent"] = json!(100);
+                }
+                set_usage(&mut forge.replay, &snapshot);
+            }
+            let limits = Limits {
+                dispatch: Some(usize::from(case != "dispatch cap")),
+                writes: Some(if case == "write cap" { 0 } else { 10 }),
+                status_changes: Some(5),
+            };
+            let report = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run(
+                    &forge,
+                    &forge,
+                    &cfg,
+                    State::default(),
+                    (if applying { Mode::Local } else { Mode::Preview }, limits),
+                    forge.replay.now,
+                ))
+                .unwrap();
+            let success = matches!(case, "merge" | "fix" | "rerun");
+            if rerun {
+                assert!(
+                    report.lines.iter().any(|l| l.starts_with("run rerun ")),
+                    "{case}/{applying}: {:?}",
+                    report.lines
+                );
+            }
+            assert_eq!(
+                report.failures > 0,
+                matches!(case, "unknown" | "issue" | "unfollowed"),
+                "{case}/{applying}: {:?}",
+                report.lines
+            );
+            assert_eq!(
+                report.summary.contains("dispatched 1/") || report.summary.contains("writes 1/"),
+                success,
+                "{case}/{applying}: {} {:?}",
+                report.summary,
+                report.lines
+            );
+            if !applying || !success {
+                assert!(
+                    forge.writes.borrow().is_empty(),
+                    "{case}/{applying}: {:?}",
+                    forge.writes.borrow()
+                );
+            }
+            assert!(
+                !report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("unrelated#") || l.starts_with(&format!("{REPO}#1 "))),
+                "{case}: {:?}",
+                report.lines
+            );
+            for (_, url, body) in forge.writes.borrow().iter() {
+                assert!(
+                    url.contains("/issues/2/")
+                        || url.contains("/issues/comments/")
+                        || url.contains("/actions/runs/77/rerun-failed-jobs")
+                        || url.contains("dispatch")
+                        || body["id"] == "PR_2",
+                    "{case}: {url} {body}"
+                );
+            }
+        }
+    }
+}
+
 fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, comments: Value) {
     let committed = replay.now.format(&Rfc3339).unwrap();
     let mut pull = json!({
@@ -26946,6 +27127,71 @@ fn apply_starts_reviews_by_priority_within_wip() {
             reruns,
             "{name}"
         );
+    }
+}
+
+#[test]
+fn single_pull_keeps_authored_review_census() {
+    for applying in [false, true] {
+        for active in [false, true] {
+            let active_run = review_run(
+                &replay(),
+                ("cgwalters-forge/agentic-job", 9, "old"),
+                json!({"status":"in_progress","conclusion":null}),
+            );
+            let (mut forge, mut cfg) = reviews_due(
+                WIP_BASE + 1,
+                [if active { vec![active_run] } else { vec![] }, vec![]],
+                json!([]),
+            );
+            cfg.follow = vec!["cgwalters-forge/tracker".into()];
+            cfg.authored = Some(1);
+            cfg.pull = Some("cgwalters-forge/tracker#889".parse().unwrap());
+            for (url, link, body) in authored_search(&[&[("cgwalters-forge/agentic-job", 9)]]) {
+                forge.replay.requests.push(
+                    json!({"request":{"get":url},"answer":{"status":200,"link":link,"body":body}}),
+                );
+            }
+            let report = block(run(
+                &forge,
+                &forge,
+                &cfg,
+                State::default(),
+                (
+                    if applying { Mode::Local } else { Mode::Preview },
+                    Limits {
+                        dispatch: Some(1),
+                        writes: Some(10),
+                        status_changes: Some(5),
+                    },
+                ),
+                forge.replay.now,
+            ))
+            .unwrap();
+            assert_eq!(
+                report.failures, 0,
+                "{active}/{applying}: {:?}",
+                report.lines
+            );
+            assert_eq!(
+                report.summary.contains("dispatched 1/"),
+                !active,
+                "{active}/{applying}: {} {:?}",
+                report.summary,
+                report.lines
+            );
+            if active || !applying {
+                assert!(forge.writes.borrow().is_empty());
+            }
+            assert!(
+                !report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("review cgwalters-forge/agentic-job#")),
+                "{:?}",
+                report.lines
+            );
+        }
     }
 }
 

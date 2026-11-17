@@ -4115,7 +4115,13 @@ fn pass_local_apply_needs_both_caps() {
             &[],
         ),
     ];
-    for (args, actions, code, error, stdout) in cases {
+    for (args, actions, code, error, stdout, selected) in
+        cases
+            .iter()
+            .flat_map(|(args, actions, code, error, stdout)| {
+                [false, true].map(|selected| (args, actions, code, error, stdout, selected))
+            })
+    {
         let mut command = command();
         command
             .args(apply)
@@ -4128,6 +4134,9 @@ fn pass_local_apply_needs_both_caps() {
             .env_remove("GITHUB_ACTIONS");
         if *actions {
             command.env("GITHUB_ACTIONS", "true");
+        }
+        if selected {
+            command.args(["--pull", "cgwalters-forge/tracker#123"]);
         }
         let output = command.assert().code(*code).get_output().clone();
         let err = String::from_utf8(output.stderr).unwrap();
