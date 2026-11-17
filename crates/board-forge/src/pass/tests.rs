@@ -96,30 +96,51 @@ fn issue_intake_enrolls_a_fresh_unlabelled_issue_and_triages_only_ours() {
     assert!(!report.lines.iter().any(|l| l.starts_with("start triage")));
 }
 
+/// A faulty issue listed ahead of a fresh one: a fault of the issue's own
+/// skips it and the watermark passes it; one that discredits the page holds
+/// the repository's watermark and enrolls nothing.
 #[test]
 fn issue_intake_refuses_unverified_discovery_and_preserves_preview_state() {
     let cfg = config(json!({"issueIntake":true,"state":"state.json","triage":{},
         "follow":["cgwalters-forge/tracker"],"workRepositories":["cgwalters-forge/tracker"],"pr":{"fixPools":["claude"]}}));
-    for (name, pointer, value) in [
+    for (name, pointer, value, skipped) in [
         (
             "foreign repository",
             "/nodes/0/repository/nameWithOwner",
             json!("other/repo"),
+            false,
         ),
-        ("closed", "/nodes/0/state", json!("CLOSED")),
-        ("truncated labels", "/nodes/0/labels/totalCount", json!(51)),
+        ("closed", "/nodes/0/state", json!("CLOSED"), false),
+        (
+            "truncated labels",
+            "/nodes/0/labels/totalCount",
+            json!(51),
+            true,
+        ),
         (
             "truncated membership",
             "/nodes/0/projectItems/pageInfo/hasNextPage",
             json!(true),
+            true,
         ),
         (
             "redacted membership",
             "/nodes/0/projectItems/nodes",
             json!([{"id":"member","project":null}]),
+            true,
         ),
-        ("missing timestamp", "/nodes/0/updatedAt", Value::Null),
-        ("incomplete page", "/pageInfo/hasNextPage", Value::Null),
+        (
+            "missing timestamp",
+            "/nodes/0/updatedAt",
+            Value::Null,
+            false,
+        ),
+        (
+            "incomplete page",
+            "/pageInfo/hasNextPage",
+            Value::Null,
+            false,
+        ),
     ] {
         let mut fixture = intake_fixture();
         let listing = fixture
@@ -127,27 +148,64 @@ fn issue_intake_refuses_unverified_discovery_and_preserves_preview_state() {
             .iter_mut()
             .find(|e| e["request"]["graphql"] == fnv(&intake::query(false)))
             .unwrap();
-        *listing["answer"]["data"]["repository"]["issues"]
-            .pointer_mut(pointer)
-            .unwrap() = value;
+        let issues = &mut listing["answer"]["data"]["repository"]["issues"];
+        let mut faulty = issues["nodes"][0].clone();
+        faulty["number"] = json!(9999);
+        faulty["id"] = json!("faulty-issue");
+        issues["nodes"].as_array_mut().unwrap().insert(0, faulty);
+        *issues.pointer_mut(pointer).unwrap() = value;
         let report = preview(&cfg, &fixture);
+        let warning = if skipped {
+            "intake warning: cgwalters-forge/tracker#9999: "
+        } else {
+            "intake warning: cgwalters-forge/tracker: "
+        };
         assert!(
-            report
-                .lines
-                .iter()
-                .any(|l| l.starts_with("intake warning:")),
+            report.lines.iter().any(|l| l.starts_with(warning)),
             "{name}: {:?}",
             report.lines
         );
-        assert!(
-            report.lines.contains(&"intake: 0 new issue(s)".into()),
-            "{name}"
-        );
-        assert!(
-            !report.lines.iter().any(|l| l.starts_with("start triage")),
-            "{name}"
-        );
+        let summary = if skipped {
+            "intake: 1 new issue(s) (cgwalters-forge/tracker#459)"
+        } else {
+            "intake: 0 new issue(s)"
+        };
+        assert!(report.lines.contains(&summary.into()), "{name}");
         assert!(report.issue_intake.is_empty());
+
+        let mut forge = Forge::new(None, false);
+        forge.replay = fixture;
+        let forge = IntakeForge {
+            forge,
+            enrollment: RefCell::default(),
+            fail_field: false,
+        };
+        let now = forge.forge.replay.now;
+        let limits = Limits {
+            dispatch: Some(0),
+            ..Limits::default()
+        };
+        let report = block(run(
+            &forge,
+            &forge,
+            &cfg,
+            State::default(),
+            (Mode::Local, limits),
+            now,
+        ))
+        .unwrap();
+        let watermark = &report.state.unwrap().issue_intake["cgwalters-forge/tracker"];
+        let expected = if skipped {
+            now - time::Duration::seconds(1)
+        } else {
+            now - time::Duration::days(2)
+        };
+        assert_eq!(watermark, &expected.format(&Rfc3339).unwrap(), "{name}");
+        assert_eq!(
+            forge.enrollment.borrow().len(),
+            if skipped { 2 } else { 0 },
+            "{name}"
+        );
     }
 }
 
