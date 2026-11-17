@@ -1881,6 +1881,8 @@ pub struct State {
     /// state, rather than in the store with the watermarks, so that a forged
     /// store cannot put the next full walk off. Losing it walks in full.
     pub changes_swept: Option<String>,
+    /// Scoped cross-pass full-walk coverage; trusted like changes_swept.
+    pub changes_sweep: Option<crate::pass::changed::Sweep>,
     /// The changes diff's watermarks, which the caller reads from the store
     /// and never from this file: not serialized.
     pub changes: Option<crate::changes::diff::State>,
@@ -1935,6 +1937,7 @@ impl State {
                     "maintain",
                     "authored_cursor",
                     "changes_swept",
+                    "changes_sweep",
                     // Read no more: the pass reads the live epics itself.
                     "authored_priority"
                 ]
@@ -2187,6 +2190,11 @@ impl State {
             maintain,
             authored_cursor,
             changes_swept,
+            // Corrupt/missing progress is a cold full walk. The pass also
+            // checks scope, bounds and clock before trusting its coverage.
+            changes_sweep: object
+                .get("changes_sweep")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
             changes: None,
         })
     }
@@ -2265,6 +2273,9 @@ impl State {
         }
         if let Some(swept) = &self.changes_swept {
             state["changes_swept"] = swept.as_str().into();
+        }
+        if let Some(sweep) = &self.changes_sweep {
+            state["changes_sweep"] = json!(sweep);
         }
         state
     }
@@ -10235,6 +10246,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         maintain: None,
         authored_cursor: None,
         changes_swept: None,
+        changes_sweep: None,
         changes: None,
     };
     Ok(outcome)

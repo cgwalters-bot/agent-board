@@ -30,6 +30,49 @@ pub const CHANGE_SWEEP_HOURS_LIMIT: u64 = 7 * 24;
 /// list one page short of a full page of 100.
 const VALIDATED_NUMBERS: usize = 99;
 
+/// Trusted coverage, never restored from the changes store. Losing or
+/// invalidating it costs a full walk, not missed work.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Sweep {
+    scope: String,
+    started: String,
+    observed: String,
+    covered: BTreeSet<String>,
+    active: bool,
+}
+
+impl Sweep {
+    fn resume(
+        previous: Option<Self>,
+        scope: String,
+        repositories: &BTreeSet<String>,
+        now: OffsetDateTime,
+    ) -> (Self, bool) {
+        if let Some(previous) = previous
+            && previous.scope == scope
+            && previous.covered.len() <= POLL_REPOSITORY_LIMIT
+            && previous.covered.is_subset(repositories)
+            && parse_time(&previous.started).is_ok_and(|start| {
+                parse_time(&previous.observed).is_ok_and(|last| start <= last && last <= now)
+            })
+        {
+            return (previous, true);
+        }
+        let at = now.format(&Rfc3339).unwrap_or_default();
+        (
+            Self {
+                scope,
+                started: at.clone(),
+                observed: at,
+                covered: BTreeSet::new(),
+                active: true,
+            },
+            false,
+        )
+    }
+}
+
 /// What stage 0 read, for stage 2 to walk and then commit.
 pub(super) struct Read {
     /// A diff for each repository read; one that could not be read has none.
@@ -43,6 +86,9 @@ pub(super) struct Read {
     sweep: bool,
     /// The last full walk's time, kept where this one is not one.
     swept: Option<String>,
+    coverage: Sweep,
+    repositories: BTreeSet<String>,
+    scope_read: bool,
 }
 
 pub(super) fn check(config: &Config) -> Result<()> {
@@ -148,11 +194,37 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let hours = self.config.change_sweep_hours;
         let stored = state.changes.take();
         if hours == 0 {
+            state.changes_sweep = None;
+            state.changes_swept = None;
             return;
         }
-        let swept = state.changes_swept.clone();
+        let (diffs, watermarks, repositories, scope_read) =
+            self.read_diffs(stored.unwrap_or_default());
+        // The config includes identity, actionFirst and envelope settings;
+        // the resolved set also binds dynamic midstream membership. A failed
+        // membership read cannot validate an old sweep or complete a new one.
+        let scope = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "changes/sweep/v1\0{:?}\0{repositories:?}",
+                self.config
+            ))
+        );
+        let (mut coverage, compatible) =
+            Sweep::resume(state.changes_sweep.take(), scope, &repositories, self.now);
+        let swept = state
+            .changes_swept
+            .clone()
+            .filter(|_| compatible && scope_read);
         let sweep = sweep_due(swept.as_deref(), hours, self.now);
-        let (diffs, watermarks) = self.read_diffs(stored.unwrap_or_default());
+        if sweep && !coverage.active {
+            // Start the next round once, not anew on each request-share cut.
+            coverage.started = self.now.format(&Rfc3339).unwrap_or_default();
+            coverage.covered.clear();
+            coverage.active = true;
+        }
+        state.changes_swept = swept.clone();
+        state.changes_sweep = Some(coverage.clone());
         let changed = match sweep {
             true => BTreeMap::new(),
             false => self::changed(&diffs, &watermarks),
@@ -181,6 +253,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             changed,
             sweep,
             swept,
+            coverage,
+            repositories,
+            scope_read,
         });
     }
 
@@ -189,8 +264,12 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// under `pr.actionFirst` only those in our own space, which its walk
     /// narrows. A repository that fails its read loses its watermark, so
     /// that the next pass reads it from a first window.
-    fn read_diffs(&mut self, stored: diff::State) -> (Vec<Diff>, diff::State) {
+    fn read_diffs(
+        &mut self,
+        stored: diff::State,
+    ) -> (Vec<Diff>, diff::State, BTreeSet<String>, bool) {
         let config = self.config;
+        let mut scope_read = true;
         let midstreams = match &config.midstream {
             None => Vec::new(),
             Some(midstream) => {
@@ -205,6 +284,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                         read
                     }
                     Err(error) => {
+                        scope_read = false;
                         self.line(format!(
                             "changes: midstream topic {} unread, so its forks are walked whole: {error:#}",
                             midstream.topic
@@ -257,7 +337,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             .into_iter()
             .take(PENDING_LIMIT)
             .collect();
-        (diffs, state)
+        (diffs, state, seen, scope_read)
     }
 
     /// The pull requests stage 2's walk may narrow to, by repository.
@@ -276,7 +356,12 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             return;
         };
         let applied = self.apply.then_some(self.now);
-        let watermarks = walked(changes, outcome, applied);
+        let visited = self
+            .follows
+            .iter()
+            .map(|r| r.to_ascii_lowercase())
+            .collect();
+        let watermarks = walked(changes, outcome, applied, &visited);
         self.report.records.borrow_mut().changes = Some(watermarks);
     }
 }
@@ -289,6 +374,7 @@ fn walked(
     changes: &mut Read,
     outcome: &mut poll::Outcome,
     applied: Option<OffsetDateTime>,
+    visited: &BTreeSet<String>,
 ) -> diff::State {
     // A pull request already labelled for the supervisor waits on it as a
     // skip does; one whose label write was refused is held.
@@ -306,19 +392,30 @@ fn walked(
     for diff in &changes.diffs {
         diff.commit_where(&mut changes.state, consumed);
     }
-    // A full walk ends where every repository a later pass may narrow, or
-    // the diff read, was walked to its end; a held step there is listed
-    // again by the next diff, its watermark kept.
-    let complete = changes.sweep
-        && !changes.diffs.is_empty()
-        && (changes.diffs.iter().flat_map(|d| &d.repositories))
-            .map(|r| r.repository.to_ascii_lowercase())
-            .chain(changes.state.repositories.keys().cloned())
-            .all(|repo| !undecided.contains(&repo));
-    outcome.state.changes_swept = match applied.filter(|_| complete) {
-        Some(now) => now.format(&Rfc3339).ok(),
-        None => changes.swept.clone(),
-    };
+    outcome.state.changes_swept = changes.swept.clone();
+    if let Some(now) = applied {
+        changes.coverage.observed = now.format(&Rfc3339).unwrap_or_default();
+        if changes.sweep && changes.scope_read {
+            // Absence from undecided proves completion only for repositories
+            // actually handed to stage 2, not unread diffs or cursor wraps.
+            changes.coverage.covered.extend(
+                changes
+                    .repositories
+                    .intersection(visited)
+                    .filter(|repo| !undecided.contains(*repo))
+                    .cloned(),
+            );
+            if !changes.repositories.is_empty() && changes.coverage.covered == changes.repositories
+            {
+                // Date from the earliest coverage, not the final pass: a
+                // slow round must not extend the maximum narrowing interval.
+                outcome.state.changes_swept = Some(changes.coverage.started.clone());
+                changes.coverage.covered.clear();
+                changes.coverage.active = false;
+            }
+        }
+    }
+    outcome.state.changes_sweep = Some(changes.coverage.clone());
     // What it left unvisited may wait on the operator as it did.
     (outcome.undecided).extend(outcome.unchanged.keys().cloned());
     changes.state.clone()
@@ -344,6 +441,157 @@ mod tests {
             (Some("2027-01-15T12:00:00Z"), false),
         ] {
             assert_eq!(sweep_due(swept, 6, now), due, "{swept:?}");
+        }
+    }
+
+    #[test]
+    fn coverage_resets_conservatively() {
+        let now = at(NOW);
+        let repos = ["o/a".into(), "o/b".into()].into();
+        let (fresh, _) = Sweep::resume(None, "scope".into(), &repos, now);
+        for (name, scope, start, observed, covered, present, valid) in [
+            ("resume", "scope", NOW, NOW, vec!["o/a"], true, true),
+            (
+                "config changed",
+                "other",
+                NOW,
+                NOW,
+                vec!["o/a"],
+                true,
+                false,
+            ),
+            (
+                "repository removed",
+                "scope",
+                NOW,
+                NOW,
+                vec!["o/c"],
+                true,
+                false,
+            ),
+            (
+                "corrupt start",
+                "scope",
+                "bad",
+                NOW,
+                vec!["o/a"],
+                true,
+                false,
+            ),
+            (
+                "corrupt clock",
+                "scope",
+                NOW,
+                "bad",
+                vec!["o/a"],
+                true,
+                false,
+            ),
+            (
+                "clock reversed",
+                "scope",
+                NOW,
+                "2027-01-15T12:01:00Z",
+                vec!["o/a"],
+                true,
+                false,
+            ),
+            (
+                "start after observation",
+                "scope",
+                "2027-01-15T12:01:00Z",
+                NOW,
+                vec!["o/a"],
+                true,
+                false,
+            ),
+            ("lost state", "scope", NOW, NOW, vec!["o/a"], false, false),
+        ] {
+            let previous = present.then(|| Sweep {
+                scope: scope.into(),
+                started: start.into(),
+                observed: observed.into(),
+                covered: covered.into_iter().map(Into::into).collect(),
+                active: true,
+            });
+            let (resumed, compatible) = Sweep::resume(previous, "scope".into(), &repos, now);
+            assert_eq!(compatible, valid, "{name}");
+            if !valid {
+                assert_eq!(resumed, fresh, "{name}");
+            }
+        }
+        let mut json = poll::State {
+            interval_seconds: poll::MIN_INTERVAL_SECONDS,
+            changes_sweep: Some(fresh),
+            ..Default::default()
+        }
+        .to_json();
+        json["changes_sweep"]["covered"] = json!("corrupt");
+        assert!(
+            poll::State::from_json(&json)
+                .unwrap()
+                .changes_sweep
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_verified_walks_accumulate_coverage() {
+        for (name, visited, unread, scope_read, applying, complete) in [
+            ("finished", vec!["o/a", "o/b"], vec![], true, true, true),
+            (
+                "failed PR read",
+                vec!["o/a", "o/b"],
+                vec!["o/b"],
+                true,
+                true,
+                false,
+            ),
+            (
+                "failed repository list",
+                vec!["o/a", "o/b"],
+                vec!["o/b"],
+                true,
+                true,
+                false,
+            ),
+            ("outside envelope", vec!["o/a"], vec![], true, true, false),
+            (
+                "unread membership",
+                vec!["o/a", "o/b"],
+                vec![],
+                false,
+                true,
+                false,
+            ),
+            ("preview", vec!["o/a", "o/b"], vec![], true, false, false),
+        ] {
+            // Cache-store loss or a plausible forged store cannot contribute
+            // coverage: only the trusted round and stage-2 outcome can.
+            for store in ["cold", "lost", "forged"] {
+                let mut read = read(true);
+                read.scope_read = scope_read;
+                if store != "forged" {
+                    read.state = diff::State::default();
+                }
+                let mut outcome = poll::Outcome::default();
+                outcome.undecided = unread.iter().map(|r| r.to_string()).collect();
+                // Even a wrapped/cleared share cursor proves nothing alone.
+                outcome.state.share_cursor = None;
+                let visited = visited.iter().map(|r| r.to_string()).collect();
+                walked(&mut read, &mut outcome, applying.then(|| at(NOW)), &visited);
+                assert_eq!(
+                    outcome.state.changes_swept.as_deref() == Some(NOW),
+                    complete,
+                    "{name}, {store}"
+                );
+                if !complete {
+                    assert!(
+                        !outcome.state.changes_sweep.unwrap().covered.contains("o/b"),
+                        "{name}"
+                    );
+                }
+            }
         }
     }
 
@@ -479,6 +727,15 @@ mod tests {
             state,
             sweep,
             swept: Some("2027-01-15T06:00:00Z".into()),
+            coverage: Sweep {
+                scope: "test".into(),
+                started: NOW.into(),
+                observed: NOW.into(),
+                covered: BTreeSet::new(),
+                active: true,
+            },
+            repositories: ["o/a".into(), "o/b".into()].into(),
+            scope_read: true,
         }
     }
 
@@ -655,7 +912,8 @@ mod tests {
             outcome.unchanged = unchanged.iter().map(|r| (r.to_string(), 2)).collect();
             outcome.steps = steps;
             let applied = applied.then(|| at(NOW));
-            let state = walked(&mut changes, &mut outcome, applied);
+            let visited = changes.repositories.clone();
+            let state = walked(&mut changes, &mut outcome, applied, &visited);
             let a_since = since(&state, "o/a");
             let a_expected = a.clone().or(Some("2027-01-15T08:00:00Z".into()));
             assert_eq!(a_since, a_expected, "{name}");
