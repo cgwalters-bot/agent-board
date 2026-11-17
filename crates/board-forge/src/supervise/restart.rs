@@ -41,6 +41,9 @@ const RUN_PAGE: usize = 100;
 pub struct RestartPass {
     pub stale_minutes: u64,
     pub inputs: BTreeMap<String, String>,
+    /// Trusted caller contract: every default-branch run of this workflow applies.
+    /// The ordinary poll workflow may mix previews and applies; titles are not evidence.
+    pub applying_workflow: Option<String>,
 }
 
 impl RestartPass {
@@ -55,7 +58,7 @@ impl RestartPass {
             .with_context(|| format!("{what} is not an object"))?;
         if let Some(key) = object
             .keys()
-            .find(|k| !["staleMinutes", "inputs"].contains(&k.as_str()))
+            .find(|k| !["staleMinutes", "inputs", "applyingWorkflow"].contains(&k.as_str()))
         {
             bail!("{what}: unknown key {key:?}");
         }
@@ -102,9 +105,21 @@ impl RestartPass {
                 Ok((name, value.to_owned()))
             })
             .collect::<Result<_>>()?;
+        let applying_workflow = object
+            .get("applyingWorkflow")
+            .filter(|v| !v.is_null())
+            .map(|v| {
+                let name = v
+                    .as_str()
+                    .context("restartPass.applyingWorkflow must be a workflow filename")?;
+                crate::poll::validate_workflow(name)?;
+                Ok::<_, anyhow::Error>(name.to_owned())
+            })
+            .transpose()?;
         Ok(Some(Self {
             stale_minutes,
             inputs,
+            applying_workflow,
         }))
     }
 }
@@ -115,10 +130,12 @@ impl RestartPass {
 pub struct Record {
     pub after: u64,
     pub escalated: bool,
+    /// Authenticated comment creation time, never text supplied in its body.
+    pub created_at: i64,
 }
 
 impl Record {
-    fn parse(body: &str) -> Option<Self> {
+    fn parse(body: &str, created_at: i64) -> Option<Self> {
         let rest = body.lines().next()?.strip_prefix(MARKER)?;
         let (kind, rest) = rest.split_once(" after=")?;
         let after = rest.strip_suffix(" -->")?.parse().ok()?;
@@ -127,7 +144,11 @@ impl Record {
             ESCALATED => true,
             _ => return None,
         };
-        Some(Self { after, escalated })
+        Some(Self {
+            after,
+            escalated,
+            created_at,
+        })
     }
 
     fn line(self) -> String {
@@ -197,6 +218,17 @@ pub fn decide(
         .iter()
         .skip(1)
         .any(|run| run["conclusion"] == "success");
+    // A successful dispatch (or a lost reply) can precede visibility in the
+    // listing. The old stalled run's age says nothing about this delay.
+    if let Some(r) = record.filter(|r| !r.escalated && !recovered) {
+        let age = (now - r.created_at) / 60_000;
+        if age < stale_minutes as i64 {
+            return Ok(Decision::Wait(format!(
+                "restart after poll run {} was recorded {age} minutes ago; waiting for visibility",
+                r.after
+            )));
+        }
+    }
     match record.filter(|_| !recovered) {
         None => Ok(Decision::Restart {
             after: newest_id,
@@ -205,13 +237,19 @@ pub fn decide(
         Some(Record {
             after,
             escalated: true,
+            ..
         }) => Ok(Decision::Wait(format!(
             "the operator was told the restart after poll run {after} did not take; not restarting"
         ))),
-        Some(Record { after, .. }) => Ok(Decision::Escalate {
+        Some(Record {
+            after, created_at, ..
+        }) => Ok(Decision::Escalate {
             after,
             error: match after_record.first() {
-                None => format!("no poll run started after the restart, {age} minutes ago or more"),
+                None => format!(
+                    "no poll run started after the restart, {} minutes ago",
+                    (now - created_at) / 60_000
+                ),
                 Some(run) => format!(
                     "poll run {} after the restart ended {} and none followed it",
                     id(run)?,
@@ -229,14 +267,16 @@ pub fn run(api: &dyn Api, s: &Settings, branch: &str, run_url: &str, now: i64) -
     let Some(restart) = &s.restart_pass else {
         return Ok(format!("{OPTION} is not configured; nothing to do"));
     };
+    // Threat: preview activity can hide a stopped applying chain, or a preview
+    // success can clear its no-retry record. REST listings omit dispatch inputs.
+    let Some(poll) = &restart.applying_workflow else {
+        return Ok("restartPass.applyingWorkflow is not configured; applying recovery is unknown; nothing to do".into());
+    };
     let agent = s
         .agent
         .as_ref()
         .with_context(|| format!("{OPTION} needs the agent's log issue"))?;
-    let workflow = format!(
-        "/repos/{}/actions/workflows/{}",
-        s.dispatch_repo, s.poll_workflow
-    );
+    let workflow = format!("/repos/{}/actions/workflows/{}", s.dispatch_repo, poll);
     let listing = api.get(&format!(
         "{workflow}/runs?branch={}&exclude_pull_requests=true&per_page={RUN_PAGE}",
         encode(branch)
@@ -244,16 +284,22 @@ pub fn run(api: &dyn Api, s: &Settings, branch: &str, run_url: &str, now: i64) -
     let runs = listing["workflow_runs"]
         .as_array()
         .context("poll runs: no workflow_runs")?;
+    let path = format!(".github/workflows/{poll}");
+    let runs: Vec<Value> = runs
+        .iter()
+        .filter(|r| r["path"] == path && r["head_branch"] == branch)
+        .cloned()
+        .collect();
     let record = newest_record(api, s, now)?;
     let log = format!(
         "/repos/{}/issues/{}/comments",
         agent.log.repository, agent.log.issue
     );
-    let poll = &s.poll_workflow;
     let escalate = |after: u64, error: &str| -> Result<String> {
         let line = Record {
             after,
             escalated: true,
+            created_at: now,
         }
         .line();
         let body = format!(
@@ -263,7 +309,7 @@ pub fn run(api: &dyn Api, s: &Settings, branch: &str, run_url: &str, now: i64) -
         api.send("POST", &log, &json!({ "body": body }))?;
         Ok(format!("escalated: {error}"))
     };
-    match decide(runs, record, now, restart.stale_minutes)? {
+    match decide(&runs, record, now, restart.stale_minutes)? {
         Decision::Wait(why) => Ok(why),
         Decision::Escalate { after, error } => escalate(after, &error),
         Decision::Restart { after, age } => {
@@ -272,6 +318,7 @@ pub fn run(api: &dyn Api, s: &Settings, branch: &str, run_url: &str, now: i64) -
             let line = Record {
                 after,
                 escalated: false,
+                created_at: now,
             }
             .line();
             let body = format!(
@@ -307,8 +354,9 @@ fn newest_record(api: &dyn Api, s: &Settings, now: i64) -> Result<Option<Record>
         // when it was written.
         for c in comments {
             if c["user"]["login"] == s.bot.as_str()
-                && millis(&c["created_at"]).is_some_and(|at| at >= since)
-                && let Some(record) = c["body"].as_str().and_then(Record::parse)
+                && let Some(at) = millis(&c["created_at"])
+                && at >= since
+                && let Some(record) = c["body"].as_str().and_then(|body| Record::parse(body, at))
             {
                 found = Some(record);
             }

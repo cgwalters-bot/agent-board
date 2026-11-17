@@ -375,6 +375,13 @@ fn unset(board: &Value, supervisor: &Value) -> Vec<String> {
     if absent(&board["pr"], "draftReviewRepositories") {
         names.push("pr.draftReviewRepositories".into());
     }
+    if supervisor
+        .get(restart::OPTION)
+        .is_some_and(|v| !v.is_null())
+        && absent(&supervisor[restart::OPTION], "applyingWorkflow")
+    {
+        names.push("restartPass.applyingWorkflow".into());
+    }
     if let Some(agent) = supervisor.get("agent").filter(|a| !a.is_null()) {
         names.extend(
             AGENT_OPTIONS
