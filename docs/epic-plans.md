@@ -67,6 +67,7 @@ structural format; runtime checks also enforce the bounds and relationships belo
 |---|---|---|
 | `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `question`, `plan`, `stacks_on`, `blocked_by` | Create the issue, link `blocked_by`, link it to the epic, enroll it in the project with its Priority, and post `plan` as a job plan |
 | `attach_sub_issue` | `issue` | Link the existing issue to the epic |
+| `post_job_plan` | `issue`, `plan` | Post one job-plan comment on an existing open child; requires `existing_child_plans` |
 | `close_sub_issue` | `issue`, `reason` | Comment the reason, close as not planned |
 | `rescope_sub_issue` | `issue`, `body`, `reason` | Replace the body, comment the reason |
 | `set_priority` | `issue` or `new`, `value` | Set the board's Priority |
@@ -82,10 +83,46 @@ and its preview refuse it unless the configuration sets
 [`close_epic`](#apply); the dry run, which has no configuration, shows it.
 
 `issue` is `OWNER/REPO#N`; `new` is the 1-based position of an earlier
-`create_sub_issue` in `actions`. A job plan in `plan` has every field of a job
+`create_sub_issue` in `actions`. A job plan in a create's `plan` has every field of a job
 plan except `repo` and `item`, which are the new issue's. In the dry run's
 output the new issue's number is `NEW-k`, and project fields are named by field
 and option, which apply resolves to node IDs.
+
+`post_job_plan` preserves planning for existing children without filing duplicate
+issues. Its `plan` takes `schema`, `kind`, `runner`, `brief`, and optional `pool`
+and `effort`, as in the schema's `job` definition; all other fields are refused,
+including `repo`, `item`, `target_repo`, `stacks_on` and `past_cap`. The controller
+binds repo and item to the action's `issue`. The target must already be an open
+child of this open epic, in a configured repository, before and after claiming;
+an issue attached by this same plan is not eligible. Duplicate job-plan actions,
+closing that child in the same plan, and closing the epic after posting a job
+plan are refused. It uses one action of the existing 20-action limit and one
+comment write, plus the plan's existing claim and receipt writes. A dry run
+shows the bound job-plan comment, and an applying pass charges its write cap.
+Only trusted epic-plan writers can propose it; the bot posts it, so child-plan
+selection must trust the bot as planner, just as for new children.
+
+Epic-idle planning must answer with exactly one comment on its own epic holding
+one `agent-board-epic-plan`, using `post_job_plan` for existing children and
+`create_sub_issue` with `plan` only for genuinely new slices. The existing epics
+controller applies that proposal. Do not post comments directly on children or
+widen fixed-item comment bounds.
+
+The failed [idle run 42561654848](https://github.com/cgwalters-forge/tracker/actions/runs/42561654848)
+and [idle run 42561645145](https://github.com/cgwalters-forge/tracker/actions/runs/42561645145)
+received the child-comment brief as a `workflow_dispatch` task input in
+`dispatch.yml`, at caller revision `38169f45cf43c9e25ef93f93361b7facfd37e4f9`.
+Their `run / check / check` jobs refused `item_number` outside the caller's
+fixed item. That input is not `pass/epics.rs::planning_brief`: at revision
+`549179c05eac95321c5e860e80aaed2c93c7622e` it already requests an epic-level
+comment. The caller's poll/supervisor workflow pin at that time was
+`7448aaf1deaf840e2833b79d1a61cbb56193ca24`; its installer release record named
+`819bb77db70b451874317aff4ea4b61ab174557e`. Neither is evidence that the pass
+produced this task. The process that supplied that dispatch input has not been
+identified; correcting this library's brief alone cannot establish deployment
+recovery. The regression fixture records the observed input separately from a
+representative corrected single-comment handback, exercised against fixed-item
+admission and controller application for both existing and new children.
 
 `stacks_on` names the slice a new one builds on: `k`, an earlier
 `create_sub_issue` with an implement plan, or `OWNER/REPO#N`, an open
@@ -278,7 +315,8 @@ dispatch branch. Its JSON object has these fields (unknown fields are refused):
   "default_priority": "P1",
   "label_by_operator": true,
   "close_epic": true,
-  "attach_sub_issue": true
+  "attach_sub_issue": true,
+  "existing_child_plans": true
 }
 ```
 
@@ -287,6 +325,14 @@ dispatch branch. Its JSON object has these fields (unknown fields are refused):
 the configured repositories that has no parent to the epic, and every later
 plan may then close or rescope it as any sub-issue: without the opt-in a plan
 reaches only the epic's own sub-issues. `agent-board pass` does not set it.
+
+An existing child may already have completed planning or work in flight: letting
+a planner post a new dispatchable job plan can re-arm that work. To keep that
+authority opt-in, `existing_child_plans` is optional and off by default; off,
+`post_job_plan` refuses the whole plan. The pass's corresponding caller setting
+is top-level `existingChildPlans: true`. It does not bypass dispatch's approval,
+hold or active-work checks. Forgejo refuses the option and action rather than
+silently dropping them.
 
 `close_epic` is optional and off by default. Off, a plan with a `close_epic`
 action is refused and closing an epic stays the operator's alone; on, a plan
@@ -333,6 +379,11 @@ partial actions), and retains the claim. No rollback or automatic retry occurs.
 Inspect a failed or interrupted run and edit/replace the plan to continue.
 Failure to update the receipt is also an error, not permission to retry.
 Receipt deletion by a repository writer can enable replay, as for dispatch.
+
+For `post_job_plan`, a confirmed `comment` write proves completion. An older
+job-plan comment on the child is never proof that an ambiguous new write
+succeeded. A stopped or incomplete receipt retains the claim for inspection;
+re-running it never posts another plan or creates a replacement child.
 
 The receipt is one comment on the epic, readable first: what the apply did,
 one line per sub-issue with its final state, then one fenced

@@ -113,6 +113,9 @@ pub struct Config {
     /// may close or rescope it, so attaching would let a plan writer reach
     /// any issue in the configured repositories, not only the epic's.
     pub attach_sub_issue: bool,
+    /// Re-arming existing work with a dispatchable plan is separate from
+    /// creating a new slice. Do not allow it without caller consent.
+    pub existing_child_plans: bool,
 }
 
 impl Config {
@@ -132,7 +135,8 @@ impl Config {
                     "default_priority",
                     "label_by_operator",
                     "close_epic",
-                    "attach_sub_issue"
+                    "attach_sub_issue",
+                    "existing_child_plans"
                 ]
                 .contains(&key.as_str()),
                 "unknown epic config field {key:?}"
@@ -223,6 +227,7 @@ impl Config {
             label_by_operator,
             close_epic: flag("close_epic")?,
             attach_sub_issue: flag("attach_sub_issue")?,
+            existing_child_plans: flag("existing_child_plans")?,
         })
     }
 
@@ -243,6 +248,14 @@ impl Config {
         ensure!(
             self.attach_sub_issue || !plan.attaches(),
             "the plan attaches an existing issue, which the configuration does not allow (attach_sub_issue)"
+        );
+        ensure!(
+            self.existing_child_plans
+                || !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, Action::PostJobPlan { .. })),
+            "the plan posts an existing child's job plan, which the configuration does not allow (existing_child_plans)"
         );
         validated
     }
@@ -364,6 +377,7 @@ pub(crate) fn needs(kind: &str, job_plan: bool, blocked: bool) -> Vec<&'static s
             out
         }
         "attach_sub_issue" => vec!["link"],
+        "post_job_plan" => vec!["comment"],
         "close_sub_issue" | "close_epic" | "rescope_sub_issue" => vec!["comment", "patch"],
         "set_priority" => vec!["priority"],
         _ => vec![],
@@ -638,6 +652,7 @@ pub fn readable(detail: &Detail, epic: Option<&IssueRef>) -> Vec<String> {
                 format!("Action {}: stopped before creating its sub-issue", c.action)
             }
             ("attach_sub_issue", Some(i)) if whole => format!("Attached {i}"),
+            ("post_job_plan", Some(i)) if whole => format!("Posted a job plan on {i}"),
             ("close_sub_issue", Some(i)) if whole => format!("Closed {i} as not planned"),
             ("rescope_sub_issue", Some(i)) if whole => format!("Rescoped {i}"),
             ("set_priority", Some(i)) => match &priority {
@@ -736,64 +751,68 @@ pub fn unproved(
         let wanted = needs(kind, job_plan.is_some(), blocked.is_some());
         let whole = c.is_some_and(|c| c.wrote("satisfied") || wanted.iter().all(|w| c.wrote(w)));
         let issue = action["issue"].as_str();
-        let missing = match kind {
-            "create_sub_issue" => match c.and_then(|c| c.issue.as_deref()) {
-                None => Some(format!(
-                    "no confirmed issue for its sub-issue in {}",
-                    action["repo"].as_str().unwrap_or("?")
-                )),
-                Some(made) if !member(made) => {
-                    Some(format!("{made} is not a sub-issue of the epic"))
+        let missing =
+            match kind {
+                "create_sub_issue" => match c.and_then(|c| c.issue.as_deref()) {
+                    None => Some(format!(
+                        "no confirmed issue for its sub-issue in {}",
+                        action["repo"].as_str().unwrap_or("?")
+                    )),
+                    Some(made) if !member(made) => {
+                        Some(format!("{made} is not a sub-issue of the epic"))
+                    }
+                    // Not observed: confirmed only as it is written.
+                    Some(made)
+                        if action.get("blocked_by").is_some()
+                            && !c.is_some_and(|c| c.wrote("blocked_by")) =>
+                    {
+                        Some(format!("{made}'s blocked-by link was not confirmed"))
+                    }
+                    // Cut short after its create, what followed is observed: it is
+                    // linked, being a sub-issue; it has a Priority on the board;
+                    // and its job plan, where it has one, is posted.
+                    Some(made)
+                        if !whole
+                            && !(priorities.contains_key(&made.to_ascii_lowercase())
+                                && (action.get("plan").is_none() || posted(made))) =>
+                    {
+                        Some(format!("{made}'s writes were not all confirmed"))
+                    }
+                    Some(_) => None,
+                },
+                "attach_sub_issue" => (!whole && !issue.is_some_and(member))
+                    .then(|| format!("{} is not a sub-issue of the epic", issue.unwrap_or("?"))),
+                "close_sub_issue" => (!whole && !issue.is_some_and(closed))
+                    .then(|| format!("{} is open", issue.unwrap_or("?"))),
+                "rescope_sub_issue" => (!whole)
+                    .then(|| format!("{}'s new body was not confirmed", issue.unwrap_or("?"))),
+                // An unrelated older plan on an existing child is not evidence
+                // that this action succeeded. Ambiguous writes retain the claim.
+                "post_job_plan" => (!whole)
+                    .then(|| format!("{}'s job plan was not confirmed", issue.unwrap_or("?"))),
+                "set_priority" => {
+                    let target = match action["new"].as_u64() {
+                        Some(k) => confirmed(k as usize).and_then(|c| c.issue.clone()),
+                        None => issue.map(str::to_owned),
+                    };
+                    let value = action["value"].as_str();
+                    let shown = target
+                        .as_deref()
+                        .and_then(|t| priorities.get(&t.to_ascii_lowercase()))
+                        .map(String::as_str);
+                    // A sub-issue closed since needs no Priority, as apply has it.
+                    let moot = target.as_deref().is_some_and(closed);
+                    (!whole && !moot && (value.is_none() || shown != value)).then(|| {
+                        format!(
+                            "{} is not {}",
+                            target.as_deref().unwrap_or("its new sub-issue"),
+                            value.unwrap_or("?")
+                        )
+                    })
                 }
-                // Not observed: confirmed only as it is written.
-                Some(made)
-                    if action.get("blocked_by").is_some()
-                        && !c.is_some_and(|c| c.wrote("blocked_by")) =>
-                {
-                    Some(format!("{made}'s blocked-by link was not confirmed"))
-                }
-                // Cut short after its create, what followed is observed: it is
-                // linked, being a sub-issue; it has a Priority on the board;
-                // and its job plan, where it has one, is posted.
-                Some(made)
-                    if !whole
-                        && !(priorities.contains_key(&made.to_ascii_lowercase())
-                            && (action.get("plan").is_none() || posted(made))) =>
-                {
-                    Some(format!("{made}'s writes were not all confirmed"))
-                }
-                Some(_) => None,
-            },
-            "attach_sub_issue" => (!whole && !issue.is_some_and(member))
-                .then(|| format!("{} is not a sub-issue of the epic", issue.unwrap_or("?"))),
-            "close_sub_issue" => (!whole && !issue.is_some_and(closed))
-                .then(|| format!("{} is open", issue.unwrap_or("?"))),
-            "rescope_sub_issue" => {
-                (!whole).then(|| format!("{}'s new body was not confirmed", issue.unwrap_or("?")))
-            }
-            "set_priority" => {
-                let target = match action["new"].as_u64() {
-                    Some(k) => confirmed(k as usize).and_then(|c| c.issue.clone()),
-                    None => issue.map(str::to_owned),
-                };
-                let value = action["value"].as_str();
-                let shown = target
-                    .as_deref()
-                    .and_then(|t| priorities.get(&t.to_ascii_lowercase()))
-                    .map(String::as_str);
-                // A sub-issue closed since needs no Priority, as apply has it.
-                let moot = target.as_deref().is_some_and(closed);
-                (!whole && !moot && (value.is_none() || shown != value)).then(|| {
-                    format!(
-                        "{} is not {}",
-                        target.as_deref().unwrap_or("its new sub-issue"),
-                        value.unwrap_or("?")
-                    )
-                })
-            }
-            "close_epic" => (!whole && epic.open).then(|| "the epic is open".to_owned()),
-            other => Some(format!("{other} is not an action this apply knows")),
-        };
+                "close_epic" => (!whole && epic.open).then(|| "the epic is open".to_owned()),
+                other => Some(format!("{other} is not an action this apply knows")),
+            };
         if let Some(why) = missing {
             out.push(format!("action {n} ({kind}): {why}"));
         }
@@ -1005,6 +1024,7 @@ pub fn planned<T: Transport>(
                 format!("Create a sub-issue in {repo} ({p})")
             }
             Action::Attach { issue } => format!("Attach {issue}"),
+            Action::PostJobPlan { issue, .. } => format!("Post a job plan on {issue}"),
             Action::Close { issue, .. } => format!("Close {issue} as not planned"),
             Action::AlreadyClosed { issue } | Action::ClosedPriority { issue } => {
                 format!("{issue} is already closed")
@@ -1205,6 +1225,7 @@ pub(crate) fn kind(action: &Action) -> &'static str {
     match action {
         Action::Create { .. } => "create_sub_issue",
         Action::Attach { .. } => "attach_sub_issue",
+        Action::PostJobPlan { .. } => "post_job_plan",
         Action::Close { .. } | Action::AlreadyClosed { .. } => "close_sub_issue",
         Action::Rescope { .. } => "rescope_sub_issue",
         Action::SetPriority { .. } | Action::ClosedPriority { .. } => "set_priority",
@@ -1529,6 +1550,7 @@ mod tests {
         /// Closed by a plan's close_epic.
         epic_closed: Cell<bool>,
         epic_reads: Cell<usize>,
+        child_closed_from: Option<usize>,
         reads: Cell<usize>,
         login: &'static str,
         /// The project's auto-add puts each issue on it first, so GitHub
@@ -1560,6 +1582,7 @@ mod tests {
                 epic_closed_from: None,
                 epic_closed: Cell::new(false),
                 epic_reads: Cell::new(0),
+                child_closed_from: None,
                 reads: Cell::new(0),
                 login: "planner",
                 auto_added: false,
@@ -1627,7 +1650,7 @@ mod tests {
                 let labelled =
                     self.labelled && !(self.remove_label_on_recheck && self.epic_reads.get() >= 2);
                 let mut nodes = vec![
-                    json!({"number": 2, "state": "OPEN", "repository": {"nameWithOwner": "example/work"}}),
+                    json!({"number": 2, "state": if self.child_closed_from.is_some_and(|from| self.epic_reads.get() >= from) { "CLOSED" } else { "OPEN" }, "repository": {"nameWithOwner": "example/work"}}),
                     json!({"number": 3, "state": if self.closed.get() { "CLOSED" } else { "OPEN" }, "repository": {"nameWithOwner": "example/work"}}),
                 ];
                 if self.created.get() {
@@ -1955,6 +1978,165 @@ mod tests {
             [ALREADY_CLAIMED]
         );
         assert_eq!(forge.requests.borrow().len(), requests.len());
+    }
+
+    #[test]
+    fn epic_idle_handback_plans_existing_and_new_children_once() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../fixtures/epic-idle-handback.json"))
+                .unwrap();
+        let handback = &fixture["handback"];
+        let value = fenced_json(handback["body"].as_str().unwrap(), EPIC_PLAN_FENCE)
+            .unwrap()
+            .unwrap();
+        let forge = Forge::new(value["actions"].clone());
+        let mut config = config();
+        assert!(preview(&forge, &issue(), &config).is_err());
+        assert!(forge.requests.borrow().is_empty());
+        config.existing_child_plans = true;
+        let preview = preview(&forge, &issue(), &config).unwrap();
+        assert!(!preview.is_empty());
+        apply(&forge, &issue(), &config, OffsetDateTime::UNIX_EPOCH).unwrap();
+        let requests = forge.requests.borrow().clone();
+        for number in [2, 10] {
+            let path = format!("repos/example/work/issues/{number}/comments");
+            let (_, _, body) = requests
+                .iter()
+                .find(|(m, p, _)| m == "POST" && p == &path)
+                .unwrap();
+            let plan = crate::plan::JobPlan::from_comment(body["body"].as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (
+                    plan.repo.as_str(),
+                    plan.item,
+                    plan.kind.as_str(),
+                    plan.runner.as_str()
+                ),
+                ("example/work", number, "implement", "hosted")
+            );
+            let comments = [crate::plan::comment(&authored(
+                1,
+                body["body"].as_str().unwrap().into(),
+                None,
+                forge.login,
+            ))
+            .unwrap()];
+            let (selected, _) = crate::plan::newest_plan(&comments, &config.writers()).unwrap();
+            let request = selected
+                .dispatch_request(
+                    &crate::dispatch::Target {
+                        caller: "example/epics".into(),
+                        workflow: "dispatch.yml".into(),
+                        git_ref: "main".into(),
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(request["body"]["inputs"]["kind"], "implement");
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, p, _)| p == "repos/example/work/issues")
+                .count(),
+            1
+        );
+        assert_eq!(receipt(&forge).detail.actions[0].writes, ["comment"]);
+        apply(&forge, &issue(), &config, OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(*forge.requests.borrow(), requests);
+    }
+
+    #[test]
+    fn existing_child_plan_refusals_and_partial_writes_retain_claim() {
+        let job = json!({"schema": crate::plan::JOB_PLAN_SCHEMA, "kind": "implement", "runner": "hosted", "brief": "do it"});
+        for case in [
+            "off",
+            "closed",
+            "nonchild",
+            "epic",
+            "repo",
+            "identity",
+            "repo-identity",
+            "unsupported",
+            "unknown",
+            "duplicate",
+            "close",
+            "close-epic",
+            "foreign",
+            "recheck",
+            "child-recheck",
+            "comment",
+            "receipt",
+        ] {
+            let mut action =
+                json!({"type": "post_job_plan", "issue": "example/work#2", "plan": job});
+            match case {
+                "closed" => action["issue"] = json!("example/work#3"),
+                "nonchild" => action["issue"] = json!("example/work#999"),
+                "epic" => action["issue"] = json!("example/epics#1"),
+                "identity" => action["plan"]["item"] = json!(999),
+                "repo-identity" => action["plan"]["repo"] = json!("outside/repo"),
+                "unsupported" => action["plan"]["target_repo"] = json!("outside/repo"),
+                "unknown" => action["extra"] = json!(true),
+                _ => {}
+            }
+            let mut actions = vec![action.clone()];
+            if case == "duplicate" {
+                actions.push(action);
+            }
+            if case == "close" {
+                actions.push(
+                    json!({"type": "close_sub_issue", "issue": "example/work#2", "reason": "drop"}),
+                );
+            }
+            if case == "close-epic" {
+                actions.push(
+                    json!({"type": "close_epic", "moved_to": "example/work#9", "reason": "move"}),
+                );
+            }
+            let mut forge = Forge::new(json!(actions));
+            let mut config = config();
+            config.existing_child_plans = case != "off";
+            if case == "repo" {
+                config.bounds.repositories.clear();
+            }
+            if case == "closed" {
+                forge.closed.set(true);
+            }
+            if case == "foreign" {
+                forge.comments.borrow_mut()[0]["editor"] = json!({"login": "intruder"});
+            }
+            if case == "recheck" {
+                forge.epic_closed_from = Some(2);
+            }
+            if case == "child-recheck" {
+                forge.child_closed_from = Some(2);
+            }
+            if case == "comment" {
+                forge.fail = Some("repos/example/work/issues/2/comments");
+            }
+            if case == "receipt" {
+                forge.fail = Some("receipt");
+            }
+            assert!(
+                apply(&forge, &issue(), &config, OffsetDateTime::UNIX_EPOCH).is_err(),
+                "{case}"
+            );
+            let requests = forge.requests.borrow().clone();
+            if ["recheck", "child-recheck", "comment", "receipt"].contains(&case) {
+                forge.fail = None;
+                let _ = apply(&forge, &issue(), &config, OffsetDateTime::UNIX_EPOCH);
+                assert_eq!(
+                    *forge.requests.borrow(),
+                    requests,
+                    "{case}: replay wrote again"
+                );
+            } else {
+                assert!(requests.is_empty(), "{case}: {requests:?}");
+            }
+        }
     }
 
     /// tracker#596: the sub-issue a plan closes closed before apply. The rest
@@ -3024,6 +3206,19 @@ mod tests {
             assert_eq!(got.is_empty(), proved, "{got:?}");
         }
         assert!(!unproved(&short, &cut, &epic(&[], &[]), &board, &|_| true).is_empty());
+        // Merely observing a job plan on an existing child cannot prove that
+        // this action posted it: it may be an older plan.
+        let post = json!({"actions": [{"type": "post_job_plan", "issue": "example/work#2"}]});
+        for writes in [vec![], vec!["comment"]] {
+            let detail = Detail {
+                actions: vec![done(1, "post_job_plan", "example/work#2", &writes)],
+                ..Detail::new("1@2026-10-14T10:00:00Z", Outcome::Claimed)
+            };
+            assert_eq!(
+                unproved(&post, &detail, &epic(&[2], &[]), &none, &|_| true).is_empty(),
+                !writes.is_empty()
+            );
+        }
         // An attach is proved by the issue being a sub-issue now; a blocked-by
         // link, which no pass reads, only by its confirmed write.
         let linked_plan = json!({"actions": [

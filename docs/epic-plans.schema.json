@@ -47,6 +47,10 @@
         {"required": ["issue"], "properties": {
           "type": {"const": "attach_sub_issue"}, "issue": {"$ref": "#/$defs/issue"}
         }},
+        {"required": ["issue", "plan"], "properties": {
+          "type": {"const": "post_job_plan"}, "issue": {"$ref": "#/$defs/issue"},
+          "plan": {"$ref": "#/$defs/job"}
+        }},
         {"required": ["issue", "reason"], "properties": {
           "type": {"const": "close_sub_issue"}, "issue": {"$ref": "#/$defs/issue"}, "reason": {"$ref": "#/$defs/reason"}
         }},
