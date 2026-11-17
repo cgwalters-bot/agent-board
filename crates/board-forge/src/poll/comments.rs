@@ -4427,6 +4427,7 @@ pub(super) mod tests {
                 report_pulls: BTreeMap::new(),
                 quiet: BTreeMap::new(),
                 quiet_replayed: 0,
+                no_review_workflow: BTreeSet::new(),
             };
             let events = "repos/upstream/app/issues/7/events?per_page=100";
             fake.page(

@@ -5469,6 +5469,9 @@ struct Pass<'a, R, G> {
     /// how many this pass decided from them.
     quiet: BTreeMap<String, quiet::Quiet>,
     quiet_replayed: usize,
+    /// The followed repositories, lower case, whose review workflow's runs
+    /// answered 404 this pass ([`Pass::review_rerun`]), said once each.
+    no_review_workflow: BTreeSet<String>,
 }
 
 /// A review start or rerun, deferred so that they go in Priority order.
@@ -5613,6 +5616,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             report_pulls: BTreeMap::new(),
             quiet: BTreeMap::new(),
             quiet_replayed: 0,
+            no_review_workflow: BTreeSet::new(),
         }
     }
 
@@ -7029,16 +7033,28 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// of the head's runs read was re-run already, at any age, or a full
     /// read may have left one out, it is a person's. None where there is no
     /// such run, or it started before the base last changed: re-run, it would
-    /// run the old base's workflow ([`reviewed_on_base`]).
+    /// run the old base's workflow ([`reviewed_on_base`]). None too where
+    /// the repository has no such workflow, whose runs answer 404: there is
+    /// no review job's verdict, only the operator's (agent-board#1088).
     fn review_rerun(&mut self, repo: &str, pull: &Value) -> Result<Option<(Decision, u64)>> {
         let Some(workflow) = &self.config.review_workflow else {
             return Ok(None);
         };
+        if self.no_review_workflow.contains(&repo.to_ascii_lowercase()) {
+            return Ok(None);
+        }
         let head = text(pull, "/headRefOid");
         let url = format!(
             "{API_ROOT}repos/{repo}/actions/workflows/{workflow}/runs?head_sha={head}&event={REVIEW_EVENT}&per_page={REVIEW_RUN_READS}"
         );
-        let list = self.get_url(&url, slim_runs, false)?.0;
+        let list = match self.get_url(&url, slim_runs, false) {
+            Ok((list, _)) => list,
+            Err(error) if error.is::<crate::github::NotFound>() => {
+                self.no_review_workflow.insert(repo.to_ascii_lowercase());
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let runs = nodes(&list, "/workflow_runs");
         // A full read may leave out an older run that was re-run.
         let whole = (runs.len() as u64) < REVIEW_RUN_READS;
@@ -10334,6 +10350,13 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
                 outcome.undecided.insert(repo.to_ascii_lowercase());
                 outcome.error(repo, &error);
             }
+        }
+    }
+    if let Some(workflow) = &config.review_workflow {
+        for repo in &pass.no_review_workflow {
+            outcome.lines.push(format!(
+                "{repo}: no {workflow} workflow (404), so only the operator's review counts"
+            ));
         }
     }
     let unchanged: usize = outcome.unchanged.values().sum();
@@ -14098,6 +14121,8 @@ mod tests {
         read_answers: RefCell<BTreeMap<String, Vec<Value>>>,
         /// URLs GitHub answers 404 for.
         missing: Vec<String>,
+        /// URLs GitHub answers 500 for.
+        failing: Vec<String>,
         pulls: BTreeMap<u64, Value>,
         /// Leave `Link` out of 304s, as a response without metadata may.
         bare_304: bool,
@@ -14192,6 +14217,9 @@ mod tests {
             if self.missing.iter().any(|m| m == url) {
                 return Err(anyhow::Error::from(crate::github::NotFound)
                     .context(format!("GET {url}: GitHub HTTP status 404")));
+            }
+            if self.failing.iter().any(|m| m == url) {
+                bail!("GET {url}: GitHub HTTP status 500: boom");
             }
             let (etag, modified, next, body) = self
                 .rest
@@ -19032,6 +19060,64 @@ mod tests {
                 outcome.lines
             );
             assert!(fake.writes.borrow().is_empty());
+        }
+    }
+
+    /// A followed repository without the review workflow, whose runs answer
+    /// 404, has no review job's verdict: the pull request waits for the
+    /// operator's, which is said once and is no error (agent-board#1088).
+    /// Any other failure of that read still is one.
+    #[test]
+    fn a_repository_without_the_review_workflow_has_no_review_job() {
+        let head = text(&fixture("pull-470"), "/headRefOid").to_owned();
+        let runs = format!(
+            "{API_ROOT}repos/{REPO}/actions/workflows/review.yml/runs?head_sha={head}&event=pull_request_target&per_page={REVIEW_RUN_READS}"
+        );
+        let wait = format!("{REPO}#470 {} wait: {NO_REVIEW}", short(&head));
+        let said = format!(
+            "{}: no review.yml workflow (404), so only the operator's review counts",
+            REPO.to_ascii_lowercase()
+        );
+        for (name, missing, errors) in [("404", true, 0), ("500", false, 1)] {
+            let mut fake = github();
+            fake.pulls
+                .insert(470, pull("pull-470", json!({"reviews": {"nodes": []}})));
+            if missing {
+                fake.missing.push(runs.clone());
+            } else {
+                fake.failing.push(runs.clone());
+            }
+            let mut cfg = config();
+            cfg.policy.reruns = true;
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.to_owned()],
+                None,
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, errors, "{name}: {:?}", outcome.lines);
+            let count = |line: &str| outcome.lines.iter().filter(|l| *l == line).count();
+            assert_eq!(
+                count(&said),
+                usize::from(missing),
+                "{name}: {:?}",
+                outcome.lines
+            );
+            assert_eq!(
+                count(&wait),
+                usize::from(missing),
+                "{name}: {:?}",
+                outcome.lines
+            );
+            assert!(
+                fake.sent.borrow().iter().any(|(url, _)| *url == runs),
+                "{name}"
+            );
         }
     }
 
@@ -25467,6 +25553,7 @@ mod tests {
             report_pulls: BTreeMap::new(),
             quiet: BTreeMap::new(),
             quiet_replayed: 0,
+            no_review_workflow: BTreeSet::new(),
         };
         let mut outcome = Outcome::default();
         let error = pass.follow(REPO, &mut outcome).unwrap_err();
