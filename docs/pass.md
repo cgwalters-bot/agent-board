@@ -606,14 +606,22 @@ removed, does not enroll it.
 The summary says `intake: N new issue(s) (repo#n, ...)`.
 
 The listing reads at most 100 issues per repository, oldest update first, and
-intake shares at most 15% of the pass request limit, inside its time limit.
-Every mutation consumes `--max-writes`, including failed attempts; admission
-requires room for the add and initial fields together. Oldest watermarks go
-first. First use looks back two days; after that, saved watermarks do not expire.
-Incomplete or refused reads, exhausted shares/caps and failed writes retain the
-repository's watermark. A full page advances only to its final timestamp minus
-one second; a page full at that boundary reports timestamp overflow for a person
-instead of silently skipping issues. Preview writes nothing and advances no
+the listings and enrollments share at most 15% of the pass request limit, inside
+its time limit; the board read before them, which later stages reuse, and the
+board's field schema are outside that share. Every mutation consumes
+`--max-writes`, including failed attempts; admission requires room for the add
+and initial fields together. Oldest watermarks go first. First use looks back
+two days; after that, saved watermarks do not expire.
+Incomplete or refused reads, a listed issue of another repository, closed, or
+with a timestamp missing or out of the page's order, exhausted shares/caps and
+failed writes retain the repository's watermark. An issue with truncated or
+unreadable labels or memberships (more than 50 labels, more than 100 cards) is
+skipped with an `intake warning: repo#n: ... skipped` line and the watermark
+passes it, so that it does not hold back every later issue; being older than
+the watermark then, it is not enrolled later, and needs adding by hand. A full
+page advances only to its final timestamp minus one second; a page full at that
+boundary reports timestamp overflow for a person instead of silently skipping
+issues. Preview writes nothing and advances no
 watermarks. Losing state repeats discovery, not recorded triage dispatches.
 
 In work repositories, enrolled issues opened by the operator or the bot enter
