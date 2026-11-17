@@ -127,6 +127,12 @@ pub enum Action {
     Attach {
         issue: IssueRef,
     },
+    /// Post a dispatchable job plan on an already open child, without creating
+    /// a duplicate issue. The action supplies the plan's identity.
+    PostJobPlan {
+        issue: IssueRef,
+        plan: Box<JobPlan>,
+    },
     Close {
         issue: IssueRef,
         reason: String,
@@ -212,6 +218,7 @@ const ACTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     ("attach_sub_issue", &["issue"]),
+    ("post_job_plan", &["issue", "plan"]),
     ("close_sub_issue", &["issue", "reason"]),
     ("rescope_sub_issue", &["issue", "body", "reason"]),
     ("set_priority", &["issue", "new", "value"]),
@@ -566,6 +573,23 @@ impl EpicPlan {
                         "issueId": epic.id,
                         "subIssueUrl": format!("https://{DEFAULT_HOST}/{}/issues/{}", issue.repo, issue.number),
                     }}));
+                }
+                Action::PostJobPlan { issue, plan } => {
+                    let mut fields = json!({"schema": crate::plan::JOB_PLAN_SCHEMA,
+                        "repo": issue.repo, "item": issue.number, "kind": plan.kind,
+                        "runner": plan.runner, "brief": plan.brief});
+                    if !plan.pool.is_empty() {
+                        fields["pool"] = json!(plan.pool);
+                    }
+                    if let Some(effort) = plan.effort {
+                        fields["effort"] = json!(effort.as_str());
+                    }
+                    out.push(rest(
+                        n,
+                        "POST",
+                        format!("repos/{}/issues/{}/comments", issue.repo, issue.number),
+                        json!({"body": format!("```{}\n{fields:#}\n```\n", crate::plan::PLAN_FENCE)}),
+                    ));
                 }
                 Action::Close { issue, reason } => {
                     let path = format!("repos/{}/issues/{}", issue.repo, issue.number);
@@ -957,6 +981,24 @@ impl Checker<'_> {
                 self.once(kind, target_key(&Target::Issue(issue.clone())))?;
                 Action::Attach { issue }
             }
+            "post_job_plan" => {
+                let issue = self.sub_issue(text(object, "issue")?)?;
+                let value = object.get("plan").context("no plan")?;
+                for key in value.as_object().context("plan is not an object")?.keys() {
+                    ensure!(
+                        ["schema", "kind", "runner", "brief", "pool", "effort"]
+                            .contains(&key.as_str()),
+                        "unsupported post_job_plan plan field {key:?}; repo and item come from issue"
+                    );
+                }
+                let mut plan = job_plan(value, &issue.repo)?;
+                plan.item = issue.number;
+                self.once(kind, target_key(&Target::Issue(issue.clone())))?;
+                Action::PostJobPlan {
+                    issue,
+                    plan: Box::new(plan),
+                }
+            }
             "close_sub_issue" | "rescope_sub_issue" => {
                 let named = text(object, "issue")?;
                 // A plan goes stale when a sub-issue it closes closes first
@@ -1033,9 +1075,16 @@ impl Checker<'_> {
             "close_epic" => {
                 // A new or attached sub-issue is work the same plan says is
                 // left to do.
-                if let Some(k) = (self.done.iter())
-                    .position(|a| matches!(a, Some(Action::Create { .. } | Action::Attach { .. })))
-                {
+                if let Some(k) = (self.done.iter()).position(|a| {
+                    matches!(
+                        a,
+                        Some(
+                            Action::Create { .. }
+                                | Action::Attach { .. }
+                                | Action::PostJobPlan { .. }
+                        )
+                    )
+                }) {
                     bail!(
                         "action {} adds a sub-issue; a plan that adds work may not close the epic",
                         k + 1

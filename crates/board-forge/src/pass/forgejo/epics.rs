@@ -89,9 +89,10 @@ fn unsupported(plan: &EpicPlan) -> Option<String> {
         .enumerate()
         .find_map(|(index, action)| {
             let what = match action {
-                Action::Attach { .. } | Action::Rescope { .. } | Action::CloseEpic { .. } => {
-                    epic_apply::kind(action)
-                }
+                Action::Attach { .. }
+                | Action::Rescope { .. }
+                | Action::CloseEpic { .. }
+                | Action::PostJobPlan { .. } => epic_apply::kind(action),
                 Action::Create {
                     blocked_by: Some(_),
                     ..
@@ -762,6 +763,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             label_by_operator: false,
             close_epic: false,
             attach_sub_issue: false,
+            existing_child_plans: false,
         }
     }
 

@@ -1,0 +1,15 @@
+{
+  "evidence": {
+    "runs": [42561654848, 42561645145],
+    "workflow_repository": "cgwalters-forge/tracker",
+    "workflow_revision": "38169f45cf43c9e25ef93f93361b7facfd37e4f9",
+    "producer": "workflow_dispatch task input (not pass planning_brief)",
+    "task": "Epic with no startable child while pools are under pace: read the epic and its children, decide the next one or two slices that need no operator decision, and post fenced implement plans for them (one per comment, on the child issues; file a child issue first if none fits). Prefer slices that unblock the most."
+  },
+  "handback": {
+    "type": "add_comment",
+    "repo": "example/epics",
+    "item_number": 1,
+    "body": "Plan the existing slice and one genuinely new slice.\n\n```agent-board-epic-plan\n{\"schema\":\"agent-board/epic-plan/v1\",\"epic\":\"example/epics#1\",\"actions\":[{\"type\":\"post_job_plan\",\"issue\":\"example/work#2\",\"plan\":{\"schema\":\"agent-board/job-plan/v1\",\"kind\":\"implement\",\"runner\":\"hosted\",\"brief\":\"Implement the existing slice; read AGENTS.md.\"}},{\"type\":\"create_sub_issue\",\"repo\":\"example/work\",\"title\":\"Independent new slice\",\"body\":\"New work not covered by existing children.\",\"plan\":{\"schema\":\"agent-board/job-plan/v1\",\"kind\":\"implement\",\"runner\":\"hosted\",\"brief\":\"Implement the new slice; read AGENTS.md.\"}}]}\n```\n"
+  }
+}

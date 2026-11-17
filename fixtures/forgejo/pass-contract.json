@@ -203,6 +203,7 @@
     "readFreeHolds": {"verdict": "refused", "reason": "board-proven holds before assignment reads are only built for GitHub"},
     "skipActiveWork": {"verdict": "refused", "reason": "active work suppression is only built for GitHub"},
     "idleReplan": {"verdict": "refused", "reason": "bounded idle epic replanning is only built for GitHub"},
+    "existingChildPlans": {"verdict": "refused", "reason": "existing-child epic job plans are only built for GitHub"},
     "replanInvalid": {"verdict": "refused", "reason": "invalid bot-plan recovery is only built for GitHub"},
     "reserveOperator": {"verdict": "refused", "reason": "verdict holds and their release are only built for GitHub"},
     "researchPlans": {"verdict": "refused", "reason": "accepted research plan starts are only built for GitHub"},

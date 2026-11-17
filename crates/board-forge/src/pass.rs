@@ -681,6 +681,10 @@ pub struct Config {
     /// pass when the selected planning pool is under-used near its reset.
     #[serde(default)]
     pub idle_replan: bool,
+    /// Off by default: permit epic plans to re-arm existing open children
+    /// with dispatchable job plans, not only plan newly created slices.
+    #[serde(default)]
+    pub existing_child_plans: bool,
     /// Avoid spending on previously manual research plans without caller consent.
     #[serde(default)]
     pub research_plans: bool,
