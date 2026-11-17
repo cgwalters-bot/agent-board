@@ -28,7 +28,7 @@ hold still keeps the pass off the work but is not an operator decision.
 ## Operator actions
 
 An operator action is a proposal, not permission to write. The schema in
-`operator-actions.schema.json` is shared with the review site; the Rust checker
+`operator-actions.schema.json` is shared with the control app; the Rust checker
 also enforces configured repository scope and comment provenance. This implements
 the schema half of tracker#582, not its execution UI.
 
@@ -101,12 +101,12 @@ Unlike the other kinds, these two carry the prior state the proposer saw:
 `expected_current_sha256` (the live ruleset's digest, or null for none of that
 name). The proposal replaces org state that is itself its input, and there is
 no issue or head to re-read; the operator must know the value being replaced is
-still the one the proposal was written against, and the review site flags the
+still the one the proposal was written against, and the control app flags the
 action stale otherwise. These are the only fields that may be null.
 A proposer that is only an org member can read a variable's current value
 through a repository it is visible to, but generally not the owner's view of a
 ruleset (its `bypass_actors` are hidden). So `expected_current_sha256` for an
-update normally comes from the operator: the review site shows the live digest
+update normally comes from the operator: the control app shows the live digest
 when it refuses a stale action. A wrong expectation only makes the action
 stale; it never applies it.
 
@@ -145,7 +145,7 @@ and identifies the source comment on stderr. No writes occur.
 
 Checking does not inspect current target state, project membership/options, old
 parent relationships, PR heads, live organisation variables or rulesets, or
-ruleset source files and their reachability. The review site must check these
+ruleset source files and their reachability. The control app must check these
 before acting, flag stale actions, use the viewer's credentials, stop on the
 first failure and record execution once. Project scope is not write authority:
 repository scope alone does not authorize changes to any project. Execution and

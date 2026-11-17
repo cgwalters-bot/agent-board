@@ -6069,7 +6069,7 @@ fn apply_publishes_the_refreshed_usage() {
     }
 }
 
-/// The holds issue's comments are read a page at most, as the review app
+/// The holds issue's comments are read a page at most, as the control app
 /// reads them, within the reads kept for the publication: past it, the pass
 /// says so rather than spend the reserve or miss a part (agent-board#774).
 #[test]
@@ -6094,7 +6094,7 @@ fn holds_past_one_page_of_comments_are_not_published() {
 }
 
 /// Nor is a publication that would add a comment past that page, where
-/// neither the next pass nor the review app would read it: refused before
+/// neither the next pass nor the control app would read it: refused before
 /// any write.
 #[test]
 fn holds_that_would_overflow_the_page_are_not_published() {
@@ -6108,7 +6108,7 @@ fn holds_that_would_overflow_the_page_are_not_published() {
     let now = forge.replay.now;
     let mode = (Mode::Actions(&own()), Limits::default());
     let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
-    let line = "holds error: holds: publish to cgwalters-forge/bot-ops#1: 1 new comment(s) would fall past the first 100 the review app reads";
+    let line = "holds error: holds: publish to cgwalters-forge/bot-ops#1: 1 new comment(s) would fall past the first 100 the control app reads";
     assert!(
         report.lines.iter().any(|l| l == line),
         "{:#?}",
@@ -6482,7 +6482,7 @@ fn apply_publishes_the_holds() {
     );
 }
 
-/// With `holds.passView`, the hold snapshot has the pass view the review
+/// With `holds.passView`, the hold snapshot has the pass view the control
 /// app reads, and the pass says it published it: at WIP 8 the runs it
 /// started, each with its run, and the runs in flight it listed; at WIP 2
 /// nothing started, and the WIP hold of every new run is its reason. Off,
@@ -14936,8 +14936,8 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
 /// back a comment, forbids any write to the pull requests' repositories and
 /// any mention of embargoed work, and leaves the recorded heads out: the
 /// pass records them itself. It gives each pull request's full head, the
-/// day's date, and an example of the digest review's Maintain view reads,
-/// which is the fixture checked against review's parser.
+/// day's date, and an example of the digest the control app's Maintain view reads,
+/// which is the fixture checked against the control app's parser.
 /// A preview prints it for a nonpublic digest, and otherwise previews a start.
 #[test]
 fn maintain_plans_a_read_only_digest() {
@@ -15327,7 +15327,7 @@ fn maintain_records_its_plan_and_lists_once_a_day() {
     assert!(edit.ends_with(&format!("/issues/comments/{id}")), "{edit}");
     assert!(body.starts_with(maintain::PLAN_MARKER), "{body}");
     // The brief's example stays inside a JSON string: the bot's plan comment
-    // holds no digest block that review's Maintain view could show.
+    // holds no digest block that the control app's Maintain view could show.
     assert_eq!(
         plan::fenced_json(body, maintain::DIGEST_FENCE).unwrap(),
         None
@@ -23949,7 +23949,7 @@ fn blockers_move_or_are_carded() {
             .map(|b| holds::parse(b).unwrap())
             .unwrap_or_else(|| panic!("{name}: no holds published: {said:#?}"));
         // Every hold's url is its item's issue address, a pull request's
-        // too, as the review app requires of the whole snapshot.
+        // too, as the control app requires of the whole snapshot.
         for h in snapshot["holds"].as_array().unwrap() {
             let issue = (h["item"].as_str())
                 .map(|i| format!("https://github.com/{}", i.replace('#', "/issues/")));

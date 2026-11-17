@@ -325,7 +325,7 @@ plan still refuses it; accepted edits identify a new plan.
 
 A successful apply prints one line per sub-issue saying what it did, then a
 `Review: REVIEW-URL GITHUB-URL` line for each issue it wrote to, where the
-review app (`https://cgwalters-forge.github.io/review/#issue/OWNER/REPO/N`)
+control app (`https://cgwalters-forge.github.io/review/#issue/OWNER/REPO/N`)
 and GitHub show it, then `Receipt: URL`.
 
 Apply stops on the first failed request, records each confirmed write (including

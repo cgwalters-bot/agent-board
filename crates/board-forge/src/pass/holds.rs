@@ -1,6 +1,6 @@
 //! The pass's holds as data (agent-board#307). Each hold is typed where it
 //! is decided; both its `hold …` line and its entry in the hold snapshot,
-//! which the review app renders instead of deriving its own verdicts, are
+//! which the control app renders instead of deriving its own verdicts, are
 //! made from that one value, so the two cannot drift. Nothing here reads
 //! the forge, a clock or a file.
 //!
@@ -34,7 +34,7 @@ pub const HOLDS_SCHEMA: &str = "agent-board/holds/v1";
 /// The first line of the bot's hold snapshot comment, by which the pass
 /// finds it again: not the usage comment's.
 pub const HOLDS_MARKER: &str = "<!-- agent-board-holds v1 -->";
-/// How a board Why that asks the operator something starts, as the review
+/// How a board Why that asks the operator something starts, as the control
 /// app reads it.
 const QUESTION_PREFIX: &str = "Q:";
 /// The most characters the hold comment may have, under GitHub's 65,536
@@ -669,7 +669,7 @@ impl Published {
     }
 }
 
-/// The question a board Why asks, as the review app reads it: what follows
+/// The question a board Why asks, as the control app reads it: what follows
 /// a leading `Q:`.
 pub fn question(why: &str) -> Option<String> {
     let asked = why.trim().strip_prefix(QUESTION_PREFIX)?.trim();
@@ -733,7 +733,7 @@ fn not_live(epic: &ItemRef, children: &[&Entry]) -> Published {
 /// holds of every new run first, in the order decided, then by repository
 /// and number. The children held under a parent that is not a live epic
 /// ([`Scope::Under`]) are one entry for that parent ([`not_live`]), so
-/// that the review app asks the operator once an epic, not once a child.
+/// that the control app asks the operator once an epic, not once a child.
 /// Each hold is new as of `at`, as is the pass's progress, until [`carry`].
 pub fn snapshot(entries: &[Entry], at: String, (wip, mut pass): (Wip, PassSummary)) -> Snapshot {
     let mut under: BTreeMap<(String, u64), (&ItemRef, Vec<&Entry>)> = BTreeMap::new();
@@ -1026,7 +1026,7 @@ pub struct Watch<'a> {
 /// Adds the stall alarms to `snapshot`, once [`carry`] has carried over its
 /// times from `previous`, and returns a `stall …` line each. Each is a
 /// [`HoldKind::Stalled`] entry that waits on the operator, so that the
-/// review app shows it as one of theirs:
+/// control app shows it as one of theirs:
 ///
 /// - after each hold that [`HoldKind::stalls`], on an epic or an item at a
 ///   `top` Priority, does not already wait on the operator, was read by
@@ -1389,10 +1389,10 @@ pub struct NeedsYou {
     pub act_now: Option<Vec<ActNow>>,
 }
 
-/// The most records `act_now` lists, as the review app's Act now shows.
+/// The most records `act_now` lists, as the control app's Act now shows.
 pub const MAX_ACT_NOW: usize = 10;
 
-/// The most items one `act_now` record says it unblocks, as the review app
+/// The most items one `act_now` record says it unblocks, as the control app
 /// accepts.
 pub const MAX_UNBLOCKS: usize = 10_000;
 
@@ -2920,7 +2920,7 @@ pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
     }))
 }
 
-/// The hold snapshot's comment: its marker, then the JSON the review app
+/// The hold snapshot's comment: its marker, then the JSON the control app
 /// reads, compact, with one entry a line.
 pub fn render(snapshot: &Snapshot) -> Result<String> {
     let holds = (snapshot.holds.iter())
@@ -2966,7 +2966,7 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         None => String::new(),
     };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{direction}{leases}{needs_you}{work}{view}{today}{focus}{pat},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the control app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{direction}{leases}{needs_you}{work}{view}{today}{focus}{pat},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -3322,7 +3322,7 @@ pub(crate) fn split(body: &str, at: &str, chars: usize) -> Result<Vec<String>> {
                 serde_json::json!({"schema": PARTS_SCHEMA, "at": at,
                     "encoding": PARTS_ENCODING, "parts": count}),
                 format!(
-                    "Holds as of {at}, compressed across {count} comments. Written by `agent-board pass`; the review app reads them."
+                    "Holds as of {at}, compressed across {count} comments. Written by `agent-board pass`; the control app reads them."
                 ),
             ),
             _ => (
@@ -6288,7 +6288,7 @@ mod tests {
     }
 
     /// The real 3 November publication and holds, spend removed, copied from
-    /// review's test/fixtures. Its own sources were partial, so the replay
+    /// the control app's test/fixtures. Its own sources were partial, so the replay
     /// reads none of them: every ask it listed is carried or a hold's.
     const REAL_SNAPSHOT: &str = include_str!("../../../../fixtures/needs-you-real-2026-11-03.json");
 
@@ -6997,6 +6997,10 @@ mod tests {
     #[test]
     fn parts_round_trip() {
         let small = render(&noisy(2, 10)).unwrap();
+        assert!(
+            small.contains("the control app reads the JSON below."),
+            "{small}"
+        );
         assert_eq!(parts(&small, "t").unwrap(), std::slice::from_ref(&small));
         assert_eq!(assemble(&small, &[]), Some(small));
         let snapshot = noisy(100, 2_000);
@@ -7006,6 +7010,11 @@ mod tests {
         assert_eq!(comments.len(), 3, "{}", chars(&body));
         assert!(comments.iter().all(|c| chars(c) <= MAX_COMMENT_CHARS));
         assert!(comments[0].starts_with(HOLDS_MARKER));
+        assert!(
+            comments[0].contains("the control app reads them."),
+            "{}",
+            comments[0]
+        );
         assert!(comments[1..].iter().all(|c| c.starts_with(PART_MARKER)));
         let (first, rest) = comments.split_first().unwrap();
         let mut others: Vec<&str> = rest.iter().map(String::as_str).collect();

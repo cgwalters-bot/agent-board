@@ -26,7 +26,7 @@ pub const APPLY_MARKER: &str = "agent-board-epic-apply";
 pub const FINGERPRINT_MARKER: &str = "agent-board-epic-fingerprint";
 /// The schema of a receipt's machine detail.
 pub const RECEIPT_SCHEMA: &str = "agent-board/epic-apply/v1";
-/// The review app, whose `#issue/OWNER/REPO/N` route shows one issue.
+/// The control app, whose `#issue/OWNER/REPO/N` route shows one issue.
 pub const REVIEW_APP: &str = "https://cgwalters-forge.github.io/review/";
 /// The prefix of an apply's output line naming a touched issue's links.
 pub const LINKS: &str = "Review: ";
@@ -1397,7 +1397,7 @@ pub(crate) fn node_id<T: Transport>(client: &T, issue: &IssueRef) -> Result<Stri
         .with_context(|| format!("{issue} is not an issue"))
 }
 
-/// The review app's and GitHub's addresses of `issue`, as an apply prints them.
+/// The control app's and GitHub's addresses of `issue`, as an apply prints them.
 pub fn links(issue: &IssueRef) -> String {
     let (repo, n) = (&issue.repo, issue.number);
     format!("{LINKS}{REVIEW_APP}#issue/{repo}/{n} https://{DEFAULT_HOST}/{repo}/issues/{n}")
@@ -2056,7 +2056,7 @@ mod tests {
 
     /// agent-board#412: one plan attaches an existing issue with a Priority,
     /// adds slices blocked by it and by each other, one of them an ask, and
-    /// apply prints where the review app and GitHub show each issue touched.
+    /// apply prints where the control app and GitHub show each issue touched.
     #[test]
     fn attaches_and_links_blocked_by_before_the_job_plan() {
         let job = json!({"schema": crate::plan::JOB_PLAN_SCHEMA, "kind": "implement",

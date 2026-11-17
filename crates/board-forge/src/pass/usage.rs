@@ -2,7 +2,7 @@
 //! broker's `/usage` and paced as tracker's `usage.cjs` paced it, so that
 //! the pass's runs, pull requests' included, pace by a fresh reading rather
 //! than by whatever another job last published. An applying pass publishes
-//! it to the bot's usage comment, where the review app reads it too.
+//! it to the bot's usage comment, where the control app reads it too.
 use super::*;
 use crate::poll::pace::PACE_ONLY_REASON;
 
@@ -217,7 +217,7 @@ fn pace(
     }
     let (goal, burst) = (settings.target * 100.0, settings.burst);
     let allowed = allowed(settings.target, paced.minutes, resets, now);
-    // Published, so the review app shows the pass's limit, not its own.
+    // Published, so the control app shows the pass's limit, not its own.
     let limit = (allowed + burst).min(goal);
     let window = paced.minutes * 60.0;
     let mut reason = None;
@@ -262,7 +262,7 @@ fn pace(
 
 /// The broker's Mistral counters, which have no window and so no pace:
 /// every successful response, metered or not, and its tokens, since the
-/// broker started. No allowance or spend: the review app reads that from
+/// broker started. No allowance or spend: the control app reads that from
 /// the pools file.
 fn mistral(broker: &Value, at: &str) -> Result<Option<Value>> {
     let counts = &broker["mistral"]["counts"];
@@ -288,7 +288,7 @@ fn mistral(broker: &Value, at: &str) -> Result<Option<Value>> {
 /// unbounded at $0.
 ///
 /// `since` (when metering began) and the unmetered count are published for
-/// the review app but hold nothing: spend resets on each broker restart
+/// the control app but hold nothing: spend resets on each broker restart
 /// until praxis-credential-broker#35, and holding on a young `since` would
 /// stall the board for a week after every deploy.
 fn spend(broker: &Value, weekly: f64) -> Value {
@@ -539,12 +539,12 @@ fn budget_line(snapshot: &Value) -> Option<String> {
 }
 
 /// The comment: the marker, a line per pool and the budget's, then the JSON
-/// that pacing and the review app read.
+/// that pacing and the control app read.
 pub(super) fn render(snapshot: &Value) -> Result<String> {
     let lines = pools(snapshot).into_iter().chain(budget_line(snapshot));
     let pools: String = lines.map(|p| format!("- {p}\n")).collect();
     Ok(format!(
-        "{USAGE_MARKER}\nUsage as of {}, from the inference broker's `/usage`. Written by `agent-board pass`; the review app's ops view reads the JSON below.\n\n{pools}\n```json\n{}\n```\n",
+        "{USAGE_MARKER}\nUsage as of {}, from the inference broker's `/usage`. Written by `agent-board pass`; the control app's ops view reads the JSON below.\n\n{pools}\n```json\n{}\n```\n",
         text(snapshot, "/updated_at"),
         serde_json::to_string_pretty(snapshot)?
     ))
@@ -723,7 +723,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let added = usize::from(comment.is_none()) + targets.iter().filter(|t| t.is_none()).count();
         ensure!(
             added <= room,
-            "{added} new comment(s) would fall past the first {} the review app reads",
+            "{added} new comment(s) would fall past the first {} the control app reads",
             HOLDS_PAGES * COMMENTS_PER_PAGE
         );
         self.private(on, "hold")?;
@@ -1569,7 +1569,7 @@ pub(super) mod tests {
         }
     }
 
-    /// The snapshot's `budget`, which the review app reads: the broker's
+    /// The snapshot's `budget`, which the control app reads: the broker's
     /// week of runs at list prices in dollars, or no reading, never $0.
     #[test]
     fn spend_of_the_week() {
@@ -1652,7 +1652,7 @@ pub(super) mod tests {
     }
 
     /// The whole snapshot from the recorded answer: the shape pacing and the
-    /// review app read, each pool's own observation time, and Mistral's
+    /// control app read, each pool's own observation time, and Mistral's
     /// counters without an allowance.
     #[test]
     fn snapshot_of_the_recorded_answer() {
@@ -1684,6 +1684,10 @@ pub(super) mod tests {
         );
         let body = render(&snap).unwrap();
         assert!(body.starts_with(USAGE_MARKER), "{body}");
+        assert!(
+            body.contains("the control app's ops view reads the JSON below."),
+            "{body}"
+        );
         assert_eq!(usage_snapshot(&body), Some(snap));
         let mut other = broker();
         other["schema"] = json!("praxis-broker-usage/v2");

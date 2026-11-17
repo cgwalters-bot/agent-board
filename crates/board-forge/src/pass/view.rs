@@ -1,5 +1,5 @@
 //! The pass view (`holds.passView`): the last passes, each pool's pace and
-//! the agent runs in flight, published with the holds for the review app's
+//! the agent runs in flight, published with the holds for the control app's
 //! pass view, whose parser (review `src/github/passview.ts`) rejects the
 //! whole view past its bounds. It is built from facts the pass already read,
 //! with no read of its own, and names no broker or inference address and no
@@ -18,7 +18,7 @@ const MAX_REASONS: usize = 8;
 const MAX_FLIGHTS: usize = 32;
 const MAX_POOLS: usize = 16;
 /// How long an unchanged view may stand before it is written again: the
-/// review app calls one older than an hour stale.
+/// control app calls one older than an hour stale.
 pub(super) const REFRESH_MINUTES: i64 = 30;
 /// The holds of every new run, which the view counts as `capped`.
 const CAPS: &[HoldKind] = &[HoldKind::Wip, HoldKind::Pools, HoldKind::Budget];
@@ -258,7 +258,7 @@ pub(super) mod tests {
     use super::*;
     use crate::pass::holds::{Hold, Scope};
 
-    /// The review app's `parsePassView` (review `src/github/passview.ts`),
+    /// The control app's `parsePassView` (review `src/github/passview.ts`),
     /// as this view's contract: whether it takes `view` whole.
     pub(in crate::pass) fn accepted(view: &Value) -> bool {
         let time = |v: &Value| {
@@ -364,7 +364,7 @@ pub(super) mod tests {
             && list(&view["in_flight"], 100, &flight)
     }
 
-    /// The review app's fixture (review `test/fixtures/pass-view.json`).
+    /// The control app's fixture (review `test/fixtures/pass-view.json`).
     fn fixture() -> Value {
         json!({
             "schema": SCHEMA, "observed_at": "2026-11-05T12:00:00Z", "complete": true, "omitted": 0,

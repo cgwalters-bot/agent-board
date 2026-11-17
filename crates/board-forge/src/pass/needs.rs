@@ -1652,7 +1652,7 @@ mod tests {
     /// actionable approval, the late `pr.operatorPaths` one included, whole,
     /// and cuts the lowest ranked other cards instead; the rest keep their
     /// order, the totals and inventory stay, and the next pass's same list
-    /// writes nothing. Its publication is the shared fixture review replays.
+    /// writes nothing. Its publication is the shared fixture the control app replays.
     #[test]
     fn approvals_survive_fitting_the_174_decision_board() {
         let at = "2026-11-05T12:00:00Z";
@@ -1724,7 +1724,7 @@ mod tests {
             .unwrap();
         assert_eq!(late["target"]["head"], json!(format!("{:040x}", 174)));
         assert_eq!(late["quality"], "decision");
-        // The fixture review replays with its parser (agent-board#722).
+        // The fixture the control app replays with its parser (agent-board#722).
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../../fixtures/needs-you-approval-fit-174.json"
         ))

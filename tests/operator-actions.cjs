@@ -1,4 +1,4 @@
-// The review site's JavaScript JSON Schema semantics, using Ajv 2020.
+// The control app's JavaScript JSON Schema semantics, using Ajv 2020.
 // Supply Ajv through NODE_PATH; no application dependency is added here.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');

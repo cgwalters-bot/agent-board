@@ -783,7 +783,7 @@ mod tests {
                 let mut value = valid.clone();
                 value["actions"] = json!([action]);
                 let error = format!("{:#}", Proposal::from_json(&value, &config).unwrap_err());
-                // The review site matches scope rejections by this phrase.
+                // The control app matches scope rejections by this phrase.
                 assert!(
                     key == "invalid_actions" || error.contains("not allowed"),
                     "{error}"

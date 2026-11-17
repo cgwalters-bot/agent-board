@@ -1,6 +1,6 @@
 //! The epic focus (`holds.epicFocus`): each open P0 epic's progress, the
 //! agent runs on it and its children, and what blocks each open child, as
-//! typed facts for the review app's Focus view (review#298). It is built
+//! typed facts for the control app's Focus view (review#298). It is built
 //! from what the pass already read, with no read of its own: stage 3's
 //! listing of the epics and their sub-issues (with titles and last changes,
 //! which `holds.epicFocus` adds to that listing's queries), the runs in
