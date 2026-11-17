@@ -498,7 +498,7 @@ fn deduplicate(
 /// for the slot, not for a cached capacity count. On an ambiguous answer the
 /// reservation stays. Only a named dispatch response can bind it to a run,
 /// or an accepted rerun of `rerun`, the run it restarts.
-pub(super) struct Dispatch<'a, C, D> {
+pub struct Dispatch<'a, C, D> {
     pub client: &'a C,
     pub dispatcher: &'a D,
     pub config: &'a Config,
@@ -508,6 +508,59 @@ pub(super) struct Dispatch<'a, C, D> {
     pub sent: Cell<bool>,
     pub reserved: RefCell<Option<Held>>,
     pub rerun: Option<u64>,
+}
+
+impl<'a, C, D> Dispatch<'a, C, D> {
+    /// A dispatch of `item` on `pool` that takes its lease with `client`
+    /// and starts the run with `dispatcher`.
+    pub fn new(
+        (client, dispatcher): (&'a C, &'a D),
+        config: &'a Config,
+        (item, pool): (&'a ItemRef, &'a str),
+        now: OffsetDateTime,
+    ) -> Self {
+        Self {
+            client,
+            dispatcher,
+            config,
+            item,
+            pool,
+            now,
+            sent: Cell::new(false),
+            reserved: RefCell::new(None),
+            rerun: None,
+        }
+    }
+}
+
+/// Refuses a start outside the pass on `pool` to `target` unless `config`
+/// admits it as the pass's own: with `leases` on, so that [`Dispatch`]
+/// takes a slot under `wip` and pacing at the send, and `target` the
+/// workflow whose runs they count. Without them a start the pass did not
+/// make skips both (agent-board#382).
+pub fn check_outside(config: &Config, target: &Target, pool: &str) -> Result<()> {
+    ensure!(
+        config.leases,
+        "a start outside the pass needs leases on in the pass configuration, to take a slot under its wip and pacing"
+    );
+    ensure!(
+        config.dispatch_repo.eq_ignore_ascii_case(&target.caller)
+            && config.dispatch_workflow == target.workflow,
+        "the leases count runs of {}/{}, not {}/{}",
+        config.dispatch_repo,
+        config.dispatch_workflow,
+        target.caller,
+        target.workflow
+    );
+    let account = match config.mix.contains_key(pool) {
+        true => mix::account(pool).unwrap_or(pool),
+        false => pool,
+    };
+    ensure!(
+        config.pools.0.iter().any(|(name, _)| name == account),
+        "{pool} is not in pools"
+    );
+    Ok(())
 }
 
 impl<C: Rest, D: Rest> Rest for Dispatch<'_, C, D> {

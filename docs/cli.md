@@ -563,6 +563,11 @@ Options:
 - `--bot <LOGIN>`: Login that opens the implement runs' pull requests: before dispatching, compare the issue with its open pull requests and the runs in flight on the plan's repository, and wait for or run beside them. Off without it; from the caller's configuration
 - `--collaborators-only`: Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository. Off without it; from the caller's configuration
 - `--status-app-id <ID>`: With --collaborators-only, also admit issue comments that the GitHub App with this id posted as its bot: the status app (docs/apps.md). From the caller's configuration
+- `--kind <KIND>`: Start the issue without a plan comment, as a run of this kind: dispatch builds a hosted plan of --task or --task-from-body on --pool, held to a plan's bounds, posts it as the token's own and dispatches it as any plan, admitted by --config's leases with GH_TOKEN; where nothing is sent, the plan is removed. Refused where a writer's plan or dispatch record is on the issue (docs/job-plans.md#without-a-plan-comment) (possible values: `implement`)
+- `--task <TEXT>`: With --kind, the task the run gets
+- `--task-from-body`: With --kind, the issue's body as the task: only a plan writer's own text, edited by no one else
+- `--pool <POOL>`: With --kind, the inference pool: one of --config's pools
+- `--config <FILE>`: With --kind, the pass configuration (docs/pass.md) from a trusted default-branch checkout: its leases, which must be on, admit the run under the pass's wip and pacing
 
 ## agent-board pools
 

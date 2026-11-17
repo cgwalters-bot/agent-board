@@ -16,7 +16,7 @@ use crate::epic::{EPIC_LABEL, epic_labelled_by};
 // traits would be ambiguous.
 use crate::github::{API_ROOT, DEFAULT_HOST, RateLimited, Transport, is_github_login};
 use crate::overlap::{self, Decision};
-use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target};
+use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target, plan_body};
 use crate::poll::{
     self, OPERATOR_APPROVAL_LABEL, POLL_REPOSITORY_LIMIT, PollPolicy, RERUN_CONCLUSION,
     RERUN_WINDOW_SECONDS, Rest, RestResponse, State, next_link, text, validate_repository,
@@ -278,13 +278,6 @@ const EDITED_SINCE: &str = "the issue was edited after this verdict";
 /// Why [`TriageScope::Epics`] starts no triage run on an issue outside
 /// every live epic.
 const OUTSIDE_EPICS: &str = "outside every live epic, so not triaged (triage scope epics)";
-/// A plan comment's body: `intro`, then `plan` in its fence.
-fn plan_body(intro: &str, plan: &Value) -> String {
-    format!(
-        "{intro}\n\n```{PLAN_FENCE}\n{plan:#}\n```\n\n{}",
-        crate::Footer::default()
-    )
-}
 
 /// What a triage plan posted again by [`Scheduler::follow_up`] says first.
 const AGAIN: &str = "The board pass asks a triage run to plan this issue again.";
@@ -499,7 +492,7 @@ const FIX_PULL_QUERY: &str = r#"query($owner: String!, $name: String!, $number: 
 }"#;
 /// An issue's own text, as a comment's is read ([`plan::comment`]), for the
 /// plan in its body ([`Config::body_plans`]).
-const BODY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+pub(crate) const BODY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
     url title body createdAt lastEditedAt author { login } editor { login }
   } }
@@ -8495,17 +8488,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         item: &'b ItemRef,
         pool: &'b str,
     ) -> lease::Dispatch<'b, Budget<'b, C>, Budget<'b, C>> {
-        lease::Dispatch {
-            client: &self.client,
-            dispatcher: &self.dispatcher,
-            config: self.config,
-            item,
-            pool,
-            now: self.now,
-            sent: Cell::new(false),
-            reserved: RefCell::new(None),
-            rerun: None,
-        }
+        let clients = (&self.client, &self.dispatcher);
+        lease::Dispatch::new(clients, self.config, (item, pool), self.now)
     }
 
     /// [`choose`] of `names`, or where none has room, the first that may
@@ -10059,28 +10043,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Posts `plan` on `issue` after `intro`, as the plan writer the pass's
     /// token is, and returns the posted plan's id ([`plan::plan_id`]).
     fn post_plan(&self, issue: &ItemRef, intro: &str, plan: &Value) -> Result<String> {
-        let body = plan_body(intro, plan);
-        let comments = format!(
-            "{API_ROOT}repos/{}/issues/{}/comments",
-            issue.repository, issue.number
-        );
-        let (_, posted) = plan::send(&self.client, "POST", &comments, &json!({"body": body}), 0)?;
-        let field = |key: &str| {
-            posted[key]
-                .as_str()
-                .with_context(|| format!("posted plan has no {key}"))
-        };
-        let created = OffsetDateTime::parse(field("created_at")?, &Rfc3339)
-            .context("posted plan's created_at")?;
-        plan::plan_id(&plan::Comment {
-            url: field("html_url")?.into(),
-            body,
-            author: None,
-            edited: false,
-            editor: None,
-            created,
-            changed: created,
-        })
+        plan::post_plan(&self.client, issue, intro, plan)
     }
 
     /// With [`Config::body_plans`], the plan an issue with no plan comment
