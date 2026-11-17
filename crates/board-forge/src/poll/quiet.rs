@@ -262,6 +262,11 @@ mod tests {
                 false,
             ),
             (
+                "an untested draft",
+                decided("wait", UNTESTED_WAIT, Some("untested")),
+                false,
+            ),
+            (
                 "left to the operator",
                 decided("skip", LEFT_TO_OPERATOR, Some("needs-human")),
                 false,

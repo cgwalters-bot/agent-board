@@ -200,6 +200,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             sha: stop.sha.clone(),
             stopped: true,
             queue: stop.queue.clone(),
+            continued_before: stop.continued_here(),
             ..Marker::default()
         };
         self.mark_claim(

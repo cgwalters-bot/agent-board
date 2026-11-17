@@ -1864,7 +1864,9 @@ The asks come from five sources, each named by an item's `source`:
   (labelled `needs-operator-approval`, it waits on the operator's approval of
   the head), `review-withheld` (the review job withheld its approval, so a
   person approves), `review-promote` (a clean, green draft of the bot on a
-  `pr.noMerge` base, which only the operator promotes) and
+  `pr.noMerge` base, which only the operator promotes), `review-untested`
+  (such a draft that says it is untested, with `continuation.untested` off;
+  listed alone, not grouped with promotions) and
   `review-needs-human` (labelled `needs-human`, or
   stopped so by this pass's step, a draft with no checkpoint outside
   `pr.noMerge` among them, or
@@ -2936,7 +2938,9 @@ A pass captures one clock and performs these stages in order:
     rounds run within the usual limits (a conflict alone takes a rebase round
     without an approval, as the review job skips drafts), and once its checks
     are green and it merges cleanly it waits with `a midstream draft, waiting
-    for promotion`, unlabelled, listed as `review-promote`. Elsewhere such a
+    for promotion`, unlabelled, listed as `review-promote`, unless its own
+    words say it is untested ([poll](poll.md), `continuation.untested`).
+    Elsewhere such a
     draft still goes to `needs-human`. A midstream draft already labelled
     `needs-human` keeps its label until the operator removes it.
     Already queued PRs and externally enabled auto-merge are not revoked;

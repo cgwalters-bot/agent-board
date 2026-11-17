@@ -1234,7 +1234,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             queue: stop.queue.clone(),
             pending: keys,
             answering: true,
-            ..Marker::default()
+            ..stop.reset()
         };
         // The answer is pending until its run may have started, as for any
         // round on the operator's comments ([`handled`]).
@@ -1685,7 +1685,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let marker = find_marker(read, &self.config.bot);
         // A stop whose label is gone was reset, as decide reads it.
         let carried = if marker.stopped {
-            Marker::default()
+            marker.reset()
         } else {
             marker.clone()
         };
@@ -1777,6 +1777,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             pool: pool.clone(),
             queue: superseded.queue.clone(),
             continued: carried.continued,
+            continued_before: carried.continued_before,
             raised: carried.raised,
             rebased: carried.rebased,
             pending: keys,

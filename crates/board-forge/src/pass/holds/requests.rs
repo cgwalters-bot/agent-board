@@ -179,7 +179,7 @@ pub(super) fn describe(
         | RefKind::ReviewPullRequest
         | RefKind::ReplyPullRequest
         | RefKind::ClosePullRequest => true,
-        _ if ask.kind == "review-promote"
+        _ if matches!(ask.kind.as_str(), "review-promote" | "review-untested")
             || matches!(
                 ask.source.as_str(),
                 DECISIONS | DRAFTS | super::super::pat::SOURCE
