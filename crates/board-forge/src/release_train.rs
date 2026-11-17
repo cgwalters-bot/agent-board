@@ -19,19 +19,23 @@ use crate::supervise::encode;
 use crate::supervise::health::base64_decode;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Requests a pass may make, however the API answers.
 pub const REQUEST_LIMIT: u32 = 200;
-/// Every listing is one page of this many; the train's are far shorter.
+/// Maximum page size; inventory listings continue to an empty/short page.
 pub const PAGE_SIZE: u64 = 100;
+pub const CACHE_SCHEMA: &str = "agent-board.release-train-cache.v1";
 /// Release notes carried into a pin bump's description, in characters.
 const NOTES_LIMIT: usize = 30_000;
 const SECURE_HOST_PIN: &str = "secure-host/Containerfile.pin";
 const SECURE_HOST_IMAGE: &str = "ghcr.io/cgwalters-forge/secure-host";
+// Repeated reference strings could otherwise multiply full YAML parses during
+// scalar selection. Refuse excessive edit work, never a partial pin bump.
+const MAX_WORKFLOW_REFERENCES: usize = 128;
 
 fn image_pin(version: &str, digest: &str) -> Result<String> {
     if !digest.strip_prefix("sha256:").is_some_and(|s| {
@@ -143,6 +147,200 @@ fn repin_host_line(text: &mut String, merge: &str) -> Result<usize> {
 fn pin_boundary(rest: &str) -> bool {
     rest.is_empty() || rest.starts_with([' ', '\t', '\n', '\r', '\'', '"', '`'])
 }
+
+/// Only exact configured workflow paths, never other actions/workflows in the
+/// same repository. Fixtures opt into string scanning; workflows read jobs.uses.
+fn caller_pins(
+    text: &str,
+    wrappers: &Target,
+    fixture: bool,
+) -> Result<Vec<(usize, usize, String)>> {
+    let paths: BTreeSet<_> = wrappers.files.iter().filter(|p| workflow_file(p)).collect();
+    let reference = |s: &str| -> Result<Option<(String, String)>> {
+        let Some((path, pin)) = s.split_once('@') else {
+            return Ok(None);
+        };
+        let Some(path) = path.strip_prefix(&format!("{}/", wrappers.repository)) else {
+            return Ok(None);
+        };
+        if !paths.contains(&path.to_owned()) {
+            return Ok(None);
+        }
+        ensure!(
+            full_sha(pin),
+            "{}:{path} requires a full commit SHA, got {pin:?}",
+            wrappers.repository
+        );
+        Ok(Some((path.into(), pin.into())))
+    };
+    if fixture {
+        let mut found = vec![];
+        for path in &paths {
+            let needle = format!("{}/{path}@", wrappers.repository);
+            for (at, _) in text.match_indices(&needle) {
+                // Do not match another repository's suffix.
+                if text[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| !c.is_whitespace() && !"\"'`=([".contains(c))
+                {
+                    continue;
+                }
+                let start = at + needle.len();
+                let len = text[start..]
+                    .find(|c: char| c.is_whitespace() || "\"'`;,)]}".contains(c))
+                    .unwrap_or(text.len() - start);
+                let pin = &text[start..start + len];
+                reference(&format!("{needle}{pin}"))?;
+                found.push((start, len, (*path).clone()));
+            }
+        }
+        found.sort();
+        return Ok(found);
+    }
+    let workflow = caller_workflow(text)?;
+    let Some(jobs) = workflow
+        .get("jobs")
+        .and_then(serde_yaml_ng::Value::as_mapping)
+    else {
+        return Ok(vec![]);
+    };
+    let mut refs = BTreeSet::new();
+    for job in jobs.values() {
+        if let Some(uses) = job.get("uses").and_then(serde_yaml_ng::Value::as_str)
+            && let Some((path, pin)) = reference(uses)?
+        {
+            refs.insert((path, pin));
+        }
+    }
+    // YAML supplies the actual references; locate their exact scalar spelling
+    // for a minimal edit. Unsupported escaped scalars fail rather than omit.
+    let mut found = vec![];
+    for (path, pin) in refs {
+        let needle = format!("{}/{path}@{pin}", wrappers.repository);
+        let mut located = false;
+        for (at, _) in text.match_indices(&needle) {
+            let start = at + needle.len() - pin.len();
+            found.push((start, pin.len(), path.clone()));
+            located = true;
+        }
+        ensure!(located, "unsupported escaped workflow reference {needle}");
+    }
+    found.sort();
+    Ok(found)
+}
+
+fn workflow_file(path: &str) -> bool {
+    path.strip_prefix(".github/workflows/").is_some_and(|name| {
+        !name.contains('/') && (name.ends_with(".yml") || name.ends_with(".yaml"))
+    })
+}
+
+fn full_sha(pin: &str) -> bool {
+    pin.len() == 40
+        && pin
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn caller_workflow(text: &str) -> Result<serde_yaml_ng::Value> {
+    let mut value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(text).context("decode caller workflow YAML")?;
+    value
+        .apply_merge()
+        .context("expand caller workflow YAML merges")?;
+    Ok(value)
+}
+
+fn set_caller_pins(value: &mut serde_yaml_ng::Value, wrappers: &Target, to: &str) {
+    if let Some(jobs) = value
+        .get_mut("jobs")
+        .and_then(serde_yaml_ng::Value::as_mapping_mut)
+    {
+        for job in jobs.values_mut() {
+            if let Some(uses) = job.get_mut("uses")
+                && let Some(reference) = uses.as_str()
+                && let Some((target, _)) = reference.split_once('@')
+                && wrappers
+                    .files
+                    .iter()
+                    .any(|p| workflow_file(p) && target == format!("{}/{p}", wrappers.repository))
+            {
+                *uses = serde_yaml_ng::Value::String(format!("{target}@{to}"));
+            }
+        }
+    }
+}
+
+fn repin_caller(
+    files: &[(String, String)],
+    wrappers: &Target,
+    project: &str,
+    to: &Pin,
+) -> Result<Vec<(String, String)>> {
+    ensure!(full_sha(&to.pin), "wrappers merge is not a full commit SHA");
+    let mut out = vec![];
+    for (path, text) in files {
+        let pins = caller_pins(text, wrappers, !workflow_file(path))?;
+        ensure!(
+            !pins.is_empty(),
+            "{path} no longer pins a configured wrapper"
+        );
+        let expected = if workflow_file(path) {
+            ensure!(
+                pins.len() <= MAX_WORKFLOW_REFERENCES,
+                "{path}: workflow reference edit budget exhausted"
+            );
+            let mut value = caller_workflow(text)?;
+            set_caller_pins(&mut value, wrappers, &to.pin);
+            Some(value)
+        } else {
+            None
+        };
+        let mut moved = text.clone();
+        for (start, len, _) in pins.into_iter().rev() {
+            let mut candidate = moved.clone();
+            candidate.replace_range(start..start + len, &to.pin);
+            if let Some(expected) = &expected {
+                let mut value = caller_workflow(&candidate)?;
+                set_caller_pins(&mut value, wrappers, &to.pin);
+                if value != *expected {
+                    continue;
+                }
+            }
+            moved = candidate;
+        }
+        let named = format!("{project} ");
+        moved = moved
+            .split_inclusive('\n')
+            .map(|line| {
+                if !wrappers
+                    .files
+                    .iter()
+                    .any(|p| line.contains(&format!("{}/{p}@{}", wrappers.repository, to.pin)))
+                {
+                    return line.to_owned();
+                }
+                match named_version(line, &named) {
+                    Some(old) => {
+                        replace_after(line, &named, |s| named_at(s, named.len()), old, &to.version)
+                    }
+                    None => line.to_owned(),
+                }
+            })
+            .collect();
+        if let Some(expected) = expected {
+            ensure!(
+                caller_workflow(&moved)? == expected,
+                "{path}: pin edit would change more than workflow jobs.uses; unsupported layout"
+            );
+        }
+        if moved != *text {
+            out.push((path.clone(), moved));
+        }
+    }
+    Ok(out)
+}
 const HOUR_MS: f64 = 3_600_000.0;
 /// How long a dispatched release run may take to show in the listing.
 const DISPATCH_GRACE: time::Duration = time::Duration::HOUR;
@@ -201,6 +399,16 @@ fn status(error: &anyhow::Error) -> Option<u16> {
 pub trait Api {
     fn request(&self, method: &str, path: &str, body: &Value) -> Result<Value>;
 
+    fn cache_context(&self) -> Option<String> {
+        None
+    }
+
+    /// A cache hit still makes a conditional request. Only discovery uses it;
+    /// identities, inventories, branch heads, fork parents and edit inputs don't.
+    fn discovery_get(&self, path: &str, _previous: Option<&Value>) -> Result<Value> {
+        Ok(json!({"body": self.request("GET", path, &Value::Null)?}))
+    }
+
     /// Resolve the tag once and verify its digest's attestation against the
     /// release workflow and reviewed source commit. No unverified digest may
     /// be returned. Implementations must bound their external requests.
@@ -210,6 +418,23 @@ pub trait Api {
 }
 
 impl Api for Client {
+    fn cache_context(&self) -> Option<String> {
+        Rest::cache_context(self)
+    }
+
+    fn discovery_get(&self, path: &str, previous: Option<&Value>) -> Result<Value> {
+        let url = format!("{API_ROOT}{}", path.trim_start_matches('/'));
+        let validator = previous
+            .and_then(|v| v["etag"].as_str())
+            .map(|v| ("If-None-Match", v));
+        let response = Rest::get(self, &url, validator)?;
+        match response.status {
+            200 => Ok(json!({"body": response.body, "etag": response.etag})),
+            304 if validator.is_some() => previous.cloned().context("304 without cached discovery"),
+            status => anyhow::bail!("GET {path}: HTTP {status}"),
+        }
+    }
+
     fn request(&self, method: &str, path: &str, body: &Value) -> Result<Value> {
         let url = format!("{API_ROOT}{}", path.trim_start_matches('/'));
         let (status, body) = Rest::send(self, method, &url, body)?;
@@ -267,7 +492,7 @@ pub struct Config {
     /// The repository whose workflows wrap the release's, pinned by the
     /// release tag's commit: a tag can move after its review.
     pub wrappers: Target,
-    /// Repositories that pin the wrappers by commit.
+    /// Additive files and verified fork overrides, not the caller inventory.
     pub callers: Vec<Target>,
     /// Off unless configured: publish the image pin before its consumers.
     pub secure_host: Option<Target>,
@@ -303,7 +528,7 @@ fn target(value: &Value, what: &str, keys: &[&str]) -> Result<Target> {
     if keys.contains(&"files") {
         for file in value["files"]
             .as_array()
-            .filter(|f| !f.is_empty())
+            .filter(|f| what == "caller" || !f.is_empty())
             .with_context(|| format!("{what} needs files, a list of paths"))?
         {
             let file = file.as_str().context("a file is not a string")?;
@@ -372,10 +597,12 @@ impl Config {
                 })
             })
             .transpose()?;
-        let callers = value["callers"]
-            .as_array()
-            .context("callers is not a list")?
-            .iter()
+        let callers = value
+            .get("callers")
+            .map(|v| v.as_array().context("callers is not a list"))
+            .transpose()?
+            .into_iter()
+            .flatten()
             .map(|c| target(c, "caller", files))
             .collect::<Result<_>>()?;
         Ok(Self {
@@ -986,6 +1213,26 @@ fn list(value: &Value) -> Result<&Vec<Value>> {
     value.as_array().context("the listing is not a list")
 }
 
+/// Pagination proves only that the visible list ended. The owner's private
+/// repository count must also be available, or a restricted credential could
+/// hide a caller and let the train falsely declare completion.
+fn complete_inventory(metadata: &Value, repos: &[Value], owner: &str) -> Result<()> {
+    let count = |field| {
+        metadata[field].as_u64().with_context(|| {
+            format!("cannot verify complete repository visibility for {owner}: missing {field}")
+        })
+    };
+    let expected = count("public_repos")?
+        .checked_add(count("owned_private_repos")?)
+        .context("repository count overflow")?;
+    ensure!(
+        repos.len() as u64 == expected,
+        "incomplete repository inventory for {owner}: found {}, owner reports {expected}",
+        repos.len()
+    );
+    Ok(())
+}
+
 /// A tracking issue.
 struct Issue {
     number: u64,
@@ -1035,6 +1282,11 @@ struct Pass<'a> {
     now: OffsetDateTime,
     out: &'a mut dyn Write,
     requests: u32,
+    /// Immutable reads within this pass only; fresh reads authorize edits.
+    reads: &'a mut crate::prune::Cache,
+    used_reads: BTreeSet<String>,
+    read_bytes: usize,
+    callers: Vec<Target>,
 }
 
 /// One pass: prints its decisions to `out`, a line each, and with `apply`
@@ -1046,18 +1298,298 @@ pub fn pass(
     now: OffsetDateTime,
     out: &mut dyn Write,
 ) -> Result<()> {
-    Pass {
+    pass_with_cache(
+        api,
+        config,
+        apply,
+        now,
+        out,
+        &mut crate::prune::Cache::default(),
+    )
+}
+
+/// A disposable, identity-keyed response cache. Every reused representation is
+/// revalidated; losing the cache changes request payload sizes, not decisions.
+pub fn pass_with_cache(
+    api: &dyn Api,
+    config: &Config,
+    apply: bool,
+    now: OffsetDateTime,
+    out: &mut dyn Write,
+    cache: &mut crate::prune::Cache,
+) -> Result<()> {
+    crate::pass::cache::bound(&mut cache.0);
+    let result = Pass {
         api,
         config,
         apply,
         now,
         out,
         requests: 0,
+        reads: cache,
+        used_reads: BTreeSet::new(),
+        read_bytes: 0,
+        callers: vec![],
     }
-    .run()
+    .run();
+    crate::pass::cache::bound(&mut cache.0);
+    result
 }
 
 impl Pass<'_> {
+    fn cached(&mut self, path: &str) -> Result<Value> {
+        let context = self.api.cache_context();
+        let key = format!(
+            "{API_ROOT}{}#{}",
+            path.trim_start_matches('/'),
+            context.as_deref().unwrap_or("pass")
+        );
+        if self.used_reads.contains(&key) {
+            return self
+                .reads
+                .0
+                .get(&key)
+                .map(|e| e["body"].clone())
+                .context("missing memoized discovery read");
+        }
+        let previous = context
+            .and_then(|_| self.reads.0.get(&key))
+            .filter(|e| crate::pass::cache::intact(e));
+        ensure!(
+            self.requests < REQUEST_LIMIT,
+            "request budget exhausted during discovery"
+        );
+        self.requests += 1;
+        let entry = self.api.discovery_get(path, previous)?;
+        let body = entry["body"].clone();
+        self.read_bytes += entry.to_string().len();
+        ensure!(
+            self.read_bytes <= crate::pass::cache::MAX_BYTES,
+            "discovery response byte budget exhausted"
+        );
+        self.reads
+            .0
+            .insert(key.clone(), crate::pass::cache::seal(entry));
+        self.used_reads.insert(key);
+        Ok(body)
+    }
+
+    /// REST inventories are not search results. A full page always requires
+    /// another read, including an empty final page. The shared budget bounds
+    /// pagination even if the server repeats pages or never terminates.
+    fn inventory(&mut self, path: &str) -> Result<Vec<Value>> {
+        let mut all = BTreeMap::new();
+        for page in 1.. {
+            let batch = self.get(&format!("{path}&per_page={PAGE_SIZE}&page={page}"))?;
+            let batch = list(&batch)?;
+            ensure!(
+                batch.len() as u64 <= PAGE_SIZE,
+                "oversized repository inventory page"
+            );
+            for repo in batch {
+                let name = string(repo, "/full_name")?;
+                validate_repository(&name)?;
+                ensure!(
+                    all.insert(name.clone(), repo.clone()).is_none(),
+                    "incomplete repository inventory: duplicate {name}"
+                );
+            }
+            if (batch.len() as u64) < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(all.into_values().collect())
+    }
+
+    fn discover_callers(&mut self) -> Result<Vec<Target>> {
+        let c = self.config;
+        // Identity and inventories are always live. A cache never grants write
+        // authority or visibility, even when its trees describe a real commit.
+        let identity = self.get("/user")?;
+        ensure!(
+            identity["login"].as_str() == Some(&c.bot),
+            "release train requires the configured bot identity"
+        );
+        let owner = owner(&c.wrappers.repository);
+        let owner_info = self.get(&format!("/users/{owner}"))?;
+        let inventory = match owner_info["type"].as_str() {
+            Some("Organization") => {
+                format!("/orgs/{owner}/repos?type=all&sort=full_name&direction=asc")
+            }
+            Some("User") if owner.eq_ignore_ascii_case(&c.bot) => {
+                "/user/repos?affiliation=owner&visibility=all&sort=full_name&direction=asc".into()
+            }
+            _ => anyhow::bail!(
+                "cannot read a complete repository inventory for {owner} with this identity"
+            ),
+        };
+        let repos = self.inventory(&inventory)?;
+        let owner_metadata = if owner_info["type"] == "Organization" {
+            self.get(&format!("/orgs/{owner}"))?
+        } else {
+            self.get("/user")?
+        };
+        complete_inventory(&owner_metadata, &repos, owner)?;
+        let mut files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut overrides = BTreeMap::new();
+        for caller in &c.callers {
+            if let Some(previous) = overrides.insert(caller.repository.clone(), caller.fork.clone())
+            {
+                ensure!(
+                    previous == caller.fork,
+                    "conflicting fork overrides for {}",
+                    caller.repository
+                );
+            }
+            files
+                .entry(caller.repository.clone())
+                .or_default()
+                .extend(caller.files.iter().cloned());
+        }
+        let mut heads = BTreeMap::new();
+        for repo in repos {
+            let name = string(&repo, "/full_name")?;
+            ensure!(
+                owner.eq_ignore_ascii_case(self::owner(&name)),
+                "repository inventory left owner {owner}: {name}"
+            );
+            let archived = repo["archived"]
+                .as_bool()
+                .context("inventory missing archived flag")?;
+            let fork = repo["fork"]
+                .as_bool()
+                .context("inventory missing fork flag")?;
+            if archived || fork {
+                continue;
+            }
+            let base = string(&repo, "/default_branch")?;
+            let head = match self.get(&format!("/repos/{name}/commits/{}", encode(&base))) {
+                Err(e) if status(&e) == Some(409) && repo["size"] == 0 => continue,
+                head => head?,
+            };
+            let sha = string(&head, "/sha")?;
+            ensure!(full_sha(&sha), "invalid default-branch head for {name}");
+            heads.insert(name.clone(), sha.clone());
+            let tree = self.cached(&format!("/repos/{name}/git/trees/{sha}?recursive=1"))?;
+            ensure!(
+                tree["truncated"] == false,
+                "incomplete discovery: truncated tree for {name}"
+            );
+            for entry in list(&tree["tree"])? {
+                let path = string(entry, "/path")?;
+                if !workflow_file(&path) {
+                    continue;
+                }
+                ensure!(
+                    entry["type"] == "blob" && entry["mode"] == "100644",
+                    "unsupported workflow file {name}:{path}"
+                );
+                let content = self.discovery_contents(&name, &sha, &path)?;
+                if !caller_pins(&content, &c.wrappers, false)?.is_empty() {
+                    files.entry(name.clone()).or_default().insert(path);
+                }
+            }
+        }
+        // Include private and renamed bot forks; the short name conveys no
+        // parent identity. Never create a missing fork on the operator's behalf.
+        let forks = if files.is_empty() {
+            vec![]
+        } else {
+            self.inventory(
+                "/user/repos?affiliation=owner&visibility=all&sort=full_name&direction=asc",
+            )?
+        };
+        let mut by_parent: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        if !files.is_empty() {
+            complete_inventory(&self.get("/user")?, &forks, &c.bot)?;
+        }
+        for fork in forks {
+            let name = string(&fork, "/full_name")?;
+            ensure!(
+                self::owner(&name).eq_ignore_ascii_case(&c.bot),
+                "bot fork inventory left bot owner"
+            );
+            if fork["fork"]
+                .as_bool()
+                .context("fork inventory missing fork flag")?
+            {
+                let metadata = self.get(&format!("/repos/{name}"))?;
+                let parent = string(&metadata, "/parent/full_name")?;
+                by_parent.entry(parent).or_default().insert(name);
+            }
+        }
+        let mut callers = vec![];
+        for (repo, paths) in files {
+            if paths.is_empty() {
+                continue;
+            }
+            let sha = match heads.get(&repo) {
+                Some(sha) => sha.clone(),
+                None => {
+                    let base = self.default_branch(&repo)?;
+                    string(
+                        &self.get(&format!("/repos/{repo}/commits/{}", encode(&base)))?,
+                        "/sha",
+                    )?
+                }
+            };
+            for path in &paths {
+                let content = self.discovery_contents(&repo, &sha, path)?;
+                let pins = caller_pins(&content, &c.wrappers, !workflow_file(path))?;
+                ensure!(
+                    !pins.is_empty(),
+                    "configured extra {repo}:{path} has no configured wrapper pin"
+                );
+                let records: BTreeSet<_> = pins
+                    .into_iter()
+                    .map(|(at, len, wrapper)| (wrapper, content[at..at + len].to_owned()))
+                    .collect();
+                for (wrapper, pin) in records {
+                    self.log(&format!("caller {repo} {path} {wrapper} {pin}"))?;
+                }
+            }
+            let fork = if let Some(fork) = overrides.get(&repo) {
+                ensure!(
+                    self::owner(fork).eq_ignore_ascii_case(&c.bot),
+                    "caller fork override is not owned by {}",
+                    c.bot
+                );
+                let metadata = self.get(&format!("/repos/{fork}"))?;
+                ensure!(
+                    metadata["parent"]["full_name"].as_str() == Some(&repo),
+                    "{fork} is not a fork of {repo}"
+                );
+                fork.clone()
+            } else {
+                let candidates = by_parent.get(&repo).cloned().unwrap_or_default();
+                ensure!(
+                    candidates.len() == 1,
+                    "{repo}: missing or ambiguous bot fork ({} candidates); configure a verified callers fork override",
+                    candidates.len()
+                );
+                candidates.into_iter().next().context("missing bot fork")?
+            };
+            callers.push(Target {
+                repository: repo,
+                fork,
+                files: paths.into_iter().collect(),
+            });
+        }
+        Ok(callers)
+    }
+
+    fn discovery_contents(&mut self, repo: &str, sha: &str, path: &str) -> Result<String> {
+        ensure!(full_sha(sha), "discovery ref must be a full commit SHA");
+        validate_path(path)?;
+        let path = path.split('/').map(encode).collect::<Vec<_>>().join("/");
+        let file = self.cached(&format!("/repos/{repo}/contents/{path}?ref={sha}"))?;
+        ensure!(
+            file["encoding"] == "base64",
+            "discovery file is too large or not a file: {repo}:{path}"
+        );
+        decode(&file["content"])
+    }
+
     fn request(&mut self, method: &str, path: &str, body: &Value) -> Result<Value> {
         // Bounds a pass however the API answers.
         ensure!(self.requests < REQUEST_LIMIT, "request budget exhausted");
@@ -1089,6 +1621,22 @@ impl Pass<'_> {
             self.request("POST", &path, &json!({ "body": body }))?;
         }
         Ok(())
+    }
+
+    fn halt(&mut self, issue: &Issue, error: &anyhow::Error) -> Result<()> {
+        let stalled = &self.config.labels.stalled;
+        // Label first, so a failed comment does not repeat on the next pass.
+        if self.announce(&format!("label {} {stalled}", issue.html_url))? {
+            let path = format!(
+                "/repos/{}/issues/{}/labels",
+                self.config.tracking, issue.number
+            );
+            self.request("POST", &path, &json!({"labels": [stalled]}))?;
+        }
+        self.comment(
+            issue,
+            &format!("Halted: {error}. Fix it, then remove the `{stalled}` label."),
+        )
     }
 
     fn title(&self, version: &str) -> String {
@@ -1373,6 +1921,10 @@ impl Pass<'_> {
         let head = self.get(&format!("/repos/{repo}/commits/{}", encode(&base)))?;
         let sha = string(&head, "/sha")?;
         let changed = edit(&self.contents(repo, &sha, paths)?)?;
+        if changed.is_empty() {
+            self.log(&format!("{repo} is already current"))?;
+            return Ok(None);
+        }
         // A dropped train's PR still open on the branch: the force push
         // below would change what its reviewers saw.
         let head_ref = format!("{}:{branch}", owner(fork));
@@ -1622,26 +2174,71 @@ impl Pass<'_> {
             // so each pass opens only its own producer or consumer PR.
             facts.secure_host = self.pull(image, &format!("{branch}-secure-host"), since)?;
         }
-        for caller in &c.callers {
-            let pr = self.pull(caller, &branch, since)?;
-            facts.callers.push((caller.repository.clone(), pr));
+        // Earlier stages do not need discovery. But callers/done require the
+        // complete inventory on every pass, including after all known PRs merge.
+        let discovery = (|| -> Result<()> {
+            if next(&facts) == Step::Done {
+                let merge = facts
+                    .wrappers
+                    .as_ref()
+                    .and_then(|p| p.merge_commit_sha.as_deref())
+                    .context("the wrappers' pin bump has no merge commit")?;
+                ensure!(full_sha(merge), "wrappers merge is not a full commit SHA");
+                self.on_default(&c.wrappers.repository, merge, "the wrappers' pin bump")?;
+                self.callers = self.discover_callers()?;
+                for caller in self.callers.clone() {
+                    let mut pr = self.pull(&caller, &branch, since)?;
+                    let base = self.default_branch(&caller.repository)?;
+                    let sha = string(
+                        &self.get(&format!(
+                            "/repos/{}/commits/{}",
+                            caller.repository,
+                            encode(&base)
+                        ))?,
+                        "/sha",
+                    )?;
+                    let mut current = true;
+                    for path in &caller.files {
+                        let content = self.discovery_contents(&caller.repository, &sha, path)?;
+                        let pins = caller_pins(&content, &c.wrappers, !workflow_file(path))?;
+                        ensure!(
+                            !pins.is_empty(),
+                            "{}:{path} no longer pins a configured wrapper",
+                            caller.repository
+                        );
+                        current &= pins
+                            .iter()
+                            .all(|(at, len, _)| &content[*at..at + len] == merge);
+                    }
+                    if current && pr.is_none() {
+                        pr = Some(Pull {
+                            state: "closed".into(),
+                            merged_at: Some("already current".into()),
+                            ..Pull::default()
+                        });
+                    } else if !current && pr.as_ref().is_some_and(Pull::merged) {
+                        return stall(format!(
+                            "{} has stale pins after its pin bump merged; it was reverted or gained callers",
+                            caller.repository
+                        ));
+                    }
+                    facts.callers.push((caller.repository, pr));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = discovery {
+            return if error.is::<Stall>() {
+                self.halt(&issue, &error)
+            } else {
+                Err(error)
+            };
         }
 
         let step = next(&facts);
         self.log(&format!("{} v{version}: {step}", issue.html_url))?;
         match self.take(&step, &issue, &version, &branch, &facts) {
-            Err(e) if e.is::<Stall>() => {
-                // The label first: a pass that failed between the two would
-                // otherwise say so again every hour.
-                if self.announce(&format!("label {} {stalled}", issue.html_url))? {
-                    let path = format!("/repos/{}/issues/{}/labels", c.tracking, issue.number);
-                    self.request("POST", &path, &json!({ "labels": [stalled] }))?;
-                }
-                self.comment(
-                    &issue,
-                    &format!("Halted: {e}. Fix it, then remove the `{stalled}` label."),
-                )
-            }
+            Err(e) if e.is::<Stall>() => self.halt(&issue, &e),
             taken => taken,
         }
     }
@@ -1894,9 +2491,12 @@ impl Pass<'_> {
                 };
                 let mut urls = vec![];
                 for repo in repositories {
-                    let Some(caller) = c.callers.iter().find(|t| t.repository == *repo) else {
-                        continue;
-                    };
+                    let caller = self
+                        .callers
+                        .iter()
+                        .find(|t| t.repository == *repo)
+                        .with_context(|| format!("resolved caller missing: {repo}"))?
+                        .clone();
                     let why = format!(
                         "Moves review.yml to the wrappers' commit for {project} v{version}, so this repository's reviews run it, through the release train.{origin}"
                     );
@@ -1905,9 +2505,8 @@ impl Pass<'_> {
                         body: format!("{why}\n\n{}", notes(version, &release, &issue.html_url)),
                         why,
                     };
-                    let target = &c.wrappers.repository;
-                    let url = self.open(caller, branch, &text, &caller.files, |files| {
-                        repin(files, target, project, &to)
+                    let url = self.open(&caller, branch, &text, &caller.files, |files| {
+                        repin_caller(files, &c.wrappers, project, &to)
                     })?;
                     urls.push(url.unwrap_or_else(|| format!("(dry run on {repo})")));
                 }

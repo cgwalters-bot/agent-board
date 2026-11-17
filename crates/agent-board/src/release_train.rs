@@ -1,6 +1,7 @@
 //! `release-train`: one pass of the release train (docs/release-train.md).
 use anyhow::{Context, Result, ensure};
-use board_forge::release_train::{Api, Config, pass};
+use board_forge::prune::Cache;
+use board_forge::release_train::{Api, CACHE_SCHEMA, Config, pass_with_cache};
 use clap::Args;
 use std::io::Write;
 
@@ -25,6 +26,18 @@ fn checked_tool(tool: &str, args: &[&str]) -> Result<String> {
 }
 
 impl<A: Api> Api for VerifiedRegistry<A> {
+    fn cache_context(&self) -> Option<String> {
+        self.0.cache_context()
+    }
+
+    fn discovery_get(
+        &self,
+        path: &str,
+        previous: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        self.0.discovery_get(path, previous)
+    }
+
     fn request(
         &self,
         method: &str,
@@ -88,12 +101,15 @@ fn verified_digest(
 
 #[derive(Args)]
 pub struct ReleaseTrain {
-    /// The train's configuration from a trusted default-branch checkout: the bot, the release repository, the wrappers and callers to pin, labels and thresholds.
+    /// The train's configuration from a trusted default-branch checkout: the bot, release repository, wrappers, caller exceptions, labels and thresholds.
     #[arg(long, value_name = "FILE")]
     config: std::path::PathBuf,
     /// Take the pass's step with GH_TOKEN, the bot's; without it the pass only reads and prints.
     #[arg(long)]
     apply: bool,
+    /// Optional disposable discovery response cache; revalidated on every pass, never used to authorize edits.
+    #[arg(long, value_name = "FILE")]
+    cache: Option<std::path::PathBuf>,
 }
 
 /// The configuration is checked before a token is read.
@@ -106,13 +122,28 @@ pub fn run<A: Api>(
     let text = std::fs::read_to_string(&args.config).with_context(|| format!("read {path}"))?;
     let value = serde_json::from_str(&text).with_context(|| format!("decode {path}"))?;
     let config = Config::from_json(&value).with_context(|| format!("check {path}"))?;
-    pass(
+    let mut cache = match &args.cache {
+        Some(path) if path.exists() => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let value = serde_json::from_str(&text).context("decode release-train cache")?;
+            Cache::from_json_as(&value, CACHE_SCHEMA)?
+        }
+        _ => Cache::default(),
+    };
+    pass_with_cache(
         &VerifiedRegistry(api()?),
         &config,
         args.apply,
         time::OffsetDateTime::now_utc(),
         out,
-    )
+        &mut cache,
+    )?;
+    if let Some(path) = &args.cache {
+        let text = serde_json::to_string(&cache.to_json_as(CACHE_SCHEMA))?;
+        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -174,6 +205,7 @@ mod tests {
             let args = ReleaseTrain {
                 config: config.clone(),
                 apply: false,
+                cache: None,
             };
             let error = run(
                 &args,

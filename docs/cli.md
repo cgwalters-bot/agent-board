@@ -1218,8 +1218,9 @@ agent-board release-train [OPTIONS] --config <FILE>
 
 Options:
 
-- `--config <FILE>`: The train's configuration from a trusted default-branch checkout: the bot, the release repository, the wrappers and callers to pin, labels and thresholds
+- `--config <FILE>`: The train's configuration from a trusted default-branch checkout: the bot, release repository, wrappers, caller exceptions, labels and thresholds
 - `--apply`: Take the pass's step with GH_TOKEN, the bot's; without it the pass only reads and prints
+- `--cache <FILE>`: Optional disposable discovery response cache; revalidated on every pass, never used to authorize edits
 
 ## agent-board digest
 

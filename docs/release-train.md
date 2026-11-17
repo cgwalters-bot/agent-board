@@ -2,7 +2,7 @@
 
 > This text is LLM generated.
 
-`agent-board release-train --config FILE [--apply]` runs one pass of a release
+`agent-board release-train --config FILE [--cache FILE] [--apply]` runs one pass of a release
 train: it cuts a release of one Rust repository and then moves the pins of the
 repositories that use it, one step a pass. It is tracker's
 `.github/release-train/train.cjs` (at 1a550cc) moved here, with the same
@@ -50,7 +50,9 @@ The steps of a train, each a pass:
    publish; bypassing only that forwarder breaks the cycle. All other release
    workflow/action pins remain on the reviewed release commit.
 5. **callers**: once that merges into the default branch, a PR on each caller
-   moving its commit pin of the wrappers to that merge commit.
+   moving its commit pins of the configured wrapper workflows to that merge commit.
+   Discover callers across every non-archived, non-fork repository of the
+   wrappers repository's owner, not just the configuration's exceptions.
 6. **done**: close the tracking issue.
 
 A pass doesn't keep state: it reads the stage from the only open tracking issue (an
@@ -72,6 +74,25 @@ off the default branch) labels the tracking issue with the
 stalled label and says why in a comment; the train waits until the label is
 removed. Close the tracking issue to drop a train.
 
+Before deciding callers or done, each pass lists the owner's repositories with
+complete pagination, resolves their current default-branch heads, reads their
+complete recursive trees, and inspects `.github/workflows/*.yml` and `*.yaml`.
+Only actual workflow `jobs.<job>.uses` values naming an exact workflow path in
+`wrappers.files` count. Each must use a full 40-character lowercase hexadecimal
+commit SHA; other paths and repositories do not count. The output is sorted by
+repository, file, wrapper path and current pin. Multiple files and different
+pins in one repository produce one PR. Already-current files need no edit or PR.
+
+`callers` entries add extra files, including test fixture strings, and select
+fork-name overrides; they never restrict discovery. Files are deduplicated.
+An entry with `files: []` only overrides a discovered repository's fork. The
+train inventories the bot's forks and reads their parent metadata, so a renamed
+fork works without an override. A missing or ambiguous fork, wrong parent,
+unreadable repository, truncated tree, incomplete inventory or exhausted request
+budget ends the pass with an explicit error, not partial coverage or done. No
+fork is created. Existing PRs still have to pass the default-branch, fork and
+review checks; stale pins after a merged bump require intervention, not done.
+
 ## Preview and apply
 
 Without `--apply` a pass only reads, and prints each decision on a line, each
@@ -88,10 +109,41 @@ train. Run one pass at a time, for example in a
 workflow `concurrency` group without `cancel-in-progress`: passes that overlap
 race on the same step, though only one of them dispatches a release.
 
+Discovery shares that fixed 200-request budget, including pagination and cache
+revalidation. Full inventory pages always require the next page. Organization
+inventories must match the owner's independently reported `public_repos` plus
+`owned_private_repos` counts, including archives and forks before filtering.
+Missing private-count visibility or a count mismatch refuses completion rather
+than accepting a token-filtered subset. Bot fork inventories have the same check.
+This requires the existing credential to expose owner-level repository counts;
+the train does not change credentials or request broader permissions. If those
+counts are unavailable, deployment remains blocked pending an operator decision.
+A user owner is supported only when it is
+the authenticated bot, using its private-inclusive inventory; another user's
+public-only listing cannot establish complete coverage and is refused.
+
+To avoid stale discovery hiding a caller, tree and workflow representations are
+keyed by repository, immutable default-branch commit and credential/representation
+identity, and revalidated before reuse on another pass. Within a pass those
+immutable reads are memoized. `--cache FILE` optionally persists these disposable
+responses using the existing bounded response cache (1,024 entries, 8 MiB,
+256 KiB per entry); oversized entries are not retained across passes. Without
+it, caching is in memory only. Inventories, identity, branch heads, fork metadata
+and write checks remain fresh. Every PR edit rereads its inputs at the current
+default-branch head and verifies that only workflow `jobs.uses` values change;
+the cache never authorizes a push. Restoring a cache saves response bytes, not
+the revalidation requests. Neither discovery nor cache use enables writes:
+`--apply` remains off by default.
+Discovery also limits response representations to 8 MiB per pass and workflow
+editing to 128 reference occurrences per file; exceeding either bound is an
+explicit error, not a partial edit. Scalar selection checks parsed YAML so an
+identical reference in a `run` string is left untouched.
+
 ## Configuration
 
 The file comes from the caller's protected default branch; every key is
-required except `secureHost`, and unknown keys are refused. An example, with placeholder names:
+required except `secureHost` and `callers`, and unknown keys are refused. `callers`
+may be omitted or empty. An example with an additive test fixture exception:
 
 ```json
 {
@@ -103,17 +155,33 @@ required except `secureHost`, and unknown keys are refused. An example, with pla
   "labels": {"urgent": "P0", "breaking": "breaking", "tracking": "release-train", "stalled": "needs-human"},
   "wrappers": {"repository": "example/actions", "fork": "example-bot/actions", "files": [".github/workflows/tool.yml"]},
   "callers": [
-    {"repository": "example/app", "fork": "example-bot/app", "files": [".github/workflows/review.yml"]}
+    {"repository": "example/app", "fork": "example-bot/renamed-app", "files": ["tests/wrapper-pin.txt"]}
   ]
 }
 ```
 
 The shape is train.cjs's `config.json` with `bot` (formerly read from the
 poll's `agent-board.json`) added and `pageSize`, `maxRequests` and
-`requestTimeoutSeconds` removed: listings are one page of 100, the request
+`requestTimeoutSeconds` removed: inventory listings paginate in pages of 100, the request
 bound is fixed, and every request has the client's 30-second timeout.
 
 ### Caller settings
+
+Deployment still requires `cgwalters-forge/tracker` to select a release containing
+this change in `.github/workflows/release-train.yml` (`env.AGENT_BOARD_REV` must
+be the reviewed commit containing this implementation). In `.github/release-train/config.json`,
+remove `.github/workflows/review.yml` from both `callers[].files` lists, retaining
+`.github/agentic-job/config-test/tests/config.rs` for tracker and
+`.github/agentic-job/test_review.py` for agent-board and their fork overrides.
+Existing configurations continue to work before that cleanup. No discovery
+enablement key is needed. Optionally append `--cache "$RUNNER_TEMP/release-train-cache.json"`
+to the workflow's `agent-board release-train` invocation and restore/save that
+file using its existing cache mechanism; no cache wiring is required for correctness.
+After deployment run a read-only preview with the bot's token and verify that
+the org-site workflow and its real fork are included before applying. The
+historical recordings predate discovery and contain no inventory/tree/fork
+reads; synthetic extensions exercise discovery, not the deployed org-site
+failure or its remediation.
 
 `cgwalters-forge/tracker` sets this optional key in
 `.github/release-train/config.json`, asserted by its config test
