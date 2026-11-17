@@ -4636,7 +4636,11 @@ cancelled too.
   already, it is `needs-human: the review job's run URL ended (failure) again
   after a rerun, …`, and where ten were read, so that an older one re-run may
   have been left out, `needs-human: … which has more runs than the 10 read
-  for an earlier rerun; …`. With `pr.reviewPools` it takes the runs the
+  for an earlier rerun; …`. A repository whose runs read answers 404 has no
+  such workflow: the head waits for the operator's review, and the pass says
+  `OWNER/REPO: no WORKFLOW workflow (404), so only the operator's review
+  counts` once, with no error (agent-board#1088). A misnamed
+  `pr.reviewWorkflow` reads the same. With `pr.reviewPools` it takes the runs the
   pass started instead, and is a dispatch within `--max-dispatch` and
   `wip` ([reviews](#reviews)).
 * **Required checks, stage 2 (agent-board#413).** Before spending a fix round

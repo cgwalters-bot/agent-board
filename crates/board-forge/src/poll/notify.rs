@@ -4015,6 +4015,7 @@ mod tests {
                 report_pulls: BTreeMap::new(),
                 quiet: BTreeMap::new(),
                 quiet_replayed: 0,
+                no_review_workflow: BTreeSet::new(),
             };
             let mut outcome = Outcome::default();
             let next = pass
