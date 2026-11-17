@@ -4357,8 +4357,8 @@ pub fn decide(
             ),
         );
     }
-    if let Some(reason) = review_hold(config, pull) {
-        return step("skip", reason);
+    if let Some(hold) = review_hold(config, pull) {
+        return step("skip", hold.reason(pull, marker));
     }
     // `stopped` is what needs-human wrote next to the label, so with the label
     // gone someone took it off: that asks for fresh rounds, on this head too.
@@ -5133,14 +5133,15 @@ fn rest_comment(node: &Value) -> Result<Value> {
 /// What, if anything, `decision` for `pull` leaves waiting on the operator.
 /// What the pass resolves by itself is not: a run, check, review or rerun
 /// it waits for, a queue, or an answer it already acts on.
-fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
+fn operator_wait(config: &Config, pull: &Value, decision: &Decision) -> Option<&'static str> {
     let approval = format!("labelled {OPERATOR_APPROVAL_LABEL} ");
     match decision.action {
         "needs-human" => Some("needs-human"),
         "skip"
             if labelled(pull)
                 || decision.reason.starts_with(LEFT_TO_OPERATOR)
-                || decision.reason == "operator review requested" =>
+                || (decision.waiting == WaitReason::Person
+                    && review_hold(config, pull) == Some(ReviewHold::Pending)) =>
         {
             Some("needs-human")
         }
@@ -5158,7 +5159,38 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
 
 /// A review request holds all poll paths, including queue and stack recovery.
 /// Missing or partial reads cannot release it and reset the fix budget.
-fn review_hold(config: &Config, pull: &Value) -> Option<&'static str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewHold {
+    Incomplete,
+    Pending,
+}
+
+impl ReviewHold {
+    fn reason(self, pull: &Value, marker: &Marker) -> String {
+        if self == Self::Incomplete {
+            return "operator review requests not read whole".into();
+        }
+        // A bot-owned stop records what the pass did, not who requested the
+        // review. In particular, the reviewer login is not requester evidence.
+        let mut reason = "operator review pending; requester unknown".to_owned();
+        if marker.stopped {
+            let head = match marker.sha.as_deref() {
+                Some(sha) if sha == text(pull, "/headRefOid") => "current head".to_owned(),
+                Some(sha) => format!("older head {}", short(sha)),
+                None => "unknown head".to_owned(),
+            };
+            reason.push_str(&format!("; pass stop recorded for {head}"));
+            if let Some(id) = marker.id
+                && let Some(url) = pull["url"].as_str().filter(|url| !url.is_empty())
+            {
+                reason.push_str(&format!(" ({url}#issuecomment-{id})"));
+            }
+        }
+        reason
+    }
+}
+
+fn review_hold(config: &Config, pull: &Value) -> Option<ReviewHold> {
     if !config.policy.assign_holds {
         return None;
     }
@@ -5168,14 +5200,14 @@ fn review_hold(config: &Config, pull: &Value) -> Option<&'static str> {
             .and_then(Value::as_array)
             .is_none()
     {
-        return Some("operator review requests not read whole");
+        return Some(ReviewHold::Incomplete);
     }
     nodes(pull, "/reviewRequests/nodes")
         .iter()
         .any(|request| {
             text(request, "/requestedReviewer/login").eq_ignore_ascii_case(&config.operator)
         })
-        .then_some("operator review requested")
+        .then_some(ReviewHold::Pending)
 }
 
 fn approval_only(pull: &Value, checks: &Checks, run: Option<&Value>, config: &Config) -> bool {
@@ -8781,9 +8813,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             ));
         }
         if text(&pull, "/author/login") == self.config.bot
-            && let Some(reason) = review_hold(self.config, &pull)
+            && let Some(hold) = review_hold(self.config, &pull)
         {
-            return Ok(self.person_skip(repo, number, merge_only, &pull, reason));
+            return Ok(self.person_skip(
+                repo,
+                number,
+                merge_only,
+                &pull,
+                &hold.reason(&pull, &marker),
+            ));
         }
         if self.config.policy.hold_dependencies
             && !is_harness(&pull, self.config)
@@ -9290,7 +9328,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 if is_held(&p) {
                     Some(format!("labelled {HOLD_LABEL}"))
                 } else {
-                    review_hold(self.config, &p).map(str::to_owned)
+                    review_hold(self.config, &p).map(|hold| hold.reason(&p, &marker))
                 }
             })
         } else {
@@ -9480,7 +9518,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 review_run.as_ref().or(display_run.as_ref()),
                 self.config,
             );
-        let wait = operator_wait(&pull, &decision)
+        let wait = operator_wait(self.config, &pull, &decision)
             .or_else(|| approval_only.then_some("approve"))
             .map(|kind| Wait {
                 review_bucket: None,
@@ -16673,6 +16711,26 @@ mod tests {
                 "APPROVED",
                 "skip",
             ),
+            (
+                json!({"mergeQueueEntry": {"state": "QUEUED"}, "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "cgwalters"}}], "pageInfo": {"hasNextPage": false}}}),
+                "APPROVED",
+                "skip",
+            ),
+            (
+                json!({"autoMergeRequest": {"enabledAt": "now"}, "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "cgwalters"}}], "pageInfo": {"hasNextPage": false}}}),
+                "APPROVED",
+                "skip",
+            ),
+            (
+                json!({"mergeQueueEntry": {"state": "QUEUED"}, "reviewRequests": null}),
+                "APPROVED",
+                "skip",
+            ),
+            (
+                json!({"autoMergeRequest": {"enabledAt": "now"}, "reviewRequests": {"nodes": [], "pageInfo": {"hasNextPage": true}}}),
+                "APPROVED",
+                "skip",
+            ),
         ] {
             let mut fake = github();
             let mut p = pull("pull-470", change);
@@ -16695,6 +16753,7 @@ mod tests {
                 .retain(|url, _| !url.contains("/comments") && !url.contains("/actions/runs/"));
             let mut cfg = config();
             cfg.policy = PollPolicy::from_json(&json!({"mergeAuthors": ["updater[bot]"]})).unwrap();
+            cfg.policy.assign_holds = true;
             let dispatcher = Fake::default();
             let outcome = run(
                 &fake,
@@ -16718,6 +16777,11 @@ mod tests {
                 outcome.lines
             );
             assert_eq!(outcome.in_flight, 0);
+            if !fake.pulls[&470]["mergeQueueEntry"].is_null()
+                || !fake.pulls[&470]["autoMergeRequest"].is_null()
+            {
+                assert!(outcome.waits.is_empty(), "{:?}", outcome.waits);
+            }
             assert_eq!(fake.writes.borrow().len(), usize::from(expected == "merge"));
             assert!(dispatcher.writes.borrow().is_empty());
             assert!(
@@ -20932,52 +20996,177 @@ mod tests {
         assert!(!stop.contains("It is labelled"), "{stop}");
         drop(writes);
 
-        for (requests, held) in [
+        for (requests, held, incomplete) in [
             (
                 json!({"nodes": [{"requestedReviewer": {"login": "CGWalters"}}], "pageInfo": {"hasNextPage": false}}),
                 true,
+                false,
             ),
             (
                 json!({"nodes": [], "pageInfo": {"hasNextPage": true}}),
                 true,
+                true,
             ),
-            (Value::Null, true),
-            (json!({"pageInfo": {"hasNextPage": false}}), true),
+            (Value::Null, true, true),
+            (json!({"pageInfo": {"hasNextPage": false}}), true, true),
             (
                 json!({"nodes": [], "pageInfo": {"hasNextPage": false}}),
+                false,
                 false,
             ),
             (
                 json!({"nodes": [{"requestedReviewer": {"login": "someone-else"}}], "pageInfo": {"hasNextPage": false}}),
                 false,
+                false,
             ),
         ] {
-            let mut change = failed.clone();
-            change["reviewRequests"] = requests;
-            let (outcome, fake, dispatcher) =
-                applied_policy(github(), policy.clone(), change, stopped.clone());
-            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
-            if held {
-                assert!(
-                    outcome
-                        .lines
-                        .last()
-                        .unwrap()
-                        .contains(" skip: operator review"),
-                    "{:?}",
-                    outcome.lines
-                );
-                assert!(fake.writes.borrow().is_empty());
-                assert!(dispatcher.writes.borrow().is_empty());
-                assert_eq!(outcome.waits.len(), 1);
-            } else {
-                assert_eq!(dispatcher.writes.borrow().len(), 1, "{:?}", outcome.lines);
-                assert!(
-                    outcome.lines.last().unwrap().contains(" fix:"),
-                    "{:?}",
-                    outcome.lines
-                );
+            for (state, evidence) in [
+                (stopped.clone(), Some("current head")),
+                (
+                    json!({"rounds": FIX_ROUNDS, "stopped": true, "sha": "older"}),
+                    Some("older head older"),
+                ),
+                (
+                    json!({"rounds": FIX_ROUNDS, "stopped": true}),
+                    Some("unknown head"),
+                ),
+                (json!({"rounds": 0, "sha": HEAD}), None),
+                (json!({"rounds": 0, "sha": "older"}), None),
+                // The request succeeded, but the stop-marker write was interrupted.
+                (json!({}), None),
+            ] {
+                for changes_requested in [false, true] {
+                    let mut change = failed.clone();
+                    change["reviewRequests"] = requests.clone();
+                    if changes_requested {
+                        change["reviews"] = json!({"nodes": [{"author": {"login": "cgwalters"}, "state": "CHANGES_REQUESTED", "commit": {"oid": HEAD}, "submittedAt": "2026-01-01T00:00:00Z"}], "pageInfo": {"hasPreviousPage": false}});
+                    }
+                    // Exercise both the pure decision and the applying pass's early hold.
+                    let p = pull("pull-470", change.clone());
+                    let marker = find_marker(
+                        &[
+                            json!({"id": 5, "user": {"login": BOT}, "body": marker_body(&state, "Stop.")}),
+                        ],
+                        BOT,
+                    );
+                    let mut cfg = config();
+                    cfg.policy = policy.clone();
+                    let decision = decide(
+                        &cfg,
+                        &p,
+                        &Checks::default(),
+                        &marker,
+                        (None, None),
+                        &Outages::Off,
+                        now(),
+                    );
+                    if held {
+                        assert_eq!(decision.action, "skip");
+                        assert_eq!(decision.waiting, WaitReason::Person);
+                        assert_eq!(
+                            operator_wait(&cfg, &p, &decision),
+                            (!incomplete).then_some("needs-human")
+                        );
+                    }
+                    let (outcome, fake, dispatcher) =
+                        applied_policy(github(), policy.clone(), change, state.clone());
+                    assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                    if held {
+                        assert!(
+                            outcome
+                                .lines
+                                .last()
+                                .unwrap()
+                                .contains(" skip: operator review"),
+                            "{:?}",
+                            outcome.lines
+                        );
+                        assert!(fake.writes.borrow().is_empty());
+                        assert!(dispatcher.writes.borrow().is_empty());
+                        assert_eq!(outcome.waits.len(), 1);
+                        assert_eq!(outcome.waits[0].kind, "needs-human");
+                        let stepped = outcome.steps.last().unwrap();
+                        assert_eq!(stepped.waiting, WaitReason::Person);
+                        assert_eq!(stepped.progress(), Progress::Person);
+                        let reason = &stepped.reason;
+                        if incomplete {
+                            assert_eq!(reason, "operator review requests not read whole");
+                        } else {
+                            assert!(
+                                reason.starts_with("operator review pending; requester unknown"),
+                                "{reason}"
+                            );
+                            assert_eq!(
+                                reason.contains("pass stop recorded"),
+                                evidence.is_some(),
+                                "{reason}"
+                            );
+                            if let Some(head) = evidence {
+                                assert!(
+                                    reason.contains(&format!("pass stop recorded for {head}")),
+                                    "{reason}"
+                                );
+                                assert!(
+                                    reason
+                                        .contains(&format!("{}#issuecomment-5", text(&p, "/url"))),
+                                    "{reason}"
+                                );
+                            }
+                            assert_eq!(reason, &decision.reason);
+                            if changes_requested && evidence == Some("current head") {
+                                println!("hold fixture: {}", outcome.lines.last().unwrap());
+                            }
+                        }
+                    } else if !marker.stopped && marker.sha.as_deref() == Some(HEAD) {
+                        // Releasing a request without a stop does not reset an
+                        // existing round: retain the ordinary in-flight wait.
+                        assert!(
+                            outcome
+                                .lines
+                                .last()
+                                .unwrap()
+                                .contains(" wait: fix round 0 is running")
+                        );
+                        assert!(fake.writes.borrow().is_empty());
+                        assert!(dispatcher.writes.borrow().is_empty());
+                    } else {
+                        assert_eq!(dispatcher.writes.borrow().len(), 1, "{:?}", outcome.lines);
+                        assert!(
+                            outcome.lines.last().unwrap().contains(" fix:"),
+                            "{:?}",
+                            outcome.lines
+                        );
+                        assert_eq!(fake.writes.borrow().len(), 3, "{:?}", outcome.lines);
+                        let writes = fake.writes.borrow();
+                        let round =
+                            parse_marker(MARKER, text(&writes.last().unwrap().1, "/body")).unwrap();
+                        assert_eq!(round["rounds"], 1);
+                    }
+                }
             }
+        }
+
+        for (author, url, recorded, linked) in [
+            (BOT, json!("https://github.com/o/r/pull/1"), true, true),
+            (BOT, Value::Null, true, false),
+            (
+                "visitor",
+                json!("https://github.com/o/r/pull/1"),
+                false,
+                false,
+            ),
+        ] {
+            let marker = find_marker(
+                &[
+                    json!({"id": 5, "user": {"login": author}, "body": marker_body(&stopped, "Stop.")}),
+                ],
+                BOT,
+            );
+            let p = pull("pull-470", json!({"url": url}));
+            let reason = ReviewHold::Pending.reason(&p, &marker);
+            assert!(reason.starts_with("operator review pending; requester unknown"));
+            assert_eq!(reason.contains("pass stop recorded"), recorded, "{reason}");
+            assert_eq!(reason.contains("#issuecomment-5"), linked, "{reason}");
         }
 
         // A refused request must not publish a stop that looks released.

@@ -392,6 +392,17 @@ and permits fresh rounds. Comments alone do not release a review-request hold;
 labels remain holds and are not automatically migrated. This uses the pass's
 existing top-level setting, not a new standalone poll option.
 
+The hold diagnostic says `operator review pending; requester unknown`: the
+requested reviewer is not evidence of who asked. Bot-created requests still
+hold. When the existing authenticated bot marker records a stop, the diagnostic
+also names that recorded pass stop, links its comment where available, and
+distinguishes the current head from an older head (or an unknown recorded head).
+This is stop evidence, not attribution of the review request. A request written
+before an interrupted stop-marker write still holds without recorded-stop
+evidence. Missing or truncated reviewer reads retain their incomplete-read hold.
+No timeline reads or additional settings are used; labels, release/reset rules,
+and typed operator-wait/status routing are unchanged.
+
 A stop is added after its label or review request, and
 `--apply` reads the comments before the label and without the response cache,
 so a stop another pass is still writing is not taken for a reset. Steps are taken in `--follow`
