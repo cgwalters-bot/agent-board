@@ -630,6 +630,8 @@ pub struct Config {
     /// Off unless set: hold new implements at this many open bot PRs in
     /// their destination repository, and land overlapping PRs oldest first.
     pub open_pr_cap: Option<usize>,
+    /// Off unless set: diagnose aged overlap recovery candidates at the cap.
+    pub overlap_recovery_hours: Option<u16>,
     /// Off by default: keep a larger scheduling share before the maintain
     /// and PR sweeps and epic discovery can consume it.
     #[serde(default)]
@@ -1556,6 +1558,16 @@ impl Config {
                 "openPrCap supports GitHub only"
             );
         }
+        if let Some(hours) = self.overlap_recovery_hours {
+            ensure!(
+                (1..=720).contains(&hours),
+                "overlapRecoveryHours must be 1 to 720"
+            );
+            ensure!(
+                self.open_pr_cap.is_some() && self.state.is_some(),
+                "overlapRecoveryHours needs openPrCap and state"
+            );
+        }
         if self.issue_intake {
             ensure!(
                 self.github_board().is_some(),
@@ -2152,6 +2164,7 @@ impl Config {
     pub fn poll(&self, snapshot: Option<&Value>) -> poll::Config {
         let mut policy = PollPolicy {
             open_pr_cap: self.open_pr_cap,
+            overlap_recovery_hours: self.overlap_recovery_hours,
             fix_caller_workflow: Some(self.dispatch_workflow.clone()),
             assign_holds: self.assign_holds,
             merge_authors: self.pr.merge_authors.clone(),

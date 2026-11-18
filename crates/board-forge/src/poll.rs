@@ -31,6 +31,7 @@ pub mod drafts;
 pub mod lock;
 pub mod notify;
 mod operator_keys;
+mod overlap_recovery;
 pub mod pace;
 mod publication;
 pub mod quiet;
@@ -39,6 +40,7 @@ pub mod report;
 mod reviews;
 pub mod stale;
 
+pub use overlap_recovery::Seen as OverlapObservation;
 pub use reviews::routed_review_workflow;
 use reviews::{ordinary_reviews, review_key, review_reserves, review_workflow};
 
@@ -662,6 +664,7 @@ pub struct PollPolicy {
     pub pull: Option<PullSelector>,
     /// Pass-only opt-in repository backpressure; no new fix authority.
     pub open_pr_cap: Option<usize>,
+    pub overlap_recovery_hours: Option<u16>,
     /// Avoid parking mechanical queue failures and exhausted work on the operator.
     /// Off by default; two triages and one bounded round grant per PR.
     pub agent_recovery: bool,
@@ -1412,6 +1415,7 @@ impl PollPolicy {
             publication_forks: BTreeMap::new(),
             unavailable_publication_forks: vec![],
             open_pr_cap: None,
+            overlap_recovery_hours: None,
             queue_only_repository: None,
             maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
             merge_queue,
@@ -1870,6 +1874,8 @@ pub struct State {
     /// response scope ([`Self::bind_responses`]), drops them; losing them
     /// costs each pull request one whole read.
     pub quiet_waits: BTreeMap<String, quiet::Quiet>,
+    /// Diagnostic-only age, keyed by the digest of a complete component.
+    pub overlap_recovery: BTreeMap<String, OverlapObservation>,
     /// `repositoriesPerPass`: the followed repository the next pass's
     /// envelope starts from ([`board_core::admission`]); none starts over.
     /// Only an applying pass moves it, and a pass without the option drops
@@ -1963,6 +1969,7 @@ impl State {
                     "operator_direction",
                     "lock_refused",
                     "quiet_waits",
+                    "overlap_recovery",
                     "follow_cursor",
                     "share_cursor",
                     "action_first_cursor",
@@ -2117,6 +2124,7 @@ impl State {
                 .collect::<Result<_>>()?,
         };
         let quiet_waits = quiet::from_json(object.get("quiet_waits"))?;
+        let overlap_recovery = overlap_recovery::from_json(object.get("overlap_recovery"))?;
         let cursor = |key: &str| {
             object
                 .get(key)
@@ -2218,6 +2226,7 @@ impl State {
             operator_direction,
             lock_refused,
             quiet_waits,
+            overlap_recovery,
             follow_cursor,
             share_cursor,
             action_first_cursor,
@@ -2278,6 +2287,9 @@ impl State {
         }
         if !self.quiet_waits.is_empty() {
             state["quiet_waits"] = json!(self.quiet_waits);
+        }
+        if !self.overlap_recovery.is_empty() {
+            state["overlap_recovery"] = json!(self.overlap_recovery);
         }
         if let Some(cursor) = &self.follow_cursor {
             state["follow_cursor"] = cursor.as_str().into();
@@ -4995,6 +5007,7 @@ fn describe(repo: &str, event: &Value, config: &Config) -> Option<String> {
 /// Read-only backpressure observations shared by the pass's poll phases.
 #[derive(Clone, Default)]
 struct Pressure {
+    recovery: BTreeMap<String, overlap_recovery::Observations>,
     open: BTreeMap<String, Vec<Value>>,
     files: BTreeMap<(String, u64), Option<BTreeSet<String>>>,
     stopped: BTreeMap<(String, u64), bool>,
@@ -5584,6 +5597,16 @@ struct FailedJob {
 }
 
 impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
+    fn observe_overlap(&mut self, repo: &str, number: u64, seen: overlap_recovery::Observation) {
+        if self.config.policy.overlap_recovery_hours.is_some() && self.config.ours(repo) {
+            self.pressure
+                .recovery
+                .entry(repo.to_ascii_lowercase())
+                .or_default()
+                .insert(number, seen);
+        }
+    }
+
     /// A pass that has read and written nothing, with no cache, applies
     /// nothing and follows no repository.
     fn new(rest: &'a R, graphql: &'a G, config: &'a Config, now: OffsetDateTime) -> Self {
@@ -8908,6 +8931,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if text(&pull, "/author/login") == self.config.bot
             && let Some(hold) = review_hold(self.config, &pull)
         {
+            if matches!(hold, ReviewHold::Pending) {
+                self.observe_overlap(repo, number, overlap_recovery::Observation::Excluded);
+            }
             return Ok(self.person_skip(
                 repo,
                 number,
@@ -9294,11 +9320,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         // A ready head merges past older overlapping work, which then rebases
         // onto it; only work that would fight the older PR waits (#1035).
-        if matches!(
+        let pressure_blocker = if matches!(
             decision.action,
             "fix" | "rebase" | "continue" | "update" | RUN_RERUN
-        ) && let Some(older) = self.pressure_ahead(repo, &pull)?
-        {
+        ) {
+            self.pressure_ahead(repo, &pull)?
+        } else {
+            None
+        };
+        if let Some(older) = pressure_blocker {
             decision = step(
                 "wait",
                 format!("open-pr-cap: land {repo}#{older} first; overlapping paths"),
@@ -9427,6 +9457,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         } else {
             Ok(None)
         };
+        let no_late_hold = matches!(&hold, Ok(None));
         let done = match (&self.apply, &retarget, &stale) {
             _ if capped || deferred => Ok(held),
             _ if !matches!(hold, Ok(None)) => {
@@ -9556,6 +9587,33 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 (Some(_), Some(done)) => !done.starts_with("not "),
                 (Some(_), None) => false,
             };
+        if self.config.policy.overlap_recovery_hours.is_some()
+            && self.config.ours(repo)
+            && !merge_only
+        {
+            let repair = (pressure_blocker.is_some()
+                || (pull["mergeable"] == CONFLICTING
+                    && matches!(decision.action, "fix" | "rebase")))
+                && !stack_step
+                && self.writes == before
+                && no_late_hold
+                && answer.is_empty()
+                && !marker.stopped
+                && !recovery::pending(&marker)
+                && fix_run.as_ref().is_none_or(|r| r["status"] == "completed")
+                && review_run
+                    .as_ref()
+                    .is_none_or(|r| r["status"] == "completed");
+            let observation = overlap_recovery::observe(
+                repo,
+                &pull,
+                self.config,
+                review_run.as_ref(),
+                repair,
+                pressure_blocker,
+            );
+            self.observe_overlap(repo, number, observation);
+        }
         let done = done.map(|d| format!(" -> {d}")).unwrap_or_default();
         // As in `stop`, which labels nothing where the operator takes it.
         let supervisor = self.config.policy.supervisor_holds
@@ -9942,7 +10000,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 (Some(listed), _) => {
                     Ok(self.labelled_skip(repo, number, merge_only, (listed, label)))
                 }
-                (None, Some(quiet)) => Ok(quiet),
+                (None, Some(quiet)) => {
+                    self.observe_overlap(repo, number, overlap_recovery::Observation::Excluded);
+                    Ok(quiet)
+                }
                 (None, None) => {
                     let read = self.pull(repo, number, merge_only, &mut required);
                     self.quiet_record(repo, number, listings.get(&number).copied(), &read);
@@ -10440,6 +10501,18 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     // Cosmetic cleanup comes last, after locking has spent its budget too.
     pass.fold(&mut outcome.lines);
     pass.maintainer_report(&follow, &mut outcome);
+    let overlap_recovery = if let Some(hours) = policy.overlap_recovery_hours {
+        overlap_recovery::advance(
+            &pass.pressure,
+            &state.overlap_recovery,
+            &mut outcome,
+            (&config.dispatch_repo, &config.operator, &config.bot),
+            hours,
+            now,
+        )
+    } else {
+        BTreeMap::new()
+    };
     // What could not be read counts as a change: an API error must not stretch
     // the gap while a pull request may be waiting on it.
     let active = outcome.activity > 0 || outcome.in_flight > 0 || outcome.errors > 0;
@@ -10476,6 +10549,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         operator_direction: pass.operator_direction,
         lock_refused,
         quiet_waits: pass.quiet,
+        overlap_recovery,
         follow_cursor,
         share_cursor,
         action_first_cursor,

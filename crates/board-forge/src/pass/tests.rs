@@ -19338,6 +19338,12 @@ fn config_table() {
     for (edit, feature, state) in [
         (json!({}), "openPrCap", "unconfigured"),
         (json!({"openPrCap": 6}), "openPrCap", "enabled"),
+        (json!({}), "overlapRecoveryHours", "unconfigured"),
+        (
+            json!({"openPrCap": 6, "state": "state.json", "overlapRecoveryHours": 72}),
+            "overlapRecoveryHours",
+            "enabled",
+        ),
         (json!({}), "pr.agentRecovery", "unconfigured"),
         (
             json!({"pr": {"agentRecovery": false}}),
@@ -19391,6 +19397,10 @@ fn config_table() {
     for edit in [
         json!({"openPrCap": null}),
         json!({"openPrCap": 0}),
+        json!({"overlapRecoveryHours": 72}),
+        json!({"openPrCap": 6, "overlapRecoveryHours": 72}),
+        json!({"openPrCap": 6, "state": "state.json", "overlapRecoveryHours": 0}),
+        json!({"openPrCap": 6, "state": "state.json", "overlapRecoveryHours": 721}),
         json!({"authored": 0}),
         json!({"pr": {"agentRecovery": null}}),
         json!({"pr": {"agentRecovery": 0}}),

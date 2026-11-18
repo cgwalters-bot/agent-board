@@ -5,6 +5,101 @@ fn recovery_policy() -> PollPolicy {
 }
 
 #[test]
+fn overlap_recovery_replay_leaves_existing_steps_and_writes_alone() {
+    use time::Duration;
+    let base = "a".repeat(40);
+    for case in ["off", "aged", "ready", "draft", "old approval", "parked", "active", "files truncated", "reviews truncated", "census truncated", "unrelated blocker", "unrelated park", "late hold", "repair starts"] {
+        let mut fake = github();
+        let mut listed = Vec::new();
+        let last = if case == "unrelated park" { 473 } else { 472 };
+        for number in 470..=last {
+            let head = format!("{number:040x}");
+            let paths = match number {
+                470 => vec!["a"],
+                471 => vec!["a", "b"],
+                472 => vec!["b"],
+                _ => vec!["z"],
+            };
+            let selected = number == 470;
+            let draft = selected && case == "draft";
+            let labels = if selected && case == "parked" { json!([{"name":"hold"}]) } else { json!([]) };
+            let mut p = pull("pull-470", json!({
+                "number":number,"headRefOid":head,"baseRefOid":base,"isDraft":draft,
+                "mergeable":if selected && case == "ready" { "MERGEABLE" } else { CONFLICTING },
+                "files":{"nodes":paths.iter().map(|path| json!({"path":path,"changeType":"MODIFIED"})).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":selected && case == "files truncated"}},
+                "reviews":{"nodes":[review("APPROVED", user(&config().operator), if selected && case == "old approval" { HEAD } else { &head }, "") ]},
+                "labels":{"nodes":labels},"truncated":{"reviews":selected && case == "reviews truncated"},
+                "body":"Ordinary work.\n\nSupersedes #468\nSupersedes #469"
+            }));
+            p["headRepository"] = json!({"nameWithOwner": format!("{BOT}/repo")});
+            if number == 473 {
+                p["reviewRequests"]["nodes"] = json!([{"requestedReviewer":{"login":config().operator}}]);
+            }
+            fake.pulls.insert(number, p);
+            listed.push(json!({"number":number,"user":{"login":BOT},"head":{"sha":head},"base":{"sha":base},"draft":draft,"labels":labels}));
+            fake.page(&format!("repos/{REPO}/pulls/{number}/files?per_page=100"), None, None,
+                json!(paths.into_iter().map(|filename| json!({"filename":filename})).collect::<Vec<_>>()));
+            let comments = if selected && case == "active" {
+                fake.page(&format!("repos/{}/actions/runs/7", config().dispatch_repo), None, None, json!({"status":"in_progress"}));
+                json!([{"id":7,"user":{"login":BOT},"body":marker_body(&json!({"rounds":1,"run":7,"sha":head}),"Fix round") }])
+            } else { json!([]) };
+            fake.page(&format!("repos/{REPO}/issues/{number}/comments?per_page=100"), None, None, comments);
+        }
+        if case == "unrelated blocker" {
+            // The ordinary conservative hold sees an apparent overlap which
+            // the full decisions do not substantiate.
+            fake.page(&format!("repos/{REPO}/pulls/470/files?per_page=100"), None, None, json!([{"filename":"b"}]));
+        }
+        let listing = format!("repos/{REPO}/pulls?state=open&per_page=100");
+        fake.page(&listing, None, None, json!(listed));
+        if case == "census truncated" {
+            fake.rest.get_mut(&format!("{API_ROOT}{listing}")).unwrap().2 = Some(format!("<{API_ROOT}{listing}&page=2>; rel=\"next\""));
+        }
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(DISPATCHES.into(), vec![(200, json!({"workflow_run_id": 1234}))]);
+        let mut cfg = config();
+        cfg.policy.open_pr_cap = Some(2);
+        cfg.policy.rebase_rounds = 2;
+        cfg.policy.assign_holds = case == "unrelated park";
+        cfg.policy.overlap_recovery_hours = (case != "off").then_some(1);
+        let admit_repair = matches!(case, "late hold" | "repair starts");
+        if case == "late hold" {
+            fake.hold_after = Some(1);
+        }
+        let run = |state, at| {
+            let caps = caps::Caps::new(caps::Limits {dispatch: Some(usize::from(admit_repair)), writes: Some(if admit_repair { 8 } else { 0 }), status_changes: None});
+            run_capped(&fake, &fake, &cfg, state, (&[], &[REPO.to_owned()]), applying(&dispatcher), Some(&caps), at).unwrap()
+        };
+        let first = run(State::default(), now());
+        if case == "repair starts" {
+            assert!(first.state.overlap_recovery.is_empty());
+            assert_eq!(first.dispatched, 1, "{:?}", first.lines);
+            continue;
+        }
+        // A hosted export carries only the diagnostic history, not cached
+        // responses or the credential scope.
+        let saved = first.state.to_json();
+        let mut projected = json!({"schema":saved["schema"],"interval_seconds":saved["interval_seconds"]});
+        if let Some(history) = saved.get("overlap_recovery") {
+            projected["overlap_recovery"] = history.clone();
+        }
+        let mut restored = State::from_json(&projected).unwrap();
+        restored.bind_responses("cold hosted scope");
+        let second = run(restored, now() + Duration::hours(1));
+        let line = format!("{REPO}: overlap recovery for #470, #471, #472 held: caller must preserve ordered commits when opening one checked replacement PR");
+        assert!(!first.lines.contains(&line), "{case}");
+        let detected = matches!(case, "aged" | "unrelated park");
+        assert_eq!(second.lines.contains(&line), detected, "{case}: {:?}", second.lines);
+        if detected {
+            assert_eq!(second.state.overlap_recovery.len(), 1);
+            assert!(second.lines.iter().any(|l| l.contains("wait: open-pr-cap: land")));
+        }
+        assert!(dispatcher.writes.borrow().is_empty(), "{case}");
+        assert!(fake.writes.borrow().is_empty(), "{case}: {:?}", fake.writes.borrow());
+    }
+}
+
+#[test]
 fn open_pr_cap_keeps_landing_work_and_serializes_oldest_paths() {
     for cap in [None, Some(1), Some(2), Some(3)] {
         for shared in [false, true] {

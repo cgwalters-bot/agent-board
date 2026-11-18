@@ -311,6 +311,49 @@ grant more fix rounds. Explicit stage-4 `fixPlans` retain their existing policy.
 Stacked multi-issue runs remain deferred until the stacked-output dependencies
 in #750 and agentic-job#3438 are usable. This option does not synthesize stacks.
 
+### Aged overlap recovery (observation only)
+
+When several approved bot pull requests conflict with the base and the cap
+holds their repairs behind one another, fixing them separately can spend
+rounds without reducing the backlog. Set `overlapRecoveryHours: 72` at the
+top level to diagnose this pattern (1–720 hours, absent means off). It needs
+`openPrCap` and a persisted `state`. The oldest repair can still run and a
+ready head can still merge; path overlap by itself is not a deadlock.
+
+The pass uses its existing complete cap census and whole PR decisions for
+public own-space repositories. It adds no forge requests. It tracks connected groups
+of two to eight eligible PRs against the same default-branch commit, with at
+least one actual cap wait on a member whose paths overlap. Drafts, parked work,
+active rounds and PRs without approval of the current head do not qualify.
+Missing or truncated evidence defers the observation. The scan considers up to
+100 open PRs per repository and retains at most 64 groups. Each age starts on
+the first complete observation, not from a PR's creation or update time.
+Membership or head/base changes, an incomplete observation, or a gap of more
+than an hour reset the age. A preview can read but does not save this history.
+Hosted callers that project state into a public artifact must preserve the
+`overlap_recovery` map of digests and timestamps; it has no response bodies
+and does not need the credential-scoped response cache. Tracker's current
+`pass-state export` omits it, so setting the option there alone cannot age a
+group across hosted runs.
+Disable the option or drop the state cache before rolling back to a binary that
+does not recognize `overlap_recovery` in the state file.
+
+An aged group prints `overlap recovery for #N, #M held: caller must preserve
+ordered commits when opening one checked replacement PR`. Tracker's dispatch
+wrapper pins agentic-job v0.6.14, whose [new-PR handback makes one patch from
+one commit](https://github.com/cgwalters-forge/agentic-job/blob/489c69d53cc23b989131952c9e3ca4d5add4e2b5/docs/safe-outputs.md#what-the-agent-does).
+Its replacement-series output updates an existing PR branch, not a new PR.
+The manually coordinated [#4312 rebuild](https://github.com/cgwalters-forge/agentic-job/issues/4312)
+already landed as [#4313](https://github.com/cgwalters-forge/agentic-job/pull/4313/commits),
+but grouped five source PRs into one commit. It is not evidence of a
+commit-preserving new-PR handback.
+
+Until dispatch can return one independently checked new PR containing the
+ordered source commits and their original messages and trailers, this option
+does not file recovery issues, dispatch work, waive overlap, or close PRs.
+Future writes need a trusted recovery record binding the source heads and the
+accepted replacement PR; a free-text `Supersedes #N` line is not authority.
+
 ## Quiet pull request waits (GitHub)
 
 The concrete failure `pr.quietWaits` stops is the PR walk spending the

@@ -95,6 +95,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
     for name in [
         "authored",
         "openPrCap",
+        "overlapRecoveryHours",
         "triageFollowUpDays",
         "triageReplans",
         "replanAfterDays",
