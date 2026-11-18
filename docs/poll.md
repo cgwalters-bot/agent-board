@@ -1406,7 +1406,10 @@ requires explicit checked evidence for that PR, head and run. Missing notes,
 green CI, a bot assertion or a `noop` alone are not that evidence. Incomplete
 work or failed/unavailable verification must retain a checkpoint. Head messages
 without one still fall back to the body's checkpoint, even an old one; removing
-that fallback would turn absent notes into false completion.
+that fallback would turn absent notes into false completion. Once the pull
+request is ready, a leftover body checkpoint and a failed continuation are not
+by themselves merge holds. The current head still needs approval and green
+checks, and the usual poll holds still apply.
 
 The tracker `dispatch.yml` calls actions' `cgwalters-agentic-job.yml`.
 The policy/check/apply pin inspected for the initial continuation correction was

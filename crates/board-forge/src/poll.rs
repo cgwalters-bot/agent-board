@@ -11655,10 +11655,20 @@ mod tests {
                 None,
             ),
             (
-                "a ready pull request's checkpoint from before it was completed is not continued",
+                "a ready pull request merges past a failed continuation on the current head",
                 "pull-470",
-                json!({"body": checkpointed("budget")}),
-                json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older"}),
+                json!({"isDraft": false, "body": checkpointed("incomplete")}),
+                json!({"rounds": 0, "continued": 1, "continuing": true, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "merge",
+                None,
+            ),
+            (
+                "a ready pull request merges past a continuation marker on an older head",
+                "pull-470",
+                json!({"isDraft": false, "body": checkpointed("incomplete")}),
+                json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older", "run": 7}),
+                // The poll does not read a continuation run for an older head.
                 none.clone(),
                 "merge",
                 None,
