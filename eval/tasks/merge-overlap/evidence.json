@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "observedOn": "2026-11-17",
+  "fixCommit": "31b2dc5e3bdbffeb46a60528e53a0fd953109c8a",
+  "fixUrl": "https://github.com/cgwalters-forge/agent-board/commit/31b2dc5e3bdbffeb46a60528e53a0fd953109c8a",
+  "historicalRun": "https://github.com/cgwalters-forge/tracker/actions/runs/43801553601",
+  "summaryArtifact": "https://github.com/cgwalters-forge/tracker/actions/runs/43801553601/artifacts/14198115688",
+  "taskArtifact": "https://github.com/cgwalters-forge/tracker/actions/runs/43801553601/artifacts/14197135117",
+  "taskSource": "dispatch-implement-task/task.md, entire file; excludes the harness's generic user-message prefix",
+  "metricsSource": "dispatch-implement-agent-run/summary.json, agent-run-summary/v1, praxis-run-usage/v2 state=finished, unmetered=0, cost.partial=false",
+  "metrics": {
+    "inputTokens": 156431,
+    "outputTokens": 13257,
+    "cacheReadTokens": 1181115,
+    "cacheWriteTokens": null,
+    "reasoningTokens": 4158,
+    "totalTokens": 1350803,
+    "wallSeconds": 1496,
+    "turns": null,
+    "requests": 31,
+    "costUsd": 1.1271
+  },
+  "sizing": {
+    "status": "fits",
+    "tokens": "input + output = 169688 <= 200000. Cache reads (1181115) are recorded separately and not bounded by the token screen; the reported total including them is 1350803, over the earlier total-token reading of the ceiling. Reasoning is exposed separately, not added again. Cache writes unavailable, not zero.",
+    "wallSeconds": "1496 <= 1800",
+    "turns": "Summary turns is null; praxis requests=31 <= 100 is request-cap sizing evidence, not a fabricated conversation-turn count.",
+    "usd": "1.1271 <= 5, historical metered list-price basis dated 2026-10-29; not a common cost basis for future arms."
+  },
+  "checks": {
+    "ancestry": {"command": "git merge-base --is-ancestor b0f13a416a3e9137d315c5aa818d7665d235cf2d 31b2dc5e3bdbffeb46a60528e53a0fd953109c8a", "exitCode": 0},
+    "apply": {"command": "git apply --check CHECK.patch && git apply CHECK.patch", "startExitCode": 0, "fixExitCode": 0},
+    "command": "CARGO_TARGET_DIR=/tmp/opencode/eval-target cargo test --offline --locked -p board-forge eval_merge_overlap_regression -- --nocapture",
+    "start": {"exitCode": 101, "tests": 1, "failure": "Younger approved clean PR got wait (open-pr-cap: land older PR first; overlapping paths), expected merge."},
+    "fix": {"exitCode": 0, "tests": 1},
+    "targetIsolation": "Ran cargo clean -p board-forge before each recorded merge check in the shared CARGO_TARGET_DIR. A preliminary invocation without cleaning ran zero tests; it is not counted as a pass. Use a fresh target directory per checkout when reproducing."
+  }
+}

@@ -1,5 +1,5 @@
-//! Synthetic offline data only: no historical evidence or measured model usage.
-//! Ported from cgwalters-forge/agenthome's tests/eval.rs and tests/json.rs.
+//! Offline protocol tests and historical artifact integrity. Comparison runs
+//! remain synthetic; ported from agenthome's tests/eval.rs and tests/json.rs.
 
 use super::*;
 use serde_json::json;
@@ -144,8 +144,8 @@ fn checked_in_sample_stays_pending_without_fabricated_evidence() {
     assert!(error.to_string().contains("before freezing"));
 }
 
-/// The archived summary is byte for byte what agenthome's summarizer printed
-/// for the same pending inputs, trailing newline included.
+/// The archived summary matches the current pending inputs byte for byte,
+/// trailing newline included, without inventing a measured verdict.
 #[test]
 fn archived_preflight_summary_matches_pending_inputs_without_a_measured_verdict() {
     let manifest: Value = serde_json::from_str(MANIFEST).unwrap();
@@ -156,18 +156,100 @@ fn archived_preflight_summary_matches_pending_inputs_without_a_measured_verdict(
     let summary = summarize(&manifest, &runs).unwrap();
     writeln!(out, "{}", pretty_json(&summary).unwrap()).unwrap();
     assert_eq!(String::from_utf8(out).unwrap(), SUMMARY);
-    assert_eq!(preflight["status"], "blocked");
-    assert_eq!(preflight["capacity"]["status"], "unverified");
+    assert_eq!(preflight["status"], "pending");
     assert_eq!(
         preflight["evaluationCellsLaunched"],
         runs.as_array().unwrap().len()
     );
     assert_eq!(preflight["paidProbesLaunched"], 0);
     assert_eq!(
-        preflight["tasksFrozen"],
+        preflight["tasksPrepared"],
         manifest["tasks"].as_array().unwrap().len()
     );
+    assert_eq!(preflight["tasksFrozen"], 0);
+    assert_eq!(manifest["configuration"], Value::Null);
+    assert_eq!(
+        manifest_digest(&manifest).unwrap(),
+        "4d0f27fca1966cc67dacb3a723f9eb9d5a3b8278aab9da13afcd238911edb00b"
+    );
     assert_eq!(preflight["measuredVerdict"], Value::Null);
+}
+
+#[test]
+fn prepared_historical_checks_and_sizing_match_the_manifest() {
+    let manifest: Value = serde_json::from_str(MANIFEST).unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for task in manifest["tasks"].as_array().unwrap() {
+        let patch = std::fs::read(root.join(task["checks"]["artifact"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&patch)),
+            task["checks"]["sha256"].as_str().unwrap()
+        );
+        let evidence = read_json(&root.join(task["sizingEvidence"].as_str().unwrap())).unwrap();
+        assert_ne!(task["startCommit"], evidence["fixCommit"]);
+        assert_eq!(evidence["checks"]["ancestry"]["exitCode"], 0);
+        assert_eq!(evidence["checks"]["start"]["exitCode"], 101);
+        assert_eq!(evidence["checks"]["fix"]["exitCode"], 0);
+        for revision in ["start", "fix"] {
+            assert_eq!(evidence["checks"][revision]["tests"], 1);
+        }
+        let metrics = &evidence["metrics"];
+        let count = |key: &str| metrics[key].as_u64().unwrap();
+        // Cache reads stay in the record even though `tokens` excludes them.
+        assert_eq!(
+            count("totalTokens"),
+            count("inputTokens") + count("outputTokens") + count("cacheReadTokens")
+        );
+        let limits = &manifest["limits"];
+        let limit = |key: &str| limits[key].as_f64().unwrap();
+        assert!((count("inputTokens") + count("outputTokens")) as f64 <= limit("tokens"));
+        // Both fit only under the input-plus-output rule, not the earlier total.
+        assert!(count("totalTokens") as f64 > limit("tokens"));
+        assert!(count("wallSeconds") as f64 <= limit("wallSeconds"));
+        // Metered requests size the `max-requests` cap; turns stay unknown.
+        assert!(count("requests") as f64 <= limit("turns"));
+        assert!(metrics["costUsd"].as_f64().unwrap() <= limit("usd"));
+        assert_eq!(evidence["sizing"]["status"], "fits");
+        assert_eq!(metrics["turns"], Value::Null);
+        let task_text = task["taskText"].as_str().unwrap();
+        let payload = task_text
+            .split("<agentic-job-event>\n")
+            .nth(1)
+            .unwrap()
+            .split("\n</agentic-job-event>")
+            .next()
+            .unwrap();
+        let event: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(event["repository"], task["repository"]);
+    }
+}
+
+#[test]
+fn pending_preparation_validates_pins_but_never_admits_runs_or_configuration() {
+    let mut manifest = Fixture::new().manifest;
+    manifest["status"] = json!("pending");
+    manifest["pending"] = json!("configuration still being prepared");
+    manifest["configuration"] = Value::Null;
+    validate_manifest(&manifest).unwrap();
+    assert!(summarize(&manifest, &json!([{}])).is_err());
+    for edit in [
+        |m: &mut Value| m["preflight"] = Value::Null,
+        |m: &mut Value| m["tasks"][0]["checks"]["sha256"] = json!("latest"),
+        |m: &mut Value| m["tasks"][1]["id"] = m["tasks"][0]["id"].clone(),
+        |m: &mut Value| m["tasks"][0]["startCommit"] = json!("main"),
+        |m: &mut Value| m["configuration"] = json!({}),
+        |m: &mut Value| m["pending"] = json!(" "),
+        |m: &mut Value| {
+            m["tasks"].as_array_mut().unwrap().pop();
+        },
+    ] {
+        let mut invalid = manifest.clone();
+        edit(&mut invalid);
+        assert!(validate_manifest(&invalid).is_err());
+    }
+    manifest["tasks"] = json!([]);
+    manifest["preflight"] = Value::Null;
+    validate_manifest(&manifest).unwrap();
 }
 
 /// The arm bundles are references into agenthome, not copies: no prompt or
@@ -589,14 +671,6 @@ fn freezing_requires_evidence_bounded_tasks_and_immutable_dependencies() {
         let mut manifest = Fixture::new().manifest;
         edit(&mut manifest);
         assert!(validate_manifest(&manifest).is_err(), "edit {i}");
-    }
-    // A pending manifest claims nothing frozen.
-    let frozen = Fixture::new().manifest;
-    for key in ["tasks", "preflight", "configuration"] {
-        let mut manifest: Value = serde_json::from_str(MANIFEST).unwrap();
-        manifest[key] = frozen[key].clone();
-        let error = validate_manifest(&manifest).unwrap_err().to_string();
-        assert!(error.contains("pending sample"), "{key}: {error}");
     }
 }
 

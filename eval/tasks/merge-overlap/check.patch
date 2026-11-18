@@ -1,0 +1,38 @@
+diff --git a/crates/board-forge/src/poll/recovery_tests.rs b/crates/board-forge/src/poll/recovery_tests.rs
+--- a/crates/board-forge/src/poll/recovery_tests.rs
++++ b/crates/board-forge/src/poll/recovery_tests.rs
+@@ -1,1 +1,34 @@
++#[test]
++fn eval_merge_overlap_regression() {
++    for (change, expected) in [
++        (json!({}), "merge"),
++        (json!({"contexts":{"ci":{"conclusion":"FAILURE"}}}), "wait"),
++        (json!({"mergeable":CONFLICTING}), "wait"),
++    ] {
++        let mut fake = github();
++        fake.page(&format!("repos/{REPO}/pulls?state=open&per_page=100"), None, None,
++            json!([{"number":470,"user":{"login":BOT}}, {"number":471,"user":{"login":BOT}}]));
++        fake.page(&format!("repos/{REPO}/pulls/470/files?per_page=100"), None, None,
++            json!([{"filename":"src/shared.rs"}]));
++        let files = json!({"nodes":[{"path":"src/shared.rs"}],"pageInfo":{"hasNextPage":false}});
++        // The older PR cannot land; a clean younger head can.
++        let mut older = json!({"mergeable":CONFLICTING});
++        older["files"] = files.clone();
++        let mut later = pull("pull-470", change);
++        later["number"] = 471.into();
++        later["files"] = files;
++        fake.pulls.insert(471, later);
++        fake.page(&format!("repos/{REPO}/issues/471/comments?per_page=100"), None, None, json!([]));
++        let policy = PollPolicy {
++            open_pr_cap: Some(2), rebase_rounds: 2, ..PollPolicy::default()
++        };
++        let (out, _, _) = applied_policy(fake, policy, older, json!({"rounds":0}));
++        assert_eq!(out.errors, 0, "{:?}", out.lines);
++        let step = out.steps.iter().find(|s| s.number == 471).unwrap();
++        assert_eq!(step.action, expected, "{:?}", out.lines);
++        if expected == "wait" {
++            assert!(step.reason.contains("open-pr-cap: land"), "{:?}", out.lines);
++        }
++    }
++}
+ fn recovery_policy() -> PollPolicy {

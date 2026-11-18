@@ -347,17 +347,24 @@ pub fn validate_manifest(m: &Value) -> Result<()> {
         .and_then(Value::as_array)
         .context("tasks must be an array")?;
     let status = m.get("status").and_then(Value::as_str);
-    if status == Some("pending") {
+    let pending = status == Some("pending");
+    if pending {
         ensure!(
-            text(m.get("pending"))
-                && tasks.is_empty()
-                && m.get("preflight") == Some(&Value::Null)
-                && m.get("configuration") == Some(&Value::Null),
-            "pending sample must not claim frozen tasks or configuration"
+            text(m.get("pending")) && m.get("configuration") == Some(&Value::Null),
+            "pending sample needs a reason and null configuration"
         );
-        return Ok(());
+        if tasks.is_empty() {
+            ensure!(
+                m.get("preflight") == Some(&Value::Null),
+                "empty pending sample must have null preflight"
+            );
+            return Ok(());
+        }
     }
-    ensure!(status == Some("frozen"), "status must be pending or frozen");
+    ensure!(
+        pending || status == Some("frozen"),
+        "status must be pending or frozen"
+    );
     let preflight = m.get("preflight");
     ensure!(
         text(preflight.and_then(|p| p.get("authorization")))
@@ -389,6 +396,11 @@ pub fn validate_manifest(m: &Value) -> Result<()> {
             text(task.get("sizingEvidence")),
             "task sizing evidence required"
         );
+    }
+    // A prepared historical sample is not execution authority: configuration
+    // and run admission still require the separate frozen transition.
+    if pending {
+        return Ok(());
     }
     let c = m
         .get("configuration")
