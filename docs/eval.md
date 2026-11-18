@@ -57,7 +57,17 @@ configuration before the first cell is what holds it to them:
   acts before a request; the `budget` is checked after each reply and can
   overshoot, so the manifest's `usd` and `tokens` limits are sizing ceilings
   that a cell's recorded metrics are judged against, not hard caps. The
-  summarizer does not check them.
+  summarizer does not check them. `tokens` counts input plus output tokens,
+  as the [2026-11-17 rescope](https://github.com/cgwalters-forge/agent-board/issues/1038#issuecomment-6963338151)
+  decided; before it, the ceiling was read as the total including cache reads.
+  Cache reads are excluded from it but never dropped: the record keeps them
+  as `cacheReadTokens`. Nothing enforces a cache-read limit: the token screen
+  no longer covers them, and the `usd` screen only weighs them after the fact,
+  at a price that may differ from the historical list price and with a budget
+  that can overshoot. A cache-heavy cell can therefore exceed 200000 total
+  tokens and still fit. What actually bounds a cell is its timeout and
+  request cap, so the cell configuration must set both and name the pool's
+  cached-input price used to judge `usd`.
 - **The board's pool pace and slot accounting.** Each cell takes a
   [lease](pass.md#leases) with `agent-board admit` for the evaluation's tracking
   issue before any inference and frees it with `agent-board release`, so it
@@ -77,18 +87,20 @@ Anything that would exceed those bounds stays with the operator: a lease past
 without a timeout and request cap, or a measurement beyond the frozen cell count,
 needs the operator's explicit go-ahead.
 
-The [preflight report](../eval/report.md) records the 2026-11-03 state, when the
-protocol instead waited on verified pool capacity and an evaluation reservation.
-The pending manifest's `pending` text still says so; it is kept as recorded so
-the archived summary stays byte-identical. Draft
+The [preflight report](../eval/report.md#archived-2026-11-03-preflight) retains
+the 2026-11-03 state, when the protocol instead waited on verified pool capacity
+and an evaluation reservation. Its current preparation section supersedes that
+gate and records historical sizing. Draft
 [agenthome#87](https://github.com/cgwalters-forge/agenthome/pull/87)'s
 allocation-evidence checker served that gate and is not carried here.
 
 ## Freezing the sample
 
-`manifest.json` is deliberately **pending**, not an executable sample.
-Historical tasks, commits, sizing, resolved models and measured results remain
-pending; the test fixtures are synthetic and are not research evidence.
+`manifest.json` is deliberately **pending**, not an executable sample. It retains
+two historical tasks and check bundles whose sizing fits every ceiling under the
+input-plus-output token definition above, though not under the earlier total
+including cache reads; see [the report](../eval/report.md#historical-sizing). Resolved configuration and measured results
+remain pending; synthetic fixtures are not research evidence.
 `runs.json` is empty, and `summary.json` is its offline summary, not a measured
 comparison.
 
@@ -102,6 +114,22 @@ bundle and sizing evidence per task. Validate that checks fail on the start and
 pass on the historical fix; keep expected solutions/checks outside agent context.
 All arms receive identical task text, tools, environment, permissions and
 check-independent context. Do not cherry-pick the historical fix.
+
+A clean worktree and a check bundle kept at an outside path are not enough to
+keep the oracle out of agent context: the historical fix, later commits and,
+once merged, the check patches under `eval/tasks/` are reachable through Git
+history and forge reads. Before freezing, the configuration must give each arm
+a repository holding only the start commit's history (no remote, no later refs
+or tags, and no `eval/tasks/` bundles) and no forge read access
+to the task's history links or later pull requests, and the preflight must
+record a check that the fix commit is absent from the arm's object store and
+that those reads are refused. Without it, a passing check may measure retrieval
+of the solution rather than the task.
+
+Pending manifests may retain either no tasks and null preflight, or two or three
+fully pinned candidates with preflight. They require a nonempty pending reason,
+null configuration and empty runs in either case. Preparing candidates does not
+admit execution.
 
 `preflight` holds `authorization` and `evidence` links: the operator's go-ahead
 naming the permitted repositories, harness, models and artifact destination, and
@@ -163,8 +191,9 @@ For an authorized research run:
    record the dependency as pending. Do not assume acp-drive can spawn arbitrary
    tool/model children. A manual staged run must be labeled as such and not
    pooled with automatic sessions. Archive exact inter-stage context handoffs.
-3. Start a clean worktree at the frozen commit for each cell, within the
-   [admission](#admission) bounds above, in the predeclared order. No retries or
+3. Start a clean worktree at the frozen commit for each cell, isolated from
+   later history and forge reads as [freezing](#freezing-the-sample) requires,
+   within the [admission](#admission) bounds above, in the predeclared order. No retries or
    automatic top-ups.
 4. Run independent checks outside agent control; archive commands, exit codes,
    logs, patch and transcripts. Normalize exposed telemetry to the records below.

@@ -1,0 +1,39 @@
+diff --git a/crates/board-forge/src/promote/text.rs b/crates/board-forge/src/promote/text.rs
+--- a/crates/board-forge/src/promote/text.rs
++++ b/crates/board-forge/src/promote/text.rs
+@@ -8,1 +8,35 @@
++#[cfg(test)]
++mod eval_source_period {
++    use super::*;
++
++    #[test]
++    fn eval_source_period_regression() {
++        let repo = "cgwalters-forge/composefs-rs";
++        let url = format!("https://github.com/{repo}/issues/61");
++        for keyword in ["Part of", "Fixes"] {
++            let body = format!("Keep this prose.\n\n{keyword} {url}.\n");
++            let published = strip(repo, &body, 61).unwrap();
++            assert_eq!(published, "Keep this prose.");
++            check(repo, "composefs/composefs-rs", &published).unwrap();
++        }
++        for line in [format!("- Part of {url}"), format!("Part of {url}!")] {
++            let body = format!("Keep this prose.\n\n{line}");
++            let error = strip(repo, &body, 61).unwrap_err().to_string();
++            assert!(error.contains("source line not recognised"), "{error}");
++        }
++        // Closing references and ambiguous sources must still be refused.
++        let body = format!("Keep this prose.\n\n- Fixes {url}");
++        let published = strip(repo, &body, 61).unwrap();
++        assert!(check(repo, "composefs/composefs-rs", &published).is_err());
++        let body = format!("Keep this prose.\n\nPart of {url}.\nPart of {url}");
++        assert!(strip(repo, &body, 61).is_err());
++        let body = format!("Keep this prose.\n\nPart of {url}0.");
++        assert!(strip(repo, &body, 61).is_err());
++        assert_eq!(
++            strip(repo, "Keep this prose.", 61).unwrap(),
++            "Keep this prose."
++        );
++    }
++}
++
+ use super::{Held, referenced_numbers};

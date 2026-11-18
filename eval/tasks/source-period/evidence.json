@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "observedOn": "2026-11-17",
+  "fixCommit": "b0f13a416a3e9137d315c5aa818d7665d235cf2d",
+  "fixUrl": "https://github.com/cgwalters-forge/agent-board/commit/b0f13a416a3e9137d315c5aa818d7665d235cf2d",
+  "historicalRun": "https://github.com/cgwalters-forge/tracker/actions/runs/43776823995",
+  "summaryArtifact": "https://github.com/cgwalters-forge/tracker/actions/runs/43776823995/artifacts/14187009193",
+  "taskSource": "dispatch-implement-agent-run/session.md, first User message from Profile: implement through </agentic-job-event>, HTML entities decoded; generic harness prefix excluded. No separate task artifact was listed.",
+  "metricsSource": "dispatch-implement-agent-run/summary.json, agent-run-summary/v1, praxis-run-usage/v2 state=finished, unmetered=0, cost.partial=false",
+  "metrics": {
+    "inputTokens": 118901,
+    "outputTokens": 14932,
+    "cacheReadTokens": 1659260,
+    "cacheWriteTokens": null,
+    "reasoningTokens": 4529,
+    "totalTokens": 1793093,
+    "wallSeconds": 961,
+    "turns": null,
+    "requests": 35,
+    "costUsd": 1.1061
+  },
+  "sizing": {
+    "status": "fits",
+    "tokens": "input + output = 133833 <= 200000. Cache reads (1659260) are recorded separately and not bounded by the token screen; the reported total including them is 1793093, over the earlier total-token reading of the ceiling. Reasoning is exposed separately, not added again. Cache writes unavailable, not zero.",
+    "wallSeconds": "961 <= 1800",
+    "turns": "Summary turns is null; praxis requests=35 <= 100 is request-cap sizing evidence, not a fabricated conversation-turn count.",
+    "usd": "1.1061 <= 5, historical metered list-price basis dated 2026-10-29; not a common cost basis for future arms."
+  },
+  "checks": {
+    "ancestry": {"command": "git merge-base --is-ancestor 20d1a3c7d39a390872d8034e98c46718e1eed760 b0f13a416a3e9137d315c5aa818d7665d235cf2d", "exitCode": 0},
+    "apply": {"command": "git apply --check CHECK.patch && git apply CHECK.patch", "startExitCode": 0, "fixExitCode": 0},
+    "command": "CARGO_TARGET_DIR=/tmp/opencode/eval-target cargo test --offline --locked -p board-forge eval_source_period_regression -- --nocapture",
+    "start": {"exitCode": 101, "tests": 1, "failure": "Published body retained the trailing-period source line instead of stripping it; expected Keep this prose."},
+    "fix": {"exitCode": 0, "tests": 1}
+  }
+}
