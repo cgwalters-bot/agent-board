@@ -111,6 +111,21 @@ holds are not migrated automatically. A `needs-infra-fix` label always blocks fo
 including after the setting is disabled, and is excluded from the operator inbox.
 
 The stop comment is short: `Held for the supervisor: [<cause>] <reason>; tracking pending.`
+An empty fix can leave a checked `noop` explaining, for example, that the fix
+needs protected paths or belongs on the base branch. With supervisor holds on,
+the poll posts the stop with that reason as a bounded, unverified excerpt from
+the recorded run's checked-output report; it never edits the stop afterwards,
+which the supervisor alone does to link its bug. It reads one
+artifact of the first attempt, only from a public caller's run on the ref it was
+dispatched from; missing, ambiguous or unreadable evidence leaves the plain
+hold. Where `agentRecovery` also applies and the pull request has no recovery
+reservation, recovery's triage takes the empty fix first, and no stop is posted.
+The pass's own output and the supervisor's infrastructure bug keep the
+typed reason without it. The excerpt cannot authorize an apply, a new fix dispatch, a bounds change or
+release of a human hold. In particular, a diff in a PR body is not a hand-back
+the controller can apply. Protected changes still need a separately reviewed,
+independently checked write path.
+
 The supervisor's capped `supervisor_hold` action edits that comment with the bug
 link and removes only its infrastructure label after verifying a merged fix.
 See [supervisor holds](supervisor-requests.md#infrastructure-holds).

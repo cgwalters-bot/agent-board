@@ -53,6 +53,8 @@ pub const POLL_REPOSITORY_LIMIT: usize = 50;
 /// start, so that the share stops the walk between pull requests rather
 /// than inside a round.
 const PULL_SHARE_MARGIN: usize = 32;
+const FIX_CHECKED_OUTPUTS: &str = "dispatch-fix-checked-outputs";
+const FIX_REPORT_BYTES: u64 = 128 * 1024;
 /// The gap after a pass that saw anything change: poll.yml's wait today.
 pub const MIN_INTERVAL_SECONDS: i64 = 5 * 60;
 /// The gap the idle backoff stops doubling at: four passes a day.
@@ -4256,6 +4258,53 @@ fn run_wait_since(run: &Value) -> Option<OffsetDateTime> {
     timestamp(run["created_at"].as_str()).max(timestamp(run["run_started_at"].as_str()))
 }
 
+fn supervisor_text(cause: crate::stop::Cause, reason: &str) -> String {
+    format!(
+        "{}[{}] {reason}; tracking pending.",
+        crate::stop::SUPERVISOR_PREFIX,
+        cause.name()
+    )
+}
+
+/// A run can explain its stop, but must not mint poll markers, mentions or
+/// Markdown links in the bot's comment. Keep the excerpt on the supervisor's
+/// single reason line, within the same bound as the executor's reader.
+fn append_fix_reason(reason: &mut String, message: &str) {
+    use std::fmt::Write as _;
+
+    use crate::stop::RUN_REPORTED;
+
+    const ELLIPSIS: &str = "…";
+    let limit = crate::stop::SUPERVISOR_REASON_BYTES
+        .saturating_sub("[empty-fix] ".len() + reason.len() + RUN_REPORTED.len() + ELLIPSIS.len());
+    let mut excerpt = String::new();
+    for c in message
+        .split_whitespace()
+        .flat_map(|word| word.chars().chain([' ']))
+    {
+        if c.is_control() {
+            continue;
+        }
+        let before = excerpt.len();
+        if c == '@' {
+            excerpt.push('＠');
+        } else if c.is_ascii_punctuation() && !matches!(c, ',' | '-' | '/' | '(' | ')' | '\'') {
+            let _ = write!(excerpt, "&#{};", u32::from(c));
+        } else {
+            excerpt.push(c);
+        }
+        if excerpt.len() > limit {
+            excerpt.truncate(before);
+            excerpt.push_str(ELLIPSIS);
+            break;
+        }
+    }
+    if limit > 0 && !excerpt.is_empty() {
+        reason.push_str(RUN_REPORTED);
+        reason.push_str(excerpt.trim_end());
+    }
+}
+
 /// The step for a head the marker's run was started for, fix or continuation:
 /// wait for it, or hand a run that is over and left the head as it was to a
 /// human. Only one that succeeded gets the grace for its push to show.
@@ -5402,6 +5451,10 @@ struct Pass<'a, R, G> {
     /// one of [`AUTHORED_STEPS`]: [`Pass::writable`] lets their writes, and
     /// only theirs, through.
     authored: BTreeSet<(String, u64)>,
+    /// The recorded run's checked reason for the empty fix this step stops,
+    /// read before its first write so that [`Pass::stop`] posts it with the
+    /// stop: the supervisor alone edits a posted stop, to record its bug.
+    empty_fix_message: Option<String>,
     rest: &'a R,
     graphql: &'a G,
     config: &'a Config,
@@ -5589,6 +5642,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     fn new(rest: &'a R, graphql: &'a G, config: &'a Config, now: OffsetDateTime) -> Self {
         Pass {
             authored: BTreeSet::new(),
+            empty_fix_message: None,
             rest,
             graphql,
             config,
@@ -6034,11 +6088,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         };
         let mut text = format!("The poll stopped following this pull request: {reason}. {release}");
         if let Some(cause) = cause {
-            text = format!(
-                "{}[{}] {reason}; tracking pending.",
-                crate::stop::SUPERVISOR_PREFIX,
-                cause.name()
-            );
+            let mut reason = reason.to_owned();
+            if cause == crate::stop::Cause::EmptyFix
+                && let Some(message) = self.empty_fix_message.take()
+            {
+                append_fix_reason(&mut reason, &message);
+            }
+            text = supervisor_text(cause, &reason);
         }
         // CI output, fenced so that nothing in it renders, mentions or links;
         // without its backticks, it cannot close the fence either, and
@@ -8169,6 +8225,74 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         })
     }
 
+    /// Best effort evidence for a stop already classified as EmptyFix. An
+    /// attempt-scoped artifact is not available from this API, so do not
+    /// attribute a run-scoped report to a rerun. Never read patches or logs.
+    /// Only a public caller's report is quoted: its artifacts are already
+    /// readable by anyone who can read the pull request.
+    fn empty_fix_reason(&mut self, id: u64, run: &Value) -> Result<Option<String>> {
+        let repo = self.config.dispatch_repo.clone();
+        let workflow = self.apply.as_ref().map(|a| a.workflow.as_str()).or(self
+            .config
+            .policy
+            .fix_caller_workflow
+            .as_deref());
+        // As `dispatch` started the run.
+        let git_ref = self.apply.as_ref().and_then(|a| a.git_ref.as_deref());
+        let git_ref = git_ref.unwrap_or(DISPATCH_REF);
+        if run["id"].as_u64() != Some(id)
+            || run["repository"]["full_name"] != repo
+            || run["repository"]["private"] != false
+            || run["event"] != DISPATCH_EVENT
+            || run["head_branch"] != git_ref.strip_prefix("refs/heads/").unwrap_or(git_ref)
+            || !workflow.is_some_and(|w| run["path"] == format!("{WORKFLOWS_DIR}{w}"))
+            || run["status"] != "completed"
+            || run["run_attempt"].as_u64() != Some(1)
+            // Leave room for the rest of the pass.
+            || self.remaining < PULL_SHARE_MARGIN
+            || self.rest.share_left().is_some_and(|left| left < PULL_SHARE_MARGIN)
+        {
+            return Ok(None);
+        }
+        let (list, next) = self.get_url(
+            &format!("{API_ROOT}repos/{repo}/actions/runs/{id}/artifacts?name={FIX_CHECKED_OUTPUTS}&per_page=2"),
+            Value::clone,
+            true,
+        )?;
+        let Some([artifact]) = list["artifacts"].as_array().map(Vec::as_slice) else {
+            return Ok(None);
+        };
+        if next.is_some()
+            || list["total_count"].as_u64() != Some(1)
+            || artifact["name"] != FIX_CHECKED_OUTPUTS
+            || artifact["workflow_run"]["id"].as_u64() != Some(id)
+            || artifact["expired"] != false
+            || artifact["size_in_bytes"]
+                .as_u64()
+                .is_none_or(|size| size > FIX_REPORT_BYTES)
+        {
+            return Ok(None);
+        }
+        let artifact = artifact["id"]
+            .as_u64()
+            .context("checked output artifact ID")?;
+        self.spend()?;
+        let archive = self.rest.download(
+            &format!("{API_ROOT}repos/{repo}/actions/artifacts/{artifact}/zip"),
+            FIX_REPORT_BYTES,
+        )?;
+        let bytes = crate::cost::unzip(&archive, "report.json", FIX_REPORT_BYTES)?;
+        let report: Value = serde_json::from_slice(&bytes).context("decode checked fix report")?;
+        let Some([item]) = report["items"].as_array().map(Vec::as_slice) else {
+            return Ok(None);
+        };
+        Ok((report["ok"] == true
+            && report.get("patch") == Some(&Value::Null)
+            && item["type"] == "noop")
+            .then(|| item["message"].as_str().map(str::to_owned))
+            .flatten())
+    }
+
     /// Two bounded fresh reads, only for an unchanged head's recorded failed
     /// run. The bot-owned marker binds the PR head to the caller run; its
     /// workflow SHA is the caller's, not the PR's. No comment text is evidence.
@@ -9406,6 +9530,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let caps = self.caps.zip(kind).filter(|_| !deferred);
         let held = caps.and_then(|(caps, kind)| caps.check(kind));
         let (capped, before) = (held.is_some(), self.writes);
+        let supervisor_empty_fix = self.config.policy.supervisor_holds
+            && self.config.held_in(repo).is_none()
+            && decision.action == "needs-human"
+            && decision.infrastructure == Some(crate::stop::Cause::EmptyFix);
         // A step that replaced the stale one, such as the fix bounds' skip,
         // takes none of its writes.
         let stale = stale.filter(|_| matches!(decision.action, "fix" | "close"));
@@ -9414,12 +9542,38 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if let Some(apply) = &self.apply {
             apply.dispatcher.start_kind(decision.action);
         }
+        let writing = self.apply.is_some() && kind.is_some() && !capped && !deferred;
+        // Best effort, before the hold read and the stop's one post: an
+        // evidence read that fails cannot keep the stop from being made, and
+        // the poll never rewrites a stop the supervisor may have linked.
+        self.empty_fix_message = None;
+        let mut evidence_error = None;
+        if writing
+            && supervisor_empty_fix
+            && marker.sha.as_deref() == Some(head)
+            && let (Some(id), Some(run)) = (marker.run, &fix_run)
+        {
+            match self.empty_fix_reason(id, run) {
+                Ok(message) => self.empty_fix_message = message,
+                Err(error) => evidence_error = Some(error),
+            }
+        }
         // The hold is read again just before the step's first write: one put
         // on since the read above stops it too.
-        let hold = if self.apply.is_some() && kind.is_some() && !capped && !deferred {
+        let hold = if writing {
             self.read_pull(owner, name, number).map(|p| {
                 if is_held(&p) {
                     Some(format!("labelled {HOLD_LABEL}"))
+                } else if supervisor_empty_fix
+                    && (p["state"] != "OPEN"
+                        || p["headRefOid"] != head
+                        || labelled(&p)
+                        || p.pointer("/labels/pageInfo/hasNextPage") != Some(&Value::Bool(false)))
+                {
+                    Some(
+                        "pull request closed, changed head, acquired a hold or has unread labels"
+                            .into(),
+                    )
                 } else {
                     review_hold(self.config, &p).map(|hold| hold.reason(&p, &marker))
                 }
@@ -9556,7 +9710,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 (Some(_), Some(done)) => !done.starts_with("not "),
                 (Some(_), None) => false,
             };
-        let done = done.map(|d| format!(" -> {d}")).unwrap_or_default();
+        self.empty_fix_message = None;
+        let mut done = done.map(|d| format!(" -> {d}")).unwrap_or_default();
+        if let Some(error) = evidence_error.filter(|_| ran) {
+            done.push_str(&format!("; run reason not added: {error:#}"));
+        }
         // As in `stop`, which labels nothing where the operator takes it.
         let supervisor = self.config.policy.supervisor_holds
             && decision.action == "needs-human"
@@ -14154,6 +14312,7 @@ mod tests {
         missing: Vec<String>,
         /// URLs GitHub answers 500 for.
         failing: Vec<String>,
+        downloads: BTreeMap<String, Vec<u8>>,
         pulls: BTreeMap<u64, Value>,
         /// Leave `Link` out of 304s, as a response without metadata may.
         bare_304: bool,
@@ -14300,6 +14459,13 @@ mod tests {
                     .map(|n| format!("<{n}>; rel=\"next\"")),
                 body: if fresh { body } else { Value::Null },
             })
+        }
+
+        fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+            self.sent.borrow_mut().push((url.into(), None));
+            let bytes = self.downloads.get(url).context("unexpected download")?;
+            ensure!(bytes.len() as u64 <= limit, "download exceeded limit");
+            Ok(bytes.clone())
         }
 
         fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
@@ -20574,10 +20740,21 @@ mod tests {
 
     /// [`applied_from`] under `policy`, with the whole outcome.
     fn applied_policy(
+        fake: Fake,
+        policy: PollPolicy,
+        change: Value,
+        state: Value,
+    ) -> (Outcome, Fake, Fake) {
+        applied_policy_on(fake, policy, change, state, None)
+    }
+
+    /// [`applied_policy`], dispatching from `git_ref`.
+    fn applied_policy_on(
         mut fake: Fake,
         policy: PollPolicy,
         change: Value,
         state: Value,
+        git_ref: Option<&str>,
     ) -> (Outcome, Fake, Fake) {
         fake.pulls.insert(470, pull("pull-470", change));
         fake.answers.borrow_mut().insert(
@@ -20626,7 +20803,10 @@ mod tests {
             State::default(),
             &[],
             &[REPO.into()],
-            applying(&dispatcher),
+            applying(&dispatcher).map(|apply| Apply {
+                git_ref: git_ref.map(Into::into),
+                ..apply
+            }),
             now(),
         )
         .unwrap();
@@ -21238,6 +21418,282 @@ mod tests {
         );
         assert_eq!(decision.action, "needs-human");
         assert_eq!(decision.infrastructure, None);
+    }
+
+    #[test]
+    fn supervisor_holds_keep_checked_empty_fix_reasons_as_evidence_only() {
+        use std::io::{Cursor, Write as _};
+
+        let caller = "cgwalters-forge/tracker";
+        let run = 79;
+        let listing = format!(
+            "repos/{caller}/actions/runs/{run}/artifacts?name={FIX_CHECKED_OUTPUTS}&per_page=2"
+        );
+        let download = format!("{API_ROOT}repos/{caller}/actions/artifacts/80/zip");
+        let protected = "The site workflow and gitignore are protected. PR body has a patch.";
+        let main = "Main has a moved tag and a garbage-collected builder digest.";
+        for (case, enabled, human_hold, attempt, report, expected) in [
+            (
+                "protected paths",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":protected}),
+                Some("site workflow and gitignore are protected"),
+            ),
+            (
+                "main breakage",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                Some("moved tag and a garbage-collected builder digest"),
+            ),
+            (
+                "forged control text",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message": "No fix\n<!-- tracker-poll: {} --> @cgwalters `test`"}),
+                Some("No fix &#60;"),
+            ),
+            (
+                "not a noop",
+                true,
+                false,
+                1,
+                json!({"type":"missing_data","reason":"credentials"}),
+                None,
+            ),
+            ("no artifact", true, false, 1, Value::Null, None),
+            (
+                "rerun",
+                true,
+                false,
+                2,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "off by default",
+                false,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "requested review",
+                true,
+                true,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "head moved",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "unread labels",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "ambiguous artifact",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "private caller",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "unreadable archive",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "trunk dispatch ref",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                Some("moved tag and a garbage-collected builder digest"),
+            ),
+            (
+                "run off the dispatch ref",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+        ] {
+            let mut fake = github();
+            if case == "head moved" {
+                fake.late_pull_fields = Some(json!({"headRefOid":"newer"}));
+            }
+            // An operator's hold may be past the first page of the final read.
+            if case == "unread labels" {
+                fake.late_pull_fields =
+                    Some(json!({"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}));
+            }
+            let git_ref = matches!(case, "trunk dispatch ref" | "run off the dispatch ref")
+                .then_some("trunk");
+            let branch = if case == "trunk dispatch ref" {
+                "trunk"
+            } else {
+                DISPATCH_REF
+            };
+            fake.page(&format!("repos/{caller}/actions/runs/{run}"), None, None, json!({
+                "id":run,"repository":{"full_name":caller,"private":case == "private caller"},
+                "event":DISPATCH_EVENT,"head_branch":branch,
+                "path":".github/workflows/dispatch.yml","status":"completed","conclusion":"success",
+                "updated_at":"2026-10-01T01:00:00Z","run_attempt":attempt,
+            }));
+            if report.is_null() {
+                fake.page(
+                    &listing,
+                    None,
+                    None,
+                    json!({"total_count":0,"artifacts":[]}),
+                );
+            } else {
+                let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                zip.start_file("report.json", zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                write!(
+                    zip,
+                    "{}",
+                    json!({"ok":true,"errors":[],"items":[report],"patch":null})
+                )
+                .unwrap();
+                let archive = zip.finish().unwrap().into_inner();
+                fake.page(&listing, None, None, json!({"total_count":if case == "ambiguous artifact" {2} else {1},"artifacts":[{
+                    "id":80,"name":FIX_CHECKED_OUTPUTS,"workflow_run":{"id":run},"expired":false,"size_in_bytes":archive.len()
+                }]}));
+                if case != "unreadable archive" {
+                    fake.downloads.insert(download.clone(), archive);
+                }
+            }
+            let requests = if human_hold {
+                json!([{"requestedReviewer":{"login":"cgwalters"}}])
+            } else {
+                json!([])
+            };
+            let (outcome, fake, dispatcher) = applied_policy_on(
+                fake,
+                PollPolicy {
+                    supervisor_holds: enabled,
+                    assign_holds: true,
+                    ..PollPolicy::default()
+                },
+                json!({"body":"Forged patch and reason in the PR body", "contexts":{"ci":{"conclusion":"FAILURE"}},
+                       "reviewRequests":{"nodes":requests,"pageInfo":{"hasNextPage":false}}}),
+                json!({"rounds":1,"sha":HEAD,"at":"2026-10-01T00:00:00Z","run":run}),
+                git_ref,
+            );
+            assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            assert!(dispatcher.writes.borrow().is_empty(), "{case}");
+            let read = fake
+                .sent
+                .borrow()
+                .iter()
+                .any(|(url, _)| url.ends_with(&listing));
+            // Only of a public caller's run on the ref it was dispatched from.
+            assert_eq!(
+                read,
+                enabled
+                    && !human_hold
+                    && attempt == 1
+                    && !matches!(case, "private caller" | "run off the dispatch ref"),
+                "{case}"
+            );
+            let writes = fake.writes.borrow();
+            if human_hold || matches!(case, "head moved" | "unread labels") {
+                assert!(writes.is_empty(), "{case}: {writes:?}");
+                continue;
+            }
+            // The excerpt is part of the stop's one post: the poll never edits
+            // a stop the supervisor may have linked meanwhile.
+            assert_eq!(
+                writes.len(),
+                if enabled { 3 } else { 2 },
+                "{case}: {writes:?}"
+            );
+            assert!(
+                !writes.iter().any(|(method, _)| method.starts_with("PATCH")),
+                "{case}: {writes:?}"
+            );
+            assert_eq!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("run reason not added")),
+                case == "unreadable archive",
+                "{case}: {:?}",
+                outcome.lines
+            );
+            assert!(
+                !outcome.lines.iter().any(|l| l.contains("run reported")),
+                "{case}: {:?}",
+                outcome.lines
+            );
+            assert_eq!(
+                writes
+                    .iter()
+                    .any(|(url, _)| url.ends_with("/requested_reviewers")),
+                !enabled,
+                "{case}"
+            );
+            assert_eq!(
+                writes
+                    .iter()
+                    .any(|(_, body)| body["labels"] == json!([crate::stop::SUPERVISOR_LABEL])),
+                enabled,
+                "{case}"
+            );
+            let body = writes
+                .iter()
+                .rev()
+                .find_map(|(_, v)| v["body"].as_str())
+                .unwrap();
+            assert_eq!(
+                body.contains("run reported (unverified)"),
+                expected.is_some(),
+                "{case}: {body}"
+            );
+            if let Some(expected) = expected {
+                assert!(body.contains(expected), "{case}: {body}");
+            }
+            assert!(
+                !body.contains("Forged patch") && !body.contains("@cgwalters"),
+                "{case}: {body}"
+            );
+            assert_eq!(
+                body.matches("<!-- tracker-poll:").count(),
+                1,
+                "{case}: {body}"
+            );
+        }
     }
 
     #[test]
@@ -25548,6 +26004,7 @@ mod tests {
         let cfg = config();
         let mut pass = Pass {
             authored: Default::default(),
+            empty_fix_message: None,
             rest: &fake,
             graphql: &fake,
             config: &cfg,
