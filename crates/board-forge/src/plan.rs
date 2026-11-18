@@ -392,7 +392,7 @@ impl JobPlan {
 }
 
 /// An issue comment, as far as plans need it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
     pub url: String,
     pub body: String,
@@ -885,6 +885,16 @@ pub(crate) fn comment_id(url: &str) -> Option<u64> {
 
 fn marker_line(plan: &str) -> String {
     format!("<!-- {DISPATCH_MARKER}: {plan} -->")
+}
+
+/// How a dispatch record starts its text once the workflow accepted the run.
+const DISPATCHED: &str = "Dispatched the plan in ";
+
+/// Whether a dispatch record says the workflow accepted its run. A claim
+/// whose outcome was never recorded ("Dispatching …") may not have reached
+/// the workflow at all.
+pub(crate) fn dispatch_started(record: &str) -> bool {
+    record.lines().any(|line| line.starts_with(DISPATCHED))
 }
 
 /// The hash of the operator's direction a dispatch record carries on its
@@ -1502,15 +1512,15 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
                 )
             }
             (None, Some(run)) if n > 0 => format!(
-                "Dispatched the plan in {} with {}: [run]({run}).",
+                "{DISPATCHED}{} with {}: [run]({run}).",
                 record.plan_url,
                 issue.display()
             ),
             (None, Some(run)) => {
-                format!("Dispatched the plan in {}: [run]({run}).", record.plan_url)
+                format!("{DISPATCHED}{}: [run]({run}).", record.plan_url)
             }
             (None, None) => format!(
-                "Dispatched the plan in {}{} to {} {}; GitHub did not name the run.",
+                "{DISPATCHED}{}{} to {} {}; GitHub did not name the run.",
                 record.plan_url,
                 match n {
                     0 => String::new(),

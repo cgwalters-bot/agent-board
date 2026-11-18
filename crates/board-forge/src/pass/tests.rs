@@ -2417,7 +2417,7 @@ pub(super) fn preview(config: &Config, replay: &Replay) -> Report {
             })
             .map(|entry| {
                 let mut entry = entry.clone();
-                entry["request"]["graphql"] = fnv(&sessions::activity_query()).into();
+                entry["request"]["graphql"] = fnv(sessions::activity_query()).into();
                 let variables = entry["request"]["variables"].clone();
                 session_observations(&replay, &variables, &mut entry["answer"]["data"]);
                 entry
@@ -5733,6 +5733,9 @@ fn replay_scenarios() {
     }
 }
 
+/// A [`Forge::run_conclusion`] for a run GitHub no longer has.
+const MISSING_RUN: &str = "missing";
+
 /// The recording with writes: comments posted and edited show in later
 /// reads, and dispatches are kept. `fail` loses the response to the first
 /// request whose method and URL, or query, contain it: a write is made and
@@ -5758,6 +5761,9 @@ pub(super) struct Forge {
     passes: Vec<Value>,
     /// A confirmed response to workflow dispatch, instead of a successful start.
     dispatch_status: Option<u16>,
+    /// The conclusion GitHub reports for every caller run read by id, or
+    /// [`MISSING_RUN`] for the live client's not-found error.
+    run_conclusion: Option<&'static str>,
     /// Fails the first write whose method and URL contain it before it is
     /// made, unlike `fail`, which loses the answer to one that was.
     refuse: RefCell<Option<String>>,
@@ -5818,6 +5824,7 @@ impl Forge {
             on_get: None,
             passes: vec![],
             dispatch_status: None,
+            run_conclusion: None,
             refuse: RefCell::new(None),
             rival: None,
             chain_reads: RefCell::new(Vec::new()),
@@ -6075,6 +6082,15 @@ impl Rest for Forge {
         let runs = format!("{API_ROOT}repos/cgwalters-forge/tracker/actions/");
         if url == format!("{runs}runs/4242") {
             return Ok(listed(json!({"id": 4242, "workflow_id": 77})));
+        }
+        if let Some(conclusion) = self.run_conclusion
+            && let Some(id) =
+                (url.strip_prefix(&format!("{runs}runs/"))).and_then(|id| id.parse::<u64>().ok())
+        {
+            if conclusion == MISSING_RUN {
+                return Err(anyhow::Error::from(crate::github::NotFound).context("run expired"));
+            }
+            return Ok(listed(json!({"id": id, "conclusion": conclusion})));
         }
         if url == format!("{runs}workflows/77/runs?status=in_progress&per_page=100") {
             let mut runs = vec![json!({"id": 4242})];
@@ -9991,6 +10007,453 @@ fn answered(forge: &Forge, (author, editor): (&str, Option<&str>), body: &str, d
     }));
 }
 
+fn triage_verdict_body(verdict: &str) -> String {
+    format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{verdict}\"}}\n```\n")
+}
+
+fn advance_living_status_pass(forge: &mut Forge, days: i64) {
+    advance_living_status_by(forge, time::Duration::days(days));
+}
+
+fn advance_living_status_by(forge: &mut Forge, advance: time::Duration) {
+    forge.replay.now += advance;
+    let mut snapshot = usage(&mut forge.replay);
+    snapshot["updated_at"] = forge.replay.now.format(&Rfc3339).unwrap().into();
+    for pool in snapshot["pools"].as_object_mut().unwrap().values_mut() {
+        for field in ["observed_at", "resets_at"] {
+            if let Some(time) = pool[field].as_str() {
+                pool[field] = (at(time) + advance).format(&Rfc3339).unwrap().into();
+            }
+        }
+    }
+    set_usage(&mut forge.replay, &snapshot);
+}
+
+#[test]
+fn living_status_retriages_changed_inputs_without_reposting_unchanged_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = outside_harness(config(json!({
+        "livingStatus": dir.path().join("status.json"),
+        "triageFollowUpDays": 1, "triageReplans": 2, "triageClose": true,
+    })));
+    let bot = config.bot.as_str();
+    let mut forge = Forge::new(None, false);
+    forge.run_conclusion = Some("success");
+    let repo = "cgwalters-forge/tracker";
+    let issue = (repo.to_owned(), 446);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    let start = "start triage cgwalters-forge/tracker#446";
+    let first = apply(&forge, &config);
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    let initial = forge.added.borrow()[&issue][0].clone();
+    assert!(text(&initial, "/body").starts_with(living::MARKER));
+    // Simulate a bot verdict timestamped after the frozen pass clock but
+    // before the actual dispatch. Its presence cannot authorize a close.
+    answered(&forge, (bot, None), &triage_verdict_body("done"), 0);
+    forge.added.borrow_mut().get_mut(&issue).unwrap()[1]["createdAt"] = (forge.replay.now
+        + time::Duration::milliseconds(1))
+    .format(&Rfc3339)
+    .unwrap()
+    .into();
+    advance_living_status_pass(&mut forge, 2);
+
+    let count = forge.writes.borrow().len();
+    let unchanged = apply(&forge, &config);
+    assert_eq!(unchanged.failures, 0, "{:#?}", unchanged.lines);
+    assert!(
+        unchanged.lines.iter().any(|l| {
+            l.contains("no checked verdict") && l.contains("nothing changed since its triage")
+        }),
+        "{:#?}",
+        unchanged.lines
+    );
+    assert_eq!(forge.writes.borrow().len(), count);
+
+    answered(
+        &forge,
+        ("visitor", None),
+        "The missing dependency merged.",
+        -1,
+    );
+    let changed = apply(&forge, &config);
+    assert_eq!(changed.failures, 0, "{:#?}", changed.lines);
+    assert!(
+        changed.lines.iter().any(|l| l.starts_with(start)),
+        "{:#?}",
+        changed.lines
+    );
+    assert!(forge.writes.borrow()[count..].iter().any(|(_, url, body)| {
+        let body = body.to_string();
+        url.ends_with("/dispatches")
+            && body.contains("post nothing")
+            && body.contains("do not post a schedule-triage block")
+    }));
+    let after = forge.added.borrow()[&issue].clone();
+    assert_eq!(
+        after.len(),
+        3,
+        "one status, one older verdict, one visitor comment"
+    );
+    assert_eq!(after[0]["id"], initial["id"]);
+    assert_ne!(after[0]["body"], initial["body"]);
+    assert!(!text(&after[0], "/body").contains(PLAN_FENCE));
+    assert!(!text(&after[0], "/body").contains(TRIAGE_FENCE));
+
+    advance_living_status_pass(&mut forge, 2);
+    let count = forge.writes.borrow().len();
+    let silent = apply(&forge, &config);
+    assert_eq!(silent.failures, 0, "{:#?}", silent.lines);
+    assert!(
+        silent.lines.iter().any(|l| {
+            l.contains("no checked verdict") && l.contains("nothing changed since its triage")
+        }),
+        "{:#?}",
+        silent.lines
+    );
+    assert_eq!(forge.writes.borrow().len(), count);
+}
+
+#[test]
+fn living_status_quiets_only_a_triage_run_reported_successful() {
+    // Accepted is not done: a run cancelled or failed before its agent ran
+    // left no result, so its silence is retried as without living status.
+    for (conclusion, expected) in [
+        ("success", "nothing changed since its triage"),
+        ("cancelled", "start triage cgwalters-forge/tracker#446"),
+        ("failure", "start triage cgwalters-forge/tracker#446"),
+        (MISSING_RUN, "start triage cgwalters-forge/tracker#446"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = outside_harness(config(json!({
+            "livingStatus": dir.path().join("status.json"), "triageFollowUpDays": 7,
+        })));
+        let mut forge = Forge::new(None, false);
+        forge.run_conclusion = Some(conclusion);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        let first = apply(&forge, &config);
+        assert_eq!(first.failures, 0, "{:#?}", first.lines);
+        advance_living_status_pass(&mut forge, 2);
+        let early = apply(&forge, &config);
+        let early_expected = if conclusion == "success" {
+            "nothing changed since its triage"
+        } else {
+            "triaged again from"
+        };
+        assert_eq!(early.failures, 0, "{:#?}", early.lines);
+        assert!(
+            early.lines.iter().any(|l| l.contains(early_expected)),
+            "{conclusion}: {:#?}",
+            early.lines
+        );
+        assert_eq!(forge.dispatches().len(), 1, "{conclusion}");
+        advance_living_status_pass(&mut forge, 6);
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert!(
+            report.lines.iter().any(|l| l.contains(expected)),
+            "{conclusion}: {:#?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn standalone_triage_retries_without_trusting_an_edited_dispatch_receipt() {
+    let config = outside_harness(config(json!({
+        "triageFollowUpDays": 7, "triageClose": true,
+    })));
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    let first = apply(&forge, &config);
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    {
+        let mut added = forge.added.borrow_mut();
+        let receipt = added
+            .get_mut(&("cgwalters-forge/tracker".into(), 446))
+            .unwrap()
+            .iter_mut()
+            .find(|node| text(node, "/body").starts_with("<!-- agent-board-dispatch: "))
+            .unwrap();
+        receipt["lastEditedAt"] = forge.replay.now.format(&Rfc3339).unwrap().into();
+        receipt["editor"] = json!({"login": "visitor"});
+    }
+    advance_living_status_pass(&mut forge, 2);
+    answered(&forge, (&config.bot, None), &triage_verdict_body("done"), 0);
+    let early = apply(&forge, &config);
+    assert_eq!(early.failures, 0, "{:#?}", early.lines);
+    assert_eq!(forge.dispatches().len(), 1, "{:#?}", early.lines);
+    advance_living_status_pass(&mut forge, 6);
+    let retry = apply(&forge, &config);
+    assert_eq!(retry.failures, 0, "{:#?}", retry.lines);
+    assert_eq!(forge.dispatches().len(), 2, "{:#?}", retry.lines);
+    assert!(
+        !forge
+            .writes
+            .borrow()
+            .iter()
+            .any(|(_, _, body)| body["state"] == "closed")
+    );
+}
+
+#[test]
+fn living_status_retries_a_triage_claim_that_never_reached_the_workflow() {
+    // The plan's POST creates the status comment; saving the dispatch claim
+    // to it then fails, so the workflow is never asked. The saved claim is
+    // not a quiet run: an unchanged issue is triaged again after its days.
+    let dir = tempfile::tempdir().unwrap();
+    let config = outside_harness(config(json!({
+        "livingStatus": dir.path().join("status.json"), "triageFollowUpDays": 1,
+    })));
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    *forge.refuse.borrow_mut() = Some(format!(
+        "PATCH {API_ROOT}repos/cgwalters-forge/tracker/issues/comments/"
+    ));
+    let failed = apply(&forge, &config);
+    assert!(failed.failures > 0, "{:#?}", failed.lines);
+    assert!(forge.dispatches().is_empty());
+    advance_living_status_pass(&mut forge, 2);
+    let report = apply(&forge, &config);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        forge.dispatches(),
+        ["cgwalters-forge/tracker#446"],
+        "{:#?}",
+        report.lines
+    );
+}
+
+#[test]
+fn living_status_lets_the_operator_retriage_with_or_without_a_fingerprint() {
+    for fingerprint in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = outside_harness(config(json!({
+            "livingStatus":dir.path().join("status.json"), "triageFollowUpDays":1,
+        })));
+        let mut forge = Forge::new(None, false);
+        forge.run_conclusion = Some("success");
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        if !fingerprint {
+            job_plan(&mut forge.replay, ("triage", 446), &config.bot, None);
+        }
+        let first = apply(&forge, &config);
+        assert_eq!(first.failures, 0, "{:#?}", first.lines);
+        assert_eq!(forge.dispatches().len(), 1);
+        advance_living_status_by(&mut forge, time::Duration::hours(1));
+        answered(&forge, ("visitor", None), "Please triage again.", 0);
+        let held = apply(&forge, &config);
+        assert!(
+            held.lines
+                .iter()
+                .any(|line| line.contains("triaged again from")),
+            "{:#?}",
+            held.lines
+        );
+        assert_eq!(forge.dispatches().len(), 1);
+        answered(&forge, (&config.operator, None), "Please triage again.", 0);
+        let retried = apply(&forge, &config);
+        assert_eq!(retried.failures, 0, "{:#?}", retried.lines);
+        assert_eq!(forge.dispatches().len(), 2, "{:#?}", retried.lines);
+    }
+}
+
+#[test]
+fn living_status_retries_a_successful_triage_without_a_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = outside_harness(config(json!({
+        "livingStatus": dir.path().join("status.json"), "triageFollowUpDays": 1,
+    })));
+    let mut forge = Forge::new(None, false);
+    forge.run_conclusion = Some("success");
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    job_plan(&mut forge.replay, ("triage", 446), &config.bot, None);
+    let first = apply(&forge, &config);
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    advance_living_status_pass(&mut forge, 2);
+    answered(
+        &forge,
+        ("visitor", None),
+        "The missing dependency merged.",
+        -1,
+    );
+    let retry = apply(&forge, &config);
+    assert_eq!(retry.failures, 0, "{:#?}", retry.lines);
+    assert_eq!(forge.dispatches().len(), 2, "{:#?}", retry.lines);
+    advance_living_status_pass(&mut forge, 2);
+    let unchanged = apply(&forge, &config);
+    assert_eq!(unchanged.failures, 0, "{:#?}", unchanged.lines);
+    assert_eq!(forge.dispatches().len(), 2, "{:#?}", unchanged.lines);
+}
+
+#[test]
+fn living_status_keeps_hold_receipts_standalone() {
+    // The label is sent before its receipt; a ledger record that could not
+    // be saved would strand the hold, so the receipt stays its own comment.
+    let repo = "cgwalters-forge/tracker";
+    // A saved copy alone is not a verdict boundary, but the live receipt
+    // still works with cleanupHistory off, even after a scan archived it.
+    for (archived, gone) in [(false, false), (true, false), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = |living: bool| {
+            let mut raw = json!({"triageFollowUpDays": 1});
+            if living {
+                raw["livingStatus"] = json!(dir.path().join("status.json"));
+            }
+            outside_harness(config(raw))
+        };
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        let initial = settings(false);
+        let first = apply(&forge, &initial);
+        assert_eq!(first.failures, 0, "{:#?}", first.lines);
+        answered(
+            &forge,
+            ("cgwalters-bot", None),
+            &format!(
+                "**Decision needed:** Use option A or option B?\n\n{}",
+                triage_verdict_body("needs-operator")
+            ),
+            0,
+        );
+        advance_living_status_pass(&mut forge, 1);
+        if archived {
+            answered(&forge, ("cgwalters-bot", None), living::MARKER, 0);
+            let mut store = living::Store::load(
+                dir.path().join("status.json").to_str().unwrap(),
+                &initial.bot,
+                forge.replay.now,
+            )
+            .unwrap();
+            store.cleanup = true;
+            let added = forge.added.borrow();
+            let mut data = json!({"repository":{"issue":{"comments":{
+                "nodes":added[&(repo.to_owned(), 446)],"pageInfo":{"hasNextPage":false}
+            }}}});
+            store
+                .expand(
+                    &json!({"owner":"cgwalters-forge","name":"tracker","number":446}),
+                    &mut data,
+                )
+                .unwrap();
+        }
+        if gone {
+            let mut added = forge.added.borrow_mut();
+            let comments = added.get_mut(&(repo.to_owned(), 446)).unwrap();
+            assert!(text(&comments[1], "/body").starts_with("<!-- agent-board-dispatch: "));
+            comments.remove(1);
+        }
+        let report = apply(&forge, &settings(true));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        if gone {
+            assert_eq!(forge.dispatches().len(), 1, "{:#?}", report.lines);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("triaged again from")),
+                "{:#?}",
+                report.lines
+            );
+            assert!(
+                !(forge.writes.borrow().iter()).any(|(_, url, _)| url.ends_with("/labels")),
+                "{:#?}",
+                report.lines
+            );
+            advance_living_status_pass(&mut forge, 1);
+            let retry = apply(&forge, &settings(true));
+            assert_eq!(retry.failures, 0, "{:#?}", retry.lines);
+            assert_eq!(forge.dispatches().len(), 2, "{:#?}", retry.lines);
+            continue;
+        }
+        let after = forge.comments_on(repo, 446);
+        assert_eq!(after.len(), 4 + usize::from(archived), "{after:#?}");
+        let verdict_id = forge.added.borrow()[&(repo.to_owned(), 446)][2]["id"]
+            .as_u64()
+            .unwrap();
+        assert!(after.last().unwrap().starts_with(&hold_marker(verdict_id)));
+        assert!(
+            forge
+                .writes
+                .borrow()
+                .iter()
+                .any(|(_, url, _)| url.ends_with("/issues/446/labels"))
+        );
+    }
+}
+
+#[test]
+fn living_status_does_not_read_a_runs_verdict_after_status_is_deleted() {
+    let issue = ("cgwalters-forge/tracker".to_owned(), 446);
+    for old_comments_to_restore in [0, 1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let plain = outside_harness(config(json!({"triageFollowUpDays": 7})));
+        let living = outside_harness(config(json!({
+            "triageFollowUpDays": 7, "livingStatus": path,
+        })));
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        let first = apply(&forge, &plain);
+        assert_eq!(first.failures, 0, "{:#?}", first.lines);
+        let old = forge.added.borrow()[&issue].clone();
+        advance_living_status_pass(&mut forge, 1);
+        answered(&forge, (&plain.bot, None), living::MARKER, 0);
+        let mut store =
+            living::Store::load(path.to_str().unwrap(), &plain.bot, forge.replay.now).unwrap();
+        store.cleanup = true;
+        let mut data = json!({"repository":{"issue":{"comments":{
+            "nodes":forge.added.borrow()[&issue], "pageInfo":{"hasNextPage":false}
+        }}}});
+        store
+            .expand(
+                &json!({"owner":"cgwalters-forge","name":"tracker","number":446}),
+                &mut data,
+            )
+            .unwrap();
+        forge.added.borrow_mut().remove(&issue);
+        advance_living_status_pass(&mut forge, 1);
+        let next = apply(&forge, &living);
+        assert_eq!(next.failures, 0, "{:#?}", next.lines);
+        assert_eq!(forge.dispatches().len(), 2, "{:#?}", next.lines);
+        answered(
+            &forge,
+            (&plain.bot, None),
+            &triage_verdict_body("needs-operator"),
+            0,
+        );
+        {
+            let mut added = forge.added.borrow_mut();
+            let comments = added.get_mut(&issue).unwrap();
+            assert!(text(&comments[0], "/body").starts_with(living::MARKER));
+            // Removing the status withdraws its plan, not its receipt.
+            comments.splice(..1, old.into_iter().take(old_comments_to_restore));
+        }
+        advance_living_status_pass(&mut forge, 1);
+        let report = apply(&forge, &living);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        if old_comments_to_restore == 0 {
+            assert_eq!(forge.dispatches().len(), 3, "{:#?}", report.lines);
+        } else {
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("no checked verdict")),
+                "{:#?}",
+                report.lines
+            );
+            assert_eq!(forge.dispatches().len(), 2, "{:#?}", report.lines);
+        }
+        assert!(
+            !forge
+                .writes
+                .borrow()
+                .iter()
+                .any(|(_, url, _)| url.ends_with("/labels"))
+        );
+    }
+}
+
 /// The operator's issue as [`CLOSE_QUERY`] reads it, `locked` at that time
 /// or not, and its body `edited` at that time or not.
 fn close_read(variables: &Value, locked: Option<String>, edited: Option<String>) -> Value {
@@ -10041,7 +10504,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         bool,
         &'static str,
     );
-    let verdict = |v: &str| format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{v}\"}}\n```\n");
+    let verdict = triage_verdict_body;
     let bot = "cgwalters-bot";
     let cases: Vec<Case> = vec![
         (
@@ -12744,7 +13207,7 @@ fn apply_takes_an_earlier_triage_verdict() {
         &'a str,
         Option<(&'a str, &'a str)>,
     );
-    let verdict = |v: &str| format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{v}\"}}\n```\n");
+    let verdict = triage_verdict_body;
     let bot = "cgwalters-bot";
     let off = json!({});
     let on = json!({"triageFollowUpDays": 3});
@@ -14800,7 +15263,9 @@ fn apply_revisits_a_sample_with_spare_capacity() {
     // revisit that gave a verdict on an issue nothing but the bot changed
     // since is left alone for up to 90 days. One with no verdict (its run
     // may have failed), or since anyone else's comment or a new title, is
-    // due. Each step: days old, (author, comment) added, title, held.
+    // due. A verdict still proves the run when finalizing its receipt
+    // failed. Each step: days old, (author, comment) added, title, receipt
+    // left unfinalized, held.
     let key = ("cgwalters-forge/tracker".to_owned(), 468);
     let partly = format!("```{TRIAGE_FENCE}\n{{\"verdict\": \"partly\"}}\n```\n");
     let (bot, visitor) = (
@@ -14808,25 +15273,49 @@ fn apply_revisits_a_sample_with_spare_capacity() {
         Some(("visitor", "Done in #9?")),
     );
     let steps = [
-        (4, None, None, false),
-        (4, bot, None, true),
-        (91, None, None, false),
-        (4, bot, None, true),
-        (4, visitor, None, false),
-        (4, bot, None, true),
-        (4, None, Some("Work, renamed"), false),
+        (4, None, None, false, false),
+        (4, bot, None, false, true),
+        (4, None, None, true, true),
+        (91, None, None, false, false),
+        (4, bot, None, false, true),
+        (4, visitor, None, false, false),
+        (4, bot, None, false, true),
+        (4, None, Some("Work, renamed"), false, false),
     ];
     let item = "revisit cgwalters-forge/tracker#468";
-    for (step, (days, said, title, held)) in steps.into_iter().enumerate() {
+    for (step, (days, said, title, unfinalized, held)) in steps.into_iter().enumerate() {
         let earlier = forge.replay.now - time::Duration::days(days);
+        let earlier = earlier.format(&Rfc3339).unwrap();
+        let mut plan_ids = BTreeMap::new();
         for node in forge.added.borrow_mut().get_mut(&key).unwrap() {
-            node["createdAt"] = earlier.format(&Rfc3339).unwrap().into();
+            let body = text(node, "/body");
+            if body.starts_with(revisit::REVISIT) {
+                let original = plan::plan_id(&plan::comment(node).unwrap()).unwrap();
+                node["createdAt"] = earlier.as_str().into();
+                let shifted = plan::plan_id(&plan::comment(node).unwrap()).unwrap();
+                plan_ids.insert(original, shifted);
+            } else {
+                let marker = format!("<!-- {}: ", plan::DISPATCH_MARKER);
+                if let Some(id) = body
+                    .lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix(&marker)?.strip_suffix(" -->"))
+                {
+                    let mut body = body.replacen(id, &plan_ids[id], 1);
+                    if unfinalized {
+                        body =
+                            body.replacen("Dispatched the plan in ", "Dispatching the plan in ", 1);
+                    }
+                    node["body"] = body.into();
+                }
+                node["createdAt"] = earlier.as_str().into();
+            }
         }
         if let Some((author, body)) = said {
             let id = forge.ids.get() + 1;
             forge.ids.set(id);
             let comment = json!({"id": id, "url": format!("https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-{id}"),
-                "body": body, "createdAt": earlier.format(&Rfc3339).unwrap(), "lastEditedAt": null,
+                "body": body, "createdAt": earlier, "lastEditedAt": null,
                 "author": {"login": author}, "editor": null});
             forge
                 .added
@@ -14874,6 +15363,125 @@ fn apply_revisits_a_sample_with_spare_capacity() {
             .any(|(_, _, b)| text(b, "/body").starts_with(revisit::REVISIT));
         assert!(!revisited);
         assert_eq!(report.tally.1.revisited, Some(Some(0)));
+    }
+}
+
+/// With living status, a revisit written to the ledger may be silent on
+/// purpose and waits for a change; a standalone one from before it, with no
+/// verdict since, may have failed and is due again, as is a ledger one whose
+/// claim could not be saved before its start or whose run did not succeed.
+#[test]
+fn living_status_quiets_only_ledger_revisits() {
+    let section = json!({"perPass": 3, "afterDays": 14, "heldAfterDays": 3});
+    let item = "revisit cgwalters-forge/tracker#468";
+    for (ledger, claimed, conclusion, expected) in [
+        (
+            true,
+            true,
+            "success",
+            format!("{item}: nothing changed since its revisit, "),
+        ),
+        (
+            true,
+            true,
+            "cancelled",
+            format!("start {item} pool=claude record="),
+        ),
+        (
+            false,
+            true,
+            "success",
+            format!("start {item} pool=claude record="),
+        ),
+        (
+            true,
+            false,
+            "success",
+            format!("start {item} pool=claude record="),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut forge = Forge::new(None, false);
+        forge.run_conclusion = Some(conclusion);
+        let days = [("cgwalters-forge/tracker#468", 4)];
+        silent(&mut forge.replay, &days, &["cgwalters-forge/tracker#468"]);
+        // The revisit is then the only start, the one whose claim is refused.
+        only(&mut forge.replay, &["cgwalters-forge/tracker#468"]);
+        if !claimed {
+            *forge.refuse.borrow_mut() = Some(format!(
+                "PATCH {API_ROOT}repos/cgwalters-forge/tracker/issues/comments/"
+            ));
+        }
+        let living = config(json!({"wip": 12, "revisit": section,
+            "livingStatus": dir.path().join("status.json")}));
+        let plain = config(json!({"wip": 12, "revisit": section}));
+        let first = apply(&forge, if ledger { &living } else { &plain });
+        assert_eq!(first.failures, usize::from(!claimed), "{:#?}", first.lines);
+        assert!(
+            first
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&format!("start {item}"))),
+            "{:#?}",
+            first.lines
+        );
+        assert_eq!(forge.dispatches().is_empty(), !claimed);
+        if ledger && claimed {
+            let writes = forge.writes.borrow();
+            let brief = writes
+                .iter()
+                .find_map(|(_, url, body)| {
+                    url.ends_with("/dispatches")
+                        .then(|| text(body, "/inputs/task"))
+                })
+                .unwrap();
+            assert!(brief.contains("post nothing"), "{brief}");
+        }
+        if ledger {
+            // A stale case-variant ledger entry must not hide the entry
+            // that actually supplied the expanded dispatch receipt.
+            let path = dir.path().join("status.json");
+            let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            state["entries"]["cgwalters-forge/Tracker#468"] =
+                json!({"id": null, "records": [], "published": null});
+            std::fs::write(&path, state.to_string()).unwrap();
+            // The public status already existed when an older bot verdict
+            // was posted. On the next read the verdict is on a later page
+            // than the status, but it predates this ledger dispatch.
+            let before = |hours| {
+                (forge.replay.now - time::Duration::hours(hours))
+                    .format(&Rfc3339)
+                    .unwrap()
+            };
+            forge
+                .added
+                .borrow_mut()
+                .get_mut(&("cgwalters-forge/tracker".into(), 468))
+                .unwrap()[0]["createdAt"] = before(2).into();
+            let id = forge.ids.get() + 1;
+            forge.ids.set(id);
+            let older = json!({"url": format!("https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-{id}"),
+                "body": triage_verdict_body("not-done"), "createdAt": before(1),
+                "author":{"login":"cgwalters-bot"}, "lastEditedAt": null, "editor": null});
+            answer(&mut forge.replay, r#""name":"tracker","number":468"#)["data"]["repository"]["issue"]
+                ["comments"]["pageInfo"] = json!({"hasNextPage": true, "endCursor": "later"});
+            let vars = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 468, "after": "later"});
+            forge
+                .replay
+                .requests
+                .push(json!({"request": graphql_key(plan::COMMENTS_QUERY, &vars),
+                "answer": {"data":{"repository":{"issue":{"comments":{
+                    "nodes": [older], "pageInfo":{"hasNextPage": false}
+                }}}}}}));
+        }
+        advance_living_status_pass(&mut forge, 4);
+        let report = apply(&forge, &living);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(&expected)),
+            "{expected}: {:#?}",
+            report.lines
+        );
     }
 }
 
@@ -21165,6 +21773,10 @@ fn config_table() {
         (
             json!({"store": "s.db", "livingStatus": "s.db"}),
             "store must differ from state and livingStatus",
+        ),
+        (
+            json!({"livingStatus": "l.json", "sessions": {"apply": true, "issues": ["o/r#1"]}}),
+            "sessions.apply cannot be combined with livingStatus",
         ),
         (
             json!({"changeSweepHours": 169, "store": "s.db", "state": "s.json"}),
@@ -27670,6 +28282,24 @@ fn operator_questions_only_triages_wrong_kind_session_plan() {
     );
     assert!(!report.holds.iter().any(|h| h.hold.operator));
 
+    // A ledger dispatch gives repair completion no boundary to bind a
+    // public verdict to: with living status the anchor waits on a person.
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = session_settings();
+    settings["operatorQuestionsOnly"] = json!(true);
+    settings["livingStatus"] = json!(dir.path().join("status.json"));
+    let report = preview(&config(settings), &forge.replay);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(
+        !report
+            .lines
+            .iter()
+            .any(|line| line.contains("start triage cgwalters-forge/agent-board#40")),
+        "{:?}",
+        report.lines
+    );
+    assert!(report.holds.iter().any(|h| h.hold.operator));
+
     for (wip, expected) in [
         (12, "sessions.maxStarts=1 reached"),
         (1, "2 of 1 runs active"),
@@ -27712,14 +28342,22 @@ fn operator_questions_session_repair_resumes_next_day() {
         )
     };
     let question = "**Decision needed:** Which compatibility policy should we promise?\n```schedule-triage\n{\"verdict\":\"needs-operator\",\"operator\":\"architecture\"}\n```";
-    for output in ["plan", "verdict", "question", "replan-question", "none"] {
+    for (output, enable_living_status) in [
+        ("plan", false),
+        ("plan", true),
+        ("verdict", false),
+        ("verdict", true),
+        ("question", false),
+        ("question", true),
+        ("replan-question", false),
+        ("none", false),
+    ] {
         let mut forge = session_forge(None);
         anchor_plan(&mut forge.replay, "implement", "cgwalters", None);
         let mut settings = session_settings();
         settings["operatorQuestionsOnly"] = json!(true);
         settings["triageFollowUpDays"] = json!(3);
-        let settings = config(settings);
-        let report = apply(&forge, &settings);
+        let report = apply(&forge, &config(settings.clone()));
         assert_eq!(report.failures, 0, "{:?}", report.lines);
         let comments = forge.comments_on("cgwalters-forge/agent-board", 40);
         assert!(
@@ -27751,7 +28389,11 @@ fn operator_questions_session_repair_resumes_next_day() {
         let mut snapshot = usage(&mut forge.replay);
         snapshot["updated_at"] = forge.replay.now.format(&Rfc3339).unwrap().into();
         set_usage(&mut forge.replay, &snapshot);
-        let report = apply(&forge, &settings);
+        let dir = tempfile::tempdir().unwrap();
+        if enable_living_status {
+            settings["livingStatus"] = json!(dir.path().join("status.json"));
+        }
+        let report = apply(&forge, &config(settings));
         assert_eq!(report.failures, 0, "{output}: {:?}", report.lines);
         assert_eq!(
             report.lines.iter().any(|l| l.starts_with(SESSION_START)),

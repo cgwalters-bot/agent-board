@@ -1017,7 +1017,12 @@ Existing issue bodies, sub-issue links, labels and Project writes are unchanged.
 The pass writes the ledger atomically and syncs it before sending each comment
 write. Its existing protocol readers see the saved records, each linked to the
 same public comment. A no-change pass sends no comment write; a new plan or
-dispatch edits that comment. `writes saved by edit: N` counts comment POSTs
+dispatch edits that comment. Triage hold and close receipts are not
+consolidated into it and stay standalone comments: the hold marker is what
+label and assignment release find by comment, and a close receipt is the
+operator's link to reopen, so moving either into the status waits until
+their readers change (agent-board#880).
+`writes saved by edit: N` counts comment POSTs
 replaced by PATCHes, **not** API requests avoided: edits still consume the existing
 write and request caps, and the normal overhead counts their actual HTTP methods.
 Discovery uses the existing bounded comment scan. Failed public edits remain pending in the
@@ -1060,7 +1065,16 @@ the ledger.
 After a complete history read, authenticated bot-owned, self-contained dispatch
 records, fenced epic-apply receipts and valid job plans are copied verbatim into
 the ledger, with their original URLs and timestamps. This preserves logical plan
-identities and full replay guards, not just the last displayed prose. Missing edit
+identities and full replay guards, not just the last displayed prose. An archived
+dispatch alone cannot establish a public verdict boundary. With living status,
+verdict follow-up requires the standalone receipt in the live comment scan and
+no competing dispatch after it or without a live position. An absent or ambiguous
+boundary keeps the normal no-result retry after `triageFollowUpDays`; it does
+not make a saved receipt authority to label or close, even when the plan was
+withdrawn. Session batches likewise need a live standalone dispatch boundary;
+expansion can show that a session ran without proving a batch came from it, so
+the pass refuses `sessions.apply` with `livingStatus` rather than start
+sessions whose batches it could never apply. Missing edit
 facts, unknown/foreign editors, mixed protocols and unrecognized or malformed
 records are not admitted. Historical job plans need a strictly newer trusted plan;
 ambiguous plan evidence holds plan cleanup. The current plan and authoritative
@@ -1123,12 +1137,15 @@ durable `livingStatus` path and set `cleanupHistory` to `true` only after adopti
 this revision and reviewing preview candidates. No caller configuration,
 credentials, permissions or agent-output mutation authority is changed here.
 
-Agent-board#880 remains open for caller activation, the conservative exclusions
-above, and agentic-job/agenthome run-findings and verdict integration. This does
-not change agentic-job run hand-backs or publish findings/triage verdicts into the
-status. Forgejo refuses both options. Caller activation for living status:
-`cgwalters-forge/tracker`, `.github/pass.json`, set `livingStatus` to
-`.state/living-status.json`; applying passes must still be serialized.
+Agent-board#880 remains open for caller activation, the exclusions above,
+consolidating hold receipts, first status publication recovery, and a checked
+private verdict handoff from agentic-job. Triages and revisits launched into the
+ledger can post a plan or new prose for a human, but not a machine verdict for
+the pass to act on. They are asked not to post anything for an unchanged result
+and cannot edit the pass's comment through this feature. Forgejo refuses both
+options. Keep `livingStatus` unset in `cgwalters-forge/tracker`'s
+`.github/pass.json` until first publication recovery and checked verdict handoff
+are ready. Its intended value is `.state/living-status.json`.
 
 The supervisor's public epic-health census reports an explicit warning for these
 issues: it cannot infer machine progress from prose without the pass's ledger.
@@ -4203,7 +4220,7 @@ for a change or the operator (`hold …: triage verdict partly, URL; nothing
 changed since its triage, triaged again once something does, or once
 OPERATOR comments`).
 
-With `triageReplans` (0–10, off at 0, needs `triageFollowUpDays`), the
+For standalone dispatches, `triageReplans` (0–10, off at 0, needs `triageFollowUpDays`) means the
 issue is instead triaged again once that wait passes, changed or not, at
 most that many times in a row (`hold …: triaged again from T, or once
 OPERATOR comments`, then `start triage …`, the brief asking again); an
@@ -4220,11 +4237,32 @@ the pools are under pace: of the 34 `triage-cooldown` holds of tracker's
 pass 43003938732, 32 were such verdicts (18 `partly`, 10 `not-done`), 22
 of them past their day with nothing changed (agent-board#864). Each
 re-request spends a triage run, so the bound is low, and the backoff
-between them stands. Caller settings in `cgwalters-forge/tracker`: set
-`.github/pass.json`'s `triageReplans` to `2`. With no verdict, where the run may have
-failed, the issue is triaged again `triageFollowUpDays` after the record,
+between them stands. With no verdict on a standalone dispatch, where the run
+may have failed, the issue is triaged again `triageFollowUpDays` after the record,
 changed or not, as is one whose triage plan predates this and carries no
 fingerprint.
+
+For a dispatch written to the ledger, `triageReplans` does not override the
+fingerprint check. The pass compares the plan fingerprint even without a verdict:
+silence can be an intentional no-op. Without a fingerprint it retries at the
+normal time to establish a baseline. Skipping that retry needs a recorded start
+that names its run, and once the wait
+passes, one read of that run (`GET actions/runs/ID`) reporting it succeeded:
+acceptance alone is not a result. A claim whose start was never recorded, as
+when saving it to the status comment failed, a start GitHub did not name the
+run of, and a run that failed, was cancelled or is gone are triaged again
+after the full `triageFollowUpDays`, as without living status; a failed read is that issue's
+error for the pass. An operator comment after the dispatch triages the issue again at once,
+fingerprint or not. A ledger timestamp is not evidence that a public verdict belongs to the
+run, so automatic verdict actions (including operator holds and closes) still
+require a standalone dispatch or the existing earlier-verdict path. For the
+same reason `operatorQuestionsOnly` does not start new session repairs under living
+status. An earlier standalone repair can still complete on its verdict or a
+trusted replacement plan. Explicit failure recovery still has its own
+checks. Weekly revisits retain their separate maximum wait; one written to the
+ledger uses the fingerprint even when silent once its run is read as
+succeeded in the same way, while a standalone revisit needs a verdict after its
+matching dispatch receipt, not just after the plan.
 
 An issue triaged before the pass's own triage, as by a supervisor's
 dispatch, can already carry a verdict. With `triageFollowUpDays`, before a
@@ -6255,7 +6293,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
-| `triageReplans` | GitHub only: a triage that planned nothing is asked to plan again once its wait passes, changed inputs or not, at most this many times (0–10) in a row, after which an unchanged issue waits on the operator, see [scheduling](#scheduling); needs `triageFollowUpDays`; `0` (off) |
+| `triageReplans` | GitHub only, for standalone dispatches: a triage that planned nothing is asked again after its wait, changed inputs or not, at most this many times (0–10) in a row; needs `triageFollowUpDays`; `0` (off) |
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, one refused for news since the verdict waiting as `needs-close`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `readFreeHolds` | GitHub only: apply board-proven holds before assignment reads, leaving request budget for ready candidates; no cached holds or new eligibility; `false` |

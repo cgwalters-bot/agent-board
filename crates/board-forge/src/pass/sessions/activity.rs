@@ -15,12 +15,15 @@ const FIELDS: &str = r#"
     }
 "#;
 
-pub(super) fn query() -> String {
-    plan::COMMENTS_QUERY.replacen(
-        "    issue(number:",
-        &format!("{FIELDS}    issue(number:"),
-        1,
-    )
+pub(super) fn query() -> &'static str {
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        plan::COMMENTS_QUERY.replacen(
+            "    issue(number:",
+            &format!("{FIELDS}    issue(number:"),
+            1,
+        )
+    });
+    &QUERY
 }
 
 pub(super) fn read(
@@ -36,7 +39,7 @@ pub(super) fn read(
             if self.observed.borrow().is_some() {
                 return self.client.graphql(original, variables);
             }
-            let data = self.client.graphql(&query(), variables)?;
+            let data = self.client.graphql(query(), variables)?;
             let repo = &data["repository"];
             ensure!(
                 repo["sessionIssues"]["nodes"].is_array()
@@ -130,7 +133,7 @@ mod tests {
                     if page == 0 {
                         query()
                     } else {
-                        plan::COMMENTS_QUERY.into()
+                        plan::COMMENTS_QUERY
                     }
                 );
                 assert_eq!(

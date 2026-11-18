@@ -1422,6 +1422,21 @@ impl Config {
         )
     }
 
+    /// Option combinations living status cannot honour.
+    fn check_living_status(&self) -> Result<()> {
+        ensure!(
+            !self.cleanup_history || self.living_status.is_some(),
+            "cleanupHistory requires livingStatus"
+        );
+        // A ledger dispatch has no comment boundary to bind a session's batch
+        // to, so each started session's batch would be dropped unapplied.
+        ensure!(
+            self.living_status.is_none() || !self.sessions.as_ref().is_some_and(|s| s.apply),
+            "sessions.apply cannot be combined with livingStatus"
+        );
+        Ok(())
+    }
+
     fn intakes(&self, repository: &str) -> bool {
         self.issue_intake
             && self
@@ -1458,10 +1473,7 @@ impl Config {
             config.pools = source_pools(text)?;
             config
         };
-        ensure!(
-            !config.cleanup_history || config.living_status.is_some(),
-            "cleanupHistory requires livingStatus"
-        );
+        config.check_living_status()?;
         // A rebuild replaces the store's file, which must not be another's.
         if let Some(store) = &config.store {
             ensure!(!store.is_empty(), "store must name a file");
@@ -4145,8 +4157,8 @@ impl<C: Rest + Transport> Transport for Budget<'_, C> {
         self.spend_graphql(mutation, query)?;
         let mut data =
             self.graphql_spent(mutation, self.inner.graphql(query, variables.clone()))?;
-        if query == plan::COMMENTS_QUERY
-            && let Some(store) = self.bounds.living.borrow_mut().as_mut()
+        if let Some(store) = self.bounds.living.borrow_mut().as_mut()
+            && (query == plan::COMMENTS_QUERY || query == sessions::activity_query())
         {
             store.expand(&variables, &mut data)?;
         }
@@ -4548,10 +4560,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds: &Bounds,
 ) -> Result<Report> {
     config.check_pace(now)?;
-    ensure!(
-        !config.cleanup_history || config.living_status.is_some(),
-        "cleanupHistory requires livingStatus"
-    );
+    config.check_living_status()?;
     if let Some(path) = &config.living_status {
         living::check_paths(path, config.state.as_deref())?;
         let mut store = living::Store::load(path, &config.bot, now)?;
@@ -9216,7 +9225,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         brief.push_str(&self.verdict_ask(read.0));
         if config.operator_questions_only {
-            brief.push_str(" Decide engineering details yourself, including plan repair and triage follow-through; never assign the operator. Only a big-picture architectural decision may ask them: state one concrete question on a **Decision needed:** line and put \"operator\":\"architecture\" in the schedule-triage verdict block. A generic request to decide what a verdict means is not an operator question.");
+            let protocol = if config.living_status.is_none() {
+                " and put \"operator\":\"architecture\" in the schedule-triage verdict block"
+            } else {
+                ""
+            };
+            brief.push_str(&format!(" Decide engineering details yourself, including plan repair and triage follow-through; never assign the operator. Only a big-picture architectural decision may ask them: state one concrete question on a **Decision needed:** line{protocol}. A generic request to decide what a verdict means is not an operator question."));
         }
         brief.push_str(plan::VALIDATE_PLAN_JSON);
         if config.midstream.is_some() {
@@ -9266,29 +9280,47 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         )
     }
 
-    /// What a triage brief adds with [`Config::triage_follow_up_days`]: the
-    /// verdict [`Self::follow_up`] reads, with optional caller policy. Nothing
-    /// without it.
+    /// Ask for prose or silence for ledger triage and revisits, and for the
+    /// legacy public verdict only when standalone follow-up is configured.
     fn verdict_ask(&self, facts: &Facts) -> String {
+        const ACTIVE: &str = " If the work is already in an open pull request, link it and report waiting on that PR, without adding needs-human or posting another implement plan.";
         let active = if self.config.skip_active_work {
-            " If the work is already in an open pull request, link it and report waiting on that PR, without adding needs-human or posting another implement plan. Use not-done rather than needs-operator for that wait."
+            ACTIVE
         } else {
             ""
         };
-        if self.config.triage_follow_up_days == 0 {
-            return active.to_owned();
+        let legacy_wait = if self.config.skip_active_work && self.config.living_status.is_none() {
+            " Use not-done rather than needs-operator for that wait."
+        } else {
+            ""
+        };
+        if self.config.triage_follow_up_days == 0 && self.config.living_status.is_none() {
+            return format!("{active}{legacy_wait}");
         }
         let reserve = self.config.reserve_operator;
-        let harness = self.config.operator_ask.as_ref()
-            .filter(|_| reserve || self.harness_item(facts))
-            .map(|policy| format!(
-                " {} For an operator decision, answer needs-operator and add \"operator\" to the same JSON block, one of: {}.",
-                policy.text, policy.domains.join(", ")
-            )).unwrap_or_default();
+        let policy = self
+            .config
+            .operator_ask
+            .as_ref()
+            .filter(|_| reserve || self.harness_item(facts));
         let promoted = match self.config.fix_plans {
             true => format!("{PROMOTED}{NO_UPSTREAM_COMMENT}"),
             false => String::new(),
         };
+        if self.config.living_status.is_some() {
+            let question = policy.map_or("", |policy| policy.text.as_str());
+            let bar = if reserve { OPERATOR_BAR } else { "" };
+            return format!(
+                "{promoted} If you have no new actionable information and no plan, post nothing. \
+                 If there is a new finding but no plan, report it in one short prose comment \
+                 for a human; do not post a {TRIAGE_FENCE} block or edit the board pass's status comment. \
+                 {question}{bar}{active}"
+            );
+        }
+        let harness = policy.map(|policy| format!(
+                " {} For an operator decision, answer needs-operator and add \"operator\" to the same JSON block, one of: {}.",
+                policy.text, policy.domains.join(", ")
+            )).unwrap_or_default();
         let (asking, bar) = match reserve {
             true => ("needs-operator", OPERATOR_BAR),
             false => ("needs-design or needs-operator", ""),
@@ -9302,16 +9334,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
              partly, not-done or {FOLLOW_THROUGH_VERDICT} (only mechanical follow-through \
               remains and you could not plan it). With {asking}, put the one \
              decision wanted and its options on one line starting \"{DECISION_PREFIX}\", which the \
-             pass puts to the operator.{harness}{bar}{active}"
+             pass puts to the operator.{harness}{bar}{active}{legacy_wait}"
         )
     }
 
     /// A triage plan dispatched already, whose run has ended (one in flight
     /// holds the issue before this), followed up by the newest verdict the
-    /// bot posted after its record ([`Self::newest_verdict`]), so that a
-    /// visitor's comment cannot close, label or triage the issue. A comment
-    /// by a writer after an asking verdict, followed by removal of the hold
-    /// label, answers it and triages the issue again with that context.
+    /// bot posted after its standalone record ([`Self::newest_verdict`]), so
+    /// that a visitor's comment cannot close, label or triage the issue. A
+    /// ledger dispatch uses only the input fingerprint for timed follow-up,
+    /// once its run is read as succeeded ([`Self::run_succeeded`]). A
+    /// comment by a writer after an asking verdict, followed by removal of
+    /// the hold label, answers it and triages the issue again with that
+    /// context.
     /// Else [`Self::act_on_verdict`] closes the issue, or labels it
     /// [`NEEDS_HUMAN`], which holds it until a person removes the label.
     /// [`FOLLOW_THROUGH_VERDICT`] holds nothing: it is triaged again at
@@ -9334,8 +9369,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let config = self.config;
         let (facts, comments) = read;
         let writers = self.writers();
-        let after = comments.iter().position(|c| c.url == record.url);
-        let later = &comments[after.map_or(comments.len(), |n| n + 1)..];
+        let origin = self.dispatch_origin(&facts.issue, record);
+        let ledger_dispatch = origin == living::Origin::Ledger;
+        let tail = self.standalone_tail(&facts.issue, origin, comments, record);
+        let no_boundary = tail.is_none();
+        let later = tail.unwrap_or_default();
         let verdict = self.newest_verdict(later);
         let (since, rest, said) = match &verdict {
             Some((n, c, verdict)) => (
@@ -9346,7 +9384,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             None => (
                 record,
                 later,
-                format!("its triage, {}, gave no verdict", record.url),
+                if no_boundary {
+                    format!("its triage, {}, has no checked verdict", record.url)
+                } else {
+                    format!("its triage, {}, gave no verdict", record.url)
+                },
             ),
         };
         if config.operator_questions_only
@@ -9359,6 +9401,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return self.triage(read, AGAIN, (snapshot, target, slots));
         }
         let operator = [config.operator.as_str()];
+        // Operator direction may request a fresh triage, not act as a run
+        // verdict. Use the actual comment creation time, not synthetic
+        // ledger position or an edit to an older conversation. It does not
+        // wait for the input fingerprint's cooldown either: the hold says
+        // the issue is triaged again once the operator comments.
+        if no_boundary
+            && comments.iter().any(|c| {
+                c.created > record.created && plan::written_by(c, config.operator.as_str())
+            })
+        {
+            return self.triage(read, AGAIN, (snapshot, target, slots));
+        }
         if let Some((_, c, verdict)) = &verdict
             && verdict == "needs-issue"
             && let Some(answer) = (self.verdict_answers(c, rest).into_iter())
@@ -9378,6 +9432,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         // A verdict that asks no one waits for the operator's word, too.
         if verdict.as_ref().is_none_or(|(_, _, v)| !self.asks(v))
+            && !no_boundary
             && rest.iter().any(|c| is(c.author.as_deref(), &operator))
         {
             return self.triage(read, AGAIN, (snapshot, target, slots));
@@ -9452,8 +9507,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }));
         }
         let days = time::Duration::days(config.triage_follow_up_days as i64);
-        // Without a verdict the run may have failed: retried after the days.
-        let carried = carried(&from.body).filter(|_| verdict.is_some());
+        // A ledger-backed triage can deliberately leave no new verdict, but
+        // only a run GitHub names, once its wait passes, as succeeded
+        // ([`Self::run_succeeded`]) makes that silence a result. A claim
+        // whose start was never recorded, as when saving it to the status
+        // comment failed, may not have reached the workflow; a run that
+        // failed, was cancelled or cannot be read may not have triaged at
+        // all: each keeps the timed retry.
+        let named = epics::record_run(&record.body)
+            .filter(|_| ledger_dispatch && plan::dispatch_started(&record.body));
+        let carried = carried(&from.body).filter(|_| named.is_some() || verdict.is_some());
         // The triages in a row before this that planned nothing, each
         // asked by the pass; the first ask is not one.
         let planned = |c: &&plan::Comment| {
@@ -9468,25 +9531,49 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     || replan.is_some_and(|s| c.body.starts_with(s))
             })
             .count();
-        let wait = match carried {
-            None => days,
-            Some(_) => {
-                let wait = backoff(FOLLOW_UP_SECONDS, again, days.whole_seconds());
-                time::Duration::seconds(wait)
+        let short_wait =
+            time::Duration::seconds(backoff(FOLLOW_UP_SECONDS, again, days.whole_seconds()));
+        // The short cooldown belongs to a verdict or a successful quiet
+        // run. A failed or missing run still gets the full no-result wait.
+        let full_due = since.changed + days;
+        let mut due = since.changed + if carried.is_some() { short_wait } else { days };
+        let mut quiet = false;
+        let mut checked_inputs = false;
+        if let Some((run, carried)) = named.zip(carried)
+            && self.now >= due
+        {
+            // Once both waits have elapsed, changed inputs already justify
+            // retrying without reading the old run.
+            if self.now >= full_due {
+                if self.inputs(facts, comments)? != carried {
+                    return self.triage(read, AGAIN, (snapshot, target, slots));
+                }
+                checked_inputs = true;
             }
-        };
+            quiet = self.run_succeeded(target, run)?;
+            if !quiet {
+                due = full_due;
+            }
+        }
         // With `triageReplans`, a triage that planned nothing is asked
         // again once its wait passes, changed inputs or not, that many
         // times in a row; then the issue waits on the operator or a change
         // (agent-board#864). Without it, an unchanged issue waits for a
         // change or the operator (agent-board#383).
-        let replans = config.triage_replans as usize;
+        let replans = if ledger_dispatch {
+            0
+        } else {
+            config.triage_replans as usize
+        };
         let replanned = carried.is_some() && replans > 0 && again < replans;
-        let due = since.changed + wait;
         let from_due = due.format(&Rfc3339).unwrap_or_default();
         let operator = &config.operator;
         if self.now < due {
             let changed = match carried {
+                Some(_) if verdict.is_none() && due < full_due => {
+                    " if its run succeeded and anything changed"
+                }
+                Some(_) if verdict.is_none() => "",
                 Some(_) if !replanned => " if anything changed",
                 Some(_) | None => "",
             };
@@ -9498,7 +9585,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         if let Some(carried) = carried
             && !replanned
-            && self.inputs(facts, comments)? == carried
+            && (verdict.is_some() || quiet)
+            && (checked_inputs || self.inputs(facts, comments)? == carried)
         {
             if replans > 0 {
                 let decision = if config.operator_questions_only {
@@ -9524,6 +9612,73 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)));
         }
         self.triage(read, AGAIN, (snapshot, target, slots))
+    }
+
+    fn dispatch_origin(&self, issue: &ItemRef, record: &plan::Comment) -> living::Origin {
+        if plan::foreign_edit(record, &self.writers()) || run_output(&record.body) {
+            return living::Origin::Unknown;
+        }
+        self.client
+            .bounds
+            .living
+            .borrow()
+            .as_ref()
+            .map_or(living::Origin::Comment, |store| {
+                store.dispatch_origin(issue, record)
+            })
+    }
+
+    fn is_dispatch_receipt(comment: &plan::Comment, writers: &[&str]) -> bool {
+        is(comment.author.as_deref(), writers)
+            && comment.body.strip_prefix("<!-- ").is_some_and(|body| {
+                body.strip_prefix(plan::DISPATCH_MARKER)
+                    .is_some_and(|body| body.starts_with(": "))
+            })
+    }
+
+    /// Archives prevent replay, but cannot establish a verdict boundary. A
+    /// different dispatch with no live position could have produced any later
+    /// verdict (even when its plan is gone). In a mixed history, only use the
+    /// live tail of a standalone receipt if every other dispatch is visibly
+    /// before it. Do not truncate the tail: close and reply guards read it too.
+    fn standalone_tail<'c>(
+        &self,
+        issue: &ItemRef,
+        origin: living::Origin,
+        comments: &'c [plan::Comment],
+        record: &plan::Comment,
+    ) -> Option<&'c [plan::Comment]> {
+        if origin != living::Origin::Comment {
+            return None;
+        }
+        let after = comments.iter().position(|c| std::ptr::eq(c, record))?;
+        if self.config.living_status.is_some() {
+            let writers = self.writers();
+            if comments.iter().enumerate().any(|(n, other)| {
+                n != after
+                    && Self::is_dispatch_receipt(other, &writers)
+                    && (n > after || self.dispatch_origin(issue, other) != living::Origin::Comment)
+            }) {
+                return None;
+            }
+        }
+        Some(&comments[after + 1..])
+    }
+
+    /// Whether GitHub reports the caller run `id` as succeeded: the evidence
+    /// that a quiet ledger dispatch ran to completion. A failed, cancelled
+    /// or missing (expired or deleted) run is not success, and any
+    /// other failed read is the candidate's error.
+    fn run_succeeded(&self, target: &Target, id: u64) -> Result<bool> {
+        let url = format!("{API_ROOT}repos/{}/actions/runs/{id}", target.caller);
+        let run = match self.client.get(&url, None) {
+            Ok(run) => run,
+            Err(error) if error.is::<crate::github::NotFound>() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(run.status == 200
+            && run.body["id"].as_u64() == Some(id)
+            && text(&run.body, "/conclusion") == "success")
     }
 
     /// With [`TriageScope::Epics`], the hold of a candidate outside every
@@ -10016,6 +10171,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let days = self.config.triage_follow_up_days;
         if days == 0 {
             return Ok(None);
+        }
+        // A removed status comment can withdraw its plan while leaving the
+        // receipt. The no-plan path must not treat that run's verdict as
+        // earlier, independent triage.
+        if self.config.living_status.is_some() {
+            let writers = self.writers();
+            if comments
+                .iter()
+                .any(|c| Self::is_dispatch_receipt(c, &writers))
+            {
+                return Ok(None);
+            }
         }
         let Some((n, c, verdict)) = self.newest_verdict(comments) else {
             return Ok(None);

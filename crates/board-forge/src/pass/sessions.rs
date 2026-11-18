@@ -28,8 +28,7 @@ mod activity;
 
 const REPAIR: &str = "The board pass asks a triage run to repair this session anchor.";
 
-#[cfg(test)]
-pub(super) fn activity_query() -> String {
+pub(super) fn activity_query() -> &'static str {
     activity::query()
 }
 
@@ -645,6 +644,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         }
         let due = sessions.due(self.now)?;
         let writers = self.writers();
+        // Do not start new repairs without a verdict handoff. Completion of
+        // an earlier standalone repair is independent of this admission gate.
+        let repair = config.operator_questions_only && config.living_status.is_none();
         // A writer's comment that anyone else edited is weighed as a plan
         // ([`plan::newest_plan`]) and holds the anchor for a person; one
         // edited before today's due time is an earlier day's (a receipt, a
@@ -664,7 +666,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             let (plan, from) = match plan::newest_plan(&weighed, &writers) {
                 Ok(newest) => newest,
                 Err(error) => {
-                    if config.operator_questions_only
+                    if repair
                         && plan::repairable(&weighed, &writers, &config.bot, PLAN_FENCE).is_some()
                     {
                         if !self.session_admitted(sessions, repo, eligible, (free, remaining)) {
@@ -686,9 +688,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             let id = plan::plan_id(from)?;
             if plan.kind != SESSION_KIND
                 && !(config.operator_questions_only
-                    && self.session_repaired(comments, from, due)?)
+                    && self.session_repaired(anchor, comments, from, due)?)
             {
-                if config.operator_questions_only {
+                if repair {
                     if !self.session_admitted(sessions, repo, eligible, (free, remaining)) {
                         return Ok(None);
                     }
@@ -732,7 +734,21 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 // even when minHours permits multiple session starts in a day.
                 // An expired foreign-edit hold still gives way to a due
                 // replacement, as before; it cannot authorize an old batch.
-                if !eligible || session_apply::answer(comments, &writers, record_id).is_ok() {
+                // An expanded dispatch can establish that a session ran,
+                // but only a live, unambiguous receipt can locate its batch;
+                // the config refuses sessions.apply with livingStatus.
+                let batch_boundary = config.living_status.is_none()
+                    || self
+                        .standalone_tail(
+                            anchor,
+                            self.dispatch_origin(anchor, record),
+                            comments,
+                            record,
+                        )
+                        .is_some();
+                if batch_boundary
+                    && (!eligible || session_apply::answer(comments, &writers, record_id).is_ok())
+                {
                     self.batch(
                         sessions,
                         anchor,
@@ -790,6 +806,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// agent's plan as a session. An older repair authorizes nothing.
     fn session_repaired(
         &self,
+        anchor: &ItemRef,
         comments: &[plan::Comment],
         newest: &plan::Comment,
         due: OffsetDateTime,
@@ -815,7 +832,21 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         }) else {
             return Ok(false);
         };
-        let later: Vec<_> = (comments.iter())
+        if self.config.living_status.is_some()
+            && self
+                .standalone_tail(
+                    anchor,
+                    self.dispatch_origin(anchor, record),
+                    comments,
+                    record,
+                )
+                .is_none()
+        {
+            return Ok(false);
+        }
+        // Keep the session reader's strict creation-time boundary.
+        let later: Vec<_> = comments
+            .iter()
             .filter(|c| c.created > record.created)
             .cloned()
             .collect();

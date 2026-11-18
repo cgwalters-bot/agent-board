@@ -1041,6 +1041,18 @@ struct Ledger {
     entries: BTreeMap<String, Entry>,
 }
 
+/// Where a dispatch comment's GitHub boundary comes from
+/// ([`Store::dispatch_origin`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Origin {
+    /// A standalone receipt as GitHub returned it in the current read.
+    Comment,
+    /// Written to the status ledger, at the pass clock.
+    Ledger,
+    /// No live receipt or known status boundary.
+    Unknown,
+}
+
 pub(super) struct Store {
     path: PathBuf,
     ledger: Ledger,
@@ -1054,6 +1066,8 @@ pub(super) struct Store {
     pub read_only: bool,
     history: BTreeMap<String, Vec<Value>>,
     complete: BTreeSet<String>,
+    // Only standalone receipt revisions actually emitted from GitHub pages.
+    live_dispatches: BTreeMap<String, Vec<plan::Comment>>,
 }
 
 /// A prepared public write. The full machine record is already durable.
@@ -1333,6 +1347,7 @@ impl Store {
             cleanup: false,
             read_only: false,
             history: BTreeMap::new(),
+            live_dispatches: BTreeMap::new(),
             complete: BTreeSet::new(),
         })
     }
@@ -1510,6 +1525,32 @@ impl Store {
             replaced_post: method == "POST" && !created,
             record: Some(index),
         }))
+    }
+
+    /// An archived copy can block replay, but it cannot locate a verdict in
+    /// the live conversation. Use only the exact standalone revision read
+    /// from GitHub or a receipt on a known status comment.
+    pub(super) fn dispatch_origin(&self, issue: &ItemRef, comment: &plan::Comment) -> Origin {
+        let Some(id) = plan::comment_id(&comment.url) else {
+            return Origin::Unknown;
+        };
+        // Writes and discovery may use different casing. A stale alias must
+        // not mask the entry that supplied a saved record and make it look
+        // like a standalone comment.
+        let key = key(issue);
+        let status = self.ledger.entries.iter().any(|(name, entry)| {
+            name.eq_ignore_ascii_case(&key)
+                && (entry.id == Some(id) || entry.references.contains_key(&id))
+        });
+        let live = self
+            .live_dispatches
+            .get(&key.to_ascii_lowercase())
+            .is_some_and(|records| records.contains(comment));
+        match (live, status) {
+            (true, false) => Origin::Comment,
+            (false, true) => Origin::Ledger,
+            _ => Origin::Unknown,
+        }
     }
 
     pub fn finish(&mut self, write: &Write, response: &mut (u16, Value)) -> Result<()> {
@@ -1705,7 +1746,9 @@ impl Store {
             .map(|e| e.records.clone())
             .unwrap_or_default();
         let archived_legacy = previous_records.iter().any(is_split_record);
+        let live_key = key.to_ascii_lowercase();
         if variables["after"].is_null() {
+            self.live_dispatches.remove(&live_key);
             self.discovered.remove(&key);
             self.duplicates.remove(&key);
             self.history.remove(&key);
@@ -1925,6 +1968,7 @@ impl Store {
         }
         // A read immediately after our write may not show the status yet.
         // Keep local claims authoritative even during that visibility window.
+        let mut saved = Vec::new();
         if let Some(entry) = self.ledger.entries.get(&key) {
             // Archived records outlive turning cleanup off; without its
             // complete history, judge them by this page alone.
@@ -1953,7 +1997,7 @@ impl Store {
                     })
                 })
             });
-            expanded.extend(
+            saved.extend(
                 entry
                     .records
                     .iter()
@@ -1972,6 +2016,17 @@ impl Store {
                     .cloned(),
             );
         }
+        for node in &expanded {
+            if kind(text(node, "/body")) == Some("Last dispatch")
+                && let Ok(record) = plan::comment(node)
+            {
+                self.live_dispatches
+                    .entry(live_key.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        expanded.extend(saved);
         *nodes = expanded;
         self.save()?;
         Ok(())

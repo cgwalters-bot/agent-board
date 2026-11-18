@@ -415,26 +415,34 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 return Ok(Step::Hold(Hold::new(HoldKind::Other, why)));
             }
         }
-        // Without a verdict since, the revisit may have failed: retried.
-        let bot = [config.bot.as_str()];
-        let answered = |last: &plan::Comment| {
-            let after = comments.iter().position(|c| c.url == last.url);
-            comments[after.map_or(comments.len(), |n| n + 1)..]
-                .iter()
-                .any(|c| {
-                    let unedited =
-                        (!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &writers);
-                    is(c.author.as_deref(), &bot)
-                        && unedited
-                        && plan::triage_verdict(&c.body).is_some()
-                })
-        };
         if let Some(last) = last
             && let Some(carried) = carried(&last.body)
-            && answered(last)
         {
             let again = last.changed + time::Duration::days(UNCHANGED_DAYS as i64);
-            if self.now < again && self.inputs(due.facts, &comments)? == carried {
+            let id = plan::plan_id(last)?;
+            let records = plan::records(&comments, &writers, &id);
+            // A fingerprint describes inputs, not a result. Bind evidence to
+            // the matching receipt, never to the plan's reused status URL.
+            if self.now < again
+                && let [(_, record)] = records.as_slice()
+                && record.created >= last.changed
+                && self.inputs(due.facts, &comments)? == carried
+                && match self.dispatch_origin(issue, record) {
+                    // Without a verdict, only a finalized start names the run
+                    // whose success may stand in for one.
+                    living::Origin::Ledger => {
+                        plan::dispatch_started(&record.body)
+                            && epics::record_run(&record.body)
+                                .map_or(Ok(false), |run| self.run_succeeded(target, run))?
+                    }
+                    // A trusted verdict after the receipt proves the run,
+                    // even when finalizing the receipt failed.
+                    origin => self
+                        .standalone_tail(issue, origin, &comments, record)
+                        .and_then(|tail| self.newest_verdict(tail))
+                        .is_some(),
+                }
+            {
                 let why = format!(
                     "nothing changed since its revisit, {}; again from {} regardless",
                     last.url,
