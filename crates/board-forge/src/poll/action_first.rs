@@ -1,5 +1,6 @@
 //! Cheap discovery is ordering evidence only; `pull` still authorizes every action.
 use super::*;
+use std::borrow::Cow;
 
 const UPSTREAM_REPOSITORIES: usize = 2;
 
@@ -150,6 +151,18 @@ pub(crate) const SCREEN: &str = r#"query($owner: String!, $name: String!) {
   }
 }"#;
 
+pub(super) fn screen_query(overlap_recovery: bool) -> Cow<'static, str> {
+    // Recordings key GraphQL by query text. Keep the exact ordinary screen
+    // when the diagnostic that needs to reconcile the base is off.
+    if overlap_recovery {
+        SCREEN
+            .replacen("headRefOid updatedAt", "headRefOid baseRefOid updatedAt", 1)
+            .into()
+    } else {
+        SCREEN.into()
+    }
+}
+
 fn ready(p: &Value) -> bool {
     let approved = p["reviewDecision"] == "APPROVED"
         || p["reviews"]["nodes"].as_array().is_some_and(|reviews| {
@@ -176,9 +189,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     fn screen(&mut self, repo: &str) -> Result<Vec<Value>> {
         let (owner, name) = repo.split_once('/').context("repository")?;
         self.spend()?;
+        let query = screen_query(self.config.policy.overlap_recovery_hours.is_some());
         let data = self
             .graphql
-            .graphql(SCREEN, json!({"owner": owner, "name": name}))?;
+            .graphql(&query, json!({"owner": owner, "name": name}))?;
         let pulls = &data["repository"]["pullRequests"];
         ensure!(
             pulls["pageInfo"]["hasNextPage"] == false,
@@ -196,7 +210,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 );
                 // As the REST listing has them, `updated_at` for `quietWaits`.
                 Ok(json!({"number": p["number"], "user": p["author"],
-                "head": {"sha": p["headRefOid"]}, "updated_at": p["updatedAt"],
+                "head": {"sha": p["headRefOid"]}, "base": {"sha": p["baseRefOid"]},
+                "draft": p["isDraft"], "updated_at": p["updatedAt"],
                 "labels": p["labels"]["nodes"],
                 "ready": ready(p) && !self.config.policy.no_merge.iter().any(|r| r.eq_ignore_ascii_case(repo))}))
             })

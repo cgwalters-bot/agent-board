@@ -267,6 +267,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         if self.apply.is_none() {
             self.dispatched += 1;
+            let number = pull["number"].as_u64().unwrap_or_default();
+            self.repair_started(repo, number, Some(head_branch(pull)));
             return Ok(format!(
                 "would start agent triage pool={}",
                 pool.as_deref().unwrap_or("default")
@@ -301,6 +303,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         self.dispatched += 1;
+        self.repair_started(repo, number, Some(head_branch(pull)));
         let mut next = Marker {
             recovery: Some(Recovery {
                 head: head.into(),

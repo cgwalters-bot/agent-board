@@ -330,6 +330,64 @@ grant more fix rounds. Explicit stage-4 `fixPlans` retain their existing policy.
 Stacked multi-issue runs remain deferred until the stacked-output dependencies
 in #750 and agentic-job#3438 are usable. This option does not synthesize stacks.
 
+### Aged overlap recovery (observation only)
+
+When several approved bot pull requests conflict with the base and the cap
+holds their repairs behind one another, fixing them separately can spend
+rounds without reducing the backlog. Set `overlapRecoveryHours: 72` at the
+top level to diagnose this pattern (1–720 hours, absent means off). It needs
+`openPrCap` and a persisted `state`; leave `changeSweepHours` off. Narrowed
+walks skip unchanged PRs, so they cannot maintain the continuous full census
+that cluster aging requires. The oldest repair can still run and a
+ready head can still merge; path overlap by itself is not a deadlock.
+
+The pass uses its existing complete cap census and whole PR decisions for
+public own-space repositories that the pass follows explicitly; a repository
+added only by `authored` is merge-free and never qualifies, so list each one
+to watch under `follow`. It checks branch eligibility for repairs the cap
+would otherwise skip only after the pass's ordinary forge work, using leftover
+request and GraphQL budgets. A rate limit on those checks stops them and
+leaves the observation incomplete, resetting its repository's ages, but does
+not fail the pass; checks skipped for too little budget reset those ages too,
+and are counted in an `overlap recovery: N scope check(s) deferred` line. A pass that merges or
+queues any PR in a repository, or starts a run on one of its open PRs or on
+any PR whose head branch a member shares (a `fixPlans` start through a paired
+upstream PR, say), in any turn including operator-comment intake, resets that repository's ages rather than judging them on
+evidence it has since outdated. It tracks connected groups of two to eight eligible PRs
+against the same default-branch commit, with at least one actual cap wait on a
+member whose paths overlap. Drafts, parked work,
+active rounds and PRs without approval of the current head do not qualify; a
+pending operator review parks a PR only with `assignHolds`, as in the poll.
+Missing or truncated evidence defers the observation. The scan considers up to
+100 open PRs per repository and retains at most 64 groups. Each age starts on
+the first complete observation, not from a PR's creation or update time.
+Membership or head/base changes, an incomplete observation, a pass that saves
+state without reaching the census, or a gap of more than an hour reset the age. A preview can read but does not save this history.
+Hosted callers that project state into a public artifact must preserve the
+`overlap_recovery` map of digests and timestamps; it has no response bodies
+and does not need the credential-scoped response cache. Tracker's current
+`pass-state export` omits it, so setting the option there alone cannot age a
+group across hosted runs.
+Before rolling back to a binary that does not recognize `overlap_recovery`,
+disable the option and remove that map from the saved state (or drop the state
+cache). Disabling the option alone does not remove a previously saved map.
+
+An aged group prints `overlap recovery for #N, #M held: caller must preserve
+ordered commits when opening one checked replacement PR`. Tracker's dispatch
+wrapper pins agentic-job v0.6.14, whose [new-PR handback makes one patch from
+one commit](https://github.com/cgwalters-forge/agentic-job/blob/489c69d53cc23b989131952c9e3ca4d5add4e2b5/docs/safe-outputs.md#what-the-agent-does).
+Its replacement-series output updates an existing PR branch, not a new PR.
+The manually coordinated [#4312 rebuild](https://github.com/cgwalters-forge/agentic-job/issues/4312)
+already landed as [#4313](https://github.com/cgwalters-forge/agentic-job/pull/4313/commits),
+but grouped five source PRs into one commit. It is not evidence of a
+commit-preserving new-PR handback.
+
+Until dispatch can return one independently checked new PR containing the
+ordered source commits and their original messages and trailers, this option
+does not file recovery issues, dispatch work, waive overlap, or close PRs.
+Future writes need a trusted recovery record binding the source heads and the
+accepted replacement PR; a free-text `Supersedes #N` line is not authority.
+
 ## Quiet pull request waits (GitHub)
 
 The concrete failure `pr.quietWaits` stops is the PR walk spending the
@@ -2963,7 +3021,9 @@ retries stops the pass from sending anything more, as more requests only
 prolong a secondary limit: the refused operation fails as usual, the
 requests not sent are left out, and one `rate-limited: …` line says why,
 before the summary, which includes `, rate-limited` before its final effect
-counts. The next pass carries on.
+counts. The next pass carries on. A limit first met by the overlap recovery
+checks, after all ordinary work, adds no failure: its `rate-limited: …` line
+says the census is incomplete, and the summary still says `, rate-limited`.
 `--record FILE` previews live and saves every read as a new fixture. Add
 `--replay SEED` to answer reads the token cannot make, such as a private usage
 snapshot or the broker's `/usage`. A preview counts only the PR runs that stage 2 actually starts, so it

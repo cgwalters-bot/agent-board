@@ -4,6 +4,322 @@ fn recovery_policy() -> PollPolicy {
     policy
 }
 
+/// A pass's share of `left` reads, and the reads made of it in order.
+struct Metered<'a> {
+    fake: &'a Fake,
+    left: Cell<usize>,
+    trace: RefCell<Vec<String>>,
+}
+
+impl Metered<'_> {
+    fn read(&self, what: String) {
+        self.left.set(self.left.get().saturating_sub(1));
+        self.trace.borrow_mut().push(what);
+    }
+}
+
+impl Transport for Metered<'_> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if !query.trim_start().starts_with("mutation") {
+            self.read(variables.to_string());
+        }
+        self.fake.graphql(query, variables)
+    }
+}
+
+impl Rest for Metered<'_> {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        self.read(url.into());
+        self.fake.get(url, validator)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.fake.send(method, url, body)
+    }
+
+    fn share_left(&self) -> Option<usize> {
+        Some(self.left.get())
+    }
+}
+
+#[test]
+fn overlap_recovery_prefilters_scope_checks_by_canonical_repository() {
+    const MIXED_CASE: &str = "cgwalters-forge/Agentic-Job";
+    let fake = github();
+    let mut cfg = config();
+    cfg.policy.overlap_recovery_hours = Some(1);
+    cfg.policy.fix_bounds = bounds::FixBoundsSet::new(vec![bounds::FixBounds::parse(&format!(
+        "repos = [\"{REPO}\"]\n[outputs]\npush_to_pull_request_branch = {{ branches = [\"dispatch/**\"] }}\n"
+    )).unwrap()]);
+    let (owner, name) = MIXED_CASE.split_once('/').unwrap();
+    let pull = pull("pull-470", json!({"headRefName":"outside/470", "headRefOid":"b".repeat(40), "baseRefOid":"a".repeat(40), "isDraft":false}));
+    for (size, undecided, eligible) in [
+        (1, false, true),
+        (1, true, false),
+        (crate::pass::pressure::OLDER_LIMIT + 1, false, false),
+    ] {
+        let mut pass = Pass::new(&fake, &fake, &cfg, now());
+        pass.pressure.open.insert(REPO.into(), vec![Value::Null; size]);
+        pass.pressure.scope_checks.push((MIXED_CASE.into(), (owner.into(), name.into(), 470), pull.clone()));
+        let undecided = undecided.then(|| REPO.to_owned()).into_iter().collect();
+        pass.check_overlap_scope(&undecided, &mut Vec::new());
+        let seen = pass.pressure.recovery.get(REPO).and_then(|repo| repo.get(&470));
+        if eligible {
+            assert!(matches!(seen, Some(overlap_recovery::Observation::Excluded(_))));
+        } else {
+            assert!(seen.is_none());
+        }
+    }
+}
+
+#[test]
+fn overlap_recovery_replay_leaves_existing_steps_and_writes_alone() {
+    use time::Duration;
+    let base = "a".repeat(40);
+    for case in ["off", "aged", "ready", "failing ci", "fix bounds", "disjoint fix bounds", "stale excluded head", "stale draft", "stale hold", "action first quiet", "action first new member", "draft", "old approval", "parked", "active", "claimed", "files truncated", "reviews truncated", "census truncated", "unrelated blocker", "unrelated park", "review holds off", "dependency hold", "dependency closed", "dependency unread", "late dependency hold", "late dependency unread", "late hold", "repair starts", "share boundary", "disjoint merge"] {
+        let mut fake = github();
+        let mut listed = Vec::new();
+        let dependencies = case.starts_with("dependency ");
+        let late_dependency = case.starts_with("late dependency ");
+        let action_first = case.starts_with("action first ");
+        // #474 is a later, landable PR outside the cluster.
+        let last = if matches!(case, "share boundary" | "disjoint fix bounds" | "disjoint merge") { 474 } else if matches!(case, "unrelated park" | "stale excluded head" | "stale draft" | "stale hold") || dependencies || action_first { 473 } else { 472 };
+        for number in 470..=last {
+            let head = format!("{number:040x}");
+            let paths = match number {
+                470 => vec!["a"],
+                471 => vec!["a", "b"],
+                472 => vec!["b"],
+                473 if matches!(case, "stale draft" | "stale hold" | "stale excluded head" | "action first new member") => vec!["a"],
+                _ => vec!["z"],
+            };
+            let selected = number == 470;
+            let failing_ci = number == 471 && case == "failing ci";
+            let branch = if (number == 471 && case == "fix bounds") || (number == 474 && case == "disjoint fix bounds") { format!("outside/{number}") } else { format!("dispatch/{number}") };
+            let draft = (selected && case == "draft") || (number == 473 && case == "stale draft");
+            let labels = if (selected && case == "parked") || (number == 473 && case == "stale hold") { json!([{"name":"hold"}]) } else { json!([]) };
+            let mut p = pull("pull-470", json!({
+                "number":number,"headRefOid":head,"headRefName":branch,"baseRefOid":base,"isDraft":draft,
+                "mergeable":if failing_ci || (number == 474 && matches!(case, "share boundary" | "disjoint merge")) || (selected && case == "ready") { "MERGEABLE" } else { CONFLICTING },
+                "contexts":{"ci":{"conclusion": if failing_ci { "FAILURE" } else { "SUCCESS" }}},
+                "files":{"nodes":paths.iter().map(|path| json!({"path":path,"changeType":"MODIFIED"})).collect::<Vec<_>>(),"pageInfo":{"hasNextPage":selected && case == "files truncated"}},
+                "reviews":{"nodes":[review("APPROVED", user(&config().operator), if selected && case == "old approval" { HEAD } else { &head }, "") ]},
+                "labels":{"nodes":labels},"truncated":{"reviews":selected && case == "reviews truncated"},
+                "body":"Ordinary work.\n\nSupersedes #468\nSupersedes #469"
+            }));
+            p["headRepository"] = json!({"nameWithOwner": format!("{BOT}/repo")});
+            if dependencies || late_dependency {
+                fake.page(&format!("repos/{REPO}/issues/{number}/dependencies/blocked_by?per_page=11"), None, None, json!([]));
+            }
+            if number == 473 && dependencies {
+                p["isCrossRepository"] = json!(false);
+                p["body"] = json!("Depends on: other/repo#12");
+                let issue = match case {
+                    "dependency hold" => Some(json!({"number":12,"state":"open"})),
+                    "dependency closed" => Some(json!({"number":12,"state":"closed","state_reason":"not_planned"})),
+                    _ => None,
+                };
+                if let Some(issue) = issue {
+                    fake.page("repos/other/repo/issues/12", None, None, issue);
+                }
+            } else if number == 473 && case == "action first quiet" {
+                p["mergeable"] = json!("MERGEABLE");
+                p["updatedAt"] = json!("2026-10-12T01:30:00Z");
+                p["reviews"]["nodes"] = json!([review("COMMENTED", job(), &head, WITHHELD)]);
+                fake.page(&format!("repos/{REPO}/actions/runs/{REVIEW_RUN}"), None, None, job_run(&p["headRefOid"]));
+            } else if (number == 473 && !matches!(case, "disjoint fix bounds" | "stale draft" | "stale hold" | "action first new member"))
+                // Without assignHolds the poll does not park a requested review.
+                || (number == 471 && case == "review holds off")
+            {
+                p["reviewRequests"]["nodes"] = json!([{"requestedReviewer":{"login":config().operator}}]);
+            }
+            fake.pulls.insert(number, p);
+            if number != 473 || case != "action first new member" {
+                listed.push(json!({"number":number,"user":{"login":BOT},"head":{"sha":head},"base":{"sha":base},"draft":draft,"labels":labels}));
+            }
+            fake.page(&format!("repos/{REPO}/pulls/{number}/files?per_page=100"), None, None,
+                json!(paths.into_iter().map(|filename| json!({"filename":filename})).collect::<Vec<_>>()));
+            let comments = if selected && case == "active" {
+                fake.page(&format!("repos/{}/actions/runs/7", config().dispatch_repo), None, None, json!({"status":"in_progress"}));
+                json!([{"id":7,"user":{"login":BOT},"body":marker_body(&json!({"rounds":1,"run":7,"sha":head}),"Fix round") }])
+            } else if selected && case == "claimed" {
+                json!([{"id":7,"user":{"login":BOT},"body":format!("<!-- {CLAIM}: {} -->", json!({"from":"none","round":1,"sha":head}))}])
+            } else { json!([]) };
+            fake.page(&format!("repos/{REPO}/issues/{number}/comments?per_page=100"), None, None, comments);
+        }
+        if case == "late dependency hold" {
+            fake.page("repos/other/repo/issues/12", None, None, json!({"number":12,"state":"open"}));
+        }
+        if case == "unrelated blocker" {
+            // The ordinary conservative hold sees an apparent overlap which
+            // the full decisions do not substantiate.
+            fake.page(&format!("repos/{REPO}/pulls/470/files?per_page=100"), None, None, json!([{"filename":"b"}]));
+        }
+        let listing = format!("repos/{REPO}/pulls?state=open&per_page=100");
+        fake.page(&listing, None, None, json!(listed));
+        if case == "census truncated" {
+            fake.rest.get_mut(&format!("{API_ROOT}{listing}")).unwrap().2 = Some(format!("<{API_ROOT}{listing}&page=2>; rel=\"next\""));
+        }
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(DISPATCHES.into(), vec![(200, json!({"workflow_run_id": 1234}))]);
+        let mut cfg = config();
+        cfg.policy.action_first = action_first;
+        cfg.policy.quiet_waits = case == "action first quiet";
+        if action_first {
+            fake.page(&action_first::approved_path(&cfg), None, None, json!({"incomplete_results":false,"total_count":0,"items":[]}));
+        }
+        cfg.policy.open_pr_cap = Some(2);
+        cfg.policy.rebase_rounds = 2;
+        cfg.policy.assign_holds = case == "unrelated park";
+        cfg.policy.hold_dependencies = dependencies || late_dependency;
+        if matches!(case, "fix bounds" | "disjoint fix bounds") {
+            cfg.policy.fix_bounds = bounds::FixBoundsSet::new(vec![bounds::FixBounds::parse(&format!(
+                "repos = [\"{REPO}\"]\n[outputs]\npush_to_pull_request_branch = {{ branches = [\"dispatch/**\"] }}\n"
+            )).unwrap()]);
+        }
+        cfg.policy.overlap_recovery_hours = (case != "off").then_some(1);
+        let admit_repair = matches!(case, "late hold" | "repair starts" | "claimed");
+        if case == "late hold" {
+            fake.hold_after = Some(1);
+        }
+        if case == "share boundary" {
+            // Measure the ordinary walk's reads before #474, then leave it
+            // exactly the walk's margin there: the diagnostic's scope reads
+            // must not take it, and have no share left after it.
+            let metered = |cfg: &Config, left| {
+                let meter = Metered { fake: &fake, left: Cell::new(left), trace: RefCell::default() };
+                let dispatcher = Metered { fake: &dispatcher, left: Cell::new(usize::MAX), trace: RefCell::default() };
+                let caps = caps::Caps::new(caps::Limits {dispatch: Some(0), writes: Some(0), status_changes: None});
+                let outcome = run_capped(&meter, &meter, cfg, State::default(), (&[], &[REPO.to_owned()]), applying(&dispatcher), Some(&caps), now()).unwrap();
+                (outcome, meter.trace.take())
+            };
+            cfg.policy.overlap_recovery_hours = None;
+            let (_, trace) = metered(&cfg, usize::MAX);
+            let before = trace.iter().position(|t| t.contains("/474") || t.contains("\"number\":474")).unwrap();
+            cfg.policy.overlap_recovery_hours = Some(1);
+            let (outcome, _) = metered(&cfg, before + PULL_SHARE_MARGIN);
+            assert!(!outcome.lines.iter().any(|l| l.contains("request share is spent")), "{:?}", outcome.lines);
+            assert!(outcome.lines.iter().any(|l| l.contains(&format!("{REPO}#474"))), "{:?}", outcome.lines);
+            assert!(outcome.state.overlap_recovery.is_empty());
+            // Unlike a repository with no aged cluster, the deferral is said.
+            assert!(outcome.lines.iter().any(|l| l.starts_with("overlap recovery: ") && l.contains(" scope check(s) deferred for lack of budget")), "{:?}", outcome.lines);
+            assert!(fake.writes.borrow().is_empty());
+            continue;
+        }
+        let run = |fake: &Fake, state, at| {
+            let admit_repair = admit_repair || (late_dependency && at > now());
+            let caps = caps::Caps::new(caps::Limits {dispatch: Some(usize::from(admit_repair)), writes: Some(if admit_repair || (case == "disjoint merge" && at > now()) { 8 } else { 0 }), status_changes: None});
+            run_capped(fake, fake, &cfg, state, (&[], &[REPO.to_owned()]), applying(&dispatcher), Some(&caps), at).unwrap()
+        };
+        let new_member = (case == "action first new member").then(|| fake.pulls.remove(&473).unwrap());
+        let mut state = State::default();
+        if case == "action first quiet" {
+            state.bind_responses("same quiet scope");
+        }
+        let first = run(&fake, state, now());
+        if let Some(new_member) = new_member {
+            fake.pulls.insert(473, new_member);
+        }
+        if case == "claimed" {
+            assert!(first.lines.iter().any(|l| l.contains("another pass went first")), "{:?}", first.lines);
+        }
+        if case == "repair starts" {
+            assert!(first.state.overlap_recovery.is_empty());
+            assert_eq!(first.dispatched, 1, "{:?}", first.lines);
+            continue;
+        }
+        // A hosted export carries only the diagnostic history, not cached
+        // responses or the credential scope.
+        let saved = first.state.to_json();
+        let mut projected = json!({"schema":saved["schema"],"interval_seconds":saved["interval_seconds"]});
+        if let Some(history) = saved.get("overlap_recovery") {
+            projected["overlap_recovery"] = history.clone();
+        }
+        if case == "action first quiet" {
+            assert!(first.state.quiet_waits.contains_key(&quiet::key(REPO, 473)), "{:?}", first.lines);
+            projected = saved;
+        }
+        let mut restored = State::from_json(&projected).unwrap();
+        restored.bind_responses(if case == "action first quiet" { "same quiet scope" } else { "cold hosted scope" });
+        if late_dependency {
+            assert_eq!(first.state.overlap_recovery.len(), 1, "{case}: {:?}", first.lines);
+            // The initial decision and take() both see no dependency. The
+            // round's fresh check sees the prerequisites change just in time.
+            fake.read_answers.borrow_mut().insert(
+                format!("{API_ROOT}repos/{REPO}/issues/470/dependencies/blocked_by?per_page=11"),
+                vec![json!([]), json!([]), json!([{"number":12,"repository_url":format!("{API_ROOT}repos/other/repo")}])],
+            );
+        }
+        // Only the second census disagrees with the full PR decision.
+        match case {
+            "stale excluded head" => {
+                let mut rows = fake.rest[&format!("{API_ROOT}{listing}")].3.clone();
+                rows[3]["head"]["sha"] = json!("f".repeat(40));
+                fake.read_answers.borrow_mut().insert(format!("{API_ROOT}{listing}"), vec![rows]);
+            }
+            "stale draft" => fake.pulls.get_mut(&473).unwrap()["isDraft"] = json!(false),
+            "stale hold" => fake.pulls.get_mut(&473).unwrap()["labels"]["nodes"] = json!([]),
+            _ => (),
+        }
+        let second = run(&fake, restored, now() + Duration::hours(1));
+        let line = format!("{REPO}: overlap recovery for #470, #471, #472 held: caller must preserve ordered commits when opening one checked replacement PR");
+        assert!(!first.lines.contains(&line), "{case}");
+        let detected = matches!(case, "aged" | "disjoint fix bounds" | "unrelated park" | "review holds off" | "dependency hold" | "dependency closed" | "action first quiet");
+        if case == "action first quiet" {
+            assert!(second.lines.iter().any(|l| l.contains("quietWaits decided 1 ")), "{:?}", second.lines);
+        }
+        if case == "action first new member" {
+            assert_eq!(first.state.overlap_recovery.len(), 1, "{:?}", first.lines);
+            assert!(second.state.overlap_recovery.is_empty(), "{:?}", second.lines);
+            assert!(second.lines.iter().any(|l| l.starts_with(&format!("{REPO}#473 ")) && l.contains("open-pr-cap: land")), "{:?}", second.lines);
+        }
+        if matches!(case, "stale excluded head" | "stale draft" | "stale hold") {
+            assert_eq!(first.state.overlap_recovery.len(), 1, "{case}: {:?}", first.lines);
+            assert!(second.state.overlap_recovery.is_empty(), "{case}: {:?}", second.lines);
+            if matches!(case, "stale draft" | "stale hold") {
+                assert!(second.lines.iter().any(|l| l.starts_with(&format!("{REPO}#473 ")) && l.contains("open-pr-cap: land")), "{:?}", second.lines);
+            }
+        }
+        if case == "disjoint merge" {
+            // The cluster aged against the base that #474 then moved.
+            assert_eq!(first.state.overlap_recovery.len(), 1, "{:?}", first.lines);
+            assert!(second.lines.iter().any(|l| l.starts_with(&format!("merge {REPO}#474: ")) && l.ends_with(" -> merged")), "{:?}", second.lines);
+            assert!(second.lines.iter().any(|l| l.starts_with(&format!("{REPO}#471 ")) && l.contains("open-pr-cap: land")), "{:?}", second.lines);
+            assert!(second.state.overlap_recovery.is_empty(), "{:?}", second.lines);
+            let writes = fake.writes.borrow();
+            assert!(writes.len() == 1 && writes[0].0.contains("mergePullRequest"), "{writes:?}");
+            assert!(dispatcher.writes.borrow().is_empty());
+            continue;
+        }
+        if case == "disjoint fix bounds" {
+            assert!(second.lines.iter().any(|l| l.starts_with(&format!("{REPO}#474 ")) && l.contains("open-pr-cap: land") && l.contains("#473")), "{:?}", second.lines);
+        }
+        if dependencies {
+            let reason = match case {
+                "dependency hold" => "blocked by other/repo#12",
+                "dependency closed" => "dependency hold: other/repo#12 closed without completion/merge",
+                _ => "dependency hold:",
+            };
+            assert!(second.lines.iter().any(|l| l.starts_with(&format!("{REPO}#473 blocked: {reason}"))), "{case}: {:?}", second.lines);
+        }
+        if late_dependency {
+            assert!(second.lines.iter().any(|l| l.starts_with(&format!("{REPO}#470 ")) && l.contains(if case == "late dependency hold" { "not started: blocked by other/repo#12" } else { "not started: dependency hold:" })), "{case}: {:?}", second.lines);
+            assert!(second.state.overlap_recovery.is_empty(), "{case}");
+        }
+        assert_eq!(second.lines.contains(&line), detected, "{case}: {:?}", second.lines);
+        if matches!(case, "failing ci" | "fix bounds") {
+            assert!(second.lines.iter().any(|l| l.starts_with(&format!("{REPO}#471 ")) && l.contains("wait: open-pr-cap: land")), "{:?}", second.lines);
+            assert!(second.state.overlap_recovery.is_empty());
+        }
+        if detected {
+            assert_eq!(second.state.overlap_recovery.len(), 1);
+            assert!(second.lines.iter().any(|l| l.contains("wait: open-pr-cap: land")));
+        }
+        assert!(dispatcher.writes.borrow().is_empty(), "{case}");
+        assert!(fake.writes.borrow().is_empty(), "{case}: {:?}", fake.writes.borrow());
+    }
+}
+
 #[test]
 fn open_pr_cap_keeps_landing_work_and_serializes_oldest_paths() {
     // The pass's policy and a standalone poll's `openPrCap` decide alike.

@@ -28,6 +28,19 @@ struct Admission {
     previous: Option<(u64, Held)>,
     failed: Vec<String>,
     blockers: Vec<String>,
+    unread: bool,
+}
+
+impl Admission {
+    fn work_hold(&self) -> String {
+        if !self.failed.is_empty() {
+            format!("dependency hold: {}", self.failed.join(", "))
+        } else if !self.blockers.is_empty() {
+            format!("blocked by {}", self.blockers.join(", "))
+        } else {
+            "dependency hold awaits branch update and draft release".into()
+        }
+    }
 }
 
 fn marker(comments: &[Value], bot: &str) -> Result<Option<(u64, Held)>> {
@@ -132,10 +145,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .unwrap_or_default();
         let mut failed = Vec::new();
         let mut blockers = Vec::new();
+        let mut unread = false;
         // Treat malformed declarations and unreadable dependencies as holds,
         // not permission to spend a recovery round on an impossible head.
         match refs {
-            Err(error) => failed.push(format!("dependency declaration: {error:#}")),
+            Err(error) => {
+                unread = true;
+                failed.push(format!("dependency declaration: {error:#}"));
+            }
             Ok(refs) => {
                 if refs.is_empty() && !held.released {
                     failed.push("dependency declarations removed during hold".into());
@@ -171,7 +188,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                             failed.push(format!("{target} closed without completion/merge"))
                         }
                         Ok(None) => blockers.push(target),
-                        Err(error) => failed.push(format!("{target}: {error:#}")),
+                        Err(error) => {
+                            unread = true;
+                            failed.push(format!("{target}: {error:#}"));
+                        }
                     }
                 }
             }
@@ -183,6 +203,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             previous,
             failed,
             blockers,
+            unread,
         }))
     }
 
@@ -194,25 +215,29 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if !self.config.policy.hold_dependencies {
             return Ok(None);
         }
+        let admission = self.fresh_dependency_admission(repo, pull)?;
+        if let Some(admission) = &admission
+            && let Some(number) = pull["number"].as_u64()
+        {
+            self.observe_dependency_hold(repo, number, pull, admission);
+        }
+        Ok(admission.as_ref().map(Admission::work_hold))
+    }
+
+    fn fresh_dependency_admission(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+    ) -> Result<Option<Admission>> {
         let number = pull["number"].as_u64().context("dependency PR number")?;
         let comments = self.paged(
             &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
             true,
         )?;
-        Ok(self
-            .dependency_admission(repo, number, pull, &comments)?
-            .map(|state| {
-                if !state.failed.is_empty() {
-                    format!("dependency hold: {}", state.failed.join(", "))
-                } else if !state.blockers.is_empty() {
-                    format!("blocked by {}", state.blockers.join(", "))
-                } else {
-                    "dependency hold awaits branch update and draft release".into()
-                }
-            }))
+        self.dependency_admission(repo, number, pull, &comments)
     }
 
-    pub(super) fn dependency_hold(
+    pub(super) fn dependency_step(
         &mut self,
         repo: &str,
         number: u64,
@@ -220,17 +245,64 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         comments: &[Value],
         review_turn: bool,
     ) -> Result<Option<PullStep>> {
-        let Some(Admission {
-            previous,
-            failed,
-            blockers,
-        }) = self.dependency_admission(repo, number, pull, comments)?
-        else {
+        if !self.config.policy.hold_dependencies {
+            return Ok(None);
+        }
+        let harness = is_harness(pull, self.config);
+        let admission = if !harness {
+            self.fresh_dependency_admission(repo, pull)?
+        } else if !is_held(pull) && !labelled(pull) {
+            self.dependency_admission(repo, number, pull, comments)?
+        } else {
+            None
+        };
+        let Some(admission) = admission else {
             return Ok(None);
         };
+        self.observe_dependency_hold(repo, number, pull, &admission);
+        if !harness {
+            return Ok(Some((
+                format!("{repo}#{number} blocked: {}", admission.work_hold()),
+                false,
+                None,
+                None,
+            )));
+        }
         if review_turn {
             return Err(PrioritySkip("dependency hold belongs to the ordinary walk").into());
         }
+        self.dependency_hold(repo, number, pull, admission)
+            .map(Some)
+    }
+
+    fn observe_dependency_hold(&mut self, repo: &str, number: u64, pull: &Value, held: &Admission) {
+        if self.config.policy.overlap_recovery_hours.is_none()
+            || text(pull, "/author/login") != self.config.bot
+        {
+            return;
+        }
+        // A decision and its fresh write admission are both evidence. Only
+        // a confirmed hold excludes this head; failed reads defer the census.
+        self.observe_overlap(
+            repo,
+            number,
+            overlap_recovery::Observation::dependency_hold(pull, held.unread),
+        );
+    }
+
+    fn dependency_hold(
+        &mut self,
+        repo: &str,
+        number: u64,
+        pull: &Value,
+        admission: Admission,
+    ) -> Result<PullStep> {
+        let Admission {
+            previous,
+            failed,
+            blockers,
+            ..
+        } = admission;
         let mut held = previous
             .as_ref()
             .map(|(_, h)| h.clone())
@@ -451,7 +523,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             review_bucket: None,
             approval: None,
         });
-        Ok(Some((
+        Ok((
             format!(
                 "{repo}#{number} {action}: {reason}{}{}",
                 if allowed {
@@ -479,7 +551,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     && allowed
                     && (self.apply.is_none() || self.writes > before),
             }),
-        )))
+        ))
     }
 }
 

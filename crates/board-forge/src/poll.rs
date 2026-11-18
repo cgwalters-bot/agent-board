@@ -34,6 +34,7 @@ pub mod drafts;
 pub mod lock;
 pub mod notify;
 mod operator_keys;
+mod overlap_recovery;
 pub mod pace;
 mod publication;
 pub mod quiet;
@@ -42,6 +43,7 @@ pub mod report;
 mod reviews;
 pub mod stale;
 
+pub use overlap_recovery::Seen as OverlapObservation;
 pub use reviews::routed_review_workflow;
 use reviews::{ordinary_reviews, review_key, review_reserves, review_workflow};
 
@@ -686,6 +688,7 @@ pub struct PollPolicy {
     /// `openPrCap`: opt-in repository backpressure on PR follow-up, the
     /// pass's setting or the standalone poll's; no new fix authority.
     pub open_pr_cap: Option<usize>,
+    pub overlap_recovery_hours: Option<u16>,
     /// Avoid parking mechanical queue failures and exhausted work on the operator.
     /// Off by default; two triages and one bounded round grant per PR.
     pub agent_recovery: bool,
@@ -1525,6 +1528,7 @@ impl PollPolicy {
                     anyhow::Ok(cap)
                 })
                 .transpose()?,
+            overlap_recovery_hours: None,
             queue_only_repository: None,
             maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
             merge_queue,
@@ -2023,6 +2027,8 @@ pub struct State {
     /// response scope ([`Self::bind_responses`]), drops them; losing them
     /// costs each pull request one whole read.
     pub quiet_waits: BTreeMap<String, quiet::Quiet>,
+    /// Diagnostic-only age, keyed by the digest of a complete component.
+    pub overlap_recovery: BTreeMap<String, OverlapObservation>,
     /// `repositoriesPerPass`: the followed repository the next pass's
     /// envelope starts from ([`board_core::admission`]); none starts over.
     /// Only an applying pass moves it, and a pass without the option drops
@@ -2152,6 +2158,7 @@ impl State {
                     "operator_direction",
                     "lock_refused",
                     "quiet_waits",
+                    "overlap_recovery",
                     "follow_cursor",
                     "share_cursor",
                     "action_first_cursor",
@@ -2303,6 +2310,7 @@ impl State {
                 .collect::<Result<_>>()?,
         };
         let quiet_waits = quiet::from_json(object.get("quiet_waits"))?;
+        let overlap_recovery = overlap_recovery::from_json(object.get("overlap_recovery"))?;
         let cursor = |key: &str| {
             object
                 .get(key)
@@ -2405,6 +2413,7 @@ impl State {
             operator_direction,
             lock_refused,
             quiet_waits,
+            overlap_recovery,
             follow_cursor,
             share_cursor,
             action_first_cursor,
@@ -2466,6 +2475,9 @@ impl State {
         }
         if !self.quiet_waits.is_empty() {
             state["quiet_waits"] = json!(self.quiet_waits);
+        }
+        if !self.overlap_recovery.is_empty() {
+            state["overlap_recovery"] = json!(self.overlap_recovery);
         }
         if let Some(cursor) = &self.follow_cursor {
             state["follow_cursor"] = cursor.as_str().into();
@@ -5270,15 +5282,62 @@ fn describe(repo: &str, event: &Value, config: &Config) -> Option<String> {
 /// Read-only backpressure observations shared by the pass's poll phases.
 #[derive(Clone, Default)]
 struct Pressure {
+    recovery: BTreeMap<String, overlap_recovery::Observations>,
+    /// Cap waiters whose round scope the overlap diagnostic has yet to check.
+    scope_checks: Vec<(String, (String, String, u64), Value)>,
+    /// Repositories this pass merged or queued a pull request in, or a
+    /// preview would have: their census predates the base it leaves.
+    landed: BTreeSet<String>,
+    /// The repairs this pass started, in any turn, and the head branches a
+    /// run or branch update can push: a census naming either predates them.
+    /// Judged only by the final census, so no later observation hides one.
+    started: Starts,
+    /// The head branch of the pull request [`Pass::pull`] read last.
+    read: Option<Branch>,
     open: BTreeMap<String, Vec<Value>>,
     files: BTreeMap<(String, u64), Option<BTreeSet<String>>>,
     stopped: BTreeMap<(String, u64), bool>,
+}
+
+/// A pull request's head branch: its lowercased repository and ref.
+pub(crate) type Branch = (String, String);
+
+pub(crate) fn head_branch(pull: &Value) -> Branch {
+    (
+        text(pull, "/headRepository/nameWithOwner").to_ascii_lowercase(),
+        text(pull, "/headRefName").to_owned(),
+    )
+}
+
+/// The runs a pass started, or a preview would have: the items each went
+/// out for and, where its start read them, the head branches each can push.
+#[derive(Clone, Default)]
+pub(crate) struct Starts {
+    pub(crate) items: BTreeSet<(String, u64)>,
+    pub(crate) branches: BTreeSet<Branch>,
+}
+
+impl Pressure {
+    /// Runs started on pull requests after their observation, by this poll
+    /// or the enclosing pass: that evidence no longer says a repair stalls.
+    fn started(&mut self, started: &Starts) {
+        self.started.items.extend(
+            started
+                .items
+                .iter()
+                .map(|(repo, number)| (repo.to_ascii_lowercase(), *number)),
+        );
+        self.started
+            .branches
+            .extend(started.branches.iter().cloned());
+    }
 }
 
 /// The result of one pass.
 #[derive(Clone, Default)]
 pub struct Outcome {
     pressure: Pressure,
+    pub(crate) overlap: Option<PendingOverlap>,
     pub(crate) open_pr_counts: BTreeMap<String, usize>,
     pub(crate) approved_read: bool,
     pub(crate) decided: BTreeSet<(String, u64)>,
@@ -5323,6 +5382,46 @@ pub struct Outcome {
     pub unchanged: BTreeMap<String, usize>,
     /// The state to keep for the next pass; its interval is the next gap.
     pub state: State,
+}
+
+/// A hosted poll's census, awaiting checks that may use only the resources
+/// left after the enclosing pass has finished ordinary forge work.
+#[derive(Clone)]
+pub(crate) struct PendingOverlap {
+    pressure: Pressure,
+    history: overlap_recovery::History,
+    followed: BTreeSet<String>,
+}
+
+impl PendingOverlap {
+    pub(crate) fn finish<R: Rest, G: Transport>(
+        self,
+        (rest, graphql): (&R, &G),
+        config: &Config,
+        now: OffsetDateTime,
+        (undecided, started): (&BTreeSet<String>, &Starts),
+        lines: &mut Vec<String>,
+    ) -> overlap_recovery::History {
+        let Some(hours) = config.policy.overlap_recovery_hours else {
+            return BTreeMap::new();
+        };
+        let mut pass = Pass::new(rest, graphql, config, now);
+        pass.pressure = self.pressure;
+        pass.followed = self.followed;
+        // The enclosing pass's final stage owns the remaining budget. A cut
+        // in the PR stage affects only the repositories it left undecided.
+        pass.remaining = usize::MAX;
+        pass.check_overlap_scope(undecided, lines);
+        pass.pressure.started(started);
+        overlap_recovery::advance(
+            &pass.pressure,
+            &self.history,
+            (undecided, lines),
+            (&config.dispatch_repo, &config.operator, &config.bot),
+            hours,
+            now,
+        )
+    }
 }
 
 impl Outcome {
@@ -5867,7 +5966,85 @@ struct FailedJob {
     url: Option<String>,
 }
 
+/// Branch admission fails closed for ordinary rounds. The diagnostic also
+/// needs to know whether the refusal proves ineligibility or leaves it unknown.
+enum RoundScope {
+    Allowed,
+    Excluded(String),
+    Unread(String),
+}
+
+impl RoundScope {
+    fn refusal(self) -> Option<String> {
+        match self {
+            Self::Allowed => None,
+            Self::Excluded(why) | Self::Unread(why) => Some(why),
+        }
+    }
+}
+
 impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
+    fn observe_overlap(&mut self, repo: &str, number: u64, seen: overlap_recovery::Observation) {
+        if self.config.policy.overlap_recovery_hours.is_some() && self.config.ours(repo) {
+            self.pressure
+                .recovery
+                .entry(repo.to_ascii_lowercase())
+                .or_default()
+                .insert(number, seen);
+        }
+    }
+
+    /// Every start of a run that can repair a pull request records it here,
+    /// whichever turn starts it; `branch` where the start read it.
+    fn repair_started(&mut self, repo: &str, number: u64, branch: Option<Branch>) {
+        self.pressure.started(&Starts {
+            items: BTreeSet::from([(repo.to_owned(), number)]),
+            branches: branch
+                .filter(|(at, name)| !at.is_empty() && !name.is_empty())
+                .into_iter()
+                .collect(),
+        });
+    }
+
+    /// The diagnostic's deferred scope reads, on the leftover budget only.
+    /// A confirmed denial excludes one member; unknown scope defers the census.
+    fn check_overlap_scope(&mut self, undecided: &BTreeSet<String>, lines: &mut Vec<String>) {
+        let mut deferred = 0;
+        for (repo, (owner, name, number), pull) in std::mem::take(&mut self.pressure.scope_checks) {
+            if overlap_recovery::eligible_open(
+                &self.pressure,
+                undecided,
+                &repo.to_ascii_lowercase(),
+            )
+            .is_none()
+            {
+                continue;
+            }
+            let left = self.cut.is_none()
+                && self.remaining >= PULL_SHARE_MARGIN
+                && self
+                    .rest
+                    .share_left()
+                    .is_none_or(|left| left >= PULL_SHARE_MARGIN);
+            let observation = if left {
+                match self.round_scope(&repo, (&owner, &name, number), &pull) {
+                    RoundScope::Allowed => continue,
+                    RoundScope::Excluded(_) => overlap_recovery::Observation::excluded(&pull),
+                    RoundScope::Unread(_) => overlap_recovery::Observation::Unread,
+                }
+            } else {
+                deferred += 1;
+                overlap_recovery::Observation::Unread
+            };
+            self.observe_overlap(&repo, number, observation);
+        }
+        if deferred > 0 {
+            lines.push(format!(
+                "overlap recovery: {deferred} scope check(s) deferred for lack of budget; their repositories' ages reset"
+            ));
+        }
+    }
+
     /// A pass that has read and written nothing, with no cache, applies
     /// nothing and follows no repository.
     fn new(rest: &'a R, graphql: &'a G, config: &'a Config, now: OffsetDateTime) -> Self {
@@ -6618,6 +6795,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 return Ok(format!("not started: {why}"));
             }
             self.dispatched += 1;
+            let number = pull["number"].as_u64().unwrap_or_default();
+            self.repair_started(repo, number, Some(head_branch(pull)));
             if let Some(pool) = &pool {
                 self.rest.preview_pool_start(pool);
             }
@@ -6694,6 +6873,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         };
         // Counted once the round is this pass's to start, whatever follows.
         self.dispatched += 1;
+        self.repair_started(repo, number, Some(head_branch(pull)));
         let superseded = marker;
         let mut marker = Marker {
             recovery: carried.recovery.clone(),
@@ -9043,44 +9223,50 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// A read that fails is said too, as [`Self::shared_head`] says its own.
     /// The decoder is looser than apply's, which can only let a round start
     /// that apply then refuses.
-    fn owner_branches(&mut self, head: &str, own: bool) -> Option<String> {
+    fn owner_branches(&mut self, head: &str, own: bool) -> RoundScope {
         if own {
-            return None;
+            return RoundScope::Allowed;
         }
         // The name goes into a path: GitHub's, but checked as any other is.
         if validate_repository(head).is_err() {
-            return Some("its head repository could not be read".into());
+            return RoundScope::Unread("its head repository could not be read".into());
         }
+        let refusal = || {
+            format!(
+                "its head is a branch of {head}, not the bot's fork, and apply pushes there only once {head}'s default branch has {OWNER_BRANCHES} naming it"
+            )
+        };
         let file = match self.get(&format!("repos/{head}/contents/{OWNER_BRANCHES}")) {
-            Ok(file) => Some(file),
-            Err(error) if error.is::<crate::github::NotFound>() => None,
+            Ok(file) => file,
+            Err(error) if error.is::<crate::github::NotFound>() => {
+                return RoundScope::Excluded(refusal());
+            }
             Err(error) => {
-                return Some(format!(
+                return RoundScope::Unread(format!(
                     "{head}'s {OWNER_BRANCHES} could not be read ({error:#})"
                 ));
             }
         };
-        let accepts = file.as_ref().is_some_and(|file| {
-            let content = file["content"].as_str().filter(|_| {
-                file["type"] == "file"
-                    && file["encoding"] == "base64"
-                    && file["size"]
-                        .as_u64()
-                        .is_some_and(|size| size <= OWNER_BRANCHES_MAX as u64)
-            });
-            let bytes = content.and_then(|c| crate::supervise::health::base64_decode(c).ok());
-            bytes.is_some_and(|bytes| {
-                bytes.len() <= OWNER_BRANCHES_MAX
-                    && String::from_utf8_lossy(&bytes)
-                        .split('\n')
-                        .any(|line| line.trim().eq_ignore_ascii_case(head))
-            })
+        let content = file["content"].as_str().filter(|_| {
+            file["type"] == "file"
+                && file["encoding"] == "base64"
+                && file["size"]
+                    .as_u64()
+                    .is_some_and(|size| size <= OWNER_BRANCHES_MAX as u64)
         });
-        (!accepts).then(|| {
-            format!(
-                "its head is a branch of {head}, not the bot's fork, and apply pushes there only once {head}'s default branch has {OWNER_BRANCHES} naming it"
-            )
-        })
+        let Some(bytes) = content.and_then(|c| crate::supervise::health::base64_decode(c).ok())
+        else {
+            return RoundScope::Unread(refusal());
+        };
+        if bytes.len() <= OWNER_BRANCHES_MAX
+            && String::from_utf8_lossy(&bytes)
+                .split('\n')
+                .any(|line| line.trim().eq_ignore_ascii_case(head))
+        {
+            RoundScope::Allowed
+        } else {
+            RoundScope::Excluded(refusal())
+        }
     }
 
     /// Why `pull` gets no round, if its head ref is also the head of an open
@@ -9088,10 +9274,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// round's push would change too, such as an upstream's that only an
     /// approved promote may push to (agent-board#562); or if those could not
     /// all be read, which counts the same.
-    fn shared_head(&mut self, owner: &str, name: &str, number: u64) -> Option<String> {
+    fn shared_head(&mut self, owner: &str, name: &str, number: u64) -> RoundScope {
         let pulls = match self.shared_pulls(owner, name, number) {
             Ok(pulls) => pulls,
-            Err(why) => return Some(why),
+            Err(why) => return RoundScope::Unread(why),
         };
         pulls
             .iter()
@@ -9100,17 +9286,55 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 self.config.policy.handed_over(at)
                     || !self.followed.contains(&at.to_ascii_lowercase())
             })
-            .map(|(at, n)| {
+            .map_or(RoundScope::Allowed, |(at, n)| {
                 let why = if self.config.policy.handed_over(at) {
                     "was handed over to its own maintainer"
                 } else {
                     "this pass does not follow"
                 };
-                format!(
+                let refusal = format!(
                     "its head is also the head of {at}#{}, which {why}",
                     n.unwrap_or_default()
-                )
+                );
+                if validate_repository(at).is_ok() && n.is_some_and(|n| n > 0) {
+                    RoundScope::Excluded(refusal)
+                } else {
+                    RoundScope::Unread(refusal)
+                }
             })
+    }
+
+    /// Reuse the round's branch admission even when the cap masks its action.
+    fn round_scope(
+        &mut self,
+        repo: &str,
+        (owner, name, number): (&str, &str, u64),
+        pull: &Value,
+    ) -> RoundScope {
+        let author = text(pull, "/author/login");
+        if let Some(why) =
+            self.config
+                .policy
+                .fix_bounds
+                .refusal(repo, author, text(pull, "/headRefName"))
+        {
+            return RoundScope::Excluded(why);
+        }
+        if self.config.policy.owner_branches {
+            let cross = pull["isCrossRepository"].as_bool().unwrap_or(false);
+            let own = cross
+                && text(pull, "/headRepositoryOwner/login").eq_ignore_ascii_case(&self.config.bot);
+            let head = if cross {
+                text(pull, "/headRepository/nameWithOwner")
+            } else {
+                repo
+            };
+            let scope = self.owner_branches(head, own);
+            if !matches!(scope, RoundScope::Allowed) {
+                return scope;
+            }
+        }
+        self.shared_head(owner, name, number)
     }
 
     /// A branch update on a managed PR can also advance a handed-over PR.
@@ -9304,6 +9528,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // labels here, or after them, so a new stop with no label reads them
         // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
         let mut pull = self.read_pull(owner, name, number)?;
+        let observe_overlap = self.config.policy.overlap_recovery_hours.is_some()
+            && self.config.ours(repo)
+            && !merge_only;
+        if observe_overlap {
+            // Even when the decision exits early, do not fall back to a REST
+            // draft or label that this whole read may have contradicted.
+            self.observe_overlap(repo, number, overlap_recovery::Observation::parked(&pull));
+        }
+        self.pressure.read = Some(head_branch(&pull));
         if priority.is_some() && text(&pull, "/author/login") != self.config.bot {
             return Err(PrioritySkip("fresh PR author is not the configured bot").into());
         }
@@ -9367,6 +9600,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 .is_none_or(|at| self.now - at < time::Duration::seconds(STOP_WRITES_SECONDS))
         {
             let fresh = self.read_pull(owner, name, number)?;
+            if observe_overlap {
+                self.observe_overlap(repo, number, overlap_recovery::Observation::parked(&fresh));
+            }
             if review_only {
                 if fresh["headRefOid"] != pull["headRefOid"] {
                     return Err(
@@ -9383,6 +9619,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // included, is skipped. This narrows the window to the reads between
         // here and the write; it does not close it.
         if pull["state"] != "OPEN" {
+            if observe_overlap {
+                self.observe_overlap(repo, number, overlap_recovery::Observation::Unread);
+            }
             return Ok((
                 format!("{repo}#{number} skip: closed since the list was read"),
                 false,
@@ -9451,6 +9690,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if text(&pull, "/author/login") == self.config.bot
             && let Some(hold) = review_hold(self.config, &pull)
         {
+            if observe_overlap && matches!(hold, ReviewHold::Pending) {
+                self.observe_overlap(repo, number, overlap_recovery::Observation::excluded(&pull));
+            }
             return Ok(self.person_skip(
                 repo,
                 number,
@@ -9459,19 +9701,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 &hold.reason(&pull, &marker),
             ));
         }
-        if self.config.policy.hold_dependencies
-            && !is_harness(&pull, self.config)
-            && let Some(why) = self.dependency_work_hold(repo, &pull)?
-        {
-            return Ok((format!("{repo}#{number} blocked: {why}"), false, None, None));
-        }
-        if self.config.policy.hold_dependencies
-            && is_harness(&pull, self.config)
-            && !is_held(&pull)
-            && !labelled(&pull)
-            && let Some(result) =
-                self.dependency_hold(repo, number, &pull, &comments, review_only)?
-        {
+        if let Some(result) = self.dependency_step(repo, number, &pull, &comments, review_only)? {
             return Ok(result);
         }
         let publication_checks = if !merge_only && !labelled(&pull) {
@@ -9875,11 +10105,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         // A ready head merges past older overlapping work, which then rebases
         // onto it; only work that would fight the older PR waits (#1035).
-        if matches!(
+        let conflict_repair =
+            pull["mergeable"] == CONFLICTING && matches!(decision.action, "fix" | "rebase");
+        let pressure_blocker = if matches!(
             decision.action,
             "fix" | "rebase" | "continue" | "update" | RUN_RERUN
-        ) && let Some(older) = self.pressure_ahead(repo, &pull)?
-        {
+        ) {
+            self.pressure_ahead(repo, &pull)?
+        } else {
+            None
+        };
+        if let Some(older) = pressure_blocker {
             decision = step(
                 "wait",
                 format!("open-pr-cap: land {repo}#{older} first; overlapping paths"),
@@ -9887,30 +10123,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         // Repairs and their triage share the fix scope checks here. The caller
         // independently checks each dispatched kind against its own bounds.
-        let bounds = &self.config.policy.fix_bounds;
         let round = matches!(
             decision.action,
             "fix" | "continue" | "rebase" | "answer" | "triage" | "triage-grant" | RUN_RERUN
         );
-        let mut left = round
-            .then(|| {
-                let author = text(&pull, "/author/login");
-                bounds.refusal(repo, author, text(&pull, "/headRefName"))
-            })
-            .flatten();
-        if round && left.is_none() && self.config.policy.owner_branches {
-            let cross = pull["isCrossRepository"].as_bool().unwrap_or(false);
-            let owner = text(&pull, "/headRepositoryOwner/login");
-            let own = cross && owner.eq_ignore_ascii_case(&self.config.bot);
-            let head = match cross {
-                true => text(&pull, "/headRepository/nameWithOwner"),
-                false => repo,
-            };
-            left = self.owner_branches(head, own);
-        }
-        if round && left.is_none() {
-            left = self.shared_head(owner, name, number);
-        }
+        let scope = round.then(|| self.round_scope(repo, (owner, name, number), &pull));
+        let scope_unread = matches!(scope, Some(RoundScope::Unread(_)));
+        let mut left = scope.and_then(RoundScope::refusal);
         if left.is_none()
             && (decision.action == "update"
                 || (decision.action == "merge" && !queued && pull["mergeStateStatus"] == BEHIND))
@@ -10093,6 +10312,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         } else {
             Ok(None)
         };
+        let no_late_hold = matches!(&hold, Ok(None));
+        let dispatched_before = self.dispatched;
         let done = match (&self.apply, &retarget, &stale) {
             _ if capped || deferred => Ok(held),
             _ if !matches!(hold, Ok(None)) => {
@@ -10168,7 +10389,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     Ok(Some(format!("not re-run: {why}")))
                 } else {
                     let done = self.rerun(dispatcher, (&caller, run), pool, &fix)?;
-                    self.dispatched += usize::from(done == RE_RUN);
+                    if done == RE_RUN {
+                        self.dispatched += 1;
+                        self.repair_started(repo, number, Some(head_branch(&pull)));
+                    }
                     Ok(Some(done))
                 }
             }
@@ -10230,6 +10454,56 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 (Some(_), Some(done)) => !done.starts_with("not "),
                 (Some(_), None) => false,
             };
+        if observe_overlap
+            // Keep a typed dependency hold from the fresh work admission,
+            // rather than inferring eligibility from the rendered result.
+            && !self.pressure.recovery.get(&repo.to_ascii_lowercase()).is_some_and(|seen| {
+                matches!(seen.get(&number), Some(overlap_recovery::Observation::DependencyHold(_)))
+            })
+        {
+            let repair = conflict_repair
+                && (pressure_blocker.is_some() || matches!(decision.action, "fix" | "rebase"))
+                && !stack_step
+                && self.writes == before
+                && self.dispatched == dispatched_before
+                && no_late_hold
+                && answer.is_empty()
+                && !marker.stopped
+                // A claim can predate its run marker. Check the same evidence
+                // the repair uses rather than guessing from its report string.
+                && earliest_claim(&comments, &self.config.bot, &claim_from(&marker)).is_none()
+                && !recovery::pending(&marker)
+                && fix_run.as_ref().is_none_or(|r| r["status"] == "completed")
+                && review_run
+                    .as_ref()
+                    .is_none_or(|r| r["status"] == "completed");
+            let observation = if conflict_repair && scope_unread {
+                overlap_recovery::Observation::Unread
+            } else {
+                overlap_recovery::observe(
+                    repo,
+                    &pull,
+                    self.config,
+                    review_run.as_ref(),
+                    repair,
+                    pressure_blocker,
+                )
+            };
+            // The ordinary decision remains a cap wait. An observation also
+            // needs the scope evidence that taking the repair would require,
+            // which costs reads. Defer them until all ordinary forge work
+            // has finished, not just the PR walk in a hosted pass.
+            if pressure_blocker.is_some()
+                && matches!(observation, overlap_recovery::Observation::Candidate(_))
+            {
+                self.pressure.scope_checks.push((
+                    repo.into(),
+                    (owner.into(), name.into(), number),
+                    pull.clone(),
+                ));
+            }
+            self.observe_overlap(repo, number, observation);
+        }
         self.empty_fix_message = None;
         let mut done = done.map(|d| format!(" -> {d}")).unwrap_or_default();
         if let Some(error) = evidence_error.filter(|_| ran) {
@@ -10313,6 +10587,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             });
         if self.apply.is_none() && ran && decision.action == "merge" {
             self.preview_merges += 1;
+        }
+        if ran && decision.action == "merge" {
+            self.pressure.landed.insert(repo.to_ascii_lowercase());
         }
         if self.apply.is_none() && ran && decision.action == "update" {
             self.updated.insert((repo.to_owned(), base.to_owned()));
@@ -10654,8 +10931,21 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 (Some(listed), _) => {
                     Ok(self.labelled_skip(repo, number, merge_only, (listed, label)))
                 }
-                (None, Some(quiet)) => Ok(quiet),
+                (None, Some(quiet)) => {
+                    if self.config.policy.overlap_recovery_hours.is_some()
+                        && let Some(listed) = listings.get(&number)
+                    {
+                        self.observe_overlap(
+                            repo,
+                            number,
+                            overlap_recovery::Observation::quiet(listed),
+                        );
+                    }
+                    Ok(quiet)
+                }
                 (None, None) => {
+                    let moves = (self.dispatched, self.writes, self.updated.len());
+                    self.pressure.read = None;
                     self.turn_floor = priority.map(|(_, floor)| floor);
                     let read = self.pull(
                         repo,
@@ -10664,6 +10954,14 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                         &mut required,
                     );
                     self.turn_floor = None;
+                    // A run started here, or a branch update (a preview's
+                    // too), can move a branch other followed pull requests
+                    // share, observed before or after this one.
+                    if (self.dispatched, self.writes, self.updated.len()) != moves
+                        && let Some(branch) = self.pressure.read.take()
+                    {
+                        self.pressure.started.branches.insert(branch);
+                    }
                     if priority.is_none() {
                         self.quiet_record(repo, number, listings.get(&number).copied(), &read);
                     }
@@ -10805,6 +11103,9 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     shared_budget: bool,
 ) -> Result<Outcome> {
     let policy = &config.policy;
+    // Only a census that reaches `advance` carries the overlap ages on: any
+    // other return drops them, so the next census cannot span a missed one.
+    let overlap_history = std::mem::take(&mut state.overlap_recovery);
     if let Some(pull) = &policy.pull {
         ensure!(
             follow
@@ -11214,6 +11515,28 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     // Cosmetic cleanup comes last, after locking has spent its budget too.
     pass.fold(&mut outcome.lines);
     pass.maintainer_report(&follow, &mut outcome);
+    let overlap_recovery = if let Some(hours) = policy.overlap_recovery_hours {
+        if shared_budget {
+            outcome.overlap = Some(PendingOverlap {
+                pressure: std::mem::take(&mut pass.pressure),
+                history: overlap_history,
+                followed: std::mem::take(&mut pass.followed),
+            });
+            BTreeMap::new()
+        } else {
+            pass.check_overlap_scope(&outcome.undecided, &mut outcome.lines);
+            overlap_recovery::advance(
+                &pass.pressure,
+                &overlap_history,
+                (&outcome.undecided, &mut outcome.lines),
+                (&config.dispatch_repo, &config.operator, &config.bot),
+                hours,
+                now,
+            )
+        }
+    } else {
+        BTreeMap::new()
+    };
     // What could not be read counts as a change: an API error must not stretch
     // the gap while a pull request may be waiting on it.
     let active = outcome.activity > 0 || outcome.in_flight > 0 || outcome.errors > 0;
@@ -11256,6 +11579,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         operator_direction: pass.operator_direction,
         lock_refused,
         quiet_waits: pass.quiet,
+        overlap_recovery,
         follow_cursor,
         share_cursor,
         action_first_cursor,
@@ -11315,6 +11639,8 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
         reviewing: outcome.reviewing,
         review_runs: std::mem::take(&mut outcome.review_runs),
         review_unread: outcome.review_unread.take(),
+        // The approved turn's census, which this turn's starts can outdate.
+        pressure: std::mem::take(&mut outcome.pressure),
         apply,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps: Some(caps),
@@ -11352,6 +11678,7 @@ pub(crate) fn run_direction_capped<R: Rest, G: Transport>(
     state.intake_refused = pass.intake_refused;
     state.operator_direction = pass.operator_direction;
     outcome.dispatched = pass.dispatched;
+    outcome.pressure = pass.pressure;
     outcome.reviewing = pass.reviewing;
     outcome.review_runs = pass.review_runs;
     outcome.review_unread = pass.review_unread;
@@ -11499,11 +11826,11 @@ pub(crate) fn planned_fix_control<R: Rest, G: Transport>(
         } else {
             repo
         };
-        if let Some(why) = pass.owner_branches(head, own) {
+        if let Some(why) = pass.owner_branches(head, own).refusal() {
             return Err(why);
         }
     }
-    if let Some(why) = pass.shared_head(owner, name, number) {
+    if let Some(why) = pass.shared_head(owner, name, number).refusal() {
         return Err(why);
     }
     if config.ours(repo) {
@@ -15190,13 +15517,17 @@ mod tests {
 
     impl Transport for Fake {
         fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-            if query == action_first::SCREEN {
+            if query == action_first::SCREEN || query == action_first::screen_query(true) {
                 let nodes: Vec<Value> = self
                     .pulls
                     .iter()
                     .map(|(number, pull)| {
                         let mut pull = pull.clone();
                         pull["number"] = json!(number);
+                        if query == action_first::SCREEN {
+                            // The ordinary GraphQL selection does not read this field.
+                            pull.as_object_mut().unwrap().remove("baseRefOid");
+                        }
                         pull
                     })
                     .collect();

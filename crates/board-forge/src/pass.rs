@@ -634,6 +634,8 @@ pub struct Config {
     /// Off unless set: hold new implements at this many open bot PRs in
     /// their destination repository, and land overlapping PRs oldest first.
     pub open_pr_cap: Option<usize>,
+    /// Off unless set: diagnose aged overlap recovery candidates at the cap.
+    pub overlap_recovery_hours: Option<u16>,
     /// Off by default: keep a larger scheduling share before the maintain
     /// and PR sweeps and epic discovery can consume it.
     #[serde(default)]
@@ -1565,6 +1567,20 @@ impl Config {
                 "openPrCap supports GitHub only"
             );
         }
+        if let Some(hours) = self.overlap_recovery_hours {
+            ensure!(
+                (1..=720).contains(&hours),
+                "overlapRecoveryHours must be 1 to 720"
+            );
+            ensure!(
+                self.open_pr_cap.is_some() && self.state.is_some(),
+                "overlapRecoveryHours needs openPrCap and state"
+            );
+            ensure!(
+                self.change_sweep_hours == 0,
+                "overlapRecoveryHours needs a full PR walk; disable changeSweepHours"
+            );
+        }
         if self.issue_intake {
             ensure!(
                 self.github_board().is_some(),
@@ -2188,6 +2204,7 @@ impl Config {
     pub fn poll(&self, snapshot: Option<&Value>) -> poll::Config {
         let mut policy = PollPolicy {
             open_pr_cap: self.open_pr_cap,
+            overlap_recovery_hours: self.overlap_recovery_hours,
             fix_caller_workflow: Some(self.dispatch_workflow.clone()),
             assign_holds: self.assign_holds,
             merge_authors: self.pr.merge_authors.clone(),
@@ -2921,10 +2938,11 @@ enum Stage {
     Status,
     Holds,
     Cost,
+    OverlapRecovery,
 }
 
 impl Stage {
-    const ALL: [Stage; 10] = [
+    const ALL: [Stage; 11] = [
         Stage::Setup,
         Stage::Changes,
         Stage::Usage,
@@ -2935,6 +2953,7 @@ impl Stage {
         Stage::Status,
         Stage::Holds,
         Stage::Cost,
+        Stage::OverlapRecovery,
     ];
 
     fn name(self) -> &'static str {
@@ -2949,6 +2968,7 @@ impl Stage {
             Stage::Status => "status",
             Stage::Holds => "holds",
             Stage::Cost => "cost",
+            Stage::OverlapRecovery => "overlap recovery",
         }
     }
 }
@@ -2970,6 +2990,9 @@ struct Bounds {
     publication_runs: RefCell<Option<Option<BTreeMap<u64, Value>>>>,
     publication_pending: RefCell<Vec<String>>,
     publication_summary_cursor: RefCell<Option<String>>,
+    /// The saved overlap ages, held apart from the state so that only stage
+    /// 2's census carries them on and every early return drops them.
+    overlap_history: RefCell<BTreeMap<String, poll::OverlapObservation>>,
     /// Physical requests, including conditional reads refunded elsewhere.
     publication_requests: Cell<usize>,
     /// The percentage of [`Self::limit`] they may be ([`Config::holds_share`]).
@@ -3011,9 +3034,10 @@ struct Bounds {
     /// With requestShare, stop GraphQL once its observed/estimated points
     /// reach this share. The last query can overshoot: cost is post-execution.
     graphql_limit: Cell<Option<u64>>,
-    /// The breaker: why a refusal under a rate limit outlasted its wait,
-    /// after which nothing more is sent, and how many requests were not.
-    rate_limited: RefCell<Option<String>>,
+    /// The breaker: why a refusal under a rate limit outlasted its wait and
+    /// the stage under way then, after which nothing more is sent, and how
+    /// many requests were not.
+    rate_limited: RefCell<Option<(String, Stage)>>,
     not_sent: Cell<usize>,
     /// What the stage under way leaves to the stages after it
     /// ([`AFTER_PULL_REQUESTS`], [`AFTER_EPICS`]), or none, and how many of
@@ -3041,6 +3065,7 @@ impl Bounds {
             publication_runs: RefCell::default(),
             publication_pending: RefCell::default(),
             publication_summary_cursor: RefCell::default(),
+            overlap_history: RefCell::default(),
             publication_requests: Cell::new(0),
             publication_share: Cell::new(HOLDS_SHARE),
             cache_enabled: Cell::new(false),
@@ -3254,10 +3279,19 @@ impl Bounds {
     /// `report` with its failures for requests the breaker did not send
     /// replaced by one `rate-limited` line, still a failure: the operation
     /// that tripped it says what it was, and the next pass carries on.
+    /// Tripped by the overlap scope reads, which run after all ordinary
+    /// forge work, it is no failure: only that diagnostic went unfinished.
     fn collapse(&self, report: &mut Report) {
-        let Some(why) = self.rate_limited.borrow().clone() else {
+        let Some((why, stage)) = self.rate_limited.borrow().clone() else {
             return;
         };
+        if stage == Stage::OverlapRecovery {
+            report.lines.push(format!(
+                "rate-limited: {why}; overlap recovery's census is incomplete, {} more request(s) not sent",
+                self.not_sent.get()
+            ));
+            return;
+        }
         report.lines.retain(|line| !line.contains(NOT_SENT));
         let before = report.failed_operations.len();
         report
@@ -3724,7 +3758,7 @@ impl<C> Budget<'_, C> {
             && error.is::<RateLimited>()
         {
             let mut tripped = self.bounds.rate_limited.borrow_mut();
-            tripped.get_or_insert_with(|| format!("{error:#}"));
+            tripped.get_or_insert_with(|| (format!("{error:#}"), self.bounds.stage.get()));
         }
         result
     }
@@ -4604,6 +4638,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     };
     let network_before = network();
     *bounds.responses.borrow_mut() = state.pass_responses.clone();
+    *bounds.overlap_history.borrow_mut() = std::mem::take(&mut state.overlap_recovery);
     let previous = state.clone();
     let preserved_state = scope.as_ref().map(|_| state.clone());
     let caps = Caps::new(limits);
@@ -4779,12 +4814,14 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         progressed: 0,
         not_started: 0,
         schedule_runs: RefCell::default(),
+        started: RefCell::default(),
         free: None,
         top: None,
         follows: config.follow.clone(),
         midstreams: config.midstream.is_none().then(Vec::new),
         released: Cell::new(0),
         followed: None,
+        overlap: None,
         stepped: Vec::new(),
         blocking: RefCell::default(),
         blocked: BTreeSet::new(),
@@ -4799,6 +4836,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         // reads the existing snapshot; WIP/leases still use the full census.
         bounds.enter(Stage::PullRequests);
         scheduler.follow(state, &git_ref, 0);
+        scheduler.finish_overlap();
         return report;
     }
     match scheduler.direction() {
@@ -4903,7 +4941,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if !apply {
         scheduler.observe_decision();
     }
-    // Last, the cost reports. Opted-in sizing covers their requests too;
+    // After ordinary work, the cost reports. Opted-in sizing covers their requests too;
     // the default keeps the historical independent cost-stage allowance.
     if bounds.rate_limited.borrow().is_none() {
         let within = (now, apply, bounds.admit_by);
@@ -4914,6 +4952,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
             cost::stage(unbudgeted, config, within, caps, scheduler.report);
         }
     }
+    scheduler.finish_overlap();
     if let Some(routing) = bounds.routing.borrow_mut().as_mut() {
         report.lines.append(&mut routing.lines);
     }
@@ -5334,6 +5373,23 @@ fn dispatch_attempt<C, D>(dispatch: &lease::Dispatch<'_, C, D>) -> Option<Schedu
     }
 }
 
+/// The dispatch's outcome, or else the step's, a preview's included.
+fn attempt(dispatch: Option<ScheduleAttempt>, step: &Step) -> Option<ScheduleAttempt> {
+    dispatch.or(match step {
+        Step::Started(..) => Some(ScheduleAttempt::Started),
+        Step::Failed(..) => Some(ScheduleAttempt::Failed),
+        _ => None,
+    })
+}
+
+/// Whether a run went out, or may have, or a preview would have started it.
+fn started(dispatch: Option<ScheduleAttempt>, step: &Step) -> bool {
+    matches!(
+        attempt(dispatch, step),
+        Some(ScheduleAttempt::Started | ScheduleAttempt::Unconfirmed)
+    )
+}
+
 /// What stopped a pass's starts.
 #[derive(Clone, Copy)]
 enum Halt {
@@ -5513,6 +5569,11 @@ struct Scheduler<'a, C> {
     progressed: usize,
     not_started: usize,
     schedule_runs: RefCell<Vec<ScheduleRun>>,
+    /// The items a start went out for, or a preview would have started,
+    /// keyed by lowercased repository, and the head branches a fix plan's
+    /// start can push: overlap recovery's evidence is stale for each
+    /// ([`poll::PendingOverlap::finish`]).
+    started: RefCell<poll::Starts>,
     /// Stage 4's candidates free to start ([`holds::free`]), once it
     /// considered them.
     free: Option<usize>,
@@ -5531,6 +5592,7 @@ struct Scheduler<'a, C> {
     /// Stage 2's review waits and the repositories it left undecided
     /// ([`poll::Outcome::waits`]), once it ran.
     followed: Option<(Vec<poll::Wait>, BTreeSet<String>)>,
+    overlap: Option<(poll::Config, poll::PendingOverlap)>,
     /// Stage 2's step for each followed pull request ([`poll::Outcome::steps`]).
     stepped: Vec<poll::Stepped>,
     /// The pull requests stage 4's overlap holds named, and the items each
@@ -6434,6 +6496,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         });
         let follow = &self.follows;
         let deferred_state = state.clone();
+        state.overlap_recovery = self.client.bounds.overlap_history.take();
         let prior = direction.clone();
         match poll::run_capped_after_direction(
             &self.client,
@@ -6453,6 +6516,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 outcome.undecided.extend(waiting);
                 outcome.state.authored_cursor = cursor;
                 self.changes_walked(&mut outcome);
+                self.overlap = outcome.overlap.take().map(|pending| (poll, pending));
                 self.finish_follow(outcome)
             }
             Err(error) if budget_spent(&error) => {
@@ -6536,6 +6600,25 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.followed = Some((outcome.waits, outcome.undecided));
         self.stepped = outcome.steps;
         outcome.dispatched
+    }
+
+    /// Scope reads share the pass's request, point and rate budgets. Run
+    /// them after every ordinary forge stage, including hold and cost reports:
+    /// they must stay the last budgeted work, as a rate limit they meet fails
+    /// no pass ([`Bounds::collapse`]).
+    fn finish_overlap(&mut self) {
+        if let (Some((config, pending)), Some((_, undecided)), Some(state)) =
+            (self.overlap.take(), &self.followed, &mut self.report.state)
+        {
+            self.client.bounds.enter(Stage::OverlapRecovery);
+            state.overlap_recovery = pending.finish(
+                (&self.client, &self.client),
+                &config,
+                self.now,
+                (undecided, &self.started.borrow()),
+                &mut self.report.lines,
+            );
+        }
     }
 
     fn schedule(&mut self, earlier: usize, git_ref: &str) -> Result<()> {
@@ -7937,7 +8020,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         plan: &plan::JobPlan,
         dest: &ItemRef,
         busy: &BTreeMap<String, String>,
-    ) -> std::result::Result<(String, ItemRef), Hold> {
+    ) -> std::result::Result<(String, ItemRef, poll::Branch), Hold> {
         let config = self.config;
         let held = |why: String| {
             Hold::new(
@@ -8073,7 +8156,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 if let Some(why) = refusal {
                     return Err(held(why));
                 }
-                Ok((head.to_owned(), control))
+                // A same-head midstream ledger shares this branch.
+                Ok((head.to_owned(), control, poll::head_branch(&pull)))
             }
         }
     }
@@ -8549,13 +8633,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             );
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
-        let control = if fix {
+        let (control, branch) = if fix {
             match self.fix_plan_head(&id, &plan, &dest, busy) {
-                Ok((_, control)) => Some(control),
+                Ok((_, control, branch)) => (Some(control), Some(branch)),
                 Err(held) => return Ok(Step::Hold(held)),
             }
         } else {
-            None
+            (None, None)
         };
         if !fix && !config.works_in(&dest.repository) {
             let dest = dest.display();
@@ -8712,6 +8796,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return Ok(step);
             }
             self.client.preview_pool_start(&pool);
+            // As apply's start would ([`poll::Starts::branches`]).
+            if let Some(branch) = branch {
+                self.started.borrow_mut().branches.insert(branch);
+            }
             return Ok(self.schedule_attempt(&dest, &pool, None, Step::Started(line, holds)));
         }
         // What the dispatch's own check waives is what the pass reports.
@@ -8751,8 +8839,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         };
+        let branch = head.as_ref().map(|(_, _, branch)| branch.clone());
         let charge = match head {
-            Some((head, control)) => {
+            Some((head, control, _)) => {
                 match self.charge_fix(&chosen, &dest, (&control, &head, &pool), (&line, &holds)) {
                     Ok(charge) => Some(charge),
                     Err(step) => return Ok(self.schedule_attempt(&dest, &pool, None, step)),
@@ -8785,7 +8874,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             charge.refund(&self.client, &self.client, &config.poll(None), self.now)?;
         }
         let step = self.dispatched(line, holds, done);
-        Ok(self.schedule_attempt(&dest, &pool, dispatch_attempt(&dispatcher), step))
+        let attempt = dispatch_attempt(&dispatcher);
+        if let Some(branch) = branch
+            && started(attempt, &step)
+        {
+            self.started.borrow_mut().branches.insert(branch);
+        }
+        Ok(self.schedule_attempt(&dest, &pool, attempt, step))
     }
 
     /// The step for `issue`, whose `plan`'s dispatched `run` failed
@@ -9090,23 +9185,25 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         dispatch: Option<ScheduleAttempt>,
         step: Step,
     ) -> Step {
-        if self.client.bounds.stage.get() == Stage::Schedule {
-            let attempt = dispatch.or(match &step {
-                Step::Started(..) => Some(ScheduleAttempt::Started),
-                Step::Failed(..) => Some(ScheduleAttempt::Failed),
-                _ => None,
+        let attempt = attempt(dispatch, &step);
+        if started(dispatch, &step) {
+            self.started
+                .borrow_mut()
+                .items
+                .insert((item.repository.to_ascii_lowercase(), item.number));
+        }
+        if self.client.bounds.stage.get() == Stage::Schedule
+            && let Some(attempt) = attempt
+        {
+            let account = match self.config.mix.contains_key(pool) {
+                true => mix::account(pool).unwrap_or(pool),
+                false => pool,
+            };
+            self.schedule_runs.borrow_mut().push(ScheduleRun {
+                item: item.display(),
+                pool: account.to_owned(),
+                attempt,
             });
-            if let Some(attempt) = attempt {
-                let account = match self.config.mix.contains_key(pool) {
-                    true => mix::account(pool).unwrap_or(pool),
-                    false => pool,
-                };
-                self.schedule_runs.borrow_mut().push(ScheduleRun {
-                    item: item.display(),
-                    pool: account.to_owned(),
-                    attempt,
-                });
-            }
         }
         step
     }

@@ -2506,7 +2506,7 @@ fn every_counted_failure_is_named_in_the_summary() {
 #[test]
 fn rate_limit_collapse_counts_operations_not_duplicate_diagnostics() {
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
-    *bounds.rate_limited.borrow_mut() = Some("server throttled".into());
+    *bounds.rate_limited.borrow_mut() = Some(("server throttled".into(), Stage::Schedule));
     let mut report = Report::default();
     report.failure("schedule error: server throttled".into());
     report.failure("follow error: connection lost".into());
@@ -2748,7 +2748,7 @@ fn replay_idle_board_starts_work() {
     // classes and the causes: each started candidate's reads are its own,
     // the epics' theirs, and the rest the stage's.
     let spent = &report.spent;
-    assert_eq!(spent.by_stage, [0, 0, 0, 0, 0, 16, 37, 3, 0, 0]);
+    assert_eq!(spent.by_stage, [0, 0, 0, 0, 0, 16, 37, 3, 0, 0, 0]);
     assert_eq!(spent.by_stage.iter().sum::<usize>(), spent.requests);
     assert_eq!(spent.by_class.values().sum::<usize>(), spent.requests);
     assert_eq!(spent.by_cause.values().sum::<usize>(), spent.requests);
@@ -2813,14 +2813,14 @@ fn spent_names_each_stage_that_spent() {
             "requests 0, points 7",
         ),
         (
-            [1, 0, 0, 0, 40, 0, 2, 0, 0, 0],
+            [1, 0, 0, 0, 40, 0, 2, 0, 0, 0, 0],
             true,
             counts(&[]),
             counts(&[]),
             "requests 43 (setup 1, pull requests 40, schedule 2), points ~7",
         ),
         (
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0],
             false,
             counts(&[]),
             counts(&[]),
@@ -2829,14 +2829,14 @@ fn spent_names_each_stage_that_spent() {
         // Most requests first, then by name; the stage's own reads are a
         // cause like a candidate's.
         (
-            [0, 0, 0, 0, 0, 0, 6, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0],
             false,
             counts(&[("issues comments", 2), ("graphql repository.issue", 4)]),
             counts(&[("o/r#2", 2), ("schedule", 2), ("o/r#1", 2)]),
             r#"requests 6 (schedule 6), endpoints {"graphql repository.issue":4,"issues comments":2}, causes {"o/r#1":2,"o/r#2":2,"schedule":2}, points 7"#,
         ),
         (
-            [0, 0, 0, 0, 0, 0, 24, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0],
             false,
             counts(&[("issues", 24)]),
             many.clone(),
@@ -9112,7 +9112,26 @@ fn authored_read_at_its_share_is_deferred() {
     let forge = Forge::new(None, false);
     let without = apply_within(&forge, &config(settings.clone()), 10);
     settings["authored"] = json!(2);
-    let report = apply_within(&forge, &config(settings), 10);
+    // The early return skips the overlap census, so it must not carry the
+    // last census's ages over to the next one.
+    let mut saved = State::default().to_json();
+    saved["interval_seconds"] = json!(poll::MIN_INTERVAL_SECONDS);
+    saved["overlap_recovery"] = json!({"a".repeat(64): {"since": 0, "last": 1}});
+    let within = (
+        State::from_json(&saved).unwrap(),
+        Mode::Actions(&own()),
+        Limits::default(),
+        forge.replay.now,
+    );
+    let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
+    let report = block(run_within(
+        &forge,
+        &forge,
+        &config(settings),
+        within,
+        &Bounds::new(10, admit_by),
+    ))
+    .unwrap();
     let deferred = "budget: pull requests stopped at its share; authored pull requests wait for the next pass: pull requests keeps its last 8 requests for the stages after it";
     assert!(
         report.lines.iter().any(|l| l == deferred),
@@ -9125,12 +9144,191 @@ fn authored_read_at_its_share_is_deferred() {
         report.lines
     );
     assert_eq!(report.failures, without.failures, "{:#?}", report.lines);
-    assert!(report.state.is_some());
+    assert!(report.state.unwrap().overlap_recovery.is_empty());
     // Too small a pass for a start, which stage 4 says once.
     let starved = (report.lines.iter())
         .filter(|l| l.starts_with("budget: the pull request walk used ") && l.contains(" of 10 "))
         .count();
     assert_eq!(starved, 1, "{:#?}", report.lines);
+}
+
+#[test]
+fn overlap_recovery_uses_only_points_left_after_ordinary_work() {
+    const LATER_REPO: &str = "cgwalters-forge/later";
+    let mut cfg = config(
+        json!({"follow": [AUTHORED_REPO], "state": "state.json", "openPrCap": 1,
+        "workRepositories": ["cgwalters-forge/actions"],
+        "requestShare": 50, "pr": {"fixPools": ["claude"], "rebaseRounds": 2}}),
+    );
+    // GitHub refuses the `after`th request on; also returns what reached it.
+    let run = |cfg: &Config, points, after, previous: Option<State>| {
+        let mut forge = Forge::new(None, false);
+        let cut = previous.is_some();
+        if cut {
+            followed(&mut forge.replay, (LATER_REPO, 1), json!({}), json!([]));
+        }
+        let base = "a".repeat(40);
+        let mut listed = Vec::new();
+        for n in 1..=2 {
+            let head = format!("{n:040x}");
+            let committed = forge.replay.now.format(&Rfc3339).unwrap();
+            followed(
+                &mut forge.replay,
+                (AUTHORED_REPO, n),
+                json!({
+                    "headRefOid": head, "baseRefOid": base, "mergeable": "CONFLICTING",
+                    "headRefName": format!("dispatch/implement/agent-run-{n}"),
+                    "headRepository": {"nameWithOwner": "cgwalters-bot/agentic-job"},
+                    "files": {"nodes": [{"path": "README.md", "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": false}},
+                    "reviews": {"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
+                        "commit": {"oid": head}, "submittedAt": committed, "body": "Approved"}], "pageInfo": {"hasPreviousPage": false}},
+                    "commits": {"nodes": [{"commit": {"oid": head, "committedDate": committed, "message": "Do the thing", "statusCheckRollup": null}}]},
+                }),
+                json!([]),
+            );
+            listed.push(
+                json!({"number": n, "draft": false, "user": {"login": "cgwalters-bot"},
+                "head": {"sha": head}, "base": {"sha": base}, "labels": []}),
+            );
+            let shared = graphql_key(
+                poll::SHARED_HEAD_QUERY,
+                &json!({"owner": "cgwalters-forge", "name": "agentic-job", "number": n, "pulls": poll::SHARED_HEAD_READS}),
+            );
+            forge
+                .replay
+                .requests
+                .iter_mut()
+                .find(|entry| entry["request"] == shared)
+                .unwrap()["answer"]["data"]["rateLimit"] = json!({"cost": 1});
+        }
+        for entry in &mut forge.replay.requests {
+            if entry["request"]["get"]
+                == format!("{API_ROOT}repos/{AUTHORED_REPO}/pulls?state=open&per_page=100")
+            {
+                entry["answer"]["body"] = json!(listed);
+            }
+        }
+        forge.replay.requests.extend([
+            json!({"request":{"get":format!("{API_ROOT}user")},
+                "answer":{"status":200,"link":null,"body":{"login":"cgwalters-bot"}}}),
+            json!({"request":{"get":format!("{API_ROOT}repos/{AUTHORED_REPO}/pulls/1/files?per_page=100")},
+                "answer":{"status":200,"link":null,"body":[{"filename":"README.md"}]}}),
+            json!({"request":{"get":format!("{API_ROOT}rate_limit")},
+                "answer":{"status":200,"link":null,"body":{"resources":{
+                    "core":{"remaining":1300,"reset":1700000000},
+                    "graphql":{"remaining":1300,"reset":1700000000}}}}}),
+        ]);
+        let bounds = std::rc::Rc::new(Bounds::new(
+            PASS_REQUEST_LIMIT,
+            Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
+        ));
+        let budget = bounds.clone();
+        // Keep the request headroom fixed; vary only the GraphQL point limit.
+        forge.on_get = Some(Box::new(move |url, _| {
+            if url == format!("{API_ROOT}repos/{AUTHORED_REPO}/pulls?state=open&per_page=100") {
+                budget.graphql_limit.set(Some(points));
+            }
+            if cut && url == format!("{API_ROOT}repos/{LATER_REPO}/pulls?state=open&per_page=100") {
+                // Stop after the listing, before deciding its first pull.
+                assert_eq!(budget.stage.get(), Stage::PullRequests);
+                assert!(budget.kept.get() > 0);
+                budget.left.set(budget.kept.get() + WRITE_RESERVE);
+            }
+        }));
+        let now = forge.replay.now + time::Duration::hours(i64::from(cut));
+        let forge = Throttled {
+            forge,
+            after,
+            sent: Cell::new(0),
+        };
+        let report = block(run_within(
+            &forge,
+            &forge,
+            cfg,
+            (
+                previous.unwrap_or_default(),
+                Mode::Actions(&own()),
+                Limits {
+                    dispatch: Some(0),
+                    ..Limits::default()
+                },
+                now,
+            ),
+            &bounds,
+        ))
+        .unwrap();
+        (report, forge.sent.get())
+    };
+    let (ordinary, sent) = run(&cfg, 650, usize::MAX, None);
+    assert_eq!(ordinary.failures, 0, "{:#?}", ordinary.lines);
+    assert!(ordinary.spent.by_stage[Stage::Schedule as usize] > 0);
+    assert!(
+        ordinary
+            .lines
+            .iter()
+            .any(|l| l.contains("wait: open-pr-cap: land")),
+        "{:#?}",
+        ordinary.lines
+    );
+    cfg.overlap_recovery_hours = Some(1);
+    for spare in [0, 1] {
+        let (report, _) = run(&cfg, ordinary.spent.points + spare, usize::MAX, None);
+        assert_eq!(report.failures, ordinary.failures, "{:#?}", report.lines);
+        assert_eq!(
+            report.spent.by_stage[Stage::Schedule as usize],
+            ordinary.spent.by_stage[Stage::Schedule as usize]
+        );
+        assert_eq!(
+            report.state.unwrap().overlap_recovery.len(),
+            spare as usize,
+            "{:#?}",
+            report.lines
+        );
+    }
+    // A throttle on the first scope read stops the rest and leaves the census
+    // incomplete, without failing the pass whose ordinary work it follows.
+    let (report, reached) = run(&cfg, ordinary.spent.points + 1, sent, None);
+    let lines = &report.lines;
+    assert_eq!(reached, sent + 1, "{lines:#?}");
+    assert_eq!(report.failures, ordinary.failures, "{lines:#?}");
+    assert!(report.failed_operations.is_empty(), "{lines:#?}");
+    assert!(report.state.as_ref().unwrap().overlap_recovery.is_empty());
+    let limited: Vec<_> = (lines.iter())
+        .filter(|l| l.starts_with("rate-limited: "))
+        .collect();
+    assert_eq!(limited.len(), 1, "{lines:#?}");
+    assert!(
+        limited[0].starts_with("rate-limited: GitHub rate limit: ")
+            && limited[0].contains("overlap recovery's census is incomplete"),
+        "{}",
+        limited[0]
+    );
+    assert!(report.spent.rate_limited, "{lines:#?}");
+    let line = report.summary_line();
+    assert!(line.contains(", rate-limited"), "{line}");
+
+    let (first, _) = run(&cfg, 650, usize::MAX, None);
+    let previous = State {
+        overlap_recovery: first.state.unwrap().overlap_recovery,
+        // Exercise a cut after the census, regardless of clock rotation.
+        share_cursor: Some(AUTHORED_REPO.into()),
+        ..State::default()
+    };
+    cfg.follow.push(LATER_REPO.into());
+    cfg.reserve_scheduling = true;
+    let (report, _) = run(&cfg, 650, usize::MAX, Some(previous));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    for expected in [
+        format!("pull requests: the stage's request share is spent at {LATER_REPO}#1;"),
+        format!("{AUTHORED_REPO}: overlap recovery for #1, #2 held:"),
+    ] {
+        assert!(
+            report.lines.iter().any(|line| line.starts_with(&expected)),
+            "missing {expected}: {:#?}",
+            report.lines
+        );
+    }
+    assert_eq!(report.state.unwrap().overlap_recovery.len(), 1);
 }
 
 /// Derived headroom removes the default stage reservations without increasing
@@ -20226,6 +20424,12 @@ fn config_table() {
     for (edit, feature, state) in [
         (json!({}), "openPrCap", "unconfigured"),
         (json!({"openPrCap": 6}), "openPrCap", "enabled"),
+        (json!({}), "overlapRecoveryHours", "unconfigured"),
+        (
+            json!({"openPrCap": 6, "state": "state.json", "overlapRecoveryHours": 72}),
+            "overlapRecoveryHours",
+            "enabled",
+        ),
         (json!({}), "pr.agentRecovery", "unconfigured"),
         (
             json!({"pr": {"agentRecovery": false}}),
@@ -20279,6 +20483,11 @@ fn config_table() {
     for edit in [
         json!({"openPrCap": null}),
         json!({"openPrCap": 0}),
+        json!({"overlapRecoveryHours": 72}),
+        json!({"openPrCap": 6, "overlapRecoveryHours": 72}),
+        json!({"openPrCap": 6, "state": "state.json", "overlapRecoveryHours": 0}),
+        json!({"openPrCap": 6, "state": "state.json", "overlapRecoveryHours": 721}),
+        json!({"openPrCap": 6, "state": "state.json", "overlapRecoveryHours": 72, "changeSweepHours": 6}),
         json!({"authored": 0}),
         json!({"pr": {"agentRecovery": null}}),
         json!({"pr": {"agentRecovery": 0}}),

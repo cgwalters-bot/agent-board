@@ -1235,6 +1235,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         self.dispatched += 1;
+        self.repair_started(repo, number, Some(head_branch(pull)));
         // Fresh counts, as after a reset; of the queue, the removal the stop saw.
         let mut marker = Marker {
             rounds: 1,
@@ -1707,7 +1708,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let from = &pull["head"]["repo"];
             let owner = text(from, "/owner/login");
             let own = from["fork"] == true && owner.eq_ignore_ascii_case(&self.config.bot);
-            if let Some(why) = self.owner_branches(text(from, "/full_name"), own) {
+            if let Some(why) = self.owner_branches(text(from, "/full_name"), own).refusal() {
                 return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
             }
         }
@@ -1746,7 +1747,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         }
         let round = carried.rounds + 1;
+        let branch = (
+            text(&pull, "/head/repo/full_name").to_ascii_lowercase(),
+            text(&pull, "/head/ref").to_owned(),
+        );
         let Some(apply) = &self.apply else {
+            self.repair_started(repo, number, Some(branch));
             return Ok((true, format!("fix round {round}")));
         };
         if let Err(why) = self.admits() {
@@ -1801,6 +1807,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         self.dispatched += 1;
+        self.repair_started(repo, number, Some(branch));
         let superseded = marker;
         let mut marker = Marker {
             rounds: round,
@@ -1938,6 +1945,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     Err(why) => return Ok((false, format!("not started: {why}"))),
                 };
                 self.dispatched += 1;
+                if pull {
+                    self.repair_started(repo, number, None);
+                }
                 self.rest.preview_pool_start(&pool);
                 return Ok((true, format!("{kind} pool={pool}")));
             }
@@ -2001,6 +2011,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         self.dispatched += 1;
+        if pull {
+            self.repair_started(repo, number, None);
+        }
         let mut state = state;
         let footer = self.config.policy.footer.clone();
         let claim_body = |state: &Value, text: &str| {
@@ -3107,6 +3120,33 @@ pub(super) mod tests {
         );
         // A preview keeps the cursor for the pass that applies.
         assert_eq!(preview.state.operator_cursor, None);
+        // The intake's own turn adds its fix round to the starts the approved
+        // turn before it recorded, for the walk's overlap census after it.
+        let mut prior = Outcome::default();
+        prior.pressure.started(&Starts {
+            items: BTreeSet::from([("o/r".into(), 1)]),
+            ..Starts::default()
+        });
+        let (intake, _) = run_direction_capped(
+            &fake,
+            &fake,
+            &config(),
+            State::default(),
+            &[],
+            None,
+            &caps::Caps::default(),
+            now(),
+            POLL_REQUEST_LIMIT,
+            Some((prior, 0)),
+        )
+        .unwrap();
+        assert_eq!(
+            intake.pressure.started.items,
+            BTreeSet::from([("o/r".into(), 1), ("upstream/app".into(), 7)]),
+            "{:?}",
+            intake.lines
+        );
+        assert!(fake.writes.borrow().is_empty());
         // The first search reaches back over the lookback, less the lag.
         assert!(
             fake.searched.borrow()[0].contains("commenter%3Aop+updated%3A%3E%3D2026-10-14T11%3A50%3A00Z+org%3Aupstream&sort=updated&order=asc"),
