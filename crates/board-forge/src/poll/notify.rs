@@ -4024,6 +4024,7 @@ mod tests {
             };
             let mut pass = Pass {
                 authored: Default::default(),
+                empty_fix_message: None,
                 rest: &fake,
                 graphql: &fake,
                 config: &config,

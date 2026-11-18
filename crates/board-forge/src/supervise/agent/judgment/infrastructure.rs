@@ -1,7 +1,9 @@
 //! One capped action owns the infrastructure hold lifecycle. It cannot touch a
 //! human hold, choose API paths or publish an agent-written execution brief.
 use super::*;
-use crate::stop::{Cause, SUPERVISOR_LABEL, SUPERVISOR_PREFIX};
+use crate::stop::{
+    Cause, RUN_REPORTED, SUPERVISOR_LABEL, SUPERVISOR_PREFIX, SUPERVISOR_REASON_BYTES,
+};
 
 const BUG_LIMIT: usize = 100;
 const BUG_LABEL: &str = "agent-board-infrastructure";
@@ -57,7 +59,7 @@ fn hold(api: &dyn Api, p: &Policy, repo: &str, item: u64) -> Result<Hold> {
         .strip_suffix('.')
         .context("Malformed tracking reference")?;
     ensure!(
-        reason.len() <= 2000 && !reason.contains(['\r', '\n', '`', '<', '>']),
+        reason.len() <= SUPERVISOR_REASON_BYTES && !reason.contains(['\r', '\n', '`', '<', '>']),
         "Malformed stop reason"
     );
     Ok(Hold {
@@ -233,10 +235,16 @@ pub(super) fn apply(
                 }
                 Err(error) => return Err(error).context("Read infrastructure label"),
             }
+            // The held item's audience may not be the owner's: keep its run's
+            // excerpt out of the new issue.
+            let reason = held
+                .reason
+                .split_once(RUN_REPORTED)
+                .map_or(held.reason.as_str(), |(typed, _)| typed);
             let receipt = api.send("POST", &format!("/repos/{owner}/issues"), &json!({
                 "title": format!("Infrastructure: {}", held.cause),
                 "labels": [BUG_LABEL],
-                "body": format!("{}\n\nInvestigate and fix the framework failure holding https://github.com/{repo}/issues/{item}.\n\nCause: {}.\n\nRequest a bounded fix in this owning repository; link its pull request here. Do not change operator posture or target bounds.\n\n{}", bug_marker(held.cause), held.reason, p.settings.footer),
+                "body": format!("{}\n\nInvestigate and fix the framework failure holding https://github.com/{repo}/issues/{item}.\n\nCause: {}.\n\nRequest a bounded fix in this owning repository; link its pull request here. Do not change operator posture or target bounds.\n\n{}", bug_marker(held.cause), reason, p.settings.footer),
             }))?;
             receipt["number"]
                 .as_u64()
@@ -418,6 +426,37 @@ mod tests {
         assert_eq!(
             api.writes.borrow().last().unwrap().0,
             "DELETE /repos/example/project/issues/3/labels/needs-infra-fix"
+        );
+    }
+
+    #[test]
+    fn supervisor_hold_keeps_a_run_excerpt_on_its_pull_request() {
+        let s = settings(3);
+        let p = Policy::new(&s, &json!({"small":{},"large":{}}))
+            .unwrap()
+            .unwrap();
+        let api = Forge::default();
+        let held = format!("[empty-fix] no change{RUN_REPORTED}private/path.rs is protected");
+        api.comments.borrow_mut()[0]["body"] = json!(format!(
+            "<!-- {}: {{\"rounds\":1,\"stopped\":true}} -->\n{SUPERVISOR_PREFIX}{held}; tracking pending.",
+            crate::poll::MARKER
+        ));
+        apply(&api, &p, "example/project", 3, "example/control", None).unwrap();
+        let writes = api.writes.borrow();
+        let bug = writes
+            .iter()
+            .find(|(m, _)| m == "POST /repos/example/control/issues")
+            .unwrap();
+        let bug = bug.1["body"].as_str().unwrap();
+        assert!(bug.contains("Cause: [empty-fix] no change.\n"), "{bug}");
+        assert!(!bug.contains("private/path.rs"), "{bug}");
+        let stop = api.comments.borrow()[0]["body"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            stop.contains(&format!("{held}; tracking https://")),
+            "{stop}"
         );
     }
 

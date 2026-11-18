@@ -3,6 +3,10 @@
 
 pub const SUPERVISOR_LABEL: &str = "needs-infra-fix";
 pub const SUPERVISOR_PREFIX: &str = "Held for the supervisor: ";
+pub(crate) const SUPERVISOR_REASON_BYTES: usize = 2000;
+/// Separates the typed reason from a run's excerpt, which the supervisor's
+/// infrastructure bug leaves out.
+pub(crate) const RUN_REPORTED: &str = "; run reported (unverified): ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
