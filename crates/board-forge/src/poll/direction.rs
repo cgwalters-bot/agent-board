@@ -245,6 +245,7 @@ mod tests {
             at: now,
             body: "Why?".into(),
             changes_requested: false,
+            direct_body: None,
         };
         let mut ledger = Direction::default();
         for prefix in super::super::comments::ANCHORS {

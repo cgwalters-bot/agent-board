@@ -156,6 +156,8 @@ pub(super) struct Said {
     pub(super) key: String,
     pub(super) at: OffsetDateTime,
     pub(super) body: String,
+    /// Submitted text for direct intent, only for eligible sources within the byte bound.
+    pub(super) direct_body: Option<String>,
     /// Authenticated review state, never inferred from words in its body.
     pub(super) changes_requested: bool,
 }
@@ -163,7 +165,77 @@ pub(super) struct Said {
 /// Quoted imperative prose cannot authorize a fix; use GitHub review state.
 /// Mixed batches stay in triage rather than guessing which intent wins.
 pub(super) fn review_fix(policy: &PollPolicy, said: &[Said]) -> bool {
-    policy.operator_review_fixes && !said.is_empty() && said.iter().all(|s| s.changes_requested)
+    policy.operator_review_fixes && requests_changes(said)
+}
+
+/// Only structured operator review state, never prose, supplies fix authority.
+fn requests_changes(said: &[Said]) -> bool {
+    !said.is_empty() && said.iter().all(|s| s.changes_requested)
+}
+
+const DIRECT_INTENT_BODY_LIMIT: usize = 4_000;
+const DIRECT_INTENT_BATCH_LIMIT: usize = 5;
+
+/// Recognize complete plain requests for reporting only. Do not look for
+/// commands in arbitrary substrings: quotes and prerequisites stay unclassified.
+fn plain_direct_intent(body: &str) -> Option<(bool, bool)> {
+    if body.len() > DIRECT_INTENT_BODY_LIMIT {
+        return None;
+    }
+    let body = body.trim_end().to_ascii_lowercase().replace('’', "'");
+    let body = body
+        .strip_prefix("…whatever ")
+        .or_else(|| body.strip_prefix("...whatever "))
+        .unwrap_or(&body);
+    let body = body.strip_suffix(['.', '!']).unwrap_or(body);
+    let (mut ship, mut signoff) = (false, false);
+    for sentence in body.split(". ") {
+        match sentence {
+            "ship it" | "let's ship" => ship = true,
+            "you can add my dco" => signoff = true,
+            "it can always clean it up later" if ship => (),
+            _ => return None,
+        }
+    }
+    Some((ship, signoff))
+}
+
+/// Classify only a bounded, entirely direct batch; a mixed one is unclassified.
+fn direct_intent(said: &[Said]) -> Option<&'static str> {
+    if said.len() > DIRECT_INTENT_BATCH_LIMIT {
+        return None;
+    }
+    let (ship, signoff) = said.iter().try_fold((false, false), |(ship, signoff), s| {
+        let (s, d) = plain_direct_intent(s.direct_body.as_deref()?)?;
+        Some((ship || s, signoff || d))
+    })?;
+    match (ship, signoff) {
+        (true, true) => Some("signoff-and-ship"),
+        (true, false) => Some("ship"),
+        (false, true) => Some("signoff"),
+        (false, false) => None,
+    }
+}
+
+/// `what` prefixed with the intent recognized on the bot's own PR, if any.
+/// The label reports classification only; routing is decided elsewhere.
+fn with_intent(
+    policy: &PollPolicy,
+    mine: bool,
+    review_fix: bool,
+    said: &[Said],
+    what: String,
+) -> String {
+    // A review fix implies `requests_changes`, so it is labelled as before.
+    if !mine || !(policy.operator_intents || review_fix) {
+        what
+    } else if requests_changes(said) {
+        format!("intent=requested-changes (review state): {what}")
+    } else if let Some(intent) = direct_intent(said) {
+        format!("intent={intent} (plain patterns): {what}")
+    } else {
+        format!("intent=unclassified: {what}")
+    }
 }
 
 /// The comments that a round's marker of the bot's, or a winning triage
@@ -1030,12 +1102,27 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .filter_map(|(anchor, at, c)| {
                 let id = c["id"].as_u64()?;
                 let at = OffsetDateTime::parse(at, &Rfc3339).ok()?;
+                let raw_body = text(c, "/body");
+                let review = *anchor == "pullrequestreview-";
+                let state = text(c, "/state");
+                // Inline text carries no review state of its own, so it may
+                // belong to a dismissed review: never classified as direct.
+                let eligible = match *anchor {
+                    "pullrequestreview-" => matches!(state, "APPROVED" | "COMMENTED"),
+                    "discussion_r" => false,
+                    _ => true,
+                };
                 Some(Said {
                     key: format!("{anchor}{id}"),
                     at,
-                    body: review_text(text(c, "/body")),
-                    changes_requested: *anchor == "pullrequestreview-"
-                        && text(c, "/state") == "CHANGES_REQUESTED"
+                    body: review_text(raw_body),
+                    direct_body: (pull
+                        && self.config.policy.operator_intents
+                        && raw_body.len() <= DIRECT_INTENT_BODY_LIMIT
+                        && eligible)
+                        .then(|| raw_body.to_owned()),
+                    changes_requested: review
+                        && state == "CHANGES_REQUESTED"
                         && review_superseded_through.is_none_or(|boundary| (at, id) > boundary),
                 })
             })
@@ -1581,13 +1668,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let (done, what) = if let Some(why) = private {
             (true, why)
         } else if mine && (!directed || review_fix) {
-            let (done, what) = self.comment_fix(repo, number, hit, comments, &said)?;
-            let what = if review_fix {
-                format!("intent=requested-changes (review state): {what}")
-            } else {
-                what
-            };
-            (done, what)
+            self.comment_fix(repo, number, hit, comments, &said, review_fix)?
         } else if let Some(tracked) = &tracked
             && !directed
             && !said.iter().any(|s| explicit(&s.body, &bot))
@@ -1603,6 +1684,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 &said,
             )?
         };
+        let what = with_intent(&self.config.policy, mine, review_fix, &said, what);
         Ok(Some((
             done,
             format!("operator comments {}: {what}", keys.join(", ")),
@@ -1654,13 +1736,27 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         hit: &Value,
         read: &[Value],
         said: &[Said],
+        review_fix: bool,
     ) -> Result<Handled> {
         if hit["state"] != "open" {
             return Ok((true, "left: the pull request is closed".into()));
         }
-        let pull = self.get(&format!("repos/{repo}/pulls/{number}"))?;
+        let pull = self
+            .get_url(
+                &format!("{API_ROOT}repos/{repo}/pulls/{number}"),
+                Value::clone,
+                review_fix && self.apply.is_some(),
+            )?
+            .0;
         let head = text(&pull, "/head/sha").to_owned();
         ensure!(!head.is_empty(), "the pull request has no head");
+        if review_fix && (pull["state"] != "open" || text(&pull, "/user/login") != self.config.bot)
+        {
+            return Ok((
+                true,
+                "left: the pull request is no longer open and bot-authored".into(),
+            ));
+        }
         if nodes(&pull, "/labels").iter().any(|l| l["name"] == LABEL) {
             return Ok((true, format!("left to a person: labelled {LABEL}")));
         }
@@ -2379,6 +2475,74 @@ pub(super) mod tests {
         OffsetDateTime::parse("2026-10-16T12:00:00Z", &Rfc3339).unwrap()
     }
 
+    #[test]
+    fn operator_intents_recognize_only_structured_change_batches() {
+        let comment = |body: &str, changes_requested| Said {
+            key: "pullrequestreview-5862878257".into(),
+            at: now(),
+            body: body.into(),
+            changes_requested,
+            direct_body: None,
+        };
+        for (batch, expected) in [
+            (vec![], false),
+            (vec![comment("Please fix this", false)], false),
+            (vec![comment("Please fix this", true)], true),
+            (
+                vec![comment("Please fix this", true), comment("Wait", false)],
+                false,
+            ),
+            (
+                vec![comment("Please fix this", true), comment("And this", true)],
+                true,
+            ),
+        ] {
+            assert_eq!(requests_changes(&batch), expected);
+        }
+        let request = [comment("Please fix this", true)];
+        assert!(!review_fix(&PollPolicy::default(), &request));
+        for operator_intents in [false, true] {
+            for operator_review_fixes in [false, true] {
+                assert_eq!(
+                    review_fix(
+                        &PollPolicy {
+                            operator_intents,
+                            operator_review_fixes,
+                            ..PollPolicy::default()
+                        },
+                        &request
+                    ),
+                    operator_review_fixes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operator_intents_recognize_complete_plain_requests() {
+        for (body, expected) in [
+            ("Ship it!", Some("ship")),
+            ("Let’s ship.", Some("ship")),
+            ("You can add my DCO", Some("signoff")),
+            (
+                "...whatever let's ship. It can always clean it up later. You can add my DCO",
+                Some("signoff-and-ship"),
+            ),
+            ("Ship it. First fix the tests.", None),
+            ("> Ship it", None),
+            ("    Ship it", None),
+        ] {
+            let comment = Said {
+                key: "issuecomment-1".into(),
+                at: now(),
+                body: body.into(),
+                direct_body: Some(body.into()),
+                changes_requested: false,
+            };
+            assert_eq!(direct_intent(&[comment]), expected, "{body}");
+        }
+    }
+
     fn config() -> Config {
         Config {
             operator: OPERATOR.into(),
@@ -3064,6 +3228,38 @@ pub(super) mod tests {
                 .any(|l| l.starts_with("warning: operator direction search failed"));
             assert_eq!(warned, !scoped, "{:?}", outcome.lines);
             assert_eq!(outcome.state.operator_cursor, None);
+        }
+    }
+
+    #[test]
+    fn operator_intents_preserve_legacy_comment_fix_authorization() {
+        for intents in [false, true] {
+            for held in [false, true] {
+                let fake = github();
+                fake.page(
+                    "repos/upstream/app/pulls/7",
+                    json!({"head": {"sha": "abcdef0123456789"},
+                        "labels": if held { json!([{"name": HOLD_LABEL}]) } else { json!([]) }}),
+                );
+                let mut config = config();
+                config.policy.operator_intents = intents;
+                let result = pass_configured(&fake, &config, (None, None), true, now());
+                assert_eq!(result.errors, 0, "{intents}/{held}: {:?}", result.lines);
+                let runs = dispatches(&fake);
+                assert_eq!(
+                    runs.iter().filter(|run| run["kind"] == "fix").count(),
+                    1,
+                    "{intents}/{held}: {:?}",
+                    result.lines
+                );
+                // The standalone poll reports intent on the same route.
+                assert_eq!(
+                    result.lines.iter().any(|l| l.contains("intent=")),
+                    intents,
+                    "{intents}/{held}: {:?}",
+                    result.lines
+                );
+            }
         }
     }
 
@@ -4414,6 +4610,7 @@ pub(super) mod tests {
                 at: now(),
                 body: "Please rename.".into(),
                 changes_requested: false,
+                direct_body: None,
             }];
             let pull = json!({"number": 7, "headRefOid": "abcdef0123456789"});
             let apply = Apply {
@@ -4707,6 +4904,7 @@ pub(super) mod tests {
                 at: now(),
                 body: body.into(),
                 changes_requested: false,
+                direct_body: None,
             }];
             assert_eq!(run_kind(&said, BOT), kind, "{body}");
         }

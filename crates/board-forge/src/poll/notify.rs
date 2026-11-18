@@ -811,10 +811,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .unwrap_or((true, "notification: operator review already handled".into())));
         }
         if self.awaits_fork(repo) {
-            return Ok((
-                false,
-                "notification: waiting for a matching topic-selected midstream fork".into(),
-            ));
+            // A selected fork can change where tracking claims are read. Do
+            // not classify a batch until those receipts can be subtracted.
+            let wait = "notification: waiting for a matching topic-selected midstream fork";
+            let wait = if mine && self.config.policy.operator_intents {
+                format!("intent=deferred (pending tracking receipt lookup): {wait}")
+            } else {
+                wait.into()
+            };
+            return Ok((false, wait));
         }
         let result =
             self.thread_read_from(repo, issue, comments, false, (since, true, admission_floor))?;
@@ -991,6 +996,7 @@ fn peer_said(
                 at: OffsetDateTime::parse(text(c, "/created_at"), &Rfc3339).ok()?,
                 body: review_text(text(c, "/body")).replace('<', "&lt;"),
                 changes_requested: false,
+                direct_body: None,
             })
         })
         .filter(|s| s.at >= floor && !s.body.is_empty() && !done.contains(&s.key))
@@ -2372,6 +2378,7 @@ mod tests {
                         at: now(),
                         body: "pending".into(),
                         changes_requested: false,
+                        direct_body: None,
                     })
                     .collect();
                 state
@@ -2461,27 +2468,199 @@ mod tests {
     }
 
     #[test]
+    fn operator_intents_policy_table() {
+        for (value, expected) in [
+            (json!({}), Some(false)),
+            (json!({"operatorIntents": false}), Some(false)),
+            (json!({"operatorIntents": true}), Some(true)),
+            (json!({"operatorIntents": "true"}), None),
+            (json!({"operatorIntents": null}), None),
+        ] {
+            assert_eq!(
+                PollPolicy::from_json(&value)
+                    .ok()
+                    .map(|p| p.operator_intents),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn operator_intents_report_without_retaining() {
+        const SHIP: &str =
+            "…whatever let's ship. It can always clean it up later. You can add my DCO";
+        const REVIEW: u64 = 5862878257;
+        let repo = "other/app";
+        // The label reports intent; the route is the one taken without it,
+        // and only a fork wait is kept for retry.
+        for (state, body, inline, routed, label) in [
+            ("APPROVED", SHIP, None, true, "intent=signoff-and-ship"),
+            ("APPROVED", SHIP, None, false, "intent=deferred"),
+            (
+                "CHANGES_REQUESTED",
+                "Please fix this typo.",
+                None,
+                false,
+                "intent=deferred",
+            ),
+            // Inline text has no review state that could qualify it.
+            (
+                "DISMISSED",
+                "",
+                Some("Ship it"),
+                true,
+                "intent=unclassified",
+            ),
+            ("APPROVED", "", Some("Ship it"), true, "intent=unclassified"),
+        ] {
+            for apply in [false, true] {
+                let fake = intake_github(repo, true, "comment", OPERATOR);
+                fake.rest
+                    .borrow_mut()
+                    .get_mut(&format!("{API_ROOT}repos/{repo}/issues/2"))
+                    .unwrap()["user"]["login"] = BOT.into();
+                fake.page(
+                    &format!("repos/{repo}/issues/2/comments?per_page=100"),
+                    json!([]),
+                );
+                let mut review = said(REVIEW, OPERATOR, UPDATED, body);
+                review["state"] = state.into();
+                review["commit_id"] = "abcdef0123456789".into();
+                fake.page(
+                    &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
+                    json!([review]),
+                );
+                let inline: Vec<Value> = (inline.into_iter())
+                    .map(|body| {
+                        let mut c = said(77, OPERATOR, UPDATED, body);
+                        c["pull_request_review_id"] = REVIEW.into();
+                        c
+                    })
+                    .collect();
+                fake.page(
+                    &format!("repos/{repo}/pulls/2/comments?per_page=100"),
+                    json!(inline),
+                );
+                let mut config = search_intake(&fake, repo);
+                config.policy.operator_intents = true;
+                if routed {
+                    config.policy.notification_intake =
+                        Some(BTreeMap::from([(repo.into(), DISPATCH.into())]));
+                }
+                let result = pass(&fake, &config, State::default(), apply);
+                let case = format!("{state}/{routed}/{apply}: {:?}", result.lines);
+                assert_eq!(result.errors, 0, "{case}");
+                let route = if routed { "triage" } else { "fork" };
+                assert!(
+                    result
+                        .lines
+                        .iter()
+                        .any(|l| l.contains(label) && l.contains(route)),
+                    "{case}"
+                );
+                let runs = dispatches(&fake);
+                assert_eq!(runs.len(), usize::from(apply && routed), "{case}");
+                assert!(runs.iter().all(|r| r["kind"] == "triage"), "{case}");
+                assert_eq!(
+                    result.state.intake_waiting.is_empty(),
+                    !apply || routed,
+                    "{case}"
+                );
+                if !apply {
+                    assert!(fake.writes.borrow().is_empty(), "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn operator_intents_leave_ambiguous_prose_unclassified() {
+        for body in [
+            "    Ship it",
+            "\tShip it",
+            "<!-- sample -->Ship it",
+            &format!("Ship it{}", " ".repeat(4_000)),
+            "Before you merge it, fix the failing tests",
+            "Avoid saying ship it in the release notes",
+            "Ship it. First resolve the failing tests.",
+            "You can add my DCO. After resolving the failures.",
+            "“Ship it”",
+        ] {
+            let repo = "other/app";
+            let fake = intake_github(repo, true, "comment", OPERATOR);
+            fake.rest
+                .borrow_mut()
+                .get_mut(&format!("{API_ROOT}repos/{repo}/issues/2"))
+                .unwrap()["user"]["login"] = BOT.into();
+            fake.page(
+                &format!("repos/{repo}/issues/2/comments?per_page=100"),
+                json!([said(11, OPERATOR, UPDATED, body)]),
+            );
+            let mut config = search_intake(&fake, repo);
+            config.policy.operator_intents = true;
+            config.policy.notification_intake =
+                Some(BTreeMap::from([(repo.into(), DISPATCH.into())]));
+            let result = pass(&fake, &config, State::default(), true);
+            assert_eq!(result.errors, 0, "{:?}", result.lines);
+            assert!(
+                result
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("intent=unclassified") && l.contains("triage")),
+                "{:?}",
+                result.lines
+            );
+            assert!(
+                !result.lines.iter().any(|l| l.contains("intent=ship")),
+                "{:?}",
+                result.lines
+            );
+            assert_eq!(dispatches(&fake).len(), 1);
+            assert_eq!(dispatches(&fake)[0]["kind"], "triage");
+        }
+    }
+
+    #[test]
     fn operator_review_fixes_route_only_changes_requested_on_our_pr() {
         const SHIP: &str =
             "…whatever let's ship. It can always clean it up later. You can add my DCO";
-        for (enabled, author, reviewer, state, body, mixed, fix) in [
+        const FIX: &str = "Please fix this typo.";
+        // The reported intent, asserted apart from the route taken.
+        const CHANGES: Option<&str> = Some("requested-changes");
+        const UNCLASSIFIED: Option<&str> = Some("unclassified");
+        const DIRECT: Option<&str> = Some("signoff-and-ship");
+        for (enabled, author, reviewer, state, body, mixed, fix, intent) in [
+            (true, BOT, OPERATOR, "STALE_HEAD", FIX, false, true, CHANGES),
             (
                 true,
                 BOT,
                 OPERATOR,
-                "CHANGES_REQUESTED",
-                "Please fix this typo.",
+                "MISSING_HEAD",
+                FIX,
                 false,
                 true,
+                CHANGES,
             ),
             (
+                true,
+                BOT,
+                OPERATOR,
+                "CHANGES_REQUESTED",
+                FIX,
+                false,
+                true,
+                CHANGES,
+            ),
+            // Disabled, the operator's later prose makes a mixed batch.
+            (
                 false,
                 BOT,
                 OPERATOR,
                 "CHANGES_REQUESTED",
-                "Please fix this typo.",
+                FIX,
                 false,
                 false,
+                UNCLASSIFIED,
             ),
             (
                 true,
@@ -2491,43 +2670,48 @@ mod tests {
                 "@worker please fix this typo.",
                 false,
                 false,
+                None,
             ),
             (
                 true,
                 BOT,
                 "someone",
                 "CHANGES_REQUESTED",
-                "Please fix this typo.",
+                FIX,
                 false,
                 false,
+                None,
             ),
-            (true, BOT, OPERATOR, "APPROVED", SHIP, false, false),
+            (true, BOT, OPERATOR, "APPROVED", SHIP, false, false, DIRECT),
             (
                 true,
                 BOT,
                 OPERATOR,
                 "SUPERSEDED",
-                "Please fix this typo.",
+                FIX,
                 false,
                 false,
+                UNCLASSIFIED,
             ),
             (
                 true,
                 BOT,
                 OPERATOR,
                 "REREQUESTED",
-                "Please fix this typo.",
+                FIX,
                 false,
                 false,
+                UNCLASSIFIED,
             ),
             (
                 true,
                 BOT,
                 OPERATOR,
                 "REREQUESTED_SAME_SECOND",
-                "Please fix this typo.",
+                FIX,
                 false,
                 false,
+                UNCLASSIFIED,
             ),
             (
                 true,
@@ -2537,24 +2721,27 @@ mod tests {
                 "They said 'please fix this'. What do you think?",
                 false,
                 false,
+                UNCLASSIFIED,
             ),
             (
                 true,
                 BOT,
                 OPERATOR,
                 "DISMISSED",
-                "Please fix this typo.",
+                FIX,
                 false,
                 false,
+                UNCLASSIFIED,
             ),
             (
                 true,
                 BOT,
                 OPERATOR,
                 "CHANGES_REQUESTED",
-                "Please fix this typo.",
+                FIX,
                 true,
                 false,
+                UNCLASSIFIED,
             ),
         ] {
             let repo = "other/app";
@@ -2572,11 +2759,19 @@ mod tests {
                 },
             );
             let mut review = said(5862878257, reviewer, UPDATED, body);
+            if state != "MISSING_HEAD" {
+                review["commit_id"] = if state == "STALE_HEAD" {
+                    "old-head"
+                } else {
+                    "abcdef0123456789"
+                }
+                .into();
+            }
             let superseded = matches!(
                 state,
                 "SUPERSEDED" | "REREQUESTED" | "REREQUESTED_SAME_SECOND"
             );
-            review["state"] = if superseded {
+            review["state"] = if superseded || matches!(state, "STALE_HEAD" | "MISSING_HEAD") {
                 "CHANGES_REQUESTED"
             } else {
                 state
@@ -2602,6 +2797,7 @@ mod tests {
                         "Please fix only the remaining typo.",
                     );
                     request["state"] = "CHANGES_REQUESTED".into();
+                    request["commit_id"] = "abcdef0123456789".into();
                     reviews.push(request);
                     // Eligibility is chronological, not API array order.
                     reviews.reverse();
@@ -2618,10 +2814,12 @@ mod tests {
             fake.page(
                 &format!("repos/{repo}/pulls/2"),
                 json!({
+                "state": "open", "user": {"login": BOT},
                 "head": {"sha": "abcdef0123456789"}, "labels": []}),
             );
             let mut config = search_intake(&fake, repo);
             config.policy.operator_review_fixes = enabled;
+            config.policy.operator_intents = true;
             if !fix {
                 config.policy.notification_intake =
                     Some(BTreeMap::from([(repo.into(), DISPATCH.into())]));
@@ -2631,15 +2829,11 @@ mod tests {
             let preview = pass(&fake, &config, State::default(), false);
             assert_eq!(preview.errors, 0, "{:?}", preview.lines);
             assert!(fake.writes.borrow().is_empty());
-            assert_eq!(
-                preview
-                    .lines
-                    .iter()
-                    .any(|l| l.contains("intent=requested-changes")),
-                fix,
-                "{:?}",
-                preview.lines
-            );
+            let reported = preview.lines.iter().find_map(|l| {
+                let (_, label) = l.split_once("intent=")?;
+                label.split([' ', ':']).next()
+            });
+            assert_eq!(reported, intent, "{:?}", preview.lines);
             let first = pass(&fake, &config, State::default(), true);
             assert_eq!(first.errors, 0, "{:?}", first.lines);
             let runs = dispatches(&fake);
@@ -2660,6 +2854,9 @@ mod tests {
                 assert_eq!(runs[0]["repo"], repo);
                 assert_eq!(runs[0]["item"], "2");
                 assert!(text(&runs[0], "/task").contains(body));
+                // Outstanding change direction survives a rebase; the brief
+                // records the freshly read head, not the reviewed commit.
+                assert!(text(&runs[0], "/task").contains("abcdef0123456789"));
                 assert!(
                     !fake
                         .writes
@@ -2689,6 +2886,7 @@ mod tests {
                     "Please fix the remaining typo.",
                 );
                 review["state"] = "CHANGES_REQUESTED".into();
+                review["commit_id"] = "abcdef0123456789".into();
                 fake.rest
                     .borrow_mut()
                     .get_mut(&format!(
@@ -2714,6 +2912,8 @@ mod tests {
     fn operator_review_fixes_keep_existing_holds_and_caps() {
         for case in [
             "label",
+            "closed",
+            "foreign author",
             "rounds",
             "running",
             "dispatch cap",
@@ -2742,6 +2942,7 @@ mod tests {
             );
             let mut review = said(22, OPERATOR, UPDATED, "Please fix the typo.");
             review["state"] = "CHANGES_REQUESTED".into();
+            review["commit_id"] = "abcdef0123456789".into();
             fake.page(
                 &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
                 json!([review]),
@@ -2753,6 +2954,8 @@ mod tests {
             fake.page(
                 &format!("repos/{repo}/pulls/2"),
                 json!({"head": {"sha": "abcdef0123456789"},
+                "state": if case == "closed" { "closed" } else { "open" },
+                "user": {"login": if case == "foreign author" { "someone" } else { BOT }},
                 "labels": if case == "label" { json!([{"name": LABEL}]) } else { json!([]) }}),
             );
             let mut config = search_intake(&fake, repo);

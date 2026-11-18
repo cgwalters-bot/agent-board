@@ -697,6 +697,36 @@ Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set `notifications`
 to `true`, set `midstream: {"owner":"cgwalters-forge","topic":"bot-midstream"}`,
 and keep the existing pass token. No deployed config or token is changed here.
 
+### Direct intent recognition
+
+`pr.operatorIntents: true` labels the intake's line for a batch of operator
+direction on the bot's PR with the intent it recognized, and changes nothing
+else: the batch is routed, claimed and settled exactly as without the option.
+`intent=requested-changes` means the batch consists only of authenticated
+operator changes-requested reviews. `intent=ship`, `intent=signoff` or
+`intent=signoff-and-ship` means every entry is a plain ship or DCO request
+such as “Ship it” or “You can add my DCO”, in an issue comment or the body of
+an approving or commenting review. Recognition is limited to five entries of
+4,000 raw bytes each. Quoted or conditional prose, inline review comments
+and withdrawn reviews do not match; such batches are `intent=unclassified`.
+If intake is waiting for a matching midstream fork, the label is
+`intent=deferred` until it can check the tracking receipts for that route.
+The option defaults to off and grants no action authority.
+
+Nothing here keeps a ship or DCO request from tracking triage, or executes
+one; that needs a durable record of the request for a later executor.
+
+Notification intake needs the separate `pr.operatorReviewFixes` option to use
+the existing bounded fix-round path. The PR must still be open and bot-authored
+on a fresh read in apply. The round's marker and brief record that head's SHA;
+nothing here checks that the runner builds on it. The legacy
+`operatorComments` fix route is unchanged.
+
+The caller setting is `pr.operatorIntents` in
+`cgwalters-forge/tracker`'s `.github/pass.json`, alongside `notifications: true`.
+It only adds diagnostics, so it is safe to set; it is not needed until an
+executor uses its classification.
+
 ## Followed issue intake
 
 The concrete risks are a busy repository spending the whole pass on enrollment,
@@ -6212,6 +6242,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md). Stage 4 likewise starts no plan whose item is outside our own space: its candidate waits on the operator (`needs-operator`, `hold OWNER/REPO#N: its plan's OWNER/REPO#N is outside our own space …`) and draws no revisit. The bot's own pull requests are exempt: on them stage 2 takes its rounds, rebases and edits of them, and stage 4 starts `fixPlans`' fix runs, writing only on that pull request; a merge or stop there stays held; `false` |
 | `pr.operatorReviewFixes` | With `notifications`, route nonempty operator changes-requested reviews on the bot's PR to existing bounded fix rounds instead of intake triage; mixed batches and other intents stay in triage. See [operator intake](poll.md); `false` |
 | `pr.supervisorHolds` | Route recognized PR infrastructure stops to `needs-infra-fix`, not the operator; existing write/request caps apply. See [infrastructure stops](#infrastructure-stops); `false` |
+| `pr.operatorIntents` | Label operator direction on the bot's PRs with its recognized intent (structured changes requested, plain ship/DCO requests); reporting only, routing unchanged. Does not enable `operatorReviewFixes`. See [direct intent recognition](#direct-intent-recognition); `false` |
 | `pr.foldRounds` | Minimize as outdated the bot's routine marker each new round, refund, check rerun or review start supersedes, at the end of the pass, so a pull request shows its current round with the earlier ones folded; stops are never folded; at most 20 a pass, one `--max-writes` step; see [the poll](poll.md); `false` |
 | `pr.quietWaits` | Decide a bot pull request unchanged in its listing (head, `updated_at`) since a whole read that left it waiting on the operator alone (a promotion or withheld-approval wait) from that listing, without reading it again, for at most four hours; GitHub only; see [quiet pull request waits](#quiet-pull-request-waits-github); `true` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |

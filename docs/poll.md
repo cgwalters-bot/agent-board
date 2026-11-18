@@ -1245,12 +1245,18 @@ approval, prevents the older review from authorizing a fix, even if a newer
 changes-requested review arrives. Unhandled withdrawn reviews remain triage
 direction, so a mixed batch cannot silently revive the withdrawn request.
 
-This is the first slice of agent-board#884: mixed batches, comments, approvals,
-shipping/DCO requests (including “...whatever let's ship. It can always clean
-it up later. You can add my DCO”), and ambiguous prose retain intake triage.
-No classifier, sign-off rewriting or merge override is implemented here.
+Mixed batches, comments, approvals, shipping/DCO requests (including
+“...whatever let's ship. It can always clean it up later. You can add my DCO”)
+and ambiguous prose retain intake triage. No sign-off rewriting or merge
+override is implemented here.
 Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set
 `pr.operatorReviewFixes` to `true` alongside `notifications: true`.
+
+The separate off-by-default `operatorIntents` (the pass's `pr.operatorIntents`)
+[labels the intake line with the recognized intent](pass.md#direct-intent-recognition),
+such as a plain ship/DCO request, without changing its route. It neither
+enables `operatorReviewFixes` nor changes the existing `operatorComments` fix
+authorization.
 
 `notifications` (absent by default, which reads none) reads the bot's GitHub
 notifications, which reach no automation otherwise (agent-board#227):

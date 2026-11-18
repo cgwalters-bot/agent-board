@@ -565,6 +565,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "operatorAnswers",
     "supervisorHolds",
     "operatorReviewFixes",
+    "operatorIntents",
     "rebaseRounds",
     "pace",
     "lockCollaboratorItems",
@@ -761,6 +762,10 @@ pub struct PollPolicy {
     /// `operatorReviewFixes`: route an operator's changes-requested review on
     /// the bot's PR to its bounded fix rounds, not intake triage. Off by default.
     pub operator_review_fixes: bool,
+    /// `operatorIntents`: label operator direction on the bot's PRs with its
+    /// recognized intent (changes requested, plain ship/sign-off requests).
+    /// Off by default. Reporting only: routing and authorization are unchanged.
+    pub operator_intents: bool,
     /// The pass's existing `assignHolds`: request the operator's review instead
     /// of labelling a stop. Off by default; no standalone poll setting.
     pub assign_holds: bool,
@@ -1176,6 +1181,8 @@ pub struct PrOptions {
     #[serde(default)]
     pub operator_review_fixes: bool,
     #[serde(default)]
+    pub operator_intents: bool,
+    #[serde(default)]
     pub owner_branches: bool,
     #[serde(default)]
     pub own_space_only: bool,
@@ -1324,6 +1331,7 @@ impl PrOptions {
             unstall,
             direction_first,
             operator_review_fixes,
+            operator_intents,
             owner_branches,
             own_space_only,
             fold_rounds,
@@ -1347,6 +1355,7 @@ impl PrOptions {
         policy.unstall = unstall;
         policy.direction_first = direction_first;
         policy.operator_review_fixes = operator_review_fixes;
+        policy.operator_intents = operator_intents;
         policy.owner_branches = owner_branches;
         policy.own_space_only = own_space_only;
         policy.fold_rounds = fold_rounds;
@@ -1442,6 +1451,7 @@ impl PollPolicy {
                 .unwrap_or(false),
             operator_review_fixes: false,
             supervisor_holds: false,
+            operator_intents: false,
             rebase_rounds: get("rebaseRounds")?
                 .map(|r| {
                     r.as_u64()
