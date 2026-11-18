@@ -21922,10 +21922,6 @@ fn approval_evidence_combined_transport_replay() {
     }
 }
 
-/// The bot's open pull request `number` of `repo` from its fork, the one
-/// open pull request there, as stage 2 reads it once `repo` is followed:
-/// mergeable, unreviewed, with no checks, committed when the recording was
-/// made and with its fields replaced by `change`, and `comments` on it.
 #[test]
 fn single_pull_preview_apply_replay() {
     const REPO: &str = "cgwalters-forge/agentic-job";
@@ -22107,6 +22103,102 @@ fn single_pull_preview_apply_replay() {
     }
 }
 
+#[test]
+fn ready_pull_with_a_failed_continuation_replay() {
+    const REPO: &str = "cgwalters-forge/agent-board";
+    const RUN_PATH: &str = "repos/cgwalters-forge/tracker/actions/runs/77";
+    let cfg = config(json!({"wip": 0, "follow": [REPO], "pr": {
+        "fixPools": ["claude"], "reviewWorkflow": "review.yml"
+    }}));
+    for (name, draft, marker_head, review_head, expected) in [
+        (
+            "same head",
+            false,
+            "abc",
+            "abc",
+            "merge: review approved and checks green",
+        ),
+        (
+            "older head",
+            false,
+            "old",
+            "abc",
+            "merge: review approved and checks green",
+        ),
+        (
+            "still draft",
+            true,
+            "abc",
+            "abc",
+            "needs-human: continuation round 1 is blocked",
+        ),
+        (
+            "stale review",
+            false,
+            "abc",
+            "old",
+            "wait: no approving review of the head yet",
+        ),
+    ] {
+        let mut replay = Forge::new(None, false).replay;
+        followed(
+            &mut replay,
+            (REPO, 1089),
+            json!({
+                "isDraft": draft,
+                "body": "Handle missing workflow runs.\n\n```checkpoint\n{\"reason\":\"incomplete\",\"done\":\"code and test\",\"left\":\"just check, review\",\"next\":\"just check\"}\n```",
+                "reviews": {"nodes": [{"state": "APPROVED", "commit": {"oid": review_head},
+                    "author": {"__typename": "Bot", "login": "github-actions", "databaseId": poll::ACTIONS_BOT_ID},
+                    "submittedAt": "2026-10-23T05:00:00Z",
+                    "body": format!("VERDICT: APPROVE\n\n<!-- gh-aw-agentic-workflow: review, id: 88, workflow_id: agentic-job, run: https://github.com/{REPO}/actions/runs/88 -->")}],
+                    "pageInfo": {"hasPreviousPage": false}},
+                "commits": {"nodes": [{"commit": {"oid": "abc",
+                    "committedDate": "2026-10-23T03:00:00Z", "message": "Handle missing workflow runs",
+                    "statusCheckRollup": {"contexts": {"nodes": [{"__typename": "CheckRun",
+                        "name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+                        "pageInfo": {"hasNextPage": false}}}}}]}
+            }),
+            json!([{"id": 77, "user": {"login": "cgwalters-bot"}, "body": format!(
+                "<!-- tracker-poll: {} -->\nContinuation round 1 of 2.",
+                json!({"rounds": 0, "continued": 1, "continuing": true, "sha": marker_head, "run": 77})
+            )}]),
+        );
+        // Listing and detail straddle the transition out of draft.
+        answer(&mut replay, &format!("repos/{REPO}/pulls?"))["body"][0]["draft"] = json!(true);
+        answer(&mut replay, &format!("repos/{REPO}/rules/branches/main"))["body"] = json!([
+            {"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "CI"}]}}
+        ]);
+        replay.requests.push(
+            json!({"request": {"get": format!("{API_ROOT}repos/{REPO}/actions/runs/88")},
+            "answer": {"status": 200, "link": null, "body": {"id": 88, "status": "completed",
+                "path": ".github/workflows/review.yml", "event": "pull_request_target",
+                "head_sha": review_head, "repository": {"full_name": REPO},
+                "run_started_at": "2026-10-23T04:30:00Z", "updated_at": "2026-10-23T05:01:00Z"}}}),
+        );
+        // Deliberately omit the older run: only the run on this head is read.
+        if marker_head == "abc" {
+            replay
+                .requests
+                .push(json!({"request": {"get": format!("{API_ROOT}{RUN_PATH}")},
+                "answer": {"status": 200, "link": null, "body": {"id": 77,
+                    "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                    "updated_at": "2026-10-23T04:00:00Z"}}}));
+        }
+        let report = preview(&cfg, &replay);
+        assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+        let decision = format!("{REPO}#1089 abc {expected}");
+        assert!(
+            report.lines.iter().any(|line| line.starts_with(&decision)),
+            "{name}: {:?}",
+            report.lines
+        );
+    }
+}
+
+/// The bot's open pull request `number` of `repo` from its fork, the one
+/// open pull request there, as stage 2 reads it once `repo` is followed:
+/// mergeable, unreviewed, with no checks, committed when the recording was
+/// made and with its fields replaced by `change`, and `comments` on it.
 fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, comments: Value) {
     let committed = replay.now.format(&Rfc3339).unwrap();
     let mut pull = json!({
