@@ -7951,6 +7951,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let id = plan::plan_id(from)?;
             let operators = plan::written_by(from, &config.operator);
             match batch::held(&self.client, &comments, &writers, &id, issue)?.first() {
+                None if plan.kind == "triage"
+                    && self
+                        .client
+                        .bounds
+                        .living
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|store| store.triage_retry_exhausted(issue, &id)) =>
+                {
+                    let why = format!(
+                        "plan {id}'s triage start was refused twice; check the caller and edit or replace the plan to try again"
+                    );
+                    return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+                }
                 None => (plan, id, None, None, operators),
                 Some((_, record)) => {
                     let dispatch = crate::store::Dispatch {
@@ -8324,6 +8338,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             // A plan written by hand carries no direction.
             direction: None,
             midstreams: self.midstreams.as_deref(),
+            release_refused: config.living_status.is_some() && plan.kind == "triage",
         };
         // Without the bot, dispatch checks no overlap; it batches implement
         // plans only, and the pass asks for no batch either way.
@@ -8733,7 +8748,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         brief.push_str(&self.verdict_ask(read.0));
         if config.operator_questions_only {
-            brief.push_str(" Decide engineering details yourself, including plan repair and triage follow-through; never assign the operator. Only a big-picture architectural decision may ask them: state one concrete question on a **Decision needed:** line and put \"operator\":\"architecture\" in the schedule-triage verdict block. A generic request to decide what a verdict means is not an operator question.");
+            let protocol = if config.living_status.is_none() {
+                " and put \"operator\":\"architecture\" in the schedule-triage verdict block"
+            } else {
+                ""
+            };
+            brief.push_str(&format!(" Decide engineering details yourself, including plan repair and triage follow-through; never assign the operator. Only a big-picture architectural decision may ask them: state one concrete question on a **Decision needed:** line{protocol}. A generic request to decide what a verdict means is not an operator question."));
         }
         brief.push_str(plan::VALIDATE_PLAN_JSON);
         if config.midstream.is_some() {
@@ -8796,16 +8816,29 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return active.to_owned();
         }
         let reserve = self.config.reserve_operator;
-        let harness = self.config.operator_ask.as_ref()
-            .filter(|_| reserve || self.harness_item(facts))
-            .map(|policy| format!(
-                " {} For an operator decision, answer needs-operator and add \"operator\" to the same JSON block, one of: {}.",
-                policy.text, policy.domains.join(", ")
-            )).unwrap_or_default();
+        let policy = self
+            .config
+            .operator_ask
+            .as_ref()
+            .filter(|_| reserve || self.harness_item(facts));
         let promoted = match self.config.fix_plans {
             true => format!("{PROMOTED}{NO_UPSTREAM_COMMENT}"),
             false => String::new(),
         };
+        if self.config.living_status.is_some() {
+            let question = policy.map_or("", |policy| policy.text.as_str());
+            let bar = if reserve { OPERATOR_BAR } else { "" };
+            return format!(
+                "{promoted} If you have no new actionable information and no plan, post nothing. \
+                 If there is a new finding but no plan, report it in one short prose comment \
+                 for a human; do not post a {TRIAGE_FENCE} block or edit the board pass's status comment. \
+                 {question}{bar}{active}"
+            );
+        }
+        let harness = policy.map(|policy| format!(
+                " {} For an operator decision, answer needs-operator and add \"operator\" to the same JSON block, one of: {}.",
+                policy.text, policy.domains.join(", ")
+            )).unwrap_or_default();
         let (asking, bar) = match reserve {
             true => ("needs-operator", OPERATOR_BAR),
             false => ("needs-design or needs-operator", ""),
@@ -8825,8 +8858,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// A triage plan dispatched already, whose run has ended (one in flight
     /// holds the issue before this), followed up by the newest verdict the
-    /// bot posted after its record ([`Self::newest_verdict`]), so that a
-    /// visitor's comment cannot close, label or triage the issue. A comment
+    /// bot posted after its standalone record ([`Self::newest_verdict`]), so
+    /// that a visitor's comment cannot close, label or triage the issue. A
+    /// ledger dispatch uses only the input fingerprint for timed follow-up.
+    /// A comment
     /// by a writer after an asking verdict, followed by removal of the hold
     /// label, answers it and triages the issue again with that context.
     /// Else [`Self::act_on_verdict`] closes the issue, or labels it
@@ -8851,9 +8886,44 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let config = self.config;
         let (facts, comments) = read;
         let writers = self.writers();
-        let after = comments.iter().position(|c| c.url == record.url);
-        let later = &comments[after.map_or(comments.len(), |n| n + 1)..];
-        let verdict = self.newest_verdict(later);
+        // A ledger record's timestamp is the pass clock, not GitHub's
+        // dispatch boundary. A verdict posted before the actual dispatch
+        // could look new; until there is a checked private handoff, do not
+        // consume public verdicts here. Standalone dispatches keep their
+        // existing comment-order boundary.
+        let (ledger_dispatch, archived) = self
+            .client
+            .bounds
+            .living
+            .borrow()
+            .as_ref()
+            .map_or((false, false), |store| {
+                store.dispatch_origin(&facts.issue, record)
+            });
+        let ordered;
+        let later = if archived {
+            // Archived records may be appended on the final page rather than
+            // at their original position. Use GitHub's original creation
+            // time and comment ID, not the archive or edit time.
+            let order = |c: &plan::Comment| (c.created, plan::comment_id(&c.url));
+            let boundary = order(record);
+            let mut tail: Vec<_> = comments
+                .iter()
+                .filter(|c| order(c) > boundary)
+                .cloned()
+                .collect();
+            tail.sort_by_key(order);
+            ordered = tail;
+            ordered.as_slice()
+        } else {
+            let after = comments.iter().position(|c| c.url == record.url);
+            &comments[after.map_or(comments.len(), |n| n + 1)..]
+        };
+        let verdict = if ledger_dispatch {
+            None
+        } else {
+            self.newest_verdict(later)
+        };
         let (since, rest, said) = match &verdict {
             Some((n, c, verdict)) => (
                 *c,
@@ -8863,7 +8933,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             None => (
                 record,
                 later,
-                format!("its triage, {}, gave no verdict", record.url),
+                if ledger_dispatch {
+                    format!("its triage, {}, has no checked verdict", record.url)
+                } else {
+                    format!("its triage, {}, gave no verdict", record.url)
+                },
             ),
         };
         if config.operator_questions_only
@@ -8876,6 +8950,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return self.triage(read, AGAIN, (snapshot, target, slots));
         }
         let operator = [config.operator.as_str()];
+        // Operator direction may request a fresh triage, not act as a run
+        // verdict. Use the actual comment creation time, not synthetic
+        // ledger position or an edit to an older conversation.
+        if ledger_dispatch
+            && carried(&from.body).is_none()
+            && comments.iter().any(|c| {
+                c.created > record.created && plan::written_by(c, config.operator.as_str())
+            })
+        {
+            return self.triage(read, AGAIN, (snapshot, target, slots));
+        }
         if let Some((_, c, verdict)) = &verdict
             && verdict == "needs-issue"
             && let Some(answer) = (self.verdict_answers(c, rest).into_iter())
@@ -8895,6 +8980,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         // A verdict that asks no one waits for the operator's word, too.
         if verdict.as_ref().is_none_or(|(_, _, v)| !self.asks(v))
+            && !ledger_dispatch
             && rest.iter().any(|c| is(c.author.as_deref(), &operator))
         {
             return self.triage(read, AGAIN, (snapshot, target, slots));
@@ -8969,8 +9055,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }));
         }
         let days = time::Duration::days(config.triage_follow_up_days as i64);
-        // Without a verdict the run may have failed: retried after the days.
-        let carried = carried(&from.body).filter(|_| verdict.is_some());
+        // A ledger-backed triage can deliberately leave no new verdict. Do
+        // not retry that silence as though it were a failed run.
+        let quiet = ledger_dispatch;
+        let carried = carried(&from.body).filter(|_| quiet || verdict.is_some());
         // The triages in a row before this that planned nothing, each
         // asked by the pass; the first ask is not one.
         let planned = |c: &&plan::Comment| {
@@ -8997,7 +9085,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // times in a row; then the issue waits on the operator or a change
         // (agent-board#864). Without it, an unchanged issue waits for a
         // change or the operator (agent-board#383).
-        let replans = config.triage_replans as usize;
+        let replans = if config.living_status.is_some() {
+            0
+        } else {
+            config.triage_replans as usize
+        };
         let replanned = carried.is_some() && replans > 0 && again < replans;
         let due = since.changed + wait;
         let from_due = due.format(&Rfc3339).unwrap_or_default();
@@ -9009,6 +9101,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             };
             let why = format!(
                 "{said}; triaged again from {from_due}{changed}, or once {operator} comments"
+            );
+            return Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)));
+        }
+        if quiet && carried.is_none() {
+            let why = format!(
+                "{said}; its older triage has no input fingerprint; waiting for operator direction"
             );
             return Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)));
         }
@@ -9155,6 +9253,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             None => return Ok(Acted::Nothing),
         };
+        // Preserve legacy checks and no-write outcomes. A new close,
+        // close-candidate label, or assignment still requires an original
+        // public authority receipt, not a synthesized ledger record.
+        if self.config.living_status.is_some() && (closing.is_some() || assign) {
+            return Ok(Acted::Step(Step::Hold(Hold::new(
+                HoldKind::Other,
+                format!("{said}; {act} deferred: requires a standalone authority receipt"),
+            ))));
+        }
         let rule = match (close, assign) {
             (Some(_), _) => String::new(),
             (None, true) => {
@@ -9167,11 +9274,57 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     .to_owned()
             }
         };
-        // The comment, and the close, label or assignment.
-        let writes = match (close, assign) {
-            (None, true) => 1 + wait::ASSIGN_WRITES,
-            _ => 2,
+        let id = plan::comment_id(&c.url).with_context(|| format!("{} has no id", c.url))?;
+        let receipt = if let Some((_, reason)) = close {
+            format!(
+                "{CLOSED} {} on [this triage verdict]({}); reopen it if that is wrong.",
+                reason.replace('_', " "),
+                c.url
+            )
+        } else {
+            let with = if assign {
+                format!("assigned to {operator}; any response of theirs releases it")
+            } else {
+                format!("labelled {NEEDS_HUMAN}; a comment, then the label taken off, releases it")
+            };
+            let decision = self.decision(verdict, c, closing, refused);
+            format!(
+                "{}\n{decision}\n\n[This triage verdict]({}) waits on {operator}: {with}.",
+                hold_marker(id),
+                c.url
+            )
         };
+        let body = format!("{receipt}\n\n{}", crate::Footer::default());
+        // Reapplying a removed label does not need another copy of its
+        // receipt, including one predating the ledger.
+        let already_reported = self.config.living_status.is_some()
+            && comments.iter().any(|c| {
+                plan::written_by(c, &self.config.bot)
+                    && !run_output(&c.body)
+                    && (c.body == receipt || c.body == body)
+            });
+        if !already_reported
+            && self
+                .client
+                .bounds
+                .living
+                .borrow()
+                .as_ref()
+                .is_some_and(|store| store.first_post_pending(issue))
+        {
+            return Ok(Acted::Step(Step::Hold(Hold::new(
+                kind,
+                format!(
+                    "{said}; waiting for the previous status publication to reconcile before {act}"
+                ),
+            ))));
+        }
+        let writes = usize::from(!already_reported)
+            + if close.is_none() && assign {
+                wait::ASSIGN_WRITES
+            } else {
+                1
+            };
         if let Some(held) = self.caps.check_many(Kind::Write, writes) {
             let why = format!("{said}; {held}: {act}{rule}");
             let kind = match close {
@@ -9180,7 +9333,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             };
             return Ok(Acted::Step(Step::Hold(Hold::new(kind, why))));
         }
-        let id = plan::comment_id(&c.url).with_context(|| format!("{} has no id", c.url))?;
         // Counted once sent, whether or not its answer comes back.
         self.caps.count_many(Kind::Write, writes);
         if self.apply {
@@ -9188,8 +9340,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 "{API_ROOT}repos/{}/issues/{}",
                 issue.repository, issue.number
             );
-            let post = |body: String| {
-                let body = format!("{body}\n\n{}", crate::Footer::default());
+            let post = || {
                 let url = format!("{issue_url}/comments");
                 plan::send(&self.client, "POST", &url, &json!({"body": body}), 0)
             };
@@ -9198,33 +9349,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 // the close fail, the next pass asks the operator rather
                 // than closing, and a close never lands without it.
                 Some((_, reason)) => {
-                    post(format!(
-                        "{CLOSED} {} on [this triage verdict]({}); reopen it if that is wrong.",
-                        reason.replace('_', " "),
-                        c.url
-                    ))?;
+                    post()?;
                     let state = json!({"state": "closed", "state_reason": reason});
                     plan::send(&self.client, "PATCH", &issue_url, &state, 0)?;
                 }
                 None => {
-                    let with = match assign {
-                        true => {
-                            self.assign(issue)?;
-                            format!("assigned to {operator}; any response of theirs releases it")
-                        }
-                        false => {
-                            plan::send(
-                                &self.client,
-                                "POST",
-                                &format!("{issue_url}/labels"),
-                                &json!({"labels": [NEEDS_HUMAN]}),
-                                0,
-                            )?;
-                            format!(
-                                "labelled {NEEDS_HUMAN}; a comment, then the label taken off, releases it"
-                            )
-                        }
-                    };
+                    if assign {
+                        self.assign(issue)?;
+                    } else {
+                        plan::send(
+                            &self.client,
+                            "POST",
+                            &format!("{issue_url}/labels"),
+                            &json!({"labels": [NEEDS_HUMAN]}),
+                            0,
+                        )?;
+                    }
                     // After the label: should this fail, the hold has no
                     // marker and waits for the operator, rather than a
                     // second marker being posted by the next pass. The
@@ -9232,12 +9372,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     // ([`holds::summary`]); a refused close says why on
                     // the issue, not only in the pass's log, so that the
                     // operator and the supervisor see why.
-                    let decision = self.decision(verdict, c, closing, refused);
-                    post(format!(
-                        "{}\n{decision}\n\n[This triage verdict]({}) waits on {operator}: {with}.",
-                        hold_marker(id),
-                        c.url
-                    ))?;
+                    if !already_reported {
+                        post()?;
+                    }
                 }
             }
         }
@@ -9944,6 +10081,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             waiver: Default::default(),
             direction: self.direction_hash(),
             midstreams: None,
+            release_refused: self.config.living_status.is_some(),
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);

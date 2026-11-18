@@ -857,6 +857,8 @@ fn marker_line(plan: &str) -> String {
     format!("<!-- {DISPATCH_MARKER}: {plan} -->")
 }
 
+pub(crate) const REFUSED_TRIAGE: &str = "<!-- agent-board-refused-triage: ";
+
 /// The hash of the operator's direction a dispatch record carries on its
 /// own hidden line, where the pass wrote the plan's brief with it.
 pub(crate) fn recorded_direction(record: &str) -> Option<&str> {
@@ -1075,6 +1077,8 @@ pub struct Scheduled<'a> {
     /// The topic-admitted midstream forks stage 2 read: an implement or fix
     /// plan that works in one gets [`crate::promote::midstream_brief`].
     pub midstreams: Option<&'a [String]>,
+    /// Let a later pass take the plan after a confirmed workflow refusal.
+    pub release_refused: bool,
 }
 
 /// A dispatcher's refusal before it sent anything, as a lease admission
@@ -1329,6 +1333,7 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     // Extras left out, by index into `chosen.extras`, why, and whether their
     // record is released (the read-back failed rather than found a conflict).
     let mut dropped: Vec<(usize, String, bool)> = Vec::new();
+    let mut refused_triage = false;
     let started = (|| -> Result<Option<String>> {
         for extra in &chosen.extras {
             records.push(post(
@@ -1388,6 +1393,10 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             StartOutcome::Unnamed => Ok(None),
             // Only a failed route check before any POST is definitely unsent.
             // A compatibility retry's check cannot release an earlier send's claim.
+            StartOutcome::NotStarted(error) if scheduled.release_refused && !admission_failed => {
+                refused_triage = true;
+                Err(Refused(format!("{error:#}")).into())
+            }
             StartOutcome::NotStarted(error) if admission_failed && !sent => {
                 Err(Refused(format!("{error:#}")).into())
             }
@@ -1401,6 +1410,16 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             let refused = error.is::<Refused>();
             let mut noted = Ok(());
             for record in &records {
+                let release = if refused_triage {
+                    format!("{REFUSED_TRIAGE}{} -->\n", record.plan)
+                } else {
+                    String::new()
+                };
+                let retry = if refused_triage {
+                    ""
+                } else {
+                    " A later dispatch may take it."
+                };
                 noted = noted.and(match refused {
                     // Without its marker the comment no longer holds the plan.
                     true => send(
@@ -1411,7 +1430,7 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
                             record.issue.repository, record.id
                         ),
                         &json!({"body": format!(
-                            "The plan in {} was not dispatched ({why}). A later dispatch may take it.{note}",
+                            "{release}The plan in {} was not dispatched ({why}).{retry}{note}",
                             record.plan_url
                         )}),
                         0,

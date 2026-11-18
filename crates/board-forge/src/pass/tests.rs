@@ -9680,6 +9680,413 @@ fn answered(forge: &Forge, (author, editor): (&str, Option<&str>), body: &str, d
     }));
 }
 
+fn triage_verdict_body(verdict: &str) -> String {
+    format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{verdict}\"}}\n```\n")
+}
+
+fn advance_living_status_pass(forge: &mut Forge, days: i64) {
+    let advance = time::Duration::days(days);
+    forge.replay.now += advance;
+    let mut snapshot = usage(&mut forge.replay);
+    snapshot["updated_at"] = forge.replay.now.format(&Rfc3339).unwrap().into();
+    for pool in snapshot["pools"].as_object_mut().unwrap().values_mut() {
+        for field in ["observed_at", "resets_at"] {
+            if let Some(time) = pool[field].as_str() {
+                pool[field] = (at(time) + advance).format(&Rfc3339).unwrap().into();
+            }
+        }
+    }
+    set_usage(&mut forge.replay, &snapshot);
+}
+
+#[test]
+fn living_status_retriages_changed_inputs_without_reposting_unchanged_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = outside_harness(config(json!({
+        "livingStatus": dir.path().join("status.json"),
+        "triageFollowUpDays": 1, "triageReplans": 2, "triageClose": true,
+    })));
+    let bot = config.bot.as_str();
+    let mut forge = Forge::new(None, false);
+    let repo = "cgwalters-forge/tracker";
+    let issue = (repo.to_owned(), 446);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    let start = "start triage cgwalters-forge/tracker#446";
+    let first = apply(&forge, &config);
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    let initial = forge.added.borrow()[&issue][0].clone();
+    assert!(text(&initial, "/body").starts_with(living::MARKER));
+    // Simulate a bot verdict timestamped after the frozen pass clock but
+    // before the actual dispatch. Its presence cannot authorize a close.
+    answered(&forge, (bot, None), &triage_verdict_body("done"), 0);
+    forge.added.borrow_mut().get_mut(&issue).unwrap()[1]["createdAt"] = (forge.replay.now
+        + time::Duration::milliseconds(1))
+    .format(&Rfc3339)
+    .unwrap()
+    .into();
+    advance_living_status_pass(&mut forge, 2);
+
+    let count = forge.writes.borrow().len();
+    let unchanged = apply(&forge, &config);
+    assert_eq!(unchanged.failures, 0, "{:#?}", unchanged.lines);
+    assert!(
+        unchanged.lines.iter().any(|l| {
+            l.contains("no checked verdict") && l.contains("nothing changed since its triage")
+        }),
+        "{:#?}",
+        unchanged.lines
+    );
+    assert_eq!(forge.writes.borrow().len(), count);
+
+    answered(
+        &forge,
+        ("visitor", None),
+        "The missing dependency merged.",
+        -1,
+    );
+    let changed = apply(&forge, &config);
+    assert_eq!(changed.failures, 0, "{:#?}", changed.lines);
+    assert!(
+        changed.lines.iter().any(|l| l.starts_with(start)),
+        "{:#?}",
+        changed.lines
+    );
+    assert!(forge.writes.borrow()[count..].iter().any(|(_, url, body)| {
+        let body = body.to_string();
+        url.ends_with("/dispatches")
+            && body.contains("post nothing")
+            && body.contains("do not post a schedule-triage block")
+    }));
+    let after = forge.added.borrow()[&issue].clone();
+    assert_eq!(
+        after.len(),
+        3,
+        "one status, one older verdict, one visitor comment"
+    );
+    assert_eq!(after[0]["id"], initial["id"]);
+    assert_ne!(after[0]["body"], initial["body"]);
+    assert!(!text(&after[0], "/body").contains(PLAN_FENCE));
+    assert!(!text(&after[0], "/body").contains(TRIAGE_FENCE));
+
+    advance_living_status_pass(&mut forge, 2);
+    let count = forge.writes.borrow().len();
+    let silent = apply(&forge, &config);
+    assert_eq!(silent.failures, 0, "{:#?}", silent.lines);
+    assert!(
+        silent.lines.iter().any(|l| {
+            l.contains("no checked verdict") && l.contains("nothing changed since its triage")
+        }),
+        "{:#?}",
+        silent.lines
+    );
+    assert_eq!(forge.writes.borrow().len(), count);
+}
+
+#[test]
+fn first_living_status_claim_without_a_reply_retries_through_dispatch() {
+    for landed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(json!({"livingStatus":dir.path().join("status.json")}));
+        let comments = "/issues/446/comments";
+        let post = format!("POST {API_ROOT}repos/cgwalters-forge/tracker{comments}");
+        let mut forge = Forge::new(landed.then_some(post.as_str()), false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        unpathed(&mut forge.replay);
+        implement_plan(&mut forge.replay);
+        if !landed {
+            *forge.refuse.borrow_mut() = Some(post);
+        }
+
+        let failed = apply(&forge, &config);
+        assert!(failed.failures > 0, "{:#?}", failed.lines);
+        assert!(forge.dispatches().is_empty());
+        assert_eq!(
+            forge.comments_on("cgwalters-forge/tracker", 446).len(),
+            usize::from(landed)
+        );
+
+        for _ in 0..2 {
+            advance_living_status_pass(&mut forge, 1);
+            let report = apply(&forge, &config);
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            assert_eq!(
+                forge.dispatches(),
+                ["cgwalters-forge/tracker#446"],
+                "{:#?}",
+                report.lines
+            );
+        }
+        assert_eq!(forge.comments_on("cgwalters-forge/tracker", 446).len(), 1);
+    }
+}
+
+#[test]
+fn living_status_retries_a_refused_but_not_an_ambiguous_triage_start() {
+    for (status, restored, attempts) in [(403, true, 2), (403, false, 2), (500, true, 1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(json!({"livingStatus":dir.path().join("status.json")}));
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        forge.dispatch_status = Some(status);
+        let failed = apply(&forge, &config);
+        assert!(
+            failed
+                .lines
+                .iter()
+                .any(|line| line.contains(&format!("HTTP status {status}"))),
+            "{:#?}",
+            failed.lines
+        );
+        assert_eq!(forge.dispatches().len(), 1);
+
+        if restored {
+            forge.dispatch_status = None;
+        }
+        for pass in 0..4 {
+            advance_living_status_pass(&mut forge, 1);
+            let report = apply(&forge, &config);
+            if restored || pass > 0 {
+                assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            }
+            assert_eq!(forge.dispatches().len(), attempts, "{:#?}", report.lines);
+            if !restored && pass > 0 {
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|line| line.contains("refused twice")),
+                    "{:#?}",
+                    report.lines
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn living_status_allows_operator_to_retriage_a_plan_without_a_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = outside_harness(config(json!({
+        "livingStatus":dir.path().join("status.json"), "triageFollowUpDays":1,
+    })));
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    job_plan(&mut forge.replay, ("triage", 446), &config.bot, None);
+    let first = apply(&forge, &config);
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    assert_eq!(forge.dispatches().len(), 1);
+    advance_living_status_pass(&mut forge, 2);
+    answered(&forge, ("visitor", None), "Please triage again.", -1);
+    let held = apply(&forge, &config);
+    assert!(
+        held.lines
+            .iter()
+            .any(|line| line.contains("no input fingerprint")),
+        "{:#?}",
+        held.lines
+    );
+    assert_eq!(forge.dispatches().len(), 1);
+    answered(&forge, (&config.operator, None), "Please triage again.", -1);
+    let retried = apply(&forge, &config);
+    assert_eq!(retried.failures, 0, "{:#?}", retried.lines);
+    assert_eq!(forge.dispatches().len(), 2, "{:#?}", retried.lines);
+}
+
+#[test]
+fn living_status_reconciles_an_older_hold_before_labelling_for_a_new_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    let first = apply(
+        &forge,
+        &outside_harness(config(json!({"triageFollowUpDays":1}))),
+    );
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    let config = outside_harness(config(
+        json!({"livingStatus":dir.path().join("status.json"), "triageFollowUpDays":1}),
+    ));
+    let ask = |forge: &Forge, question| {
+        answered(
+            forge,
+            ("cgwalters-bot", None),
+            &format!(
+                "**Decision needed:** {question}\n\n{}",
+                triage_verdict_body("needs-operator")
+            ),
+            0,
+        );
+    };
+    ask(&forge, "Use option A?");
+    advance_living_status_pass(&mut forge, 1);
+    *forge.refuse.borrow_mut() = Some("/issues/446/comments".into());
+    let count_labels = || {
+        forge
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(_, url, _)| url.ends_with("/issues/446/labels"))
+            .count()
+    };
+    let failed = apply_limited(
+        &forge,
+        &config,
+        Limits {
+            writes: Some(2),
+            ..Limits::default()
+        },
+    );
+    assert!(failed.failures > 0, "{:#?}", failed.lines);
+    assert_eq!(count_labels(), 1);
+
+    // The fake does not persist labels, as if the first one was removed.
+    ask(&forge, "Use option B?");
+    let reconcile = apply(&forge, &config);
+    assert_eq!(reconcile.failures, 0, "{:#?}", reconcile.lines);
+    assert_eq!(count_labels(), 1);
+    assert!(
+        forge
+            .comments_on("cgwalters-forge/tracker", 446)
+            .last()
+            .unwrap()
+            .contains("Use option A?")
+    );
+
+    let updated = apply(&forge, &config);
+    assert_eq!(updated.failures, 0, "{:#?}", updated.lines);
+    assert_eq!(count_labels(), 2);
+    assert!(
+        forge
+            .comments_on("cgwalters-forge/tracker", 446)
+            .last()
+            .unwrap()
+            .contains("Use option B?")
+    );
+}
+
+#[test]
+fn living_status_edits_holds_and_reads_older_receipts() {
+    let repo = "cgwalters-forge/tracker";
+    for (legacy, archived, verdict, assign) in [
+        (false, false, "needs-operator", false),
+        (false, true, "needs-operator", false),
+        (true, false, "needs-operator", false),
+        (false, false, "done", false),
+        (false, false, "needs-operator", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = |living: bool| {
+            let mut raw = json!({"triageFollowUpDays": 1, "assignHolds": assign});
+            if living {
+                raw["livingStatus"] = json!(dir.path().join("status.json"));
+            }
+            outside_harness(config(raw))
+        };
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        let mut initial = settings(false);
+        initial.assign_holds = false;
+        let first = apply(&forge, &initial);
+        assert_eq!(first.failures, 0, "{:#?}", first.lines);
+        if assign {
+            assignments(&mut forge.replay, 446, &[], &[]);
+        }
+        answered(
+            &forge,
+            ("cgwalters-bot", None),
+            &format!(
+                "**Decision needed:** Use option A or option B?\n\n{}",
+                triage_verdict_body(verdict)
+            ),
+            0,
+        );
+        advance_living_status_pass(&mut forge, 1);
+        if archived {
+            answered(&forge, ("cgwalters-bot", None), living::MARKER, 0);
+            let mut store = living::Store::load(
+                dir.path().join("status.json").to_str().unwrap(),
+                &initial.bot,
+                forge.replay.now,
+            )
+            .unwrap();
+            store.cleanup = true;
+            let added = forge.added.borrow();
+            let mut data = json!({"repository":{"issue":{"comments":{
+                "nodes":added[&(repo.to_owned(), 446)],"pageInfo":{"hasNextPage":false}
+            }}}});
+            store
+                .expand(
+                    &json!({"owner":"cgwalters-forge","name":"tracker","number":446}),
+                    &mut data,
+                )
+                .unwrap();
+        }
+        let count = forge.writes.borrow().len();
+        let report = apply(&forge, &settings(!legacy));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        if verdict == "done" || assign {
+            assert_eq!(forge.writes.borrow().len(), count, "{:#?}", report.lines);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|line| line.contains("requires a standalone authority receipt"))
+            );
+            continue;
+        }
+        let after = forge.comments_on(repo, 446);
+        assert_eq!(
+            after.len(),
+            4,
+            "{verdict} assign={assign}: {after:#?}; {:#?}",
+            report.lines
+        );
+        if legacy {
+            let issue = (repo.to_owned(), 446);
+            let posted = forge.added.borrow();
+            let verdict_id = posted[&issue][2]["id"].as_u64().unwrap();
+            assert!(after[3].starts_with(&hold_marker(verdict_id)));
+        } else {
+            assert!(after[3].starts_with(living::MARKER));
+            assert!(after[3].contains("### Last triage outcome"));
+            assert!(after[3].contains("Use option A or option B?"));
+            assert!(!after[3].contains(HOLD_MARKER));
+        }
+
+        // The fake did not retain its label write: reapply the label without
+        // repeating the receipt, whether stored or from before living status.
+        let count = forge.writes.borrow().len();
+        let repeat = apply(&forge, &settings(true));
+        assert_eq!(repeat.failures, 0, "{:#?}", repeat.lines);
+        assert_eq!(forge.comments_on(repo, 446), after);
+        assert_eq!(forge.writes.borrow().len(), count + 1);
+        assert!(
+            forge.writes.borrow()[count]
+                .1
+                .ends_with("/issues/446/labels")
+        );
+        if !legacy {
+            let issue = (repo.to_owned(), 446);
+            let status_id = forge.added.borrow()[&issue][3]["id"].clone();
+            answered(
+                &forge,
+                ("cgwalters-bot", None),
+                &format!(
+                    "**Decision needed:** Use option C?\n\n{}",
+                    triage_verdict_body(verdict)
+                ),
+                0,
+            );
+            let changed = apply(&forge, &settings(true));
+            assert_eq!(changed.failures, 0, "{:#?}", changed.lines);
+            let after = forge.comments_on(repo, 446);
+            assert_eq!(after.len(), 5, "{after:#?}");
+            assert_eq!(forge.added.borrow()[&issue][3]["id"], status_id);
+            assert!(after[3].contains("Use option C?"));
+            assert!(changed.lines.contains(&"writes saved by edit: 1".into()));
+        }
+    }
+}
+
 /// The operator's issue as [`CLOSE_QUERY`] reads it, `locked` at that time
 /// or not, and its body `edited` at that time or not.
 fn close_read(variables: &Value, locked: Option<String>, edited: Option<String>) -> Value {
@@ -9730,7 +10137,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         bool,
         &'static str,
     );
-    let verdict = |v: &str| format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{v}\"}}\n```\n");
+    let verdict = triage_verdict_body;
     let bot = "cgwalters-bot";
     let cases: Vec<Case> = vec![
         (
@@ -12423,7 +12830,7 @@ fn apply_takes_an_earlier_triage_verdict() {
         &'a str,
         Option<(&'a str, &'a str)>,
     );
-    let verdict = |v: &str| format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{v}\"}}\n```\n");
+    let verdict = triage_verdict_body;
     let bot = "cgwalters-bot";
     let off = json!({});
     let on = json!({"triageFollowUpDays": 3});

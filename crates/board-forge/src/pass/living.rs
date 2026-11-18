@@ -17,6 +17,12 @@ const SCHEMA: &str = "agent-board/status/v1";
 const MAX_RECORDS: usize = 1000;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DISPLAY_CHARS: usize = 2000;
+const SECTIONS: &[&str] = &[
+    "Current plan",
+    "Last dispatch",
+    "Last apply",
+    "Last triage outcome",
+];
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,9 +33,15 @@ struct Entry {
     #[serde(default)]
     prose: BTreeMap<String, String>,
     // Last validated reference per public comment, including minimized duplicates.
+    // An empty value denotes a known legacy status without a state reference.
     // Those comments remain readable after the authoritative status advances.
     #[serde(default)]
     references: BTreeMap<u64, String>,
+    // A first POST without a response can still become visible after a
+    // complete scan and a successful retry. Keep its reference independently
+    // of the retry's ID and later revisions, never as evidence of work.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    uncertain_first_posts: BTreeSet<String>,
     #[serde(default)]
     pulls: Option<Vec<pull_links::PullLink>>,
     // A confirmed minimization stays done even if a person later restores it.
@@ -472,6 +484,209 @@ mod tests {
     }
 
     #[test]
+    fn first_living_status_post_recovers_without_appending_or_reposting() {
+        // An epic apply that lost its claim's reply never wrote; its claim
+        // must not block the retry.
+        let claim = format!(
+            "<!-- {0}: p -->\nApplying.\n```{0}\n{{\"plan\":\"p\"}}\n```",
+            epic_apply::APPLY_MARKER
+        );
+        let cases = [
+            (json!({"body":claim}), false),
+            (
+                json!({"body":format!("{}\nWaiting for a decision.", hold_marker(10))}),
+                true,
+            ),
+        ];
+        for ((receipt, kept), landed) in cases
+            .iter()
+            .flat_map(|case| [false, true].map(|landed| (case, landed)))
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.json");
+            let path = path.to_str().unwrap();
+            let mut store = Store::load(path, "bot", at()).unwrap();
+            let write = store.prepare("POST", URL, receipt).unwrap().unwrap();
+            let body = text(&write.body, "/body");
+            let url = "https://github.com/o/r/issues/1#issuecomment-30";
+            let nodes = if landed {
+                // GitHub committed the POST but the response was lost.
+                json!([{"body":body,"url":url,"author":{"login":"bot"},
+                    "lastEditedAt":null,"editor":null,"createdAt":store.at}])
+            } else {
+                store.finish(&write, &mut (422, json!({}))).unwrap();
+                json!([])
+            };
+            // The same pass's read may not show a POST that lost its reply.
+            let mut empty = json!({"repository":{"issue":{"comments":{
+                "nodes":[],"pageInfo":{"hasNextPage":false}
+            }}}});
+            store
+                .expand(&json!({"owner":"o","name":"r","number":1}), &mut empty)
+                .unwrap();
+            assert_eq!(store.ledger.entries["o/r#1"].records.len(), 1);
+            assert!(store.pending().is_empty());
+            drop(store);
+
+            let mut store = Store::load(path, "bot", at()).unwrap();
+            assert_eq!(store.pending().len(), 1);
+            assert!(store.prepare("POST", URL, receipt).is_err());
+            let mut data = json!({"repository":{"issue":{"comments":{
+                "nodes":nodes,"pageInfo":{"hasNextPage":false}
+            }}}});
+            store
+                .expand(&json!({"owner":"o","name":"r","number":1}), &mut data)
+                .unwrap();
+            if !kept {
+                let entry = &store.ledger.entries["o/r#1"];
+                assert!(entry.records.is_empty());
+                assert_eq!(entry.id, landed.then_some(30));
+                assert!(store.pending().iter().all(|w| w.method == "PATCH"));
+                continue;
+            }
+            if landed {
+                assert_eq!(text(&data, "/repository/issue/comments/nodes/0/url"), url);
+                assert!(store.pending().is_empty());
+            } else {
+                assert_eq!(data["repository"]["issue"]["comments"]["nodes"], json!([]));
+                let retry = store.pending().pop().unwrap();
+                assert_eq!(retry.method, "POST");
+                assert_eq!(retry.body, write.body);
+                store.finish(&retry, &mut (201, json!({"id":30}))).unwrap();
+            }
+            let store = Store::load(path, "bot", at()).unwrap();
+            let entry = &store.ledger.entries["o/r#1"];
+            assert_eq!(entry.id, Some(30));
+            assert_eq!(entry.records.len(), 1);
+            assert_eq!(text(&entry.records[0], "/url"), url);
+            assert_eq!(text(&entry.records[0], "/body"), text(receipt, "/body"));
+            assert!(store.pending().is_empty());
+        }
+    }
+
+    #[test]
+    fn first_status_claim_can_land_after_another_pass_saw_no_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let path = path.to_str().unwrap();
+        let variables = json!({"owner":"o","name":"r","number":1});
+        let page = |nodes| {
+            json!({"repository":{"issue":{"comments":{
+                "nodes":nodes,"pageInfo":{"hasNextPage":false}
+            }}}})
+        };
+        let day = time::Duration::days(1);
+        let mut store = Store::load(path, "bot", at()).unwrap();
+        let lost = store
+            .prepare("POST", URL, &dispatched(10))
+            .unwrap()
+            .unwrap();
+        let delayed = json!({"body":lost.body["body"],
+            "url":"https://github.com/o/r/issues/1#issuecomment-30","author":{"login":"bot"},
+            "lastEditedAt":null,"editor":null,"createdAt":store.at});
+
+        let mut store = Store::load(path, "bot", at() + day).unwrap();
+        store.expand(&variables, &mut page(json!([]))).unwrap();
+        let plan = json!({"body":format!("Current.\n```{}\n{{}}\n```", plan::PLAN_FENCE)});
+        let retry = store.prepare("POST", URL, &plan).unwrap().unwrap();
+        store.finish(&retry, &mut (201, json!({"id":31}))).unwrap();
+        let visible = json!({"body":retry.body["body"],
+            "url":"https://github.com/o/r/issues/1#issuecomment-31","author":{"login":"bot"},
+            "lastEditedAt":null,"editor":null,"createdAt":store.at});
+
+        let mut store = Store::load(path, "bot", at() + 2 * day).unwrap();
+        let mut data = page(json!([delayed, visible]));
+        store.expand(&variables, &mut data).unwrap();
+        let entry = &store.ledger.entries["o/r#1"];
+        assert_eq!(entry.id, Some(30));
+        assert_eq!(entry.records.len(), 1);
+        assert_eq!(entry.records[0]["body"], plan["body"]);
+        assert_eq!(
+            data["repository"]["issue"]["comments"]["nodes"][0]["body"],
+            plan["body"]
+        );
+        assert!(!entry.prose.contains_key("Last dispatch"));
+        assert_eq!(store.pending()[0].method, "PATCH");
+    }
+
+    #[test]
+    fn first_hold_receipt_can_land_after_retry_and_a_new_status_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let path = path.to_str().unwrap();
+        let vars = json!({"owner":"o","name":"r","number":1});
+        let page = |nodes| {
+            json!({"repository":{"issue":{"comments":{
+                "nodes":nodes,"pageInfo":{"hasNextPage":false}
+            }}}})
+        };
+        let node = |id, write: &Write| {
+            json!({"body":write.body["body"],
+            "url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),
+            "author":{"login":"bot"},"lastEditedAt":null,"editor":null,
+            "createdAt":"2026-11-01T00:00:00Z"})
+        };
+        let receipt = |id| json!({"body":format!("{}\nHold {id}.", hold_marker(id))});
+        let day = time::Duration::days(1);
+        let mut store = Store::load(path, "bot", at()).unwrap();
+        let lost = store.prepare("POST", URL, &receipt(10)).unwrap().unwrap();
+        let delayed = node(30, &lost);
+
+        let mut store = Store::load(path, "bot", at() + day).unwrap();
+        store.expand(&vars, &mut page(json!([]))).unwrap();
+        let retry = store.pending().pop().unwrap();
+        assert_eq!(retry.body, lost.body);
+        store.finish(&retry, &mut (201, json!({"id":31}))).unwrap();
+        let newer = store.prepare("POST", URL, &receipt(11)).unwrap().unwrap();
+        store.finish(&newer, &mut (200, json!({"id":31}))).unwrap();
+        let visible = node(31, &newer);
+        store.expand(&vars, &mut page(json!([visible]))).unwrap();
+
+        let mut store = Store::load(path, "bot", at() + 2 * day).unwrap();
+        store
+            .expand(&vars, &mut page(json!([delayed, visible])))
+            .unwrap();
+        let entry = &store.ledger.entries["o/r#1"];
+        assert_eq!(entry.id, Some(30));
+        assert_eq!(entry.records.len(), 2);
+        let pending = store.pending().pop().unwrap();
+        assert_eq!(pending.method, "PATCH");
+        assert!(text(&pending.body, "/body").contains("Hold 11."));
+        assert!(!text(&pending.body, "/body").contains("Hold 10."));
+    }
+
+    #[test]
+    fn replacing_a_legacy_status_preserves_its_dispatch_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let issue = crate::github::parse_github_issue("o/r#1", None, DEFAULT_HOST).unwrap();
+        let mut store = Store::load(path.to_str().unwrap(), "bot", at()).unwrap();
+        let write = store
+            .prepare("POST", URL, &dispatched(10))
+            .unwrap()
+            .unwrap();
+        store.finish(&write, &mut (201, json!({"id":30}))).unwrap();
+        let entry = store.ledger.entries.get_mut("o/r#1").unwrap();
+        entry.references.clear(); // Older ledgers only stored the current ID.
+        let record = plan::comment(&entry.records[0]).unwrap();
+        let mut data = json!({"repository":{"issue":{"comments":{
+            "nodes":[{"body":MARKER,"url":"https://github.com/o/r/issues/1#issuecomment-40",
+                "author":{"login":"bot"},"createdAt":store.at,"lastEditedAt":null,"editor":null}],
+            "pageInfo":{"hasNextPage":false}
+        }}}});
+        store
+            .expand(&json!({"owner":"o","name":"r","number":1}), &mut data)
+            .unwrap();
+        assert_eq!(store.ledger.entries["o/r#1"].id, Some(40));
+        assert_eq!(store.dispatch_origin(&issue, &record), (true, false));
+        // The ledger keeps GitHub's case; the scheduler's key is lowercase.
+        let entry = store.ledger.entries.remove("o/r#1").unwrap();
+        store.ledger.entries.insert("O/R#1".into(), entry);
+        let mixed = crate::github::parse_github_issue("O/R#1", None, DEFAULT_HOST).unwrap();
+        assert_eq!(store.dispatch_origin(&mixed, &record), (true, false));
+    }
+
+    #[test]
     fn historical_plans_require_complete_trusted_coverage_and_publication() {
         for (name, edit, expected) in [
             ("superseded", None, 1),
@@ -803,6 +1018,10 @@ pub(super) struct Store {
     duplicates: BTreeMap<String, BTreeSet<u64>>,
     discovered: BTreeMap<String, u64>,
     written: BTreeSet<String>,
+    // First POSTs sent this pass. One that lost its reply may become visible
+    // only after a read in the same pass, so its unbound records wait for a
+    // later pass's full read before being dropped or retried.
+    attempted: BTreeSet<String>,
     pub cleanup: bool,
     pub read_only: bool,
     history: BTreeMap<String, Vec<Value>>,
@@ -858,8 +1077,12 @@ pub(super) fn check_paths(path: &str, cache: Option<&str>) -> Result<()> {
 }
 
 fn kind(body: &str) -> Option<&'static str> {
-    if body.starts_with(&format!("<!-- {}: ", plan::DISPATCH_MARKER)) {
+    if body.starts_with(&format!("<!-- {}: ", plan::DISPATCH_MARKER))
+        || body.starts_with(plan::REFUSED_TRIAGE)
+    {
         Some("Last dispatch")
+    } else if body.starts_with(&format!("<!-- {HOLD_MARKER}: verdict ")) {
+        Some("Last triage outcome")
     } else if plan::has_fence(body, epic_apply::APPLY_MARKER) {
         Some("Last apply")
     } else if plan::has_fence(body, plan::PLAN_FENCE) {
@@ -905,7 +1128,7 @@ fn state_reference(body: &str) -> Option<&str> {
 
 fn public_body(entry: &Entry) -> String {
     let mut out = format!("{MARKER}\n## Board status\n");
-    for section in ["Current plan", "Last dispatch", "Last apply"] {
+    for &section in SECTIONS {
         if let Some(record) = entry
             .records
             .iter()
@@ -944,6 +1167,15 @@ fn public_body(entry: &Entry) -> String {
 
 fn marked(body: &str) -> bool {
     body.starts_with(MARKER) || body.starts_with(ORIGINAL_MARKER)
+}
+
+fn bind_records(entry: &mut Entry, key: &str, id: u64) -> Result<()> {
+    let (repo, number) = key.rsplit_once('#').context("status issue key")?;
+    let url = format!("https://github.com/{repo}/issues/{number}#issuecomment-{id}");
+    for record in entry.records.iter_mut().filter(|r| r["url"].is_null()) {
+        record["url"] = url.clone().into();
+    }
+    Ok(())
 }
 
 impl Store {
@@ -992,7 +1224,7 @@ impl Store {
             ledger
                 .entries
                 .values()
-                .map(|e| e.references.len())
+                .map(|e| e.references.len() + e.uncertain_first_posts.len())
                 .sum::<usize>()
                 <= MAX_RECORDS,
             "status ledger reference bound exceeded"
@@ -1024,7 +1256,7 @@ impl Store {
             );
             for record in &entry.records {
                 let mut record = record.clone();
-                if entry.id.is_none() {
+                if record["url"].is_null() {
                     record["url"] = url.clone().into();
                 }
                 let comment = plan::comment(&record).context("invalid status ledger record")?;
@@ -1045,6 +1277,7 @@ impl Store {
             duplicates: BTreeMap::new(),
             discovered: BTreeMap::new(),
             written: BTreeSet::new(),
+            attempted: BTreeSet::new(),
             cleanup: false,
             read_only: false,
             history: BTreeMap::new(),
@@ -1071,7 +1304,7 @@ impl Store {
             self.ledger
                 .entries
                 .values()
-                .map(|e| e.references.len())
+                .map(|e| e.references.len() + e.uncertain_first_posts.len())
                 .sum::<usize>()
                 <= MAX_RECORDS,
             "status ledger reference bound exceeded"
@@ -1158,6 +1391,10 @@ impl Store {
             ensure!(total < MAX_RECORDS, "status ledger is full; nothing sent");
         }
         let entry = self.ledger.entries.entry(key.clone()).or_default();
+        ensure!(
+            !entry.records.iter().any(|r| r["url"].is_null()),
+            "first status publication for {key} is pending; reconcile before adding a record"
+        );
         let created = entry.id.is_none();
         let id = entry.id;
         let (repo, number) = key.rsplit_once('#').context("status issue key")?;
@@ -1170,6 +1407,10 @@ impl Store {
             entry.records.len() - 1
         } else {
             let identity = identity(text)?;
+            let identity = identity.map(|line| match line.strip_prefix(plan::REFUSED_TRIAGE) {
+                Some(plan) => format!("<!-- {}: {plan}", plan::DISPATCH_MARKER),
+                None => line,
+            });
             let index = entry
                 .records
                 .iter()
@@ -1215,6 +1456,9 @@ impl Store {
             None => url.to_owned(),
         };
         self.save()?;
+        if created {
+            self.attempted.insert(key.clone());
+        }
         Ok(Some(Write {
             key,
             method: if created { "POST" } else { "PATCH" },
@@ -1224,6 +1468,47 @@ impl Store {
             replaced_post: method == "POST" && !created,
             record: Some(index),
         }))
+    }
+
+    /// Whether the dispatch came from a status comment or a standalone
+    /// comment archived in the ledger. Copying the record does not change
+    /// which comment supplied its original dispatch boundary.
+    pub(super) fn dispatch_origin(&self, issue: &ItemRef, comment: &plan::Comment) -> (bool, bool) {
+        let Some((entry, id)) = self.entry(issue).zip(plan::comment_id(&comment.url)) else {
+            return (false, false);
+        };
+        let saved = entry.records.iter().any(|record| {
+            text(record, "/url") == comment.url && text(record, "/body") == comment.body
+        });
+        let status = entry.id == Some(id) || entry.references.contains_key(&id);
+        (saved && status, saved && !status)
+    }
+
+    pub(super) fn first_post_pending(&self, issue: &ItemRef) -> bool {
+        self.entry(issue)
+            .is_some_and(|entry| entry.records.iter().any(|record| record["url"].is_null()))
+    }
+
+    pub(super) fn triage_retry_exhausted(&self, issue: &ItemRef, id: &str) -> bool {
+        self.entry(issue).is_some_and(|entry| {
+            let marker = format!("{}{id} -->", plan::REFUSED_TRIAGE);
+            entry
+                .records
+                .iter()
+                .filter(|record| text(record, "/body").lines().next() == Some(marker.as_str()))
+                .nth(1)
+                .is_some()
+        })
+    }
+
+    /// Ledger keys keep the case GitHub returned; [`key`] lowercases.
+    fn entry(&self, issue: &ItemRef) -> Option<&Entry> {
+        let key = key(issue);
+        self.ledger
+            .entries
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+            .map(|(_, entry)| entry)
     }
 
     pub fn finish(&mut self, write: &Write, response: &mut (u16, Value)) -> Result<()> {
@@ -1240,13 +1525,9 @@ impl Store {
                 .get_mut(&write.key)
                 .context("missing status entry")?;
             entry.id = Some(id);
-            let (repo, number) = write.key.rsplit_once('#').context("status issue key")?;
-            for record in &mut entry.records {
-                if record["url"].is_null() {
-                    record["url"] =
-                        format!("https://github.com/{repo}/issues/{number}#issuecomment-{id}")
-                            .into();
-                }
+            bind_records(entry, &write.key, id)?;
+            if let Some(reference) = state_reference(text(&write.body, "/body")) {
+                entry.references.insert(id, reference.into());
             }
             self.save()?;
         }
@@ -1309,9 +1590,14 @@ impl Store {
             .entries
             .iter()
             .filter_map(|(key, entry)| {
-                // A tracking-only status can be created after a complete comment
-                // scan. Reconciliation scans again before sending this POST.
-                if entry.id.is_none() && entry.pulls.is_none() {
+                // A prepared first POST has a durable record without a URL.
+                // Reconciliation in a later pass scans the whole thread
+                // before retrying it.
+                let unbound = entry.records.iter().any(|r| r["url"].is_null());
+                if entry.id.is_none()
+                    && ((entry.pulls.is_none() && !unbound)
+                        || (unbound && self.attempted.contains(key)))
+                {
                     return None;
                 }
                 let body = public_body(entry);
@@ -1433,21 +1719,47 @@ impl Store {
                 "status comment has a foreign or unknown editor"
             );
             let id = plan::comment_id(text(node, "/url")).context("status comment id missing")?;
+            let mut ignore_display = false;
             if body.contains(STATE) {
                 let reference = state_reference(body).context("invalid status state reference")?;
+                ensure!(!reference.is_empty(), "empty status state reference");
                 ensure!(
                     self.ledger.entries.get(&key).is_some_and(|entry| {
                         reference == state_id(entry)
                             || entry.published.as_deref().and_then(state_reference)
                                 == Some(reference)
                             || entry.references.get(&id).map(String::as_str) == Some(reference)
+                            || entry.uncertain_first_posts.contains(reference)
                     }),
                     "status ledger missing or stale for {key}; restore its durable livingStatus file before continuing"
                 );
             }
             let entry = self.ledger.entries.entry(key.clone()).or_default();
             if let Some(reference) = state_reference(body) {
+                ignore_display = entry.uncertain_first_posts.contains(reference);
+                if entry.records.iter().any(|r| r["url"].is_null()) && reference == state_id(entry)
+                {
+                    // The status POST landed, but without its reply the
+                    // dispatcher never reached the workflow POST and epic
+                    // apply never wrote. Adopt the comment, not their
+                    // unstarted claims.
+                    let before = entry.records.len();
+                    entry.records.retain(|record| {
+                        !record["url"].is_null()
+                            || !matches!(
+                                kind(text(record, "/body")),
+                                Some("Last dispatch" | "Last apply")
+                            )
+                    });
+                    if entry.records.len() < before {
+                        entry.uncertain_first_posts.insert(reference.into());
+                        ignore_display = true;
+                    }
+                    bind_records(entry, &key, id)?;
+                }
                 entry.references.insert(id, reference.into());
+            } else {
+                entry.references.entry(id).or_default();
             }
             let first = self
                 .discovered
@@ -1461,7 +1773,18 @@ impl Store {
                     .insert(old.max(id));
             }
             self.discovered.insert(key.clone(), first);
+            if let Some(old) = entry.id.filter(|old| *old != first) {
+                entry.references.entry(old).or_default();
+            }
             entry.id = Some(first);
+            if ignore_display {
+                // Adopt the marker; use the ledger, not the uncertain POST's
+                // older display of a claim or a hold outcome.
+                if id == first {
+                    entry.published = Some(body.into());
+                }
+                continue;
+            }
             if let Some((_, encoded)) = body.split_once(RECORDS) {
                 let encoded = encoded
                     .strip_suffix("\n-->")
@@ -1502,7 +1825,7 @@ impl Store {
                     }
                 }
             }
-            for section in ["Current plan", "Last dispatch", "Last apply"] {
+            for &section in SECTIONS {
                 if let Some((_, prose)) = body.split_once(&format!("\n### {section}\n")) {
                     let prose = prose
                         .split("\n### ")
@@ -1537,8 +1860,34 @@ impl Store {
             && !self.written.contains(&key)
             && let Some(entry) = self.ledger.entries.get_mut(&key)
         {
-            entry.id = None;
+            if let Some(id) = entry.id.take() {
+                entry.references.entry(id).or_default();
+            }
             entry.published = None;
+        }
+        if complete
+            && !self.attempted.contains(&key)
+            && let Some(entry) = self.ledger.entries.get_mut(&key)
+        {
+            // No matching POST was found for the remaining unbound records.
+            // A dispatch or apply could not proceed without a comment ID.
+            // Let the checked operation acquire its own claim on retry; a
+            // background publication would claim work that never started.
+            // The ordinary triage receipt is different: its label write
+            // preceded the POST, so keep the display receipt pending.
+            let keep = |record: &Value| {
+                !record["url"].is_null()
+                    || kind(text(record, "/body")) == Some("Last triage outcome")
+            };
+            if entry.records.iter().any(|r| r["url"].is_null()) {
+                if !self.discovered.contains_key(&key) {
+                    entry.uncertain_first_posts.insert(state_id(entry));
+                }
+                entry.records.retain(keep);
+            }
+            if let Some(id) = self.discovered.get(&key) {
+                bind_records(entry, &key, *id)?;
+            }
         }
         if self.cleanup && complete && self.discovered.contains_key(&key) {
             let entry = self
@@ -1582,7 +1931,8 @@ impl Store {
             // once its source is deleted or no longer a trusted plan, the
             // issue has withdrawn it.
             let withdrawn = |r: &Value| {
-                plan::comment_id(text(r, "/url")) != entry.id
+                !plan::comment_id(text(r, "/url"))
+                    .is_some_and(|id| entry.id == Some(id) || entry.references.contains_key(&id))
                     && plan::has_fence(text(r, "/body"), plan::PLAN_FENCE)
                     && !sources.iter().any(|n| {
                         same_origin(r, n)
@@ -1609,7 +1959,8 @@ impl Store {
                             complete
                         } else {
                             variables["after"].is_null() || !previous_records.contains(r)
-                        }) && !sources.contains(r)
+                        }) && !r["url"].is_null()
+                            && !sources.contains(r)
                             && !withdrawn(r)
                     })
                     .cloned(),

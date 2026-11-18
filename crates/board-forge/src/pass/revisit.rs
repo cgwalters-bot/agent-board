@@ -415,7 +415,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 return Ok(Step::Hold(Hold::new(HoldKind::Other, why)));
             }
         }
-        // Without a verdict since, the revisit may have failed: retried.
+        // Without living status, no verdict since can mean the revisit
+        // failed. Under living status it may have been intentionally silent.
         let bot = [config.bot.as_str()];
         let answered = |last: &plan::Comment| {
             let after = comments.iter().position(|c| c.url == last.url);
@@ -431,7 +432,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         };
         if let Some(last) = last
             && let Some(carried) = carried(&last.body)
-            && answered(last)
+            && (config.living_status.is_some() || answered(last))
         {
             let again = last.changed + time::Duration::days(UNCHANGED_DAYS as i64);
             if self.now < again && self.inputs(due.facts, &comments)? == carried {
