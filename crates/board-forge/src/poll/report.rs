@@ -21,9 +21,8 @@ pub(super) const QUEUE_QUERY: &str = r#"query($owner: String!, $name: String!, $
 /// Queue entries read per repository; a longer queue is reported unread
 /// rather than partial.
 const QUEUE_ENTRIES: u64 = 100;
-/// Requests queue reads leave for publishing: the destination repository,
-/// the issue, a page of its comments and the write.
-const PUBLISH_REQUESTS: usize = 4;
+/// The issue and its first page of comments, once visibility is checked.
+const PUBLISH_READS: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct Destination {
@@ -147,6 +146,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let Some(at) = &self.config.policy.maintainer_report else {
             return;
         };
+        // Spend the required visibility reads before any optional queue reads.
+        if self.apply.is_some()
+            && let Err(error) = self.check_report_visibility(&at.repository, follow)
+        {
+            outcome.error("maintainer report", &error);
+            return;
+        }
         // Deferred review starts now have their final outcome; labelled skips
         // also use the poll's existing state rather than reclassifying anything.
         for step in &outcome.steps {
@@ -198,8 +204,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// publishing needs, is an error.
     fn merge_queue(&mut self, repo: &str) -> Result<Value> {
         let (owner, name) = repo.split_once('/').context("repository")?;
+        // Standalone poll also reserves the write and, in preview, the unread
+        // destination. The hosted pass already keeps a separate write reserve.
+        let reserve = PUBLISH_READS + 1 + usize::from(self.apply.is_none());
+        let share_too_short = self.apply.is_some()
+            && self
+                .rest
+                .share_left()
+                .is_some_and(|left| left <= PUBLISH_READS);
         ensure!(
-            self.remaining > PUBLISH_REQUESTS,
+            self.remaining > reserve && !share_too_short,
             "request budget left for publishing the report"
         );
         self.spend()?;
@@ -227,6 +241,39 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(Value::Array(entries))
     }
 
+    fn check_report_visibility(&mut self, repo: &str, follow: &BTreeSet<&String>) -> Result<()> {
+        let destination = self.report_repository(repo)?;
+        match (
+            destination["private"].as_bool(),
+            destination.get("visibility"),
+        ) {
+            (Some(true), None) => {} // Keep accepting the existing private flag.
+            (Some(true), Some(visibility))
+                if visibility == "private" || visibility == "internal" => {}
+            (Some(false), Some(visibility)) if visibility == "public" => {
+                // The report names even undecided repositories. Check the whole
+                // follow set, reusing the destination read if it is followed.
+                let mut checked = BTreeSet::from([repo.to_ascii_lowercase()]);
+                for repo in follow {
+                    if checked.insert(repo.to_ascii_lowercase()) {
+                        let source = self.report_repository(repo)?;
+                        ensure!(
+                            source["private"] == false && source["visibility"] == "public",
+                            "{repo} is not confirmed public; refusing to publish to a public repository"
+                        );
+                    }
+                }
+            }
+            _ => bail!("{repo}: cannot confirm maintainer report destination visibility"),
+        }
+        Ok(())
+    }
+
+    fn report_repository(&mut self, repo: &str) -> Result<Value> {
+        self.get(&format!("repos/{repo}"))
+            .with_context(|| format!("{repo}: could not read repository visibility"))
+    }
+
     fn publish_report(
         &mut self,
         at: &Destination,
@@ -235,11 +282,6 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     ) -> Result<()> {
         let repo = &at.repository;
         let issue = at.issue;
-        let destination = self.get(&format!("repos/{repo}"))?;
-        ensure!(
-            destination["private"] == true,
-            "{repo} is not private; the maintainer report is not written there"
-        );
         let target = self.get(&format!("repos/{repo}/issues/{issue}"))?;
         ensure!(
             target["pull_request"].is_null(),

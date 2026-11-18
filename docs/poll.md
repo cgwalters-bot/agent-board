@@ -661,9 +661,22 @@ a repository left out of it are still never seen.
 `maintainerReport` is absent by default: no report reads or writes. Set it to
 `{"repository": "OWNER/REPO", "issue": 1356}` in the trusted caller's
 `agent-board.json` to publish a machine-readable readout after each poll pass.
-The issue must be an issue, not a pull request, in a **private** repository:
-the followed set and reasons may disclose private repository activity, as the
-holds snapshot does. The setting does not change any pull request decision.
+The target must be an issue, not a pull request. A private destination works
+with any follow set. A **public** destination is allowed only when GitHub
+confirms that every repository in the resolved follow set is public. This
+prevents publishing private repository names and activity from that set. It
+includes undecided repositories and those outside this pass's processing
+envelope, but not activity-only watch repositories. Visibility is checked once
+per repository for publication on each applying pass, using the poll's existing
+client, conditional response cache and request budget. A non-public repository
+or an unsuccessful or ambiguous visibility read refuses publication with a
+poll error naming the repository, without changing any pull request decision.
+
+This is a point-in-time repository visibility check, not a content audit. It
+does not redact report text (such as reasons that mention other repositories),
+prevent visibility changes between the check and the write, or remove an older
+comment if a followed repository later becomes private. Use a private
+destination if the report may contain information that should not be public.
 
 The bot finds its comment by the leading marker
 `<!-- agent-board-maintainer-report -->`, creates it if absent, and otherwise
