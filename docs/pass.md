@@ -6020,6 +6020,11 @@ This applies to `follow`, `workRepositories`, `holds.proposals.repositories`,
 `statusReconcile.runRepositories`, `review.targets`, nested `repositories` selectors,
 and `maintain.repos.include`/`exclude`. Pool, label and path lists are not
 repository lists. Explicit names remain additive, even when they name a fork.
+`pr.maintainers` does not expand organization entries or subtract from `follow`.
+It sends stage 2's PR follow-up to the repositories' own maintainers without
+changing which repositories the rest of the pass follows. Only exact names in
+the resolved `follow` list are accepted. See [poll configuration](poll.md#configuration)
+for the actions this skips and the cutover note.
 The standalone poll, supervisor, status and trusted-config readers use the same
 expansion. Forgejo does not support organization entries.
 
@@ -6274,6 +6279,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.queueOnlyRepository` | One exact followed `OWNER/REPO` whose ready PRs may only be enqueued; missing queue rules hold rather than falling back to direct merge; absent/null off; see [queue-only admission](poll.md#queue-only-repository-admission) |
 | `pr.headOwners` | Logins whose head repositories the bot may push to, making its PRs there its own for fixes, rebases and merges; only the operator's review counts there; the fix bounds must admit those repositories and branches too; `[]`, the bot's fork alone |
 | `pr.noMerge` | Exact `OWNER/REPO` base repositories never directly merged, enqueued or re-enqueued by the pass, while authorized rounds continue; no globs; `[]` |
+| `pr.maintainers` | Exact `OWNER/REPO` base repositories whose PR follow-up is handed to another maintainer; `[]` (no handover), at most 50, GitHub only |
 | `pr.operatorPaths` | Files, directories ending in `/`, or a JSON file's values other than its `FILE#/json/pointer` exemptions, a pull request changing any of which merges or is enqueued only on the operator's approval of its head, waiting as an approve row naming them, see [the poll](poll.md#configuration); relative, no globs, at most 50; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.fixRounds` | Fix rounds a pull request gets before its budget is exhausted and it goes to `pr.agentRecovery`'s triage, else `needs-human`; 1–5, more than 2 only once the polling job's approval-free bound allows it; `2`, see [the poll](poll.md) |

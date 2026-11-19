@@ -319,6 +319,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             held.reason =
                 "dependencies satisfied; needs-supervisor must be released before update or readiness".into();
         }
+        if update && let Some(why) = self.handover_shared_head(repo, number) {
+            update = false;
+            held.update_head = previous
+                .as_ref()
+                .map(|(_, h)| h.update_head.clone())
+                .unwrap_or_default();
+            action = "blocked";
+            held.reason = format!("dependencies satisfied; branch update held: {why}");
+        }
         let changed = previous.as_ref().is_none_or(|(_, old)| old != &held);
         let caps = self.caps;
         let planned = changed

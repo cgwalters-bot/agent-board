@@ -794,7 +794,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                             "operator comments: ignored {repo:?}, outside the scope"
                         ));
                         true
-                    } else if !intake && follow.contains(&repo) {
+                    } else if (hit.get("pull_request").is_some_and(|p| !p.is_null())
+                        && self.config.policy.handed_over(&repo))
+                        || (!intake && follow.contains(&repo))
+                    {
                         // The poll's own steps cover its followed pull requests.
                         true
                     } else if intake && (retried.contains(&key) || listed.contains(&key)) {
@@ -1480,6 +1483,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     ) -> Result<Option<Handled>> {
         let number = hit["number"].as_u64().context("search hit has no number")?;
         let pull = hit.get("pull_request").is_some_and(|p| !p.is_null());
+        if pull && self.config.policy.handed_over(repo) {
+            return Ok(None);
+        }
         let bot = self.config.bot.clone();
         let (done, mut refused) = handled(comments, &bot, self.now);
         let mut said: Vec<Said> = self
@@ -1688,6 +1694,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             if let Some(why) = self.owner_branches(text(from, "/full_name"), own) {
                 return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
             }
+        }
+        if let Some(why) = self.handover_shared_head(repo, number) {
+            return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
         }
         let marker = find_marker(read, &self.config.bot);
         // A stop whose label is gone was reset, as decide reads it.

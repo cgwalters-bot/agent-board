@@ -153,6 +153,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
         ("pr.mergeQueue", Present),
         ("pr.reviewPools", Nonempty),
         ("pr.reviewDispatchRepositories", Nonempty),
+        ("pr.maintainers", Nonempty),
         ("pr.draftReviewRepositories", Nonempty),
         ("pr.operatorPaths", Nonempty),
     ] {

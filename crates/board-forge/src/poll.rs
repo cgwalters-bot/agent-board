@@ -577,6 +577,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "generatedBy",
     "maintainerReport",
     // The pass's `pr` keys of [`PrOptions`].
+    "maintainers",
     "queueOnlyRepository",
     "checkReruns",
     "unstall",
@@ -660,6 +661,8 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// Exact base repositories left to their own maintainer (lowercase).
+    pub maintainers: BTreeSet<String>,
     /// CLI-only selection, never authority to bypass the followed envelope.
     pub pull: Option<PullSelector>,
     /// Pass-only opt-in repository backpressure; no new fix authority.
@@ -1154,6 +1157,8 @@ pub const OPERATOR_PATHS_LIMIT: usize = 50;
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrOptions {
+    #[serde(default, deserialize_with = "maintainer_names")]
+    pub maintainers: Vec<String>,
     #[serde(default)]
     pub agent_recovery: bool,
     #[serde(default)]
@@ -1201,6 +1206,22 @@ pub struct PrOptions {
     pub fix_rounds: Option<u64>,
 }
 
+fn maintainer_names<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error> {
+    use serde::de::Error;
+    let names = <Vec<Value> as serde::Deserialize>::deserialize(deserializer)?;
+    names
+        .into_iter()
+        .map(|entry| match entry {
+            Value::String(name) => Ok(name),
+            other => Err(D::Error::custom(format_args!(
+                "maintainers entry {other} must be an exact OWNER/REPO string"
+            ))),
+        })
+        .collect()
+}
+
 impl PrOptions {
     /// The keys, as JSON names them.
     fn keys() -> Vec<String> {
@@ -1229,6 +1250,19 @@ impl PrOptions {
     /// `at` starts each error, as `pr ` for the pass.
     pub fn check(&self, at: &str, follow: &[String], review_workflow: bool) -> Result<()> {
         let names = |list: &[String], repo: &str| list.iter().any(|r| r.eq_ignore_ascii_case(repo));
+        // A wildcard or an unbounded list could silently hand off unrelated PRs;
+        // a misspelled name would leave two maintainers acting on the intended repo.
+        ensure!(
+            self.maintainers.len() <= POLL_REPOSITORY_LIMIT,
+            "{at}maintainers exceeds {POLL_REPOSITORY_LIMIT} repositories"
+        );
+        for repo in &self.maintainers {
+            validate_repository(repo).with_context(|| format!("{at}maintainers entry {repo:?}"))?;
+            ensure!(
+                names(follow, repo),
+                "{at}maintainers repository {repo} is not followed"
+            );
+        }
         if let Some(repo) = &self.queue_only_repository {
             validate_repository(repo)
                 .with_context(|| format!("{at}queueOnlyRepository repository"))?;
@@ -1315,6 +1349,7 @@ impl PrOptions {
     /// Sets these in `policy`.
     pub fn apply(&self, policy: &mut PollPolicy) {
         let Self {
+            maintainers,
             agent_recovery,
             queue_only_repository,
             hold_missing_data,
@@ -1338,6 +1373,10 @@ impl PrOptions {
             stale_days,
             fix_rounds,
         } = self.clone();
+        policy.maintainers = maintainers
+            .into_iter()
+            .map(|r| r.to_ascii_lowercase())
+            .collect();
         policy.queue_only_repository = queue_only_repository;
         policy.agent_recovery = agent_recovery;
         policy.hold_dependencies = hold_dependencies;
@@ -1364,6 +1403,24 @@ impl PrOptions {
 }
 
 impl PollPolicy {
+    pub(crate) fn handed_over(&self, repo: &str) -> bool {
+        !self.maintainers.is_empty() && self.maintainers.contains(&repo.to_ascii_lowercase())
+    }
+
+    pub(crate) fn handover_line(&self) -> Option<String> {
+        (!self.maintainers.is_empty()).then(|| {
+            format!(
+                "pr: skipped {} handed-over repositories: {}",
+                self.maintainers.len(),
+                self.maintainers
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+    }
+
     /// The fix rounds of one pull request: `fixRounds`, or [`FIX_ROUNDS`].
     pub fn fix_rounds(&self) -> u64 {
         self.fix_rounds.unwrap_or(FIX_ROUNDS)
@@ -1483,6 +1540,7 @@ impl PollPolicy {
             // The CLI's `--fix-bounds`, never the config's.
             fix_bounds: bounds::FixBoundsSet::default(),
             // [`PrOptions::apply`]'s, below.
+            maintainers: BTreeSet::new(),
             head_owners: Vec::new(),
             no_merge: Vec::new(),
             midstreams: Vec::new(),
@@ -6817,6 +6875,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// a pass for each base; the new head waits for its review. `not` starts
     /// the line of one that waits for another pass.
     fn update(&mut self, repo: &str, pull: &Value, not: &str) -> Result<String> {
+        if let Some(why) =
+            self.handover_shared_head(repo, pull["number"].as_u64().unwrap_or_default())
+        {
+            return Ok(format!("{not}{why}"));
+        }
         if let Some(why) = self.dependency_work_hold(repo, pull)? {
             return Ok(format!("{not}{why}"));
         }
@@ -8854,13 +8917,41 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         pulls
             .iter()
             .map(|p| (text(p, "/repository/nameWithOwner"), p["number"].as_u64()))
-            .find(|(at, _)| !self.followed.contains(&at.to_ascii_lowercase()))
+            .find(|(at, _)| {
+                self.config.policy.handed_over(at)
+                    || !self.followed.contains(&at.to_ascii_lowercase())
+            })
             .map(|(at, n)| {
+                let why = if self.config.policy.handed_over(at) {
+                    "was handed over to its own maintainer"
+                } else {
+                    "this pass does not follow"
+                };
                 format!(
-                    "its head is also the head of {at}#{}, which this pass does not follow",
+                    "its head is also the head of {at}#{}, which {why}",
                     n.unwrap_or_default()
                 )
             })
+    }
+
+    /// A branch update on a managed PR can also advance a handed-over PR.
+    /// Do not expand the read or change the decision without a handover.
+    fn handover_shared_head(&mut self, repo: &str, number: u64) -> Option<String> {
+        if self.config.policy.maintainers.is_empty() {
+            return None;
+        }
+        let Some((owner, name)) = repo.split_once('/') else {
+            return Some("its repository has no owner".into());
+        };
+        match self.shared_pulls(owner, name, number) {
+            Err(why) => Some(why),
+            Ok(pulls) => pulls.iter().find_map(|pr| {
+                let at = text(pr, "/repository/nameWithOwner");
+                self.config.policy.handed_over(at).then(|| {
+                    format!("its head is also the head of a handed-over pull request in {at}")
+                })
+            }),
+        }
     }
 
     /// Why stage 2 leaves `repo`'s pull request `number`, outside our own
@@ -9466,6 +9557,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         if round && left.is_none() {
             left = self.shared_head(owner, name, number);
+        }
+        if left.is_none()
+            && (decision.action == "update"
+                || (decision.action == "merge" && !queued && pull["mergeStateStatus"] == BEHIND))
+        {
+            left = self.handover_shared_head(repo, number);
         }
         if let Some(why) = &left {
             answer.clear();
@@ -10197,7 +10294,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     caps: Option<&caps::Caps>,
     now: OffsetDateTime,
 ) -> Result<Outcome> {
-    run_capped_after_direction(
+    let mut outcome = run_capped_after_direction(
         rest,
         graphql,
         config,
@@ -10208,7 +10305,11 @@ pub fn run_capped<R: Rest, G: Transport>(
         now,
         None,
         false,
-    )
+    )?;
+    if let Some(line) = config.policy.handover_line() {
+        outcome.lines.insert(0, line);
+    }
+    Ok(outcome)
 }
 
 /// Continue stage 2 after its separately budgeted operator intake. Its starts
@@ -10369,11 +10470,20 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         pass.intake_refused = std::mem::take(&mut state.intake_refused);
     }
     let follow: BTreeSet<&String> = follow.iter().collect();
+    // Only PR work uses the narrowed set. Activity, direction on issues,
+    // and the maintainer report still use the original repository scope.
+    let pr_follow: BTreeSet<&String> = follow
+        .iter()
+        .copied()
+        .filter(|repo| !policy.handed_over(repo))
+        .collect();
     pass.review_census(follow.iter().copied(), &mut outcome);
     if let Some(pull) = &policy.pull {
         // A selection changes only the walk, not its census or decision/start
         // machinery. Keep unrelated cursors and receipts for the hosted pass.
-        pass.follow_turn(&pull.repository, Turn::Only(pull.number), &mut outcome)?;
+        if !policy.handed_over(&pull.repository) {
+            pass.follow_turn(&pull.repository, Turn::Only(pull.number), &mut outcome)?;
+        }
         pass.rest.under_way(true);
         pass.start_reviews(&mut outcome);
         pass.rest.under_way(false);
@@ -10442,7 +10552,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     let mut follow_cursor = None;
     if let Some(cap) = config.policy.repositories_per_pass {
         let envelope = admission::admit(
-            follow.iter().map(|r| r.as_str()),
+            pr_follow.iter().map(|r| r.as_str()),
             cap,
             state.follow_cursor.as_deref(),
         )?;
@@ -10467,14 +10577,14 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     let mut action_first_positions = BTreeMap::new();
     if config.policy.action_first {
         (action_first_cursor, upstream_cursor, action_first_positions) =
-            pass.action_first(&follow, &state, &missing, &mut outcome);
+            pass.action_first(&pr_follow, &state, &missing, &mut outcome);
         if pass.apply.is_none() {
             action_first_cursor = state.action_first_cursor.clone();
             action_first_positions = state.action_first_positions.clone();
         }
         waiting.extend(outcome.undecided.iter().cloned());
     }
-    for (repo, turn) in walk(&follow, state.share_cursor.as_deref())
+    for (repo, turn) in walk(&pr_follow, state.share_cursor.as_deref())
         .into_iter()
         .filter(|_| !config.policy.action_first)
     {
