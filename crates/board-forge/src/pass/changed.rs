@@ -71,6 +71,14 @@ impl Sweep {
             false,
         )
     }
+
+    pub(super) fn covered(&self) -> &BTreeSet<String> {
+        &self.covered
+    }
+
+    pub(super) fn retain_covered(&mut self, keep: impl FnMut(&String) -> bool) {
+        self.covered.retain(keep);
+    }
 }
 
 /// What stage 0 read, for stage 2 to walk and then commit.
@@ -295,7 +303,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
         };
         let mut seen = BTreeSet::new();
-        let repositories: Vec<Followed> = (config.follow.iter().map(|r| (r, false)))
+        let mut repositories: Vec<Followed> = (config.follow.iter().map(|r| (r, false)))
             .chain(midstreams.iter().map(|r| (r, true)))
             .filter(|(r, _)| {
                 !config.pr.poll.action_first
@@ -307,6 +315,21 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 midstream,
             })
             .collect();
+        // `publicState`: one not public has no watermark to narrow to and
+        // no coverage, so it is walked whole every pass.
+        let (bounds, inner) = (self.client.bounds, self.client.inner);
+        if let Some(visibility) = bounds.visibility.borrow_mut().as_mut() {
+            let (public, _) = visibility.public(inner, seen.iter().cloned(), public::STAGE_QUERIES);
+            seen.retain(|repo| public.contains_key(repo));
+            let before = repositories.len();
+            repositories.retain(|r| seen.contains(&r.name.to_ascii_lowercase()));
+            if before > repositories.len() {
+                self.line(format!(
+                    "changes: {} repositories not public, so walked whole",
+                    before - repositories.len()
+                ));
+            }
+        }
         let hours = config.change_sweep_hours;
         let mut state = sane(stored, &seen, (self.now, hours));
         let mut diffs = Vec::new();

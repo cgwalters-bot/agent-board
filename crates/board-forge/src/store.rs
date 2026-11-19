@@ -17,7 +17,7 @@ use crate::changes::diff;
 use crate::github::DEFAULT_HOST;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use time::OffsetDateTime;
 
@@ -58,6 +58,10 @@ const MIGRATIONS: &[&str] = &[
         since TEXT NOT NULL
     ) STRICT;",
     "CREATE TABLE changes (state TEXT NOT NULL) STRICT;",
+    "CREATE TABLE identities (
+        repository TEXT PRIMARY KEY,
+        id TEXT NOT NULL
+    ) STRICT;",
 ];
 
 /// The schema version this build writes.
@@ -126,7 +130,17 @@ pub struct Records {
     /// The changes diff's state after stage 0, which replaces the last;
     /// none leaves it.
     pub changes: Option<diff::State>,
+    /// `publicState` ([`crate::pass::public`]): the lower-case repositories
+    /// GitHub said are public this pass with the identity the pass's state
+    /// recorded, the only ones whose rows and watermarks [`save`] leaves.
+    /// It leaves an earlier one only where it recorded that identity at
+    /// its last save, and no hold's reason, which can name other items;
+    /// none keeps all.
+    pub public: Option<Identities>,
 }
+
+/// Lower-case `OWNER/REPO`s to their GitHub node ids.
+pub type Identities = BTreeMap<String, String>;
 
 impl Records {
     /// Add `dispatch` of the comment `record`, filling in what an earlier
@@ -189,6 +203,14 @@ fn comment_item(url: &str) -> Option<String> {
     Some(key.to_ascii_lowercase())
 }
 
+/// The lower-case repository of an issue key `OWNER/REPO#N`; with its host
+/// for another host, which is never a GitHub repository name.
+pub fn repository(item: &str) -> String {
+    item.rsplit_once('#')
+        .map_or(item, |(repo, _)| repo)
+        .to_ascii_lowercase()
+}
+
 /// What [`save`] found and left.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Saved {
@@ -207,7 +229,22 @@ pub struct Saved {
 /// Any failure to open it rebuilds it, which suits an index that the
 /// comments refill; state with no other copy will need to tell a damaged
 /// database from a transient error first.
+///
+/// With [`Records::public`], a save that fails removes the database, as it
+/// can still hold rows of a repository that is not public, or their freed
+/// bytes; one it cannot remove is the error.
 pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved> {
+    let saved = write(path, records, now);
+    match saved {
+        Err(error) if records.public.is_some() => {
+            replace(path).with_context(|| format!("{error:#}; remove the store"))?;
+            Err(error.context("removed the store, which the next pass rebuilds"))
+        }
+        saved => saved,
+    }
+}
+
+fn write(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved> {
     let (mut connection, rebuilt) = match open(path) {
         Ok(connection) => (connection, None),
         Err(why) => {
@@ -225,7 +262,46 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
     };
     let seen = now.unix_timestamp();
     let tx = connection.transaction().context("store transaction")?;
-    for (record, d) in &records.dispatches {
+    let mut changes = records.changes.clone();
+    if let Some(public) = &records.public {
+        // An earlier row stays only where its repository is public now as
+        // the one it was saved from.
+        let recorded = identities(&tx)?;
+        let same = |repo: &String| {
+            public
+                .get(repo)
+                .is_some_and(|id| recorded.get(repo) == Some(id))
+        };
+        for (table, _) in ITEM_TABLES {
+            for item in (items(&tx, table)?.iter()).filter(|i| !same(&repository(i))) {
+                tx.execute(&format!("DELETE FROM {table} WHERE item = ?1"), [item])
+                    .context("drop a non-public row")?;
+            }
+        }
+        tx.execute("UPDATE holds SET reason = ''", [])
+            .context("drop the holds' reasons")?;
+        // A stored state no pass replaces now still loses the others' marks;
+        // one that cannot be read is dropped whole.
+        let fresh = changes.is_some();
+        if !fresh {
+            changes = stored_changes(&tx).unwrap_or_else(|_| Some(diff::State::default()));
+        }
+        let keep = |repo: &String| {
+            if fresh {
+                public.contains_key(repo)
+            } else {
+                same(repo)
+            }
+        };
+        if let Some(changes) = &mut changes {
+            changes.repositories.retain(|repo, _| keep(repo));
+            changes.pending.retain(|item| keep(&repository(item)));
+        }
+    }
+    let kept = |item: &str| {
+        (records.public.as_ref()).is_none_or(|public| public.contains_key(&repository(item)))
+    };
+    for (record, d) in records.dispatches.iter().filter(|(_, d)| kept(&d.item)) {
         // SQLite's integers are signed; no run id comes near the bound.
         let run = d.run.and_then(|run| i64::try_from(run).ok());
         tx.execute(
@@ -239,7 +315,7 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
         )
         .context("record a dispatch")?;
     }
-    for (comment, v) in &records.verdicts {
+    for (comment, v) in records.verdicts.iter().filter(|(_, v)| kept(&v.item)) {
         tx.execute(
             "INSERT INTO verdicts (comment, item, verdict, operator, at, seen)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -257,7 +333,7 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
         )
         .context("record a verdict")?;
     }
-    for (item, p) in &records.plans {
+    for (item, p) in records.plans.iter().filter(|(item, _)| kept(item)) {
         tx.execute(
             "INSERT INTO plans (item, plan, kind, seen) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (item) DO UPDATE SET plan = excluded.plan,
@@ -269,16 +345,33 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
     if let Some(holds) = &records.holds {
         tx.execute("DELETE FROM holds", [])
             .context("replace the holds")?;
-        for h in holds {
+        for h in holds.iter().filter(|h| h.item.as_deref().is_none_or(kept)) {
+            // An epic's names its waiting children, of any repository.
+            let reason = if records.public.is_some() {
+                ""
+            } else {
+                &h.reason
+            };
             tx.execute(
                 "INSERT INTO holds (item, epic, kind, reason, operator, since)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![h.item, h.epic, h.kind, h.reason, h.operator, h.since],
+                params![h.item, h.epic, h.kind, reason, h.operator, h.since],
             )
             .context("record a hold")?;
         }
     }
-    if let Some(changes) = &records.changes {
+    // Without the option none is recorded, so turning it on drops every
+    // earlier row once.
+    tx.execute("DELETE FROM identities", [])
+        .context("replace the identities")?;
+    for (repo, id) in records.public.iter().flatten() {
+        tx.execute(
+            "INSERT INTO identities (repository, id) VALUES (?1, ?2)",
+            [repo, id],
+        )
+        .context("record an identity")?;
+    }
+    if let Some(changes) = &changes {
         let state = serde_json::to_string(&changes.to_json()?)?;
         tx.execute("DELETE FROM changes", [])
             .context("replace the changes state")?;
@@ -287,11 +380,15 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
     }
     // Counted only as saved: decoding a row a cache planted would fail the
     // save of everything else.
-    let watermarks = records.changes.as_ref().map(|changes| {
-        (changes.repositories.values())
-            .filter(|mark| mark.since.is_some())
-            .count() as u64
-    });
+    let watermarks = records
+        .changes
+        .as_ref()
+        .and(changes.as_ref())
+        .map(|changes| {
+            (changes.repositories.values())
+                .filter(|mark| mark.since.is_some())
+                .count() as u64
+        });
     let expired = seen - STORE_RETENTION_DAYS * 24 * 60 * 60;
     for table in ["dispatches", "verdicts", "plans"] {
         tx.execute(&format!("DELETE FROM {table} WHERE seen < ?1"), [expired])
@@ -311,7 +408,54 @@ pub fn save(path: &Path, records: &Records, now: OffsetDateTime) -> Result<Saved
         watermarks,
     };
     tx.commit().context("commit the store")?;
+    if records.public.is_some() {
+        // A delete only frees its row's bytes; the file is published.
+        (connection.execute_batch("VACUUM")).context("vacuum the store")?;
+    }
     Ok(saved)
+}
+
+/// The tables whose rows name an issue in `item`, and the schema version
+/// that added each.
+const ITEM_TABLES: [(&str, usize); 4] = [
+    ("dispatches", 1),
+    ("verdicts", 1),
+    ("plans", 2),
+    ("holds", 2),
+];
+
+fn identities(connection: &Connection) -> Result<Identities> {
+    let mut statement = connection.prepare("SELECT repository, id FROM identities")?;
+    (statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?)
+        .collect::<rusqlite::Result<_>>()
+        .context("read the identities")
+}
+
+fn items(connection: &Connection, table: &str) -> Result<Vec<String>> {
+    let sql = format!("SELECT DISTINCT item FROM {table} WHERE item IS NOT NULL");
+    (connection.prepare(&sql)?.query_map([], |row| row.get(0))?)
+        .collect::<rusqlite::Result<_>>()
+        .with_context(|| format!("read the {table} items"))
+}
+
+/// The lower-case repositories the database at `path` has rows or
+/// changes watermarks of, read only. A database [`save`] would rebuild is
+/// an error.
+pub fn repositories(path: &Path) -> Result<BTreeSet<String>> {
+    let (connection, version) = inspect(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut repositories = BTreeSet::new();
+    for (table, since) in ITEM_TABLES {
+        if version >= since {
+            repositories.extend(items(&connection, table)?.iter().map(|i| repository(i)));
+        }
+    }
+    if version >= CHANGES_SCHEMA
+        && let Some(changes) = stored_changes(&connection)?
+    {
+        repositories.extend(changes.repositories.into_keys());
+        repositories.extend(changes.pending.iter().map(|item| repository(item)));
+    }
+    Ok(repositories)
 }
 
 /// The changes diff's state in the database at `path`, read only: none
@@ -659,9 +803,9 @@ mod tests {
             ("evicted", Ok(Some("no database"))),
             ("damaged", Ok(Some("integrity check: "))),
             ("oversized", Ok(Some("larger than"))),
-            ("newer", Ok(Some("schema 99 is newer than this build's 3"))),
+            ("newer", Ok(Some("schema 99 is newer than this build's 4"))),
             ("tableless", Ok(Some("schema differs from version 1's"))),
-            ("trigger", Ok(Some("schema differs from version 3's"))),
+            ("trigger", Ok(Some("schema differs from version 4's"))),
             // A constraint that every row fails, slowly: refused by its
             // schema before an integrity check would evaluate it.
             ("constraint", Ok(Some("schema differs from version 1's"))),
@@ -674,7 +818,7 @@ mod tests {
             ("wal", Ok(Some("not a rollback-journal database"))),
             (
                 "partial page",
-                Ok(Some("45057 bytes is not a whole number")),
+                Ok(Some("53249 bytes is not a whole number")),
             ),
             (
                 "page count",
@@ -809,6 +953,133 @@ mod tests {
             };
             assert_eq!(save(&path, &records, at(0)).unwrap().holds, expected);
         }
+    }
+
+    /// `publicState`: a save keeps no row or watermark of a repository not
+    /// public, an earlier one or a stored changes state no pass replaces
+    /// included, nor an earlier one saved from another repository of the
+    /// same name, or without the option; and no hold's reason, which can
+    /// name a private item. A hold of every new run names none and stays.
+    #[test]
+    fn public_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let hold = |item: Option<&str>| Hold {
+            item: item.map(Into::into),
+            epic: true,
+            kind: "epic-not-live".into(),
+            reason: "1 child waits: o/private#5 (P0)".into(),
+            operator: true,
+            since: "2027-01-15T08:00:00Z".into(),
+        };
+        let mut watermarks = diff::State::default();
+        for repo in ["o/r", "o/private"] {
+            watermarks
+                .repositories
+                .insert(repo.into(), Default::default());
+            watermarks.pending.insert(format!("{repo}#3"));
+        }
+        let identity = |repo: &str, id: &str| (repo.to_owned(), id.to_owned());
+        let mut earlier = records();
+        earlier.holds = Some(vec![hold(Some("o/r#1")), hold(Some("o/private#2"))]);
+        earlier.changes = Some(watermarks);
+        for item in ["o/private#4", "o/r#5"] {
+            (earlier.plans).insert(item.into(), records().plans["o/r#1"].clone());
+        }
+        // Both public when it was saved.
+        earlier.public = Some([identity("o/r", "R_1"), identity("o/private", "R_2")].into());
+        save(&path, &earlier, at(0)).unwrap();
+        let this_pass = || {
+            let mut records = records();
+            for item in ["o/private#1", "o/r#1"] {
+                let dispatch = Dispatch {
+                    item: item.into(),
+                    ..Default::default()
+                };
+                let issue = item.replace('#', "/issues/");
+                let url = format!("https://github.com/{issue}#issuecomment-9");
+                records.dispatch(&url, dispatch);
+            }
+            let holds = [Some("o/r#1"), Some("o/private#2"), None];
+            records.holds = Some(holds.map(hold).into());
+            records
+        };
+        let private = |bytes: &[u8]| bytes.windows(9).any(|bytes| bytes == b"o/private");
+        for (public, expected, marked) in [
+            (None, (3, 1, 3, 3), &["o/private", "o/r"][..]),
+            (
+                Some([identity("o/r", "R_1")].into()),
+                (2, 1, 2, 2),
+                &["o/r"],
+            ),
+            // Another repository has its name now: only this pass's rows.
+            (Some([identity("o/r", "R_9")].into()), (2, 1, 1, 2), &[]),
+            (Some(Identities::new()), (0, 0, 0, 1), &[]),
+        ] {
+            let path = dir.path().join(format!("{expected:?}.db"));
+            std::fs::copy(dir.path().join("state.db"), &path).unwrap();
+            let records = Records {
+                public: public.clone(),
+                ..this_pass()
+            };
+            let saved = save(&path, &records, at(0)).unwrap();
+            let counts = (saved.dispatches, saved.verdicts, saved.plans, saved.holds);
+            assert_eq!(counts, expected, "{public:?}");
+            assert_eq!(saved.watermarks, None, "no pass replaced them");
+            // Nor do a deleted row's or reason's bytes stay in the file.
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(private(&bytes), public.is_none(), "{public:?}");
+            let stored = changes(&path).unwrap().unwrap();
+            let repositories: Vec<_> = stored.repositories.keys().collect();
+            assert_eq!(repositories, marked, "{public:?}");
+            assert_eq!(stored.pending.len(), marked.len());
+        }
+        // Rows saved without the option have no identity, so none stays.
+        let path = dir.path().join("(3, 1, 3, 3).db");
+        let records = Records {
+            public: Some([identity("o/r", "R_1")].into()),
+            ..Records::default()
+        };
+        let saved = save(&path, &records, at(0)).unwrap();
+        let counts = (saved.dispatches, saved.verdicts, saved.plans, saved.holds);
+        assert_eq!(counts, (0, 0, 0, 1));
+        assert!(!private(&std::fs::read(&path).unwrap()));
+        assert_eq!(changes(&path).unwrap(), Some(diff::State::default()));
+        let named = repositories(&dir.path().join("state.db")).unwrap();
+        assert_eq!(named, BTreeSet::from(["o/private".into(), "o/r".into()]));
+    }
+
+    /// `publicState`: a save that fails, here as another connection keeps
+    /// it from committing, removes the store and its private rows; one it
+    /// cannot remove, as it is not a database, is left and is an error.
+    #[test]
+    fn public_save_failure_removes_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut earlier = records();
+        let plan = earlier.plans["o/r#1"].clone();
+        earlier.plans.insert("o/private#4".into(), plan);
+        save(&path, &earlier, at(0)).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN; SELECT * FROM plans;").unwrap();
+        let records = Records {
+            public: Some([("o/r".into(), "R_1".into())].into()),
+            ..records()
+        };
+        let error = save(&path, &records, at(0)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("removed the store"),
+            "{error:#}"
+        );
+        assert!(!path.exists());
+        drop(reader);
+        std::fs::write(&path, "not a database").unwrap();
+        let error = save(&path, &records, at(0)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("remove the store"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a database");
     }
 
     /// The changes state reads back as saved, read only; a pass without one

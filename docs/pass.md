@@ -146,7 +146,7 @@ The deterministic catalog is in `pass/features.rs`. It includes behavioral
 opt-ins, not every optional key. The GitHub catalog consists of:
 
 - Boolean switches: `notifications`, `issueIntake`, `reserveScheduling`,
-  `poolHeadroom`, `skipActiveWork`, `idleReplan`, `existingChildPlans`,
+  `poolHeadroom`, `publicState`, `skipActiveWork`, `idleReplan`, `existingChildPlans`,
   `researchPlans`, `fixPlans`, `sessionPlans`, `triageClose`, `replanInvalid`, `operatorQuestionsOnly`,
   `reserveOperator`, `assignHolds`, `readFreeHolds`, `bodyPlans`, `leases`,
   `reruns`, `reapOverdueRuns`, `cleanupHistory`, `topDown`, `usage.probe`,
@@ -3407,6 +3407,82 @@ changed sub-issue belongs to.
 Caller: `cgwalters-forge/tracker`, `.github/pass.json`, set
 `changeSweepHours` (for example `6`) where `store` and `state` are set.
 
+### Public state
+
+The concrete threat `publicState: true` stops is a non-public repository's
+responses, holds, watermarks or sweep coverage reaching the public
+`pass-state` artifact, which carries `state` and `store` from one hosted
+pass to the next (agent-board#1048). It is off by default, GitHub only, and
+needs `state`.
+
+Each pass asks GitHub, outside its request share, whether a repository is
+public: `isPrivate` false and `visibility` `PUBLIC`, in one GraphQL query per
+100 repositories and at most four queries a pass. Visibility is never read
+from the state it guards, nor kept from one question to the next. A
+repository whose answer is missing, unreadable or past that bound counts as
+not public; one query that fails, for one repository it cannot resolve,
+leaves the rest of its 100 not public too. Where `changeSweepHours` is set,
+stage 0 asks, in one of those queries, about the followed and midstream
+repositories, and leaves out those that are not public. They have no
+watermark, so stage 2 walks them whole every pass, and the sweep completes
+without them. When the pass ends, it asks again about every repository
+named in what it keeps or in the store's rows, so that one made private
+during the pass keeps nothing it read.
+
+A name is not an identity: a private repository can be renamed and its old
+name given to a public one. So the query also reads each repository's node
+id, and `state` records, in `public_repositories`, those public when the
+pass ended with their ids; the store records those it kept the same way. A
+repository counts as public only where it is public now with the id the
+last pass recorded, before anything this pass read; a store row stays only
+where the store recorded that id too. One new to that record, or whose id
+changed, keeps nothing for one pass. So the first pass with the option on
+keeps nothing it found, rows of earlier passes included, and turning the
+option off clears both records. The pass then drops what names a
+repository that is not public:
+
+- from `state`: REST responses (both caches) of any URL but a public
+  repository's `repos/OWNER/REPO/` reads whose answer is the same for
+  anyone, an exact list of paths: an issue and its comments, the pull
+  request list, a pull request and its files, commits, their pulls,
+  statuses and check runs, compare, contents, git commits, trees and
+  branch refs, check runs and suites and their annotations, and Actions
+  runs, workflow runs and jobs. So a pull request's reviews and review
+  comments (where the token's own pending review shows), a collaborator's
+  permission, Actions variables and artifacts, releases, a branch, its
+  protection and rules, the repository itself (whose `permissions` are the token's),
+  events, timelines and issue dependencies (where a private repository's
+  references can show), and search, notification and user reads are not
+  kept. Also quiet waits;
+  `holds_pending`, so a private hold's context is read in order again rather
+  than resumed; the `updated_at` watermarks of `issue_intake`,
+  `intake_waiting` and `lock_refused`; `action_first_positions`; the
+  maintain day, where it or its configuration names one, so the day is
+  derived again; and sweep coverage;
+- from `store`: dispatch records, verdicts, plans, holds and changes
+  watermarks, including rows earlier passes saved. A hold of every new run
+  names no repository and stays. No hold keeps its reason, which can name
+  other items, such as an epic's waiting children. SQLite only frees a deleted row's bytes,
+  so the save then vacuums the file. A save that fails removes the store,
+  which the next pass rebuilds; one it cannot remove fails the pass, so the
+  caller does not publish it.
+
+Public repositories' responses are still kept, so the next pass can make
+conditional requests. Cursors are kept: they say where a walk resumes, not
+what it read, yet one can name a private item. Intake refusals, which keep a
+refused write from being sent again, and operator-direction receipts are
+kept too, so tracker's export filter must still drop or check them: it is a
+required boundary, not a backstop. A repository that is not public, whose
+visibility is unread, or that is new to the record, loses its
+`intake_waiting` retry, `lock_refused` mark and pending hold context, until
+its thread is updated again. The pass ends with `public state: P
+repositories public as last recorded, F public but new to that record, Q
+not; dropped N state entries of all but the first`, which does not count
+the store's rows.
+
+Caller: `cgwalters-forge/tracker`, `.github/pass.json`, set `publicState` to
+`true` before carrying `state` and `store` in the public artifact.
+
 ### Top-down discovery
 
 The concrete failure `topDown: true` prevents is spending scheduling's
@@ -6210,6 +6286,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `store` | The [state store](#the-state-store)'s SQLite path, distinct from `state` and `livingStatus`, which an applying pass records its dispatch records, triage verdicts, plans, holds and changes watermarks in; GitHub only; absent (off) |
 | `changeSweepHours` | Hours, 1–168, between full pull request walks; between them stage 2 visits only what the stage 0 changes diff lists ([change-driven walk](#change-driven-pull-request-walk)); needs `store` and `state`; GitHub only; 0 or absent (off) |
+| `publicState` | `true`: `state` and `store` keep no response, hold, watermark or sweep entry of a repository GitHub does not say is public ([public state](#public-state)); needs `state`; GitHub only; absent (off) |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |
 | `pr.reviewDispatchRepositories` | Exact followed base repositories using ordinary `dispatch.yml` reviews and separate all-author intake; `[]` by default; needs `pr.reviewPools`; at most 50; GitHub only |

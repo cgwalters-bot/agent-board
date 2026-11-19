@@ -394,6 +394,8 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         }
         None => None,
     };
+    // A store that fails the pass, reported after the pass's lines.
+    let mut stored = Ok(());
     let report = match (&replay, &args.record) {
         (Some(replay), None) => {
             let state = State::default();
@@ -448,14 +450,15 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                             .with_context(|| format!("write {path}"))?;
                     }
                     if let (true, Some(path)) = (args.apply, &config.store) {
-                        save_store(path, &report, now);
+                        stored = save_store(path, &report, now);
                     }
                     report
                 }
             }
         }
     };
-    print_report(&report, out, args.verbose)
+    print_report(&report, out, args.verbose)?;
+    stored
 }
 
 /// The pass's client, and `changes`'s (docs/pass.md#local-github-credentials).
@@ -530,10 +533,13 @@ fn load_changes(path: &str) -> Option<board_forge::changes::diff::State> {
 /// Record the pass's dispatch records, triage verdicts, plans, holds and
 /// changes watermarks in the store.
 /// No decision reads it yet, so a store that cannot be saved only warns:
-/// the pass's own writes are done, and the next pass rebuilds it.
-fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
+/// the pass's own writes are done, and the next pass rebuilds it. Under
+/// `publicState`, one left in place fails the pass, so that the caller
+/// does not publish it.
+fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) -> Result<()> {
     let records = report.records.borrow();
-    match board_forge::store::save(std::path::Path::new(path), &records, now) {
+    let file = std::path::Path::new(path);
+    match board_forge::store::save(file, &records, now) {
         Ok(saved) => {
             if let Some(why) = &saved.rebuilt {
                 eprintln!("store: rebuilt {path} ({why}) from this pass's reads");
@@ -547,8 +553,19 @@ fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
                 saved.dispatches, saved.verdicts, saved.plans, saved.holds
             );
         }
+        Err(error)
+            if records.public.is_some()
+                && ["", "-journal", "-wal", "-shm"]
+                    .iter()
+                    .any(|suffix| std::fs::symlink_metadata(format!("{path}{suffix}")).is_ok()) =>
+        {
+            return Err(error.context(format!(
+                "store {path} not saved, and may keep a repository that is not public"
+            )));
+        }
         Err(error) => eprintln!("warning: store {path} not saved: {error:#}"),
     }
+    Ok(())
 }
 
 fn print_report(report: &Report, out: &mut impl Write, verbose: bool) -> Result<()> {

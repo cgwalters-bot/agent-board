@@ -810,6 +810,12 @@ pub struct Config {
     /// `state`.
     #[serde(default)]
     pub change_sweep_hours: u64,
+    /// Off by default: `state` and `store` keep no response, hold,
+    /// watermark or sweep entry of a repository GitHub does not say is
+    /// public, and stage 0 leaves it to a whole walk ([`public`]); needs
+    /// `state`.
+    #[serde(default)]
+    pub public_state: bool,
     /// Opt-in durable ledger path for one living status comment per issue.
     /// Retain it across runs; applying passes must still be serialized.
     pub living_status: Option<String>,
@@ -1757,6 +1763,7 @@ impl Config {
             "replanAfterDays needs triage"
         );
         changed::check(self)?;
+        public::check(self)?;
         if let Some(revisit) = &self.revisit {
             revisit.check(self)?;
         }
@@ -2948,6 +2955,8 @@ struct Bounds {
     next_responses: RefCell<BTreeMap<String, Value>>,
     response_bytes: Cell<usize>,
     shared_responses: RefCell<cache::Responses>,
+    /// `publicState`'s visibility reads, or none where it is off.
+    visibility: RefCell<Option<public::Visibility>>,
     effects: RefCell<Effects>,
     start_kind: RefCell<String>,
     /// The runs started whose dispatch named them, for the pass view.
@@ -3015,6 +3024,7 @@ impl Bounds {
             next_responses: RefCell::default(),
             response_bytes: Cell::new(0),
             shared_responses: RefCell::default(),
+            visibility: RefCell::default(),
             effects: RefCell::default(),
             start_kind: RefCell::default(),
             started: RefCell::default(),
@@ -4372,6 +4382,10 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         *bounds.living.borrow_mut() = Some(store);
     }
     bounds.cache_enabled.set(config.state.is_some());
+    if config.public_state {
+        let recorded = std::mem::take(&mut state.public_repositories);
+        *bounds.visibility.borrow_mut() = Some(public::Visibility::new(recorded));
+    }
     *bounds.publication_pending.borrow_mut() = state.holds_pending.clone();
     *bounds.publication_summary_cursor.borrow_mut() = state.holds_summary_cursor.clone();
     // No context means no persistent shared cache (including recordings and
@@ -4479,6 +4493,16 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         state.issue_intake = report.issue_intake.clone();
         state.holds_pending = bounds.publication_pending.take();
         state.holds_summary_cursor = bounds.publication_summary_cursor.take();
+    }
+    if let Some(visibility) = bounds.visibility.borrow_mut().as_mut() {
+        // Outside the request share: a pass that spent it keeps its cache.
+        let records = &mut report.records.borrow_mut();
+        let store = config.store.as_deref().map(std::path::Path::new);
+        let line = visibility.redact(client, store, report.state.as_mut(), records);
+        report.lines.push(line);
+    } else if let Some(state) = &mut report.state {
+        // Recorded while the option was off, so it says nothing of what was kept.
+        state.public_repositories.clear();
     }
     Ok(report)
 }
@@ -10723,6 +10747,7 @@ pub mod next;
 mod pat;
 pub(crate) mod pressure;
 pub mod promote;
+pub(crate) mod public;
 mod pull_links;
 mod resets;
 pub mod revisit;

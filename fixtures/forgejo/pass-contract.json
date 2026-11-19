@@ -281,6 +281,7 @@
     "state": {"verdict": "refused", "reason": "the poll's cache, PR follow-up"},
     "store": {"verdict": "refused", "reason": "dispatch records, triage verdicts, plans and holds are only recorded by GitHub scheduling"},
     "changeSweepHours": {"verdict": "refused", "reason": "the changes diff reads GitHub repositories, and narrows PR follow-up (stage 2)"},
+    "publicState": {"verdict": "refused", "reason": "reads GitHub repository visibility to filter the poll's cache"},
     "pr.reviewWorkflow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.checkReruns": {"verdict": "refused", "reason": "PR check retries (stage 2) require GitHub checks and Actions runs"},
     "pr.ownerBranches": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},

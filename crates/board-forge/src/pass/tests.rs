@@ -3215,19 +3215,34 @@ fn a_changes_diff_past_its_share_leaves_the_walk_its_requests() {
 
 #[test]
 fn change_sweep_accumulates_across_request_share_cuts() {
-    change_sweep_walk(false, false, true, 160);
+    change_sweep_walk(false, false, true, 160, false);
     for action_first in [false, true] {
         for quiet_waits in [false, true] {
             // The smaller share stops between drafts in a fork; the larger
             // walks every fork in one pass. Neither changes production caps.
             for limit in [if action_first { 200 } else { 170 }, 1000] {
-                change_sweep_walk(true, action_first, quiet_waits, limit);
+                change_sweep_walk(true, action_first, quiet_waits, limit, false);
             }
         }
     }
 }
 
-fn change_sweep_walk(midstream: bool, action_first: bool, quiet_waits: bool, limit: usize) {
+/// `publicState`: the first repository is private, so it is walked whole
+/// every pass, and the sweep completes without it.
+#[test]
+fn change_sweep_leaves_a_private_repository_out() {
+    for limit in [160, 1000] {
+        change_sweep_walk(false, false, true, limit, true);
+    }
+}
+
+fn change_sweep_walk(
+    midstream: bool,
+    action_first: bool,
+    quiet_waits: bool,
+    limit: usize,
+    public_state: bool,
+) {
     let mut forge = Forge::new(None, false);
     let now = forge.replay.now;
     let owner = if midstream {
@@ -3320,6 +3335,11 @@ fn change_sweep_walk(midstream: bool, action_first: bool, quiet_waits: bool, lim
         settings["pr"]["noMerge"] = json!([]);
         settings["midstream"] = json!({"owner": owner, "topic": "bot-midstream"});
     }
+    let private = format!("{}/", repositories[0]);
+    if public_state {
+        settings["publicState"] = json!(true);
+        forge.private = vec![repositories[0].clone()];
+    }
     let mut cfg = config(settings);
     cfg.pr.poll.action_first = action_first;
     cfg.pr.poll.quiet_waits = Some(quiet_waits);
@@ -3392,6 +3412,21 @@ fn change_sweep_walk(midstream: bool, action_first: bool, quiet_waits: bool, lim
         }
         state = State::from_json(&report.state.unwrap().to_json()).unwrap();
         state.changes = report.records.borrow().changes.clone();
+        if public_state {
+            let kept = state.to_json().to_string();
+            assert!(!kept.contains(&private), "{kept}");
+            let changes = state.changes.as_ref().unwrap().to_json().unwrap();
+            assert!(!changes.to_string().contains(&private), "{changes}");
+            let not_public = "changes: 1 repositories not public, so walked whole";
+            assert!(report.lines.iter().any(|l| l == not_public));
+            let item = format!("{}#", repositories[0]);
+            assert!(!state.quiet_waits.keys().any(|key| key.starts_with(&item)));
+            // The first pass has no identities recorded, so keeps none.
+            let kept = state.pass_responses.keys().chain(state.responses.keys());
+            assert_eq!(kept.clone().any(|url| url.contains("/repos/")), passes > 1);
+            let recorded = &state.public_repositories;
+            assert!(!recorded.is_empty() && !recorded.contains_key(&repositories[0]));
+        }
         if let Some(cursor) = &state.share_cursor {
             let (repo, number) = cursor.rsplit_once('#').unwrap_or((cursor, ""));
             cut_within_fork |= midstream && !number.is_empty() && number != "1";
@@ -3442,6 +3477,14 @@ fn change_sweep_walk(midstream: bool, action_first: bool, quiet_waits: bool, lim
         "{:#?}",
         narrowed.lines
     );
+    if public_state {
+        let walked = format!("{}#1 ", repositories[0]);
+        assert!(
+            narrowed.lines.iter().any(|l| l.starts_with(&walked)),
+            "{:#?}",
+            narrowed.lines
+        );
+    }
     let mut state = State::from_json(&narrowed.state.unwrap().to_json()).unwrap();
     state.changes = narrowed.records.borrow().changes.clone();
     let full = run(state, due, limit);
@@ -5664,6 +5707,9 @@ pub(super) struct Forge {
     /// The issues updated at [`SESSION_CHANGED`], after a session read
     /// them at [`SESSION_READ`], which a batch's apply skips.
     changed: Vec<u64>,
+    /// The repositories a `publicState` visibility query says are private;
+    /// any other is public.
+    private: Vec<String>,
 }
 
 /// When a session read each issue it acts on, as [`batch_actions`] says.
@@ -5714,6 +5760,7 @@ impl Forge {
             chain_reads: RefCell::new(Vec::new()),
             pulls: vec![],
             changed: vec![],
+            private: vec![],
         }
     }
 
@@ -6023,6 +6070,23 @@ impl Transport for Forge {
             return Ok(data);
         }
         self.failing(&format!("graphql {query}"))?;
+        if query.contains(") { id isPrivate visibility }") {
+            let mut data = json!({});
+            for n in 0.. {
+                let Some(owner) = variables[format!("o{n}")].as_str() else {
+                    break;
+                };
+                let name = text(&variables, &format!("/n{n}"));
+                let repo = format!("{owner}/{name}");
+                let id = format!("R_{owner}_{name}");
+                data[format!("r{n}")] = if self.private.contains(&repo) {
+                    json!({"id": id, "isPrivate": true, "visibility": "PRIVATE"})
+                } else {
+                    json!({"id": id, "isPrivate": false, "visibility": "PUBLIC"})
+                };
+            }
+            return Ok(data);
+        }
         if query.starts_with("mutation(") && query.contains("mergePullRequest(") {
             self.writes
                 .borrow_mut()
@@ -20558,6 +20622,8 @@ fn config_table() {
             json!({"changeSweepHours": 6, "store": "s.db"}),
             "changeSweepHours needs store and state",
         ),
+        (json!({"publicState": true}), "publicState needs state"),
+        (json!({"publicState": "yes"}), "invalid type"),
     ] {
         let mut value = minimal.clone();
         value
