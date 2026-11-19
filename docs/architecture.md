@@ -64,6 +64,23 @@ it is for library-owned documents, not arbitrary GraphQL passthrough. Deploy wit
 read-only credentials too; this adapter does not constrain an independently
 supplied transport's implementation of reads.
 
+The seam returns the snapshot next to the pass's updated state, what it spent
+and the transports' send count. The adapter forwards the transport's credential
+context (a digest, never the credential) and send count, so that with a
+configured `state` path the
+[disposable response index](poll.md#disposable-rest-responses-partial-794)
+binds for the consumer under every bound of that section, and passing the
+state to the next preview makes that one warm. There a carried state goes
+through the same decode as a state file, so corrupt entries are discarded with a
+diagnostic and an out-of-bounds state is refused. Previews also seal and check
+pass responses, including the GraphQL last editor that a REST 304 cannot verify.
+A changed context or configuration starts cold. If the primary transport's
+context changes during a stateful preview, the preview fails without returning
+decisions or state. A transport without a context gets no responses or quiet
+waits back to carry. Without a `state` path the input state comes back unchanged.
+The library writes no file; persisting the state, as privately as the responses
+it holds, is the caller's job, and the storage choice stays with #794.
+
 Observation time is not source validation time. The snapshot preserves needs-you's
 validation clock, usage's computation clock separately from per-pool observation
 clocks and stale/missing/partial evidence status, carried hold

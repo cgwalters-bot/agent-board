@@ -171,7 +171,13 @@ context and parsed configuration. Credentials themselves are never serialized.
 Dispatcher reads participate only with the same credential context as the
 primary client; a distinct or contextless dispatcher always reads directly.
 An older unscoped state starts cold on activation; its pending intake, refusal
-records, fairness cursors and maintain state are retained.
+records, fairness cursors and maintain state are retained. A primary client
+without a credential context cannot confirm a scoped state's responses, since a
+304 is no identity check, so its pass discards them and their scope and reads
+cold, keeping the rest as above. A read-only consumer
+of the [decision seam](architecture.md#proposed-read-only-persistent-consumer)
+gets the same index back in memory and carries it itself; the state it carries
+goes through the same decode as a file before the next pass.
 
 The index holds at most 1,024 responses, 8 MiB of serialized response data,
 and 256 KiB per entry. Deterministic eviction drops responses only. Newly
