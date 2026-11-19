@@ -370,65 +370,65 @@ dispatch caller (step 2) and the review caller (step 4); each says so.
    For a read-only board preview, replace every example identity below with your
    own (project is the positive organization project number, not its node ID):
 
-   ```json
-   {
-     "operator": "your-operator",
-     "bot": "your-bot",
-     "dispatchRepo": "your-org/your-caller",
-     "dispatchWorkflow": "dispatch.yml",
-     "dispatchRef": "main",
-     "board": {"owner": "your-org", "project": 1},
-     "workRepositories": ["your-org/your-target"],
-     "wip": 0,
-     "triage": false
-   }
-   ```
+    ```json
+    {
+      "operator": "your-operator",
+      "bot": "your-bot",
+      "dispatchRepo": "your-org/your-caller",
+      "dispatchWorkflow": "dispatch.yml",
+      "dispatchRef": "main",
+      "board": {"owner": "your-org", "project": 1},
+      "workRepositories": ["your-org/your-target"],
+      "wip": 0,
+      "triage": false
+    }
+    ```
 
-   The real Config parser requires `operator`, `bot`, `dispatchRepo` and
-   `dispatchWorkflow` even with work off. It rejects unknown keys and explicit
-   nulls; omit unused sections. `wip: 0` disables new work, absent `follow`
-   disables PR follow-up, and absent `epics` disables epic planning. The board
-   section still lets the Status stage preview repairs. With a read-only
-   `GH_TOKEN` for the bot (Projects read plus Issues/Pull requests read on the
-   exact repositories it must inspect, and Actions read on `dispatchRepo` to
-   list runs in flight even with `wip: 0`), from that checkout run:
+    The real Config parser requires `operator`, `bot`, `dispatchRepo` and
+    `dispatchWorkflow` even with work off. It rejects unknown keys and explicit
+    nulls; omit unused sections. `wip: 0` disables new work, absent `follow`
+    disables PR follow-up, and absent `epics` disables epic planning. The board
+    section still lets the Status stage preview repairs. With a read-only
+    `GH_TOKEN` for the bot (Projects read plus Issues/Pull requests read on the
+    exact repositories it must inspect, and Actions read on `dispatchRepo` to
+    list runs in flight even with `wip: 0`), from that checkout run:
 
-   ```sh
-   agent-board snapshot create --owner your-org --project 1 > board.json
-   agent-board reconcile plan --snapshot board.json --emit
-   agent-board pass --config pass.json --max-dispatch 0 --max-writes 0 --max-status-changes 5
-   ```
+    ```sh
+    agent-board snapshot create --owner your-org --project 1 > board.json
+    agent-board reconcile plan --snapshot board.json --emit
+    agent-board pass --config pass.json --max-dispatch 0 --max-writes 0 --max-status-changes 5
+    ```
 
-   `agent-board pass --config pass.json --check-config` checks the file
-   alone, as a pass would, with no token or forge read for explicit repository
-   lists. Organization entries require bounded live resolution and a read token
-   in a trusted context ([repository sources](pass.md#organization-repository-entries)); run the offline check in the
-   caller's pull request CI with the pinned agent-board, so a change the
-   pass refuses fails review rather than every pass after merge.
-   No `--apply`, no `--record`, no scheduled caller and no dispatch token yet.
-   Zero caps also bound proposals; Status changes over five refuse the stage
-   whole rather than silently applying a subset. Inspect errors and held lines,
-   not just exit 0. A live preview proves reads and planning, not writer access
-   or dispatch. To preview candidates later, `wip` must be positive and
-   `workRepositories` exact; automatic runs need `pools` and `usage.repository`
-   plus `usage.issue`. Refreshing usage additionally needs `usage.url`; without
-   it the pass reads the published snapshot. Triage needs `triage` and
-   `triagePools` or `planPools` naming configured pools; scope `epics` also needs
-   `epics`. Keep all optional features absent until their prerequisites are met.
-   See the [configuration reference](pass.md#one-configuration-file); the setup
-   CLI test also parses the minimal example above with the real Config parser.
+    `agent-board pass --config pass.json --check-config` checks the file
+    alone, as a pass would, with no token or forge read for explicit repository
+    lists. Organization entries require bounded live resolution and a read token
+    in a trusted context ([repository sources](pass.md#organization-repository-entries)); run the offline check in the
+    caller's pull request CI with the pinned agent-board, so a change the
+    pass refuses fails review rather than every pass after merge.
+    No `--apply`, no `--record`, no scheduled caller and no dispatch token yet.
+    Zero caps also bound proposals; Status changes over five refuse the stage
+    whole rather than silently applying a subset. Inspect errors and held lines,
+    not just exit 0. A live preview proves reads and planning, not writer access
+    or dispatch. To preview candidates later, `wip` must be positive and
+    `workRepositories` exact; automatic runs need `pools` and `usage.repository`
+    plus `usage.issue`. Refreshing usage additionally needs `usage.url`; without
+    it the pass reads the published snapshot. Triage needs `triage` and
+    `triagePools` or `planPools` naming configured pools; scope `epics` also needs
+    `epics`. Keep all optional features absent until their prerequisites are met.
+    See the [configuration reference](pass.md#one-configuration-file); the setup
+    CLI test also parses the minimal example above with the real Config parser.
 
-   Use
-   [job-plan dispatch](job-plans.md#dispatch), starting with
-   `dispatch ISSUE --dry-run`; apply needs a writer's user token and records the
-   plan before dispatching. Write the callers' configuration on the caller's
-   protected default branch: owner and project, exact repository lists, the
-   dispatch caller and the identities, never from dispatcher-set inputs. Every
-   option ships off; [pull request follow-up](poll.md#configuration) and the
-   [pass configuration](pass.md#one-configuration-file) list them. Add the
-   [callers](#pinned-callers) one at a time, each previewing before it
-   applies. Audit dispatch and fix bounds and pools before enabling a scheduled
-   applier, and never run two appliers against one board.
+    Use
+    [job-plan dispatch](job-plans.md#dispatch), starting with
+    `dispatch ISSUE --dry-run`; apply needs a writer's user token and records the
+    plan before dispatching. Write the callers' configuration on the caller's
+    protected default branch: owner and project, exact repository lists, the
+    dispatch caller and the identities, never from dispatcher-set inputs. Every
+    option ships off; [pull request follow-up](poll.md#configuration) and the
+    [pass configuration](pass.md#one-configuration-file) list them. Add the
+    [callers](#pinned-callers) one at a time, each previewing before it
+    applies. Audit dispatch and fix bounds and pools before enabling a scheduled
+    applier, and never run two appliers against one board.
 
 Only the operator can do the following; no agent or guide can do it: authorize the network
 identity and its ACLs, admit the specific repository and workflow identities and
