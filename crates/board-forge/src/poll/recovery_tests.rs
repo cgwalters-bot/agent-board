@@ -92,8 +92,13 @@ fn open_pr_cap_skips_parked_older_work() {
         ("review without a stop", json!({"requested_reviewers":operator}), Some(stop(false)), true, true, 3),
         ("review holds off", json!({"requested_reviewers":operator}), Some(stop(true)), false, true, 2),
         ("stop released", json!({}), Some(stop(true)), true, true, 2),
+        // A stopped draft cannot merge and waits on a person, hold or not.
+        ("stopped draft", json!({"draft":true}), Some(stop(true)), true, false, 2),
+        ("stopped draft, assign holds off", json!({"draft":true}), Some(stop(true)), false, false, 2),
+        ("draft without a stop", json!({"draft":true}), Some(stop(false)), true, true, 3),
         // The fixture's comments list fails on its second page.
         ("unreadable stop", json!({"requested_reviewers":operator}), None, true, true, 4),
+        ("unreadable draft stop", json!({"draft":true}), None, true, true, 4),
     ] {
         let mut fake = github();
         let mut first = older;

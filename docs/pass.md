@@ -318,8 +318,11 @@ conservative. The older-PR scan considers at most 100
 older PRs, within the poll's shared request/time budget; further older work holds
 the step. An older PR parked on a person does not hold younger work: one labelled
 `hold` or `needs-human`, or whose newest poll marker is a stop still held by an
-operator review request. It still counts toward the cap. Releasing the hold puts
-it back in the order; a stop marker that cannot be read counts as not parked.
+operator review request, or a draft whose newest poll marker is a stop even with
+no label or review request left (it cannot merge, and only a person moves it).
+It still counts toward the cap. Releasing the hold puts a non-draft back in the
+order, and a stopped draft returns once it is ready or its newest poll marker is
+not a stop; a stop marker that cannot be read counts as not parked.
 This setting does not automatically close PRs or
 grant more fix rounds. Explicit stage-4 `fixPlans` retain their existing policy.
 

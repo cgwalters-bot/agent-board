@@ -9953,9 +9953,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// Whether the older bot PR `number` waits on a person, so it does not
     /// hold younger work's paths: labelled [`HOLD_LABEL`] or [`LABEL`], or
     /// the poll's newest marker is a stop still held by the operator's review
-    /// request (without that hold, a stop reads as reset). Releasing the hold
-    /// puts it back in the order. A failed read is not parked. An operator
-    /// review requested without a stop still holds, though the poll skips it.
+    /// request (without that hold, a stop reads as reset). A draft whose
+    /// newest marker is a stop is parked without a hold: it cannot merge and
+    /// only a person moves it, until it is ready or its newest marker is no
+    /// longer a stop. Releasing the hold puts a non-draft back in the order.
+    /// A failed read is not parked. An operator review requested without a
+    /// stop still holds, though the poll skips it.
     fn pressure_parked(&mut self, repo: &str, open: &[Value], number: u64) -> bool {
         let Some(pull) = open.iter().find(|p| p["number"].as_u64() == Some(number)) else {
             return false;
@@ -9972,7 +9975,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             && nodes(pull, "/requested_reviewers")
                 .iter()
                 .any(|r| text(r, "/login").eq_ignore_ascii_case(&self.config.operator));
-        if !requested {
+        if !requested && pull["draft"].as_bool() != Some(true) {
             return false;
         }
         let key = (repo.to_ascii_lowercase(), number);
