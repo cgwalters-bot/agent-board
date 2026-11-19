@@ -3144,11 +3144,12 @@ found could use; the rest wait for the next pass without failing it, even when
 no candidate was considered. Past a candidate, the line also says how many
 were considered and the requests they took, starts included (`K candidate(s)
 considered, starts included, for R requests`), to tell them from the stage's own
-reads: the board, run listings and leases (agent-board#789). A stop before
-any candidate started leaves no slot for the `idle:` line, so it adds one line
-for each pool still under pace (`idle: POOL is under pace and nothing started;
-stage 4's budget left M candidate(s) unread, first OWNER/REPO#N`), naming the
-candidate it stopped at (agent-board#803). Whenever no candidate started,
+reads: the board, run listings and leases (agent-board#789). After scheduling,
+each pool with positive paced headroom gets one `schedule: POOL under pace;`
+outcome. It lists the items started (or proposed in preview), or says why
+none started on that pool. If the scan stops early, the outcome reports how
+many candidates remain unread and names the first deferred item; unread
+candidates are not counted as holds. Whenever no candidate started,
 stage 4 also says which candidate came first in its order and what became of
 it, and the first found ready, which only `--max-dispatch` leaves unstarted
 (`schedule: no candidate started; first candidate OWNER/REPO#N: held: …; first
@@ -3210,13 +3211,15 @@ request walk used N of M requests, maintain P and epics E; scheduling got K,
 less than a start takes (S)`). A deferred
 maintain read keeps its cached state for the next pass, not a successful
 empty digest.
-Before posting a digest's plan, maintain also requires that the pass has
-enough requests and time left for the whole start and receipt (`budget:
+Maintain checks visibility, concurrency, WIP and duplicate plans within the
+discovery share, then checks the remaining pass budget for the whole start
+and receipt before posting a plan (`budget:
 maintain stopped; a digest start and record need N requests, M left, before
 the time bound`); an admitted start may finish. Like an epic apply, the start
-is charged to what the pass has left rather than to maintain's share: in a
-busy pass that share's discovery left less than a start needs, and the digest
-did not start for days (agent-board#803). It starts once a day.
+is charged to what the pass has left rather than to maintain's share. If
+discovery runs out of share or the whole start does not fit, the digest
+defers without reserving inference capacity from later stages. It starts
+at most once a day.
 Concurrency reads refused by an earlier stage's share are retried by later
 stages, not cached as pass-wide failures.
 Scheduling also keeps one start's recheck/write reserve, plus room to read its

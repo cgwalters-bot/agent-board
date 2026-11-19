@@ -4572,6 +4572,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         reviewing: 0,
         progressed: 0,
         not_started: 0,
+        schedule_runs: RefCell::default(),
         free: None,
         top: None,
         follows: config.follow.clone(),
@@ -5085,6 +5086,47 @@ struct BudgetStop {
     free: usize,
 }
 
+/// Stage 4's terminal constraint and the candidates it did not get to read.
+#[derive(Default)]
+struct ScheduleScan {
+    reason: Option<String>,
+    capped: bool,
+    budget_deferred: bool,
+    deferred: usize,
+    first_deferred: Option<String>,
+}
+
+impl ScheduleScan {
+    fn defer(&mut self, reason: String, count: usize, first: &ItemRef) {
+        self.reason = Some(reason);
+        self.deferred += count;
+        self.first_deferred.get_or_insert_with(|| first.display());
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScheduleAttempt {
+    Started,
+    Unconfirmed,
+    Failed,
+}
+
+struct ScheduleRun {
+    item: String,
+    pool: String,
+    attempt: ScheduleAttempt,
+}
+
+// The receipt or lease bind can fail after the forge accepted a dispatch.
+fn dispatch_attempt<C, D>(dispatch: &lease::Dispatch<'_, C, D>) -> Option<ScheduleAttempt> {
+    match dispatch.status.get() {
+        Some(200..=299) => Some(ScheduleAttempt::Started),
+        Some(400..=499) => Some(ScheduleAttempt::Failed),
+        _ if dispatch.sent.get() => Some(ScheduleAttempt::Unconfirmed),
+        _ => None,
+    }
+}
+
 /// What stopped a pass's starts.
 #[derive(Clone, Copy)]
 enum Halt {
@@ -5261,6 +5303,7 @@ struct Scheduler<'a, C> {
     /// an applying pass counts as progress ([`holds::alarm`]).
     progressed: usize,
     not_started: usize,
+    schedule_runs: RefCell<Vec<ScheduleRun>>,
     /// Stage 4's candidates free to start ([`holds::free`]), once it
     /// considered them.
     free: Option<usize>,
@@ -6241,21 +6284,34 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     fn schedule(&mut self, earlier: usize, git_ref: &str) -> Result<()> {
+        let lines = self.report.lines.len();
+        let mut scan = ScheduleScan::default();
+        let result = self.schedule_work(earlier, git_ref, &mut scan);
+        self.schedule_outcomes(lines, scan, &result);
+        result.map(|_| ())
+    }
+
+    fn schedule_work(
+        &mut self,
+        earlier: usize,
+        git_ref: &str,
+        scan: &mut ScheduleScan,
+    ) -> Result<Option<String>> {
         let config = self.config;
         self.report.tally.1.started = earlier;
         if !config.work() {
-            self.line("schedule: off (wip 0 or no workRepositories)".into());
-            return Ok(());
+            let why = "off (wip 0 or no workRepositories)";
+            self.line(format!("schedule: {why}"));
+            return Ok(Some(why.into()));
         }
         // A refused focus holds every start, never read as no focus; an
         // unread one is passed over this pass rather than idle the board.
         if let (Some(focus), None) = (config.focus(), &self.focus.live) {
             let focus = focus.display();
             if self.focus.refused {
-                self.line(format!(
-                    "schedule: no new run starts: epics.focus {focus} is not a live epic"
-                ));
-                return Ok(());
+                let why = format!("epics.focus {focus} is not a live epic");
+                self.line(format!("schedule: no new run starts: {why}"));
+                return Ok(Some(why));
             }
             self.line(format!(
                 "schedule: epics.focus {focus} is unread this pass; candidates start as without a focus"
@@ -6276,8 +6332,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(other) = self.other_pass()? {
             let why = format!("another pass is in progress, {other}; it takes the free slots");
             self.sessions_waiting(&why);
-            self.pass_held(HoldKind::Wip, why);
-            return Ok(());
+            self.pass_held(HoldKind::Wip, &why);
+            return Ok(Some(why));
         }
         if config.issue_intake {
             self.intake();
@@ -6317,13 +6373,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let active = slots.active(&runs);
         self.report.tally.0.in_flight = Some(active);
         if active >= wip {
-            self.sessions_waiting(&format!("{active} of {wip} runs active"));
-            self.pass_held(HoldKind::Wip, format!("{active} of {wip} runs active"));
+            let why = format!("{active} of {wip} runs active");
+            self.sessions_waiting(&why);
+            self.pass_held(HoldKind::Wip, &why);
             if config.sweep.is_some() {
                 let snapshot = self.snapshot();
                 self.sweep_without_starts(&mut slots, (&target, snapshot.as_ref()));
             }
-            return Ok(());
+            return Ok(Some(why));
         }
         let snapshot = self.snapshot();
         let context = (&target, snapshot.as_ref());
@@ -6335,7 +6392,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.sessions_waiting(&why);
             self.pass_held(HoldKind::Pools, format!("{why}; new runs wait"));
             self.sweep_without_starts(&mut slots, context);
-            return Ok(());
+            return Ok(Some(why));
         }
         if let Some(why) = self.budget_hold(1.0) {
             // Held like a step past a cap, so the summary does not read idle.
@@ -6343,7 +6400,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.sessions_waiting(&why);
             self.pass_held(HoldKind::Budget, format!("{why}; new runs wait"));
             self.sweep_without_starts(&mut slots, context);
-            return Ok(());
+            return Ok(Some(why));
         }
         if config.top_down {
             self.line(
@@ -6356,7 +6413,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let Ok(mut board) = board else {
             self.board = Some(None);
-            return board.map(|_| ());
+            return board.map(|_| None);
         };
         self.top = Some(top(&board.options).to_vec());
         if config.reruns || config.starts.is_some() {
@@ -6378,7 +6435,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let Some((free, newest)) = self.guarded(&target, wip - active) else {
             self.board = Some(Some(board));
-            return Ok(());
+            return Ok(Some("infrastructure breaker stopped starts".into()));
         };
         let holds = self.report.holds.len();
         let decisions = self.report.lines.len();
@@ -6393,7 +6450,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 reserve + START_REQUESTS
             ));
         }
-        let mut candidates = self.candidates(&board);
+        let mut candidates = self.candidates(&board, scan);
         self.focus_first(&mut candidates);
         // From here on, until stage 4 is done, a read that would leave too
         // little for a start is not sent ([`START_RESERVE`]), with each
@@ -6402,7 +6459,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // A due session stands in for many of the item starts below, so it
         // takes its slot first ([`Self::sessions`]).
         let (free, sessions) = self.sessions(&board, &mut slots, free, context);
-        let (free, started) = self.start(&candidates, &board, &mut slots, free, context);
+        let (free, started) = self.start(&candidates, &board, &mut slots, free, context, scan);
         self.focus_judged(candidates.len(), free);
         // With a focus, only its children are revisited: a revisit is a
         // triage nothing asked for, so it is never spillover's to spend.
@@ -6459,7 +6516,106 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             ));
         }
         self.stall(holds, (earlier, taken, free), newest);
-        Ok(())
+        if free == 0 && scan.reason.is_none() {
+            scan.reason = Some("no WIP slot left".into());
+        }
+        Ok(None)
+    }
+
+    /// One outcome per under-pace pool, after all stage 4 start paths
+    /// (including revisits and idle replanning) have had their turn.
+    fn schedule_outcomes(
+        &mut self,
+        lines: usize,
+        scan: ScheduleScan,
+        result: &Result<Option<String>>,
+    ) {
+        let capped = scan.capped
+            || self.report.lines[lines..].iter().any(|line| {
+                line.starts_with("held by --max-dispatch: start ")
+                    || line.starts_with("held by --max-writes: start ")
+            });
+        let reason = match result {
+            Err(error) => format!("{error:#}"),
+            Ok(Some(why)) => why.clone(),
+            Ok(None) if capped => "a start was held by a dispatch or write cap".into(),
+            Ok(None) => scan.reason.unwrap_or_else(|| {
+                let holds = (self.report.not_ready.iter())
+                    .filter(|(kind, _)| {
+                        *kind != HoldKind::Unreadable.name() && *kind != NOT_READY_ERROR
+                    })
+                    .map(|(kind, count)| format!("{count} {kind}"))
+                    .collect::<Vec<_>>();
+                match holds.is_empty() {
+                    true => "no eligible candidate found".into(),
+                    false => format!("no candidate admitted (holds: {})", holds.join(", ")),
+                }
+            }),
+        };
+        let unread = scan.deferred + self.unread;
+        let first = scan
+            .first_deferred
+            .map_or(String::new(), |item| format!(", first deferred {item}"));
+        // Early WIP or concurrency holds can return before the normal pacing
+        // read. This diagnostic read uses the same budget and cannot grant a start.
+        let fallback = if self.snapshot.is_none() && self.config.work() {
+            self.usage()
+                .ok()
+                .flatten()
+                .map(|s| resets::apply(self.config, s, self.now))
+        } else {
+            None
+        };
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .and_then(Option::as_ref)
+            .or(fallback.as_ref());
+        let runs = self.schedule_runs.take();
+        let outcomes: Vec<_> = self
+            .config
+            .pools
+            .0
+            .iter()
+            .filter_map(|(pool, settings)| {
+                if !room(snapshot, pool, settings, self.now).is_ok_and(|r| r > 0.0) {
+                    return None;
+                }
+                let items = |attempt| {
+                    runs.iter()
+                        .filter(|run| run.pool == *pool && run.attempt == attempt)
+                        .map(|run| run.item.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let started = items(ScheduleAttempt::Started);
+                let unconfirmed = items(ScheduleAttempt::Unconfirmed);
+                let failed = items(ScheduleAttempt::Failed);
+                let mut outcome = if started.is_empty() {
+                    if !unconfirmed.is_empty() {
+                        format!("no confirmed start: dispatch unconfirmed for {unconfirmed}")
+                    } else if !failed.is_empty() {
+                        format!("no start: start failed for {failed}")
+                    } else {
+                        format!("no start: {reason}")
+                    }
+                } else {
+                    let verb = if self.apply { "started" } else { "would start" };
+                    let mut outcome = format!("{verb} {started}");
+                    if !unconfirmed.is_empty() {
+                        outcome.push_str(&format!("; dispatch unconfirmed for {unconfirmed}"));
+                    }
+                    outcome
+                };
+                if started.is_empty() || scan.budget_deferred || self.unread > 0 {
+                    outcome.push_str(&format!("; {unread} candidate(s) unread{first}"));
+                }
+                Some(format!("schedule: {pool} under pace; {outcome}"))
+            })
+            .collect();
+        for line in outcomes {
+            self.line(line);
+        }
     }
 
     /// Puts the children of the focus epic first, each keeping its rank.
@@ -6514,6 +6670,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         slots: &mut Slots,
         mut free: usize,
         (target, snapshot): (&Target, Option<&Value>),
+        scan: &mut ScheduleScan,
     ) -> (usize, usize) {
         let mut taken = 0;
         let pools = &self.config.pools;
@@ -6555,6 +6712,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let left = candidates.len() - visited;
             if free == 0 {
                 self.unconsidered += left;
+                scan.defer("no WIP slot left".into(), left, &facts.issue);
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
                 break;
             }
@@ -6563,12 +6721,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 && slots.probes.is_empty()
             {
                 self.unconsidered += left;
+                scan.defer(why.clone(), left, &facts.issue);
                 let why = format!("{why}; {left} more candidate(s) wait");
                 self.pass_held(HoldKind::Pools, why);
                 break;
             }
             if Instant::now() > self.client.bounds.admit_by {
                 self.unconsidered += left;
+                scan.budget_deferred = true;
+                scan.defer("time budget exhausted".into(), left, &facts.issue);
                 self.line(format!(
                     "time: the pass ran past {PASS_SECONDS_LIMIT} seconds; {left} candidate(s) deferred"
                 ));
@@ -6618,6 +6779,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Ok(step) => step,
                 Err(error) => {
                     self.unconsidered += 1;
+                    self.unread += 1;
                     // Past a rate limit nothing is sent: those failures are
                     // collapsed into one line ([`Bounds::collapse`]), and
                     // the candidates were not read rather than not ready.
@@ -6665,6 +6827,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
                 Step::Stop(why, halt) => {
                     self.unconsidered += left;
+                    scan.budget_deferred |= matches!(halt, Halt::Budget | Halt::Time);
+                    scan.defer(why.clone(), left, &facts.issue);
                     let read = match halt {
                         Halt::Budget if visited > 0 => {
                             let spent = before.saturating_sub(self.client.bounds.left.get());
@@ -6682,17 +6846,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         }
                         _ => self.line(line),
                     }
-                    // The stop leaves no slot free, so no `idle:` line says
-                    // why the pools under pace started nothing (agent-board#803).
                     if matches!(halt, Halt::Budget) && taken == 0 {
                         self.budget_stop = Some(BudgetStop { unread: left, free });
-                        for (pool, settings) in &pools.0 {
-                            if room(snapshot, pool, settings, self.now).is_ok() {
-                                self.line(format!(
-                                    "idle: {pool} is under pace and nothing started; stage 4's budget left {left} candidate(s) unread, first {issue}"
-                                ));
-                            }
-                        }
                     }
                     free = 0;
                     budget_stopped = matches!(halt, Halt::Budget | Halt::Time);
@@ -6704,6 +6859,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         slots.probed(pool);
                     }
                     self.line(line);
+                    scan.capped = true;
                     free -= 1;
                     continue;
                 }
@@ -7206,7 +7362,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// many were left out, then holds each child of a parent that is not a
     /// live epic ([`HoldKind::EpicNotLive`]): only the operator or the bot
     /// makes it live, but the operator learns what waits on it.
-    fn candidates<'b>(&mut self, board: &'b BoardRead) -> Vec<(Rank, &'b Facts)> {
+    fn candidates<'b>(
+        &mut self,
+        board: &'b BoardRead,
+        scan: &mut ScheduleScan,
+    ) -> Vec<(Rank, &'b Facts)> {
         let config = self.config;
         let people = self.writers();
         let usage = (config.usage.as_ref()).map(|u| (&u.repository, u.issue));
@@ -7224,7 +7384,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.quiet = Some(focus::quiet(board.items.values(), &people));
         }
         let mut ranked = Vec::new();
-        let mut deferred = 0;
+        let mut deferred = Vec::new();
         let (mut visitors, mut outside, mut unparented) = (0, Vec::new(), 0);
         for facts in board.items.values() {
             let epic = match screen(facts, config, &control, &people) {
@@ -7261,7 +7421,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         && !self.epics.contains_key(&at)
                         && self.client.bounds.reserved()
                     {
-                        deferred += 1;
+                        deferred.push(facts);
                         continue;
                     }
                     let refused = self.client.bounds.refused.get();
@@ -7287,7 +7447,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                                 && self.client.bounds.refused.get() > refused
                             {
                                 self.epics.remove(&at);
-                                deferred += 1;
+                                deferred.push(facts);
                                 continue;
                             }
                             self.not_ready(HoldKind::Unreadable.name());
@@ -7301,8 +7461,25 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let rank = rank(&board.options, epic, facts.priority.as_deref(), facts);
             ranked.push((rank, facts));
         }
-        if deferred > 0 {
-            self.candidates_deferred(deferred);
+        if let Some(first) = deferred.iter().min_by_key(|facts| {
+            let parent = facts.parent.as_ref().map(|p| key(&p.issue));
+            let outside_focus = self.focus.live.as_ref().map(key) != parent;
+            let priority = parent
+                .as_ref()
+                .and_then(|p| board.items.get(p))
+                .and_then(|p| p.priority.as_deref());
+            (
+                outside_focus,
+                rank(&board.options, priority, facts.priority.as_deref(), facts),
+            )
+        }) {
+            scan.budget_deferred = true;
+            scan.defer(
+                "request budget exhausted during candidate discovery".into(),
+                deferred.len(),
+                &first.issue,
+            );
+            self.candidates_deferred(deferred.len());
         }
         ranked.sort_by(|a, b| a.0.cmp(&b.0));
         if config.top_down {
@@ -8266,7 +8443,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return Ok(step);
             }
             self.client.preview_pool_start(&pool);
-            return Ok(Step::Started(line, holds));
+            return Ok(self.schedule_attempt(&dest, &pool, None, Step::Started(line, holds)));
         }
         // What the dispatch's own check waives is what the pass reports.
         self.ignored.borrow_mut().clear();
@@ -8299,7 +8476,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 match self.post_plan(issue, BODY_PLAN, block) {
                     Ok(posted) => posted,
                     Err(error) => {
-                        return Ok(Step::failed(&line, holds, error));
+                        let step = Step::failed(&line, holds, error);
+                        return Ok(self.schedule_attempt(&dest, &pool, None, step));
                     }
                 }
             }
@@ -8308,7 +8486,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Some((head, control)) => {
                 match self.charge_fix(&chosen, &dest, (&control, &head, &pool), (&line, &holds)) {
                     Ok(charge) => Some(charge),
-                    Err(step) => return Ok(step),
+                    Err(step) => return Ok(self.schedule_attempt(&dest, &pool, None, step)),
                 }
             }
             None => None,
@@ -8337,7 +8515,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         {
             charge.refund(&self.client, &self.client, &config.poll(None), self.now)?;
         }
-        Ok(self.dispatched(line, holds, done))
+        let step = self.dispatched(line, holds, done);
+        Ok(self.schedule_attempt(&dest, &pool, dispatch_attempt(&dispatcher), step))
     }
 
     /// The step for `issue`, whose `plan`'s dispatched `run` failed
@@ -8415,7 +8594,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return Ok(step);
             }
             self.client.preview_pool_start(&pool);
-            return Ok(Step::Started(line, holds));
+            return Ok(self.schedule_attempt(dest, &pool, None, Step::Started(line, holds)));
         }
         let rule = |facts: &Facts, busy: &BTreeMap<String, String>, writers: &[&str]| {
             hold(facts, busy, writers).or_else(|| self.assignment_hold(facts))
@@ -8435,7 +8614,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         self.dispatcher.start_kind("run rerun");
         self.client.preview_pool_start(&pool);
-        Ok(match dispatcher.send("POST", &path, &json!({})) {
+        let step = match dispatcher.send("POST", &path, &json!({})) {
             Ok((status, _)) if (200..300).contains(&status) => Step::Started(line, holds),
             // Refused, so nothing runs: the issue waits as it would have.
             Ok((status, body)) => {
@@ -8447,7 +8626,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Step::Hold(Hold::new(HoldKind::Other, error.to_string()))
             }
             Err(error) => Step::failed(&line, holds, error),
-        })
+        };
+        Ok(self.schedule_attempt(dest, &pool, dispatch_attempt(&dispatcher), step))
     }
 
     /// The caller workflow's runs created in the last [`RERUN_WINDOW_SECONDS`]
@@ -8626,6 +8806,35 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             };
             blocking.entry(pull).or_default().insert(issue.clone());
         }
+    }
+
+    /// Record the admission outcome, not the human-readable start line.
+    fn schedule_attempt(
+        &self,
+        item: &ItemRef,
+        pool: &str,
+        dispatch: Option<ScheduleAttempt>,
+        step: Step,
+    ) -> Step {
+        if self.client.bounds.stage.get() == Stage::Schedule {
+            let attempt = dispatch.or(match &step {
+                Step::Started(..) => Some(ScheduleAttempt::Started),
+                Step::Failed(..) => Some(ScheduleAttempt::Failed),
+                _ => None,
+            });
+            if let Some(attempt) = attempt {
+                let account = match self.config.mix.contains_key(pool) {
+                    true => mix::account(pool).unwrap_or(pool),
+                    false => pool,
+                };
+                self.schedule_runs.borrow_mut().push(ScheduleRun {
+                    item: item.display(),
+                    pool: account.to_owned(),
+                    attempt,
+                });
+            }
+        }
+        step
     }
 
     /// A run's outcome as a step: no record is a wait, with nothing written.
@@ -9894,7 +10103,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         if !self.apply {
             self.client.preview_pool_start(pool);
-            return Ok(Step::Started(line, holds));
+            return Ok(self.schedule_attempt(issue, pool, None, Step::Started(line, holds)));
         }
         if let Some(step) = self.recheck(slots, (issue, issue), target, rule)? {
             return Ok(step);
@@ -9932,7 +10141,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             None => self.post_plan(issue, &intro, &plan).map(drop),
         };
         if let Err(error) = posted {
-            return Ok(Step::failed(&line, holds, error));
+            let step = Step::failed(&line, holds, error);
+            return Ok(self.schedule_attempt(issue, pool, None, step));
         }
         // No overlap check: a triage run changes no files.
         let scheduled = Scheduled {
@@ -9950,7 +10160,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let dispatcher = self.lease_dispatch(issue, pool);
         self.dispatcher.start_kind(start_line_kind(&line));
         let done = plan::dispatch_with(&self.client, &dispatcher, issue, &writers, target, options);
-        Ok(self.dispatched(line, holds, done))
+        let step = self.dispatched(line, holds, done);
+        Ok(self.schedule_attempt(issue, pool, dispatch_attempt(&dispatcher), step))
     }
 
     /// [`Config::direction`]'s body and its hash, where it is set: an error

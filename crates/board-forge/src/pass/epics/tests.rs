@@ -3876,7 +3876,7 @@ fn held_board(hours: u64) -> (Replay, Value) {
 fn held_plan_hours_plans_an_epic_past_a_budget_stop() {
     const LIMIT: usize = 300;
     const STOP: &str = "budget: 113 requests left, only what a start may take (109); ";
-    const IDLE: &str = "idle: claude is under pace and nothing started; stage 4's budget left ";
+    const IDLE: &str = "schedule: claude under pace; no start: budget:";
     const POOLS: &str = "pools: claude under pace with every candidate read held, 121 unread for the budget; planning cgwalters-forge/tracker#890 (one epic a pass)";
     const START: &str = "start planning cgwalters-forge/tracker#890 pool=claude: its last planning request was at 2026-10-23T13:34:49Z, 1 hour(s) or more ago; every candidate read is held, 121 unread for the budget, with claude under pace and 6 slot(s) free and nothing started";
     type Edit = fn(&mut Replay, &mut Value);
@@ -3933,7 +3933,17 @@ fn held_plan_hours_plans_an_epic_past_a_budget_stop() {
         let has = |prefix: &str| report.lines.iter().any(|l| l.starts_with(prefix));
         assert_eq!(report.failures, failures, "{name}: {:#?}", report.lines);
         assert_eq!(has(STOP), stopped, "{name}: {:#?}", report.lines);
-        assert_eq!(has(IDLE), stopped, "{name}: {:#?}", report.lines);
+        assert_eq!(
+            has(IDLE),
+            stopped && !planned,
+            "{name}: {:#?}",
+            report.lines
+        );
+        if planned {
+            assert!(has(
+                "schedule: claude under pace; would start cgwalters-forge/tracker#890"
+            ));
+        }
         assert_eq!(has("pools: "), planned, "{name}: {:#?}", report.lines);
         assert_eq!(has(POOLS), planned, "{name}: {:#?}", report.lines);
         assert_eq!(has(START), planned, "{name}: {:#?}", report.lines);
@@ -3958,8 +3968,8 @@ fn held_plan_hours_plans_an_epic_past_a_budget_stop() {
         }
         if name == "off" {
             // The stop's line is still the stage's last word.
-            let last =
-                (report.lines.iter()).rfind(|l| l.starts_with("idle: ") || l.starts_with("start "));
+            let last = (report.lines.iter())
+                .rfind(|l| l.contains(" under pace;") || l.starts_with("start "));
             assert!(
                 last.is_some_and(|l| l.starts_with(IDLE)),
                 "{name}: {:#?}",

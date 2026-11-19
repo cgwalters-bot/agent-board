@@ -506,6 +506,7 @@ pub struct Dispatch<'a, C, D> {
     pub pool: &'a str,
     pub now: OffsetDateTime,
     pub sent: Cell<bool>,
+    pub status: Cell<Option<u16>>,
     pub reserved: RefCell<Option<Held>>,
     pub rerun: Option<u64>,
 }
@@ -527,6 +528,7 @@ impl<'a, C, D> Dispatch<'a, C, D> {
             pool,
             now,
             sent: Cell::new(false),
+            status: Cell::new(None),
             reserved: RefCell::new(None),
             rerun: None,
         }
@@ -571,7 +573,9 @@ impl<C: Rest, D: Rest> Rest for Dispatch<'_, C, D> {
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         if !self.config.leases {
             self.sent.set(true);
-            return self.dispatcher.send(method, url, body);
+            let answer = self.dispatcher.send(method, url, body)?;
+            self.status.set(Some(answer.0));
+            return Ok(answer);
         }
         if self.reserved.borrow().is_none() {
             let request = Request {
@@ -593,6 +597,7 @@ impl<C: Rest, D: Rest> Rest for Dispatch<'_, C, D> {
         }
         self.sent.set(true);
         let answer = self.dispatcher.send(method, url, body)?;
+        self.status.set(Some(answer.0));
         if let Some(run) = (answer.1["workflow_run_id"].as_u64())
             .or(self.rerun)
             .filter(|_| answer.0 < 300)
