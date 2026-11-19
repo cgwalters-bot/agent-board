@@ -3104,22 +3104,22 @@ A pass captures one clock and performs these stages in order:
    plan claim and run link, and the existing board Run update where supported;
    it does not close issues from guessed outcomes.
 
-   4b. Read-only promotion visibility. With `promote.forks`, one bounded GraphQL
-   query per fork discovers the bot's open PRs with an operator command or,
-   under `promote.onApproval`, a draft's latest deciding approval of its current
-   head. Non-selected PRs print nothing and get no per-PR gate reads. Discovery
-   accepts at most 100 open PRs and 100 reviews/comments per PR; truncation is
-   an error, never an empty list. Each selected PR is independently re-read
-   and evaluated, printing `promote awaiting OWNER/REPO#N: REASON` for its first
-   hold, already-promoted observation, or `ready to publish`. Reasons include
-   needs-human, behind distance, missing policy, DCO rewrite required and
-   unverified bot-fork staging. Reads share the pass's request/time budget and
-   reserve; unfinished known candidates print `promote: N candidate(s) not
-   evaluated (budget)`. If even discovery cannot finish, its incomplete fork
-   is named instead of claiming a candidate count. Read failures print
-   `promote error:` and count as pass failures. No publication, label, notice,
-   rewrite or fork closure occurs here. Status stays stage 5. Do not use pass
-   `--apply` to promote. The shared preview checks operator command/head evidence,
+    4b. Read-only promotion visibility. With `promote.forks`, one bounded GraphQL
+    query per fork discovers the bot's open PRs with an operator command or,
+    under `promote.onApproval`, a draft's latest deciding approval of its current
+    head. Non-selected PRs print nothing and get no per-PR gate reads. Discovery
+    accepts at most 100 open PRs and 100 reviews/comments per PR; truncation is
+    an error, never an empty list. Each selected PR is independently re-read
+    and evaluated, printing `promote awaiting OWNER/REPO#N: REASON` for its first
+    hold, already-promoted observation, or `ready to publish`. Reasons include
+    needs-human, behind distance, missing policy, DCO rewrite required and
+    unverified bot-fork staging. Reads share the pass's request/time budget and
+    reserve; unfinished known candidates print `promote: N candidate(s) not
+    evaluated (budget)`. If even discovery cannot finish, its incomplete fork
+    is named instead of claiming a candidate count. Read failures print
+    `promote error:` and count as pass failures. No publication, label, notice,
+    rewrite or fork closure occurs here. Status stays stage 5. Do not use pass
+    `--apply` to promote. The shared preview checks operator command/head evidence,
     then candidate upstream PRs, distance, accepted-plan stacks, GitHub DCO
     facts and title/body references, then the upstream's contribution-policy
      record and human-text provenance. Passing says `would promote`, not that
@@ -3139,43 +3139,46 @@ A pass captures one clock and performs these stages in order:
      rechecks share existing pagination/request/time bounds; no new caller
      option is added. Capped recoverable fork closure remains separate
      acceptance work after replay proof. A
-   separate tracker schedule and recorded bot-fork staging verification are
-   still required (tracker#1464); neither is enabled or claimed here.
+    separate tracker schedule and recorded bot-fork staging verification are
+    still required (tracker#1464); neither is enabled or claimed here.
+
 5. Derive Status for every board item, closed issues and merged pull
    requests included (this stage reads those, which earlier stages skip),
    from this pass's facts and its own starts, and write each one that differs:
-   * closed issue, or merged or closed pull request: **Done**;
-   * otherwise, the `needs-human` label on the item, or with `assignHolds`
-     an open issue assigned to the operator ([scheduling](#scheduling)):
-     **Needs human**;
-   * otherwise, our work moving on it: a run in flight for it, or an open
-     pull request of ours for it (the item itself, or one that says it closes
-     the issue, in any repository; draft or not): **In Progress**. Ours means
-     by `operator`, or by `bot` and updated within the last `pr.staleDays`
-     days (any age where that is 0); a bot pull request standing still longer
-     waits on someone, not on us. Anyone else's open pull request, a
-     dependency bot's or an upstream contributor's, is not our work under
-     way: such an item falls through to the rules below;
-   * otherwise, a derived value that no longer holds (Needs human, In
-     Progress, or Done on an issue open again), or no Status at all, goes
-     to **Todo**;
-   * otherwise the Status stays. **Blocked** and **Backlog** are a person's
-     holds: only Done replaces them, so neither the label, a run nor a pull
-     request moves them (the label still holds scheduling). The legacy
-     columns (Triage, Draft, In Review, Cancelled) give way to any rule
-     above; a person's **Todo** stays. An item added to the board without a
-     Status, by `gh project item-add` or by the pass when it files one,
-     thus becomes Todo on the next pass that reads its runs and pull
-     requests whole.
 
-   The rules' precedence is shared with poll's `statusReconcile` preview,
-   whose work under way is its own (a draft pull request or a run in flight).
-   No person or agent sets the derived values, `agent-board ask` included,
-   which only sets and clears the label; an edit to one is overwritten on the
-   next pass. An item whose facts were not read whole keeps its Status:
-   its own fields, labels or state incomplete, or, for the fall back to Todo,
-   runs that could not all be listed or an open issue's closing pull requests
-   that could not all be read.
+    * closed issue, or merged or closed pull request: **Done**;
+    * otherwise, the `needs-human` label on the item, or with `assignHolds`
+      an open issue assigned to the operator ([scheduling](#scheduling)):
+      **Needs human**;
+    * otherwise, our work moving on it: a run in flight for it, or an open
+      pull request of ours for it (the item itself, or one that says it closes
+      the issue, in any repository; draft or not): **In Progress**. Ours means
+      by `operator`, or by `bot` and updated within the last `pr.staleDays`
+      days (any age where that is 0); a bot pull request standing still longer
+      waits on someone, not on us. Anyone else's open pull request, a
+      dependency bot's or an upstream contributor's, is not our work under
+      way: such an item falls through to the rules below;
+    * otherwise, a derived value that no longer holds (Needs human, In
+      Progress, or Done on an issue open again), or no Status at all, goes
+      to **Todo**;
+    * otherwise the Status stays. **Blocked** and **Backlog** are a person's
+      holds: only Done replaces them, so neither the label, a run nor a pull
+      request moves them (the label still holds scheduling). The legacy
+      columns (Triage, Draft, In Review, Cancelled) give way to any rule
+      above; a person's **Todo** stays. An item added to the board without a
+      Status, by `gh project item-add` or by the pass when it files one,
+      thus becomes Todo on the next pass that reads its runs and pull
+      requests whole.
+
+    The rules' precedence is shared with poll's `statusReconcile` preview,
+    whose work under way is its own (a draft pull request or a run in flight).
+    No person or agent sets the derived values, `agent-board ask` included,
+    which only sets and clears the label; an edit to one is overwritten on the
+    next pass. An item whose facts were not read whole keeps its Status:
+    its own fields, labels or state incomplete, or, for the fall back to Todo,
+    runs that could not all be listed or an open issue's closing pull requests
+    that could not all be read.
+
 6. With `cost`, from its hour each day, publish the last days' cost reports
    that are not on `epics.repository`'s `data` branch yet, as one write step
    within request bounds of its own (see [cost](cost.md#publishing)).

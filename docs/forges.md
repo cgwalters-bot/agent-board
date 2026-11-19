@@ -1049,76 +1049,77 @@ Two proofs, kept apart (#515):
   through the API once the first start has been seen `waiting`.
   `cargo test` skips it (`#[ignore]`, and it needs `AGENT_BOARD_TEST_FORGEJO`).
 
-  It proves, against the real server: label (exclusive scope replacement),
-  comment, claim, receipt and state round trips through `Forge::board_write`
-  and `plan_claim`; `agent-board pass` preview, then `--apply --max-dispatch 1`,
-  starting the planned issue with a 201 that the adapter confirms by reading
-  the run back, binding its lease and receipting it; the run listed
-  `waiting`, then `running`, then ended (`failure`); a second pass starting
-  nothing while it is in flight; one rerun, receipted with attempt 1, after
-  which the jobs show attempt 2 on the same run id, and no second rerun; the
-  ended run's lease released; a start on the workflow
-  without `workflow_dispatch`, which Forgejo answers with 201 and a run
-  without the inputs, recorded as ambiguous, cancelled and never sent again;
-  and two concurrent admits on one slot, of which exactly one wins. It also
-  logs how many of 24 fresh comments have `created_at` differing from
-  `updated_at`, without failing on it: a differing pair makes a record read
-  as edited, which holds rather than trusts. None did in the runs made when
-  it was added.
+    It proves, against the real server: label (exclusive scope replacement),
+    comment, claim, receipt and state round trips through `Forge::board_write`
+    and `plan_claim`; `agent-board pass` preview, then `--apply --max-dispatch 1`,
+    starting the planned issue with a 201 that the adapter confirms by reading
+    the run back, binding its lease and receipting it; the run listed
+    `waiting`, then `running`, then ended (`failure`); a second pass starting
+    nothing while it is in flight; one rerun, receipted with attempt 1, after
+    which the jobs show attempt 2 on the same run id, and no second rerun; the
+    ended run's lease released; a start on the workflow
+    without `workflow_dispatch`, which Forgejo answers with 201 and a run
+    without the inputs, recorded as ambiguous, cancelled and never sent again;
+    and two concurrent admits on one slot, of which exactly one wins. It also
+    logs how many of 24 fresh comments have `created_at` differing from
+    `updated_at`, without failing on it: a differing pair makes a record read
+    as edited, which holds rather than trusts. None did in the runs made when
+    it was added.
 
-  Then stage 3 (#544), with `epics.repository` a fourth repository, whose
-  `epic` label the operator makes and adds, so its timeline names the
-  operator's id. Two fixture children of the work repository, each with a
-  job plan, are related on both sides by bot comments; the second is blocked
-  by an open issue. The operator posts an unedited epic plan: a create with
-  an implement job plan, its `set_priority`, and the close of the first
-  child. The preview names the apply and changes nothing in the fixture
-  repositories (each issue's state, labels and comment count, and the
-  caller's runs). With `--max-dispatch 0`, `--max-writes` one short of the
-  plan's ten writes holds it whole, unclaimed; the full ten apply it. The
-  test reads back the bot's new issue, its `priority/P1` label, its parent
-  comment and job plan, the epic's children comment, the closed child with
-  its reason, and the bot's claim with its two receipts (`claimed` naming
-  the create, then `applied`). A second pass writes nothing, and stage 4
-  holds the new issue, an agreeing child, only by the dispatch cap. A second
-  plan's close of the blocked child gets Forgejo's 412 after its reason
-  comment: the apply stops with the create confirmed. The next pass holds
-  it as not proved and writes nothing; once the operator closes the blocker
-  and the child, a pass records `recovered` with one write and creates
-  nothing, and the pass after it writes nothing.
+    Then stage 3 (#544), with `epics.repository` a fourth repository, whose
+    `epic` label the operator makes and adds, so its timeline names the
+    operator's id. Two fixture children of the work repository, each with a
+    job plan, are related on both sides by bot comments; the second is blocked
+    by an open issue. The operator posts an unedited epic plan: a create with
+    an implement job plan, its `set_priority`, and the close of the first
+    child. The preview names the apply and changes nothing in the fixture
+    repositories (each issue's state, labels and comment count, and the
+    caller's runs). With `--max-dispatch 0`, `--max-writes` one short of the
+    plan's ten writes holds it whole, unclaimed; the full ten apply it. The
+    test reads back the bot's new issue, its `priority/P1` label, its parent
+    comment and job plan, the epic's children comment, the closed child with
+    its reason, and the bot's claim with its two receipts (`claimed` naming
+    the create, then `applied`). A second pass writes nothing, and stage 4
+    holds the new issue, an agreeing child, only by the dispatch cap. A second
+    plan's close of the blocked child gets Forgejo's 412 after its reason
+    comment: the apply stops with the create confirmed. The next pass holds
+    it as not proved and writes nothing; once the operator closes the blocker
+    and the child, a pass records `recovered` with one write and creates
+    nothing, and the pass after it writes nothing.
 
-  An isolated membership-labelled fixture then opts into `statusLabels` and
-  private usage/holds publication, with dispatch capped at zero. Preview
-  changes nothing. A low `--max-status-changes` refuses both derived changes;
-  successive `--max-writes 1` applies publish usage, derive and read back Todo
-  and Done, then publish holds. A person's Blocked and closed Backlog stay
-  unchanged. The census compares every fixture issue's state, labels and
-  comment count and all caller runs after each pass, not only the targets.
-  Snapshot comments read back with the bot's id, valid equal creation/update
-  times and the expected markers. A controlled broker reading proves an
-  unchanged pass posts nothing; a changed reading appends usage while leaving
-  both old comments intact. Either publication option targeting the existing
-  public work repository is refused before stage 1 without mutation.
+    An isolated membership-labelled fixture then opts into `statusLabels` and
+    private usage/holds publication, with dispatch capped at zero. Preview
+    changes nothing. A low `--max-status-changes` refuses both derived changes;
+    successive `--max-writes 1` applies publish usage, derive and read back Todo
+    and Done, then publish holds. A person's Blocked and closed Backlog stay
+    unchanged. The census compares every fixture issue's state, labels and
+    comment count and all caller runs after each pass, not only the targets.
+    Snapshot comments read back with the bot's id, valid equal creation/update
+    times and the expected markers. A controlled broker reading proves an
+    unchanged pass posts nothing; a changed reading appends usage while leaving
+    both old comments intact. Either publication option targeting the existing
+    public work repository is refused before stage 1 without mutation.
 
-  Three things only the live server showed. v17.0.1 serializes a dispatched
-  run's `event` as `""` (`HookEventType.Event()` has no case for
-  `workflow_dispatch`); only `trigger_event` names it. The adapter had
-  required `event` to name it too, so every real start was cancelled as a
-  wrong run; it now accepts `""` or `workflow_dispatch` there. And
-  label resolution's `GET /orgs/{owner}` needs `read:organization`, now in
-  the token's scopes above. And v17.0.1 answers a timeline page past its end
-  with `null`, not `[]`, and an `X-Total-Count` of that page alone, so every
-  epic read as unreadable; the timeline read now takes `null` as its end.
+    Three things only the live server showed. v17.0.1 serializes a dispatched
+    run's `event` as `""` (`HookEventType.Event()` has no case for
+    `workflow_dispatch`); only `trigger_event` names it. The adapter had
+    required `event` to name it too, so every real start was cancelled as a
+    wrong run; it now accepts `""` or `workflow_dispatch` there. And
+    label resolution's `GET /orgs/{owner}` needs `read:organization`, now in
+    the token's scopes above. And v17.0.1 answers a timeline page past its end
+    with `null`, not `[]`, and an `X-Total-Count` of that page alone, so every
+    epic read as unreadable; the timeline read now takes `null` as its end.
 
-  It proves nothing about agents, the real caller or a
-  pass inside Forgejo Actions (it runs as a local pass, with both caps), and
-  nothing about other Forgejo or runner versions. Of stage 3 it leaves out
-  the planning run, closing a finished epic, the sweep and every refusal:
-  a lost or ambiguous create, edited or foreign records, unsupported
-  actions and plans cut short at a chosen write are proved offline, against
-  fakes, rather than by timing races here. Status relabelling races, duplicate
-  labels, edited/foreign snapshots, lost writes and readback mismatches also
-  stay offline; no timestamp, recorder, privacy or readback check is relaxed.
+    It proves nothing about agents, the real caller or a
+    pass inside Forgejo Actions (it runs as a local pass, with both caps), and
+    nothing about other Forgejo or runner versions. Of stage 3 it leaves out
+    the planning run, closing a finished epic, the sweep and every refusal:
+    a lost or ambiguous create, edited or foreign records, unsupported
+    actions and plans cut short at a chosen write are proved offline, against
+    fakes, rather than by timing races here. Status relabelling races, duplicate
+    labels, edited/foreign snapshots, lost writes and readback mismatches also
+    stay offline; no timestamp, recorder, privacy or readback check is relaxed.
+
 * **Caller smoke, separately approved.** One no-mutation research run through
   the real caller above, once it exists, on an isolated instance and
   repositories, checking the receipt, run accounting and that check and apply
