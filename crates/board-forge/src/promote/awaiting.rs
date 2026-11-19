@@ -183,9 +183,17 @@ impl<'a> Awaiting<'a> {
         match gate {
             Gates::Promoted(line) => Ok(line),
             Gates::Ready {
-                signoffs, behind, ..
+                signoffs,
+                behind,
+                fork_only,
+                direct,
+                ..
             } => {
                 hold!(behind == 0, "needs publication rebase (behind_by={behind})");
+                hold!(
+                    direct,
+                    "needs publication rebase (skipping {fork_only} fork commits)"
+                );
                 hold!(signoffs == 0, "DCO sign-off rewrite required");
                 hold!(
                     !pull["head"]["repo"]["owner"]["login"]

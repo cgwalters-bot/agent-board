@@ -3,6 +3,7 @@
 //! publication may replace its separate bot branch under an exact lease.
 use super::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     path::PathBuf,
@@ -20,20 +21,184 @@ pub(super) fn branch(head: &str) -> String {
     format!("bot/promote/{head}")
 }
 
+/// The PR's own commits: those on the reviewed head that its fork base (the
+/// fork's default branch) does not reach, as exact SHAs. A fork's marker and
+/// merge commits are never promoted. [`own`] is the only place this list is
+/// derived. Upstream validation can select a suffix without discarding the
+/// approved fork range; all publication steps use the selected suffix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Commits {
+    pub(super) fork_base: String,
+    /// Where the commits branch from the fork base's history.
+    parent: String,
+    /// The fork comparison's rows, oldest first; the last is the head.
+    rows: Vec<Value>,
+    /// Start of the publication suffix and its parent, if a prefix is upstream.
+    suffix: Option<(usize, String)>,
+}
+
+/// What a receipt records of a publication: the PR's remaining commits and the
+/// upstream commit they were validated or replayed on. The publication
+/// carries exactly these commits only while upstream contains `onto`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Cut {
+    pub(super) fork_base: String,
+    pub(super) commits: Vec<String>,
+    pub(super) onto: String,
+}
+
+/// Compute the PR's own commits once, from one bounded comparison of the
+/// fork base with the approved head.
+pub(super) fn own(client: &impl Rest, repo: &str, fork_base: &str, head: &str) -> Result<Commits> {
+    let fork = comparison(
+        client,
+        &format!("repos/{repo}/compare/{fork_base}...{head}"),
+        head,
+    )?;
+    ensure!(
+        fork["base_commit"]["sha"] == fork_base,
+        "fork comparison base mismatch"
+    );
+    let rows = fork["commits"]
+        .as_array()
+        .context("missing fork comparison commits")?
+        .clone();
+    hold!(
+        !rows.is_empty(),
+        "no commits of its own beyond fork base {fork_base}"
+    );
+    Ok(Commits {
+        fork_base: fork_base.into(),
+        parent: fork["merge_base_commit"]["sha"]
+            .as_str()
+            .filter(|s| oid(s))
+            .context("invalid fork merge base")?
+            .into(),
+        rows,
+        suffix: None,
+    })
+}
+
+impl Commits {
+    /// A complete upstream comparison omits commits it already reaches. Drop
+    /// only a prefix of the approved range, never a hole, and never adopt a
+    /// row from upstream. Keep the full fork evidence so revalidation can check a new tip
+    /// without assuming the prefix is still upstream.
+    pub(super) fn unintegrated<'a>(&mut self, upstream: &'a Value) -> Result<Vec<&'a str>> {
+        let shas: Vec<_> = upstream["commits"]
+            .as_array()
+            .context("missing compare commits")?
+            .iter()
+            .map(|c| c["sha"].as_str().context("invalid compare commit sha"))
+            .collect::<Result<_>>()?;
+        let upstream_shas: BTreeSet<_> = shas.iter().copied().collect();
+        let (integrated, remaining) = self.rows.split_at(
+            self.rows
+                .iter()
+                .take_while(|c| !c["sha"].as_str().is_some_and(|s| upstream_shas.contains(s)))
+                .count(),
+        );
+        let first = remaining
+            .first()
+            .context("no approved commits to publish")?;
+        hold!(
+            remaining
+                .iter()
+                .all(|c| c["sha"].as_str().is_some_and(|s| upstream_shas.contains(s))),
+            "already-upstream PR commits do not form a prefix"
+        );
+        self.suffix = if integrated.is_empty() {
+            None
+        } else {
+            let parents = first["parents"]
+                .as_array()
+                .context("missing commit parents")?;
+            let parent = match parents.as_slice() {
+                [p] => p["sha"]
+                    .as_str()
+                    .filter(|s| oid(s))
+                    .context("invalid commit parent")?,
+                // A direct publication may start with a merge. DCO still
+                // validates the DAG and replay still rejects merges.
+                _ => upstream["merge_base_commit"]["sha"]
+                    .as_str()
+                    .context("missing upstream merge base")?,
+            };
+            hold!(
+                !upstream_shas.contains(parent)
+                    && (parent == self.parent || integrated.iter().any(|c| c["sha"] == parent)),
+                "remaining PR commits do not start at an integrated parent"
+            );
+            Some((integrated.len(), parent.to_owned()))
+        };
+        Ok(shas)
+    }
+
+    pub(super) fn parent(&self) -> &str {
+        self.suffix
+            .as_ref()
+            .map_or(&self.parent, |(_, parent)| parent)
+    }
+
+    pub(super) fn rows(&self) -> &[Value] {
+        &self.rows[self.suffix.as_ref().map_or(0, |(start, _)| *start)..]
+    }
+
+    pub(super) fn shas(&self) -> Vec<&str> {
+        self.rows()
+            .iter()
+            .filter_map(|c| c["sha"].as_str())
+            .collect()
+    }
+
+    /// The head these commits end at; [`comparison`] proved it is the head
+    /// compared.
+    pub(super) fn head(&self) -> &str {
+        self.rows
+            .last()
+            .and_then(|c| c["sha"].as_str())
+            .unwrap_or_default()
+    }
+
+    /// These commits as a comparison against upstream commit `onto`, as tests
+    /// record a replay.
+    #[cfg(test)]
+    pub(super) fn onto(&self, onto: &str) -> Value {
+        serde_json::json!({
+            "base_commit": {"sha": onto},
+            "merge_base_commit": {"sha": self.parent()},
+            "ahead_by": self.rows().len(),
+            "total_commits": self.rows().len(),
+            "commits": self.rows(),
+        })
+    }
+
+    pub(super) fn cut(&self, onto: &str) -> Cut {
+        Cut {
+            fork_base: self.fork_base.clone(),
+            commits: self.shas().into_iter().map(str::to_owned).collect(),
+            onto: onto.into(),
+        }
+    }
+
+    /// Whether `cut` recorded exactly these commits.
+    pub(super) fn recorded(&self, cut: &Cut) -> bool {
+        cut.commits.iter().map(String::as_str).eq(self.shas())
+    }
+}
+
 /// What a replay needs before any Git run: a linear chain from the merge base
 /// of commits by the bot or operator. A preview reads this; only a conflict is
 /// left to the replay itself.
-pub(super) fn replayable(config: &Config, compare: &Value) -> Result<()> {
+pub(super) fn replayable(config: &Config, commits: &Commits) -> Result<()> {
     config
         .promote
         .as_ref()
         .and_then(|p| p.signoff.as_ref())
         .context("missing sign-off identity")?;
-    let mut parent = compare["merge_base_commit"]["sha"]
-        .as_str()
-        .filter(|s| oid(s))
-        .context("invalid merge base")?;
-    for c in compare["commits"].as_array().context("missing commits")? {
+    let mut parent = commits.parent();
+    for c in commits.rows() {
         let sha = c["sha"]
             .as_str()
             .filter(|s| oid(s))
@@ -62,7 +227,8 @@ pub(super) trait Rewrite {
         config: &Config,
         target: &pass::promote::Fork,
         pull: &Value,
-        compare: &Value,
+        commits: &Commits,
+        onto: &str,
     ) -> Result<(String, String)>;
     fn publish(
         &mut self,
@@ -183,7 +349,8 @@ impl Rewrite for Git {
         config: &Config,
         target: &pass::promote::Fork,
         pull: &Value,
-        compare: &Value,
+        commits: &Commits,
+        onto: &str,
     ) -> Result<(String, String)> {
         self.init()?;
         let token = std::env::var("GH_TOKEN")
@@ -199,11 +366,8 @@ impl Rewrite for Git {
             .as_str()
             .context("missing head repository")?;
         let head = pull["head"]["sha"].as_str().context("missing head")?;
-        let base = compare["base_commit"]["sha"]
-            .as_str()
-            .filter(|s| oid(s))
-            .context("invalid publication base")?;
-        for (repo, sha) in [(repo, head), (target.upstream.as_str(), base)] {
+        ensure!(oid(onto), "invalid publication base");
+        for (repo, sha) in [(repo, head), (target.upstream.as_str(), onto)] {
             self.run(
                 &[
                     "fetch",
@@ -216,7 +380,7 @@ impl Rewrite for Git {
                 &[],
             )?;
         }
-        self.replay(config, pull, compare)
+        self.replay(config, pull, commits, onto)
     }
 
     fn publish(
@@ -254,32 +418,32 @@ impl Rewrite for Git {
 }
 
 impl Git {
-    fn replay(&self, config: &Config, pull: &Value, compare: &Value) -> Result<(String, String)> {
+    /// Replay exactly `commits` onto upstream commit `base`.
+    fn replay(
+        &self,
+        config: &Config,
+        pull: &Value,
+        commits: &Commits,
+        base: &str,
+    ) -> Result<(String, String)> {
         let head = pull["head"]["sha"]
             .as_str()
             .filter(|s| oid(s))
             .context("invalid head")?;
-        let base = compare["base_commit"]["sha"]
-            .as_str()
-            .filter(|s| oid(s))
-            .context("invalid publication base")?;
-        let ancestor = compare["merge_base_commit"]["sha"]
-            .as_str()
-            .filter(|s| oid(s))
-            .context("invalid merge base")?;
+        ensure!(commits.head() == head, "replay range is for another head");
+        ensure!(oid(base), "invalid publication base");
         let signoff = config
             .promote
             .as_ref()
             .and_then(|p| p.signoff.as_ref())
             .context("missing sign-off identity")?;
-        replayable(config, compare)?;
-        let commits = compare["commits"].as_array().context("missing commits")?;
-        let mut parent = ancestor.to_owned();
+        replayable(config, commits)?;
+        let mut parent = commits.parent().to_owned();
         let mut rebased = base.to_owned();
         // merge-tree performs a three-way merge of each original patch onto the
         // rebased parent. Synthetic commits share the *original* parent, so Git
         // cannot accidentally replay the earlier patches a second time.
-        for c in commits {
+        for c in commits.rows() {
             let sha = c["sha"]
                 .as_str()
                 .filter(|s| oid(s))
@@ -347,12 +511,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn replay_preserves_authors_and_trailers_signs_every_commit_and_holds_conflicts() {
-        let config =
-            Config::parse(include_str!("../../../../fixtures/promote/config.json")).unwrap();
-        let mut git = Git::default();
-        git.init().unwrap();
+    fn config() -> Config {
+        Config::parse(include_str!("../../../../fixtures/promote/config.json")).unwrap()
+    }
+
+    /// A commit on the first parent's tree (empty without one) that writes
+    /// `content` to `path`.
+    fn commit(git: &Git, parents: &[&str], path: &str, content: &str, message: &str) -> String {
         let identity = [
             ("GIT_AUTHOR_NAME", "Original author"),
             ("GIT_AUTHOR_EMAIL", "author@example.invalid"),
@@ -361,31 +526,39 @@ mod tests {
             ("GIT_AUTHOR_DATE", "2026-11-10T00:00:00Z"),
             ("GIT_COMMITTER_DATE", "2026-11-10T00:00:00Z"),
         ];
-        let commit = |parent: Option<&str>, path: &str, content: &str, message: &str| {
-            let file = git.directory.as_ref().unwrap().join("blob-input");
-            fs::write(&file, content).unwrap();
-            let blob = git
-                .run(&["hash-object", "-w", file.to_str().unwrap()], &[])
-                .unwrap();
-            if let Some(parent) = parent {
-                git.run(&["read-tree", parent], &[]).unwrap();
-            }
-            git.run(
-                &[
-                    "update-index",
-                    "--add",
-                    "--cacheinfo",
-                    &format!("100644,{blob},{path}"),
-                ],
-                &[],
-            )
+        let file = git.directory.as_ref().unwrap().join("blob-input");
+        fs::write(&file, content).unwrap();
+        let blob = git
+            .run(&["hash-object", "-w", file.to_str().unwrap()], &[])
             .unwrap();
-            let tree = git.run(&["write-tree"], &[]).unwrap();
-            let mut args = vec!["commit-tree", &tree, "-m", message];
-            if let Some(parent) = parent {
-                args.extend(["-p", parent]);
-            }
-            git.run(&args, &identity).unwrap()
+        if let Some(parent) = parents.first() {
+            git.run(&["read-tree", parent], &[]).unwrap();
+        }
+        git.run(
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},{path}"),
+            ],
+            &[],
+        )
+        .unwrap();
+        let tree = git.run(&["write-tree"], &[]).unwrap();
+        let mut args = vec!["commit-tree", &tree, "-m", message];
+        for parent in parents {
+            args.extend(["-p", parent]);
+        }
+        git.run(&args, &identity).unwrap()
+    }
+
+    #[test]
+    fn replay_preserves_authors_and_trailers_signs_every_commit_and_holds_conflicts() {
+        let config = config();
+        let mut git = Git::default();
+        git.init().unwrap();
+        let commit = |parent: Option<&str>, path: &str, content: &str, message: &str| {
+            commit(&git, parent.as_slice(), path, content, message)
         };
         let ancestor = commit(None, "shared", "original\n", "Initial");
         let first = commit(
@@ -403,11 +576,16 @@ mod tests {
                 "upstream\n",
                 "Upstream change",
             );
-            let compare = json!({"base_commit":{"sha":base},"merge_base_commit":{"sha":ancestor},"commits":[
-                {"sha":first,"parents":[{"sha":ancestor}],"author":{"login":config.bot},"commit":{"message":"First\n\nGenerated-by: preserved"}},
-                {"sha":second,"parents":[{"sha":first}],"author":{"login":config.bot},"commit":{"message":"Second"}}
-            ]});
-            let result = git.replay(&config, &pull, &compare);
+            let commits = Commits {
+                fork_base: ancestor.clone(),
+                parent: ancestor.clone(),
+                rows: vec![
+                    json!({"sha":first,"parents":[{"sha":ancestor}],"author":{"login":config.bot},"commit":{"message":"First\n\nGenerated-by: preserved"}}),
+                    json!({"sha":second,"parents":[{"sha":first}],"author":{"login":config.bot},"commit":{"message":"Second"}}),
+                ],
+                suffix: None,
+            };
+            let result = git.replay(&config, &pull, &commits, &base);
             if conflict {
                 assert!(result.is_err());
                 continue;
@@ -415,7 +593,7 @@ mod tests {
             let (head, branch) = result.unwrap();
             assert_eq!(
                 (head.clone(), branch),
-                git.replay(&config, &pull, &compare).unwrap(),
+                git.replay(&config, &pull, &commits, &base).unwrap(),
                 "retry must be deterministic"
             );
             let commits = git
@@ -452,5 +630,113 @@ mod tests {
                 "second"
             );
         }
+    }
+
+    /// cgwalters-forge/ostree#10: a fork whose main carries another author's
+    /// merge and a marker commit replays only the PR's commit.
+    #[test]
+    fn replay_skips_the_forks_own_base_commits() {
+        let config = config();
+        let mut git = Git::default();
+        git.init().unwrap();
+        let ancestor = commit(&git, &[], "shared", "original\n", "Initial");
+        let side = commit(&git, &[&ancestor], "side", "side\n", "Fork change");
+        let merge = commit(&git, &[&ancestor, &side], "side", "side\n", "Merge #6");
+        let marker = commit(&git, &[&merge], "marker", "marker\n", "Marker");
+        let pr = commit(&git, &[&marker], "shared", "topic\n", "The PR");
+        let base = commit(&git, &[&ancestor], "upstream", "upstream\n", "Upstream");
+        let row = |sha: &str, parents: &[&str], login: &str| {
+            json!({"sha": sha, "parents": parents.iter().map(|p| json!({"sha": p})).collect::<Vec<_>>(),
+                "author": {"login": login}, "commit": {"message": "Message"}})
+        };
+        // Cut at the upstream merge base, the fork's commits would be replayed
+        // too, and the merge holds.
+        let whole = Commits {
+            fork_base: ancestor.clone(),
+            parent: ancestor.clone(),
+            rows: vec![
+                row(&side, &[&ancestor], "visitor"),
+                row(&merge, &[&ancestor, &side], "visitor"),
+                row(&marker, &[&merge], &config.bot),
+                row(&pr, &[&marker], &config.bot),
+            ],
+            suffix: None,
+        };
+        assert!(replayable(&config, &whole).is_err());
+        // The fork comparison at the marker holds the PR's commit alone.
+        let pull = json!({"head": {"sha": pr}, "base": {"sha": marker}});
+        let own = Commits {
+            fork_base: marker.clone(),
+            parent: marker.clone(),
+            rows: vec![row(&pr, &[&marker], &config.bot)],
+            suffix: None,
+        };
+        assert_eq!(own.shas(), [pr.as_str()]);
+        assert_eq!(own.head(), pr);
+        let compare = own.onto(&base);
+        assert_eq!(compare["merge_base_commit"]["sha"], marker);
+        assert_eq!(
+            (
+                compare["ahead_by"].clone(),
+                compare["total_commits"].clone()
+            ),
+            (json!(1), json!(1))
+        );
+        let cut = own.cut(&base);
+        assert!(own.recorded(&cut));
+        assert!(!whole.recorded(&cut));
+        replayable(&config, &own).unwrap();
+        assert!(
+            git.replay(&config, &json!({"head": {"sha": marker}}), &own, &base)
+                .is_err(),
+            "a range is replayed only for its own head"
+        );
+        let (head, _) = git.replay(&config, &pull, &own, &base).unwrap();
+        let replayed = git
+            .run(&["rev-list", &format!("{base}..{head}")], &[])
+            .unwrap();
+        assert_eq!(replayed.lines().count(), 1);
+        let files = git.run(&["ls-tree", "--name-only", &head], &[]).unwrap();
+        assert_eq!(files.lines().collect::<Vec<_>>(), ["shared", "upstream"]);
+        assert_eq!(
+            git.run(&["show", &format!("{head}:shared")], &[]).unwrap(),
+            "topic"
+        );
+        // An upstream change to the PR's file still holds as a conflict.
+        let conflicting = commit(&git, &[&ancestor], "shared", "upstream\n", "Upstream");
+        assert!(git.replay(&config, &pull, &own, &conflicting).is_err());
+    }
+
+    #[test]
+    fn revalidation_keeps_the_original_fork_range() {
+        let [base, a, b, c] = ['a', 'b', 'c', 'd'].map(|ch| ch.to_string().repeat(40));
+        let row = |sha: &str, parent: &str| json!({"sha":sha,"parents":[{"sha":parent}]});
+        let mut commits = Commits {
+            fork_base: base.clone(),
+            parent: base.clone(),
+            rows: vec![row(&a, &base), row(&b, &a), row(&c, &b)],
+            suffix: None,
+        };
+        let comparison = |rows: Vec<Value>| json!({"commits":rows});
+        commits
+            .unintegrated(&comparison(vec![row(&c, &b)]))
+            .unwrap();
+        assert_eq!(commits.shas(), [&c]);
+        assert_eq!(commits.parent(), b);
+        let cut = commits.cut(&b);
+
+        // A rewind cannot keep using a suffix derived from the previous tip.
+        commits
+            .unintegrated(&comparison(vec![row(&a, &base), row(&b, &a), row(&c, &b)]))
+            .unwrap();
+        assert_eq!(commits.shas(), [&a, &b, &c]);
+        assert_eq!(commits.parent(), base);
+        assert!(!commits.recorded(&cut));
+
+        // An absent commit inside the remaining range is not a prefix.
+        let error = commits
+            .unintegrated(&comparison(vec![row(&a, &base), row(&c, &b)]))
+            .unwrap_err();
+        assert!(error.to_string().contains("do not form a prefix"));
     }
 }

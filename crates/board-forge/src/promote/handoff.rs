@@ -23,6 +23,10 @@ pub(super) struct Record {
     pub(super) source_repository: String,
     pub(super) source_issue: u64,
     pub(super) completes_source: bool,
+    /// The published commits and the upstream commit they sit on; absent on
+    /// older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cut: Option<rewrite::Cut>,
 }
 
 /// The issues of `repo` that `body` closes or is part of.
@@ -49,6 +53,7 @@ pub(super) fn success(
     publication: &Value,
     upstream: &str,
     n: u64,
+    cut: Option<&rewrite::Cut>,
 ) -> Result<String> {
     let head = pull["head"]["sha"]
         .as_str()
@@ -75,6 +80,7 @@ pub(super) fn success(
             repo,
             source(repo, pull)?,
         ),
+        cut: cut.cloned(),
     };
     Ok(format!(
         "Published approved head {head} as https://github.com/{upstream}/pull/{n}. Fork PR stays open; Status/scheduling uses verified upstream state.\n\n{STATUS}\n\n```{FENCE}\n{}\n```",
@@ -356,6 +362,7 @@ fn enrich_pull(
         !record.completes_source && upstream["state"] == "closed" && upstream["merged"] == true;
     match (upstream["state"].as_str(), upstream["merged"].as_bool()) {
         (Some("open"), Some(false)) if upstream.get("merged_at") == Some(&Value::Null) => {
+            contained(client, target, &record)?;
             // Verified publication remains active even after staleness or
             // fork closure. None is deliberately not a stale timestamp.
             Ok(Some((
@@ -518,9 +525,24 @@ pub(crate) fn published(
     if pull["head"]["sha"] != record.approved_oid {
         return Ok(Some(Publication::AwaitingApproval));
     }
-    Ok(Some(Publication::Current(verify_upstream(
-        client, bot, repo, target, pull, &record,
-    )?)))
+    let upstream = verify_upstream(client, bot, repo, target, pull, &record)?;
+    if upstream["state"] == "open" {
+        contained(client, target, &record)?;
+    }
+    Ok(Some(Publication::Current(upstream)))
+}
+
+/// An open publication carries only its recorded commits while upstream
+/// still contains the commit they sit on. Older records cannot show this.
+fn contained(
+    client: &impl Rest,
+    target: &crate::pass::promote::Fork,
+    record: &Record,
+) -> Result<()> {
+    if let Some(cut) = &record.cut {
+        tip_containing(client, target, &cut.onto)?;
+    }
+    Ok(())
 }
 
 fn at_time(value: &Value, field: &str) -> Result<OffsetDateTime> {

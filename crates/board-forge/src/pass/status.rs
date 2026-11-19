@@ -656,6 +656,11 @@ mod tests {
         let mut mixed_items = BTreeMap::from([(good_key.clone(), good)]);
         let mut bad_keys = Vec::new();
         let mut expected_notices = Vec::new();
+        let has_comment_metadata = |entry: &Value| {
+            entry["request"]["variables"]["number"] == 34
+                && entry["answer"]["data"]["repository"]["pullRequest"]["comments"]["nodes"]
+                    .is_array()
+        };
         for case in cases {
             let (mut replay, config) = crate::promote::tests::handoff_scenario();
             for entry in &mut replay.requests {
@@ -810,7 +815,7 @@ mod tests {
                     entry["request"]["get"] =
                         json!("https://api.github.com/repos/cgwalters-bot/unrelated");
                 }
-                if entry["request"]["variables"]["number"] == 34 {
+                if has_comment_metadata(entry) {
                     let nodes = &mut entry["answer"]["data"]["repository"]["pullRequest"]["comments"]
                         ["nodes"];
                     match case {
@@ -839,9 +844,7 @@ mod tests {
                 }
             }
             if case == "metadata read" {
-                replay
-                    .requests
-                    .retain(|e| e["request"]["variables"]["number"] != 34);
+                replay.requests.retain(|e| !has_comment_metadata(e));
             }
             if case == "conflicting fork" {
                 let mut fork = replay

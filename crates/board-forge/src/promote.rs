@@ -116,6 +116,8 @@ struct Command {
     created: OffsetDateTime,
     head: String,
     pushed: OffsetDateTime,
+    /// When the head first became the branch tip: no review of it is older.
+    introduced: OffsetDateTime,
     pusher: Option<String>,
     human_text: bool,
 }
@@ -144,6 +146,15 @@ enum Gates {
         signoffs: usize,
         /// Commits the base has that the head lacks: a publication rebase.
         behind: u64,
+        /// The fork's own commits the head carries, which publication drops.
+        fork_only: usize,
+        /// Publishing the head itself would carry exactly `commits`.
+        direct: bool,
+        /// The upstream tip compared, when the comparison was pinned to one.
+        tip: Option<String>,
+        /// The PR's own commits. Publication replays and confirms this one
+        /// value, never a second read of the range.
+        commits: rewrite::Commits,
     },
 }
 
@@ -157,7 +168,14 @@ fn assess(
     command: &Command,
     policies: &mut Policies,
 ) -> Result<(Gates, std::result::Result<&'static str, GateFailure>)> {
-    let gate = gates(client, config, repo, pull, &target.upstream, &target.base)?;
+    let gate = gates(
+        client,
+        config,
+        repo,
+        pull,
+        (&target.upstream, &target.base),
+        command.introduced,
+    )?;
     if matches!(gate, Gates::Promoted(_)) {
         return Ok((gate, Ok("")));
     }
@@ -232,11 +250,13 @@ const RECORDED_FIELDS: &[&str] = &[
     "body",
     "repository_url",
     "pull_request",
+    "merged",
     "merged_at",
     "ahead_by",
     "behind_by",
     "total_commits",
     "merge_base_commit",
+    "base_commit",
     "commits",
     "commit",
     "message",
@@ -565,10 +585,26 @@ fn gates(
     config: &Config,
     repo: &str,
     pull: &Value,
-    upstream: &str,
-    base: &str,
+    target: (&str, &str),
+    introduced: OffsetDateTime,
 ) -> Result<Gates> {
-    gates_impl(client, config, repo, pull, upstream, base, true)
+    gates_impl(
+        client,
+        config,
+        repo,
+        pull,
+        target,
+        introduced,
+        Mode::Preview,
+    )
+}
+
+enum Mode {
+    /// An open upstream PR at the head reads as promoted.
+    Preview,
+    /// Pinned to one upstream tip. Revalidation passes the PR's commits as
+    /// its first validation computed them, never deriving them again.
+    Publication(Option<rewrite::Commits>),
 }
 
 fn gates_impl(
@@ -576,10 +612,14 @@ fn gates_impl(
     config: &Config,
     repo: &str,
     pull: &Value,
-    upstream: &str,
-    base: &str,
-    observe_existing: bool,
+    (upstream, base): (&str, &str),
+    introduced: OffsetDateTime,
+    mode: Mode,
 ) -> Result<Gates> {
+    let (observe_existing, prior) = match mode {
+        Mode::Preview => (true, None),
+        Mode::Publication(prior) => (false, prior),
+    };
     validate_repository(repo)?;
     validate_repository(upstream)?;
     validate_branch(base)?;
@@ -620,26 +660,62 @@ fn gates_impl(
             )));
         }
     }
-    let path = format!(
-        "repos/{upstream}/compare/{}...{}",
-        encode(base),
-        encode(&format!("{owner}:{branch}"))
-    );
-    let compare = comparison(client, &path, head)?;
+    // Publication pins its comparison to one upstream tip, so the range this
+    // proves is the one it replays and confirms.
+    let (compare, tip) = if observe_existing {
+        let path = format!(
+            "repos/{upstream}/compare/{}...{}",
+            encode(base),
+            encode(&format!("{owner}:{branch}"))
+        );
+        (comparison(client, &path, head)?, None)
+    } else {
+        let tip = branch_tip(client, upstream, base)?;
+        let compare = comparison(
+            client,
+            &format!("repos/{upstream}/compare/{tip}...{head}"),
+            head,
+        )?;
+        ensure!(
+            compare["base_commit"]["sha"] == tip,
+            "upstream comparison base mismatch"
+        );
+        (compare, Some(tip))
+    };
     let ahead = compare["ahead_by"].as_u64().context("missing ahead_by")?;
     let behind = compare["behind_by"].as_u64().context("missing behind_by")?;
     hold!(ahead > 0, "already upstream (zero ahead)");
-    // Publication replays a behind head onto the current base; only a
-    // conflict, found by that replay, is left for --apply to hold.
-    if behind > 0 {
-        rewrite::replayable(config, &compare)?;
+    let fork_base = base_settled(client, repo, pull, introduced)?;
+    let mut commits = match prior {
+        Some(commits) => {
+            hold!(
+                commits.fork_base == fork_base && commits.head() == head,
+                "fork base or head changed before publication; retry with fresh evidence"
+            );
+            commits
+        }
+        None => rewrite::own(client, repo, &fork_base, head)?,
+    };
+    let upstream_shas = commits.unintegrated(&compare)?;
+    let direct = upstream_shas == commits.shas();
+    let fork_only = upstream_shas.len().saturating_sub(commits.shas().len());
+    // Publication replays the PR's own commits onto the current base when the
+    // head is behind it or carries the fork's own commits; only a conflict,
+    // found by that replay, is left for --apply to hold.
+    if behind > 0 || !direct {
+        rewrite::replayable(config, &commits)?;
     }
     let stack = stack_gate(client, config, repo, pull, upstream, base)?;
-    let dco = dco_gate(client, config, upstream, base, &compare, head)?;
+    let dco = dco_gate(client, config, upstream, base, &commits)?;
     publication_text(repo, upstream, pull)?;
-    let rebase = if behind > 0 {
+    let rebase = if behind > 0 || !direct {
+        let skipped = if fork_only > 0 {
+            format!(", skipping {fork_only} fork commits")
+        } else {
+            String::new()
+        };
         format!(
-            "; publication rebase onto {base} (behind_by={behind}), held by --apply on conflict"
+            "; publication rebase onto {base} (behind_by={behind}{skipped}), held by --apply on conflict"
         )
     } else {
         String::new()
@@ -649,7 +725,83 @@ fn gates_impl(
         detail: format!("{stack}; {}{rebase}", dco.0),
         signoffs: dco.2,
         behind,
+        fork_only,
+        direct,
+        tip,
+        commits,
     })
+}
+
+const BASE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){nameWithOwner pullRequest(number:$number){number baseRefName baseRef{target{oid}} baseChange:timelineItems(last:1,itemTypes:[BASE_REF_CHANGED_EVENT]){nodes{... on BaseRefChangedEvent{createdAt}}}}}}";
+
+/// The fork base the PR's commits are cut at: the live tip of the base selected
+/// before the head was `introduced`, so every review of that head showed this
+/// range. Approval times cannot bind it: a review submitted after a base move
+/// may come from a diff loaded before it. A later retarget or tip move holds
+/// for a new head rather than proving the PR's commits unchanged with a second
+/// derivation.
+fn base_settled(
+    client: &(impl Rest + Transport),
+    repo: &str,
+    pull: &Value,
+    introduced: OffsetDateTime,
+) -> Result<String> {
+    let branch = pull["base"]["ref"]
+        .as_str()
+        .context("missing base branch")?;
+    validate_branch(branch)?;
+    let reference = format!("refs/heads/{branch}");
+    let activity = format!(
+        "repos/{repo}/activity?ref={}&direction=desc",
+        encode(&reference)
+    );
+    let latest = get(client, &format!("{activity}&per_page=1"))?;
+    let event = latest
+        .as_array()
+        .context("branch activity is not an array")?
+        .first();
+    let (owner, name) = repo.split_once('/').context("invalid fork repository")?;
+    let number = pull["number"].as_u64().context("invalid pull number")?;
+    let evidence = client.graphql(
+        BASE_QUERY,
+        serde_json::json!({"owner":owner,"name":name,"number":number}),
+    )?;
+    let repository = &evidence["repository"];
+    let pr = &repository["pullRequest"];
+    hold!(
+        repository["nameWithOwner"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(repo))
+            && pr["number"] == number
+            && pr["baseRefName"] == branch,
+        "fork PR base changed during validation; retry with fresh evidence"
+    );
+    // The REST PR's base SHA can lag a branch push. Read the live ref and
+    // require independent activity setting it to exactly that tip.
+    let sha = pr["baseRef"]["target"]["oid"]
+        .as_str()
+        .filter(|s| oid(s))
+        .context("invalid live fork base SHA")?;
+    hold!(
+        event.is_some_and(|e| e["ref"] == reference && e["after"] == sha),
+        "fork base {branch} has no activity setting it to {sha}"
+    );
+    let events = pr["baseChange"]["nodes"]
+        .as_array()
+        .context("missing base change evidence")?;
+    ensure!(events.len() <= 1, "oversized base change evidence");
+    if let Some(event) = events.first() {
+        hold!(
+            at(&event["createdAt"])? < introduced,
+            "fork PR was retargeted after its head was pushed; push a new head and approve it"
+        );
+    }
+    let event = event.context("missing base activity")?;
+    hold!(
+        at(&event["timestamp"])? < introduced,
+        "fork base {branch} moved after the PR's head was pushed; push a new head and approve it"
+    );
+    Ok(sha.to_owned())
 }
 
 mod drafts;
@@ -725,6 +877,40 @@ fn comparison(client: &impl Rest, path: &str, head: &str) -> Result<Value> {
         }
     }
     anyhow::bail!("compare exceeds {MAX_PAGES} pages")
+}
+
+fn branch_tip(client: &impl Rest, repo: &str, branch: &str) -> Result<String> {
+    let branch = get(client, &format!("repos/{repo}/branches/{}", encode(branch)))?;
+    branch["commit"]["sha"]
+        .as_str()
+        .filter(|s| oid(s))
+        .map(str::to_owned)
+        .context("invalid publication base")
+}
+
+/// One pinned compare summary proves ancestry without fetching the range.
+fn ancestor(client: &impl Rest, repo: &str, base: &str, head: &str) -> Result<bool> {
+    if base == head {
+        return Ok(true);
+    }
+    let proof = get(
+        client,
+        &format!("repos/{repo}/compare/{base}...{head}?per_page=1"),
+    )?;
+    Ok(proof["base_commit"]["sha"] == base
+        && proof["merge_base_commit"]["sha"] == base
+        && proof["behind_by"].as_u64() == Some(0))
+}
+
+/// The upstream tip, held unless it still contains `base`: the commit a
+/// publication sits on, without which it would carry upstream's old commits.
+fn tip_containing(client: &impl Rest, target: &pass::promote::Fork, base: &str) -> Result<String> {
+    let tip = branch_tip(client, &target.upstream, &target.base)?;
+    hold!(
+        ancestor(client, &target.upstream, base, &tip)?,
+        "upstream no longer contains the publication's base {base}; manual migration required"
+    );
+    Ok(tip)
 }
 
 fn upstream_pulls(
@@ -861,6 +1047,23 @@ fn stack_gate(
             "stack parent {upstream}#{pn}: closed unmerged; rebase by hand"
         ))
         .into());
+    }
+    let comments = pages(client, &format!("repos/{repo}/issues/{n}/comments"))?;
+    let target = pass::promote::Fork {
+        upstream: upstream.into(),
+        base: base.into(),
+    };
+    if let Some(handoff::Publication::Current(pr)) =
+        handoff::published(client, &config.bot, repo, &target, parent, &comments)?
+    {
+        let pn = pr["number"]
+            .as_u64()
+            .context("invalid parent upstream PR number")?;
+        hold!(
+            pr["state"] == "closed" && pr["merged"] == true && pr["merged_at"].is_string(),
+            "stack parent {upstream}#{pn}: publication has not merged"
+        );
+        return Ok(format!("stack={repo}#{n} -> {upstream}#{pn} merged"));
     }
     hold!(
         parent["state"] != "open",
@@ -1071,8 +1274,7 @@ fn dco_gate(
     config: &Config,
     upstream: &str,
     base: &str,
-    compare: &Value,
-    head: &str,
+    commits: &rewrite::Commits,
 ) -> Result<(String, String, usize)> {
     let rules = pages(
         client,
@@ -1115,24 +1317,13 @@ fn dco_gate(
     if !dco {
         return Ok(("dco=not-required".into(), "no DCO".into(), 0));
     }
-    signoff_gate(config, compare, head).context("dco=required")
+    signoff_gate(config, commits).context("dco=required")
 }
 
-fn signoff_gate(config: &Config, compare: &Value, head: &str) -> Result<(String, String, usize)> {
+fn signoff_gate(config: &Config, own: &rewrite::Commits) -> Result<(String, String, usize)> {
     (|| {
-        let commits = compare["commits"]
-            .as_array()
-            .context("missing compare commits")?;
-        ensure!(
-            compare["total_commits"].as_u64() == Some(commits.len() as u64)
-                && compare["ahead_by"] == compare["total_commits"],
-            "incomplete compare commits for DCO"
-        );
-        let merge_base = compare["merge_base_commit"]["sha"]
-            .as_str()
-            .filter(|s| oid(s))
-            .context("invalid merge base sha")?;
-        let mut known = BTreeSet::from([merge_base]);
+        let commits = own.rows();
+        let mut known = BTreeSet::from([own.parent()]);
         let signoff = config
             .promote
             .as_ref()
@@ -1179,10 +1370,6 @@ fn signoff_gate(config: &Config, compare: &Value, head: &str) -> Result<(String,
             );
             known.insert(sha);
         }
-        ensure!(
-            commits.last().is_some_and(|c| c["sha"] == head),
-            "compare head mismatch"
-        );
         hold!(
             problems.is_empty(),
             "missing sign-off on {missing} of {} commits: {}",
@@ -1325,7 +1512,7 @@ fn evaluate(
         &format!("repos/{head_repo}/activity?ref={encoded}&direction=desc"),
     )?;
     let head = pull["head"]["sha"].as_str().context("missing head")?;
-    let pushed = push_time(&activity, &reference, head, now)?;
+    let (pushed, introduced) = push_time(&activity, &reference, head, now)?;
     let comments = pages(client, &format!("repos/{repo}/issues/{number}/comments"))?;
     // REST's second-resolution created/updated timestamps cannot prove no edit:
     // a collaborator could replace the operator's text in the same second.
@@ -1492,6 +1679,7 @@ fn evaluate(
             created,
             head: head.into(),
             pushed,
+            introduced,
             pusher: activity[0]["actor"]["login"].as_str().map(str::to_owned),
             human_text,
         })
@@ -1565,13 +1753,14 @@ fn approval(
     }))
 }
 
-/// Complete authenticated chain, including force-pushes back to an old oid.
+/// Complete authenticated chain, including force-pushes back to an old oid:
+/// the head's latest push and the first time the branch was set to it.
 fn push_time(
     events: &[Value],
     reference: &str,
     head: &str,
     now: OffsetDateTime,
-) -> Result<OffsetDateTime> {
+) -> Result<(OffsetDateTime, OffsetDateTime)> {
     ensure!(!events.is_empty(), "missing branch activity");
     let mut expected = head;
     let mut previous = now;
@@ -1609,7 +1798,12 @@ fn push_time(
                 .is_some_and(|e| e["activity_type"] == "branch_creation"),
         "incomplete branch activity"
     );
-    at(&events[0]["timestamp"])
+    let first = events
+        .iter()
+        .rev()
+        .find(|e| e["after"] == head)
+        .context("missing head activity")?;
+    Ok((at(&events[0]["timestamp"])?, at(&first["timestamp"])?))
 }
 
 /// Only a complete plain command comment (with optional surrounding newlines).
