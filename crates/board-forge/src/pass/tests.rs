@@ -19485,6 +19485,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
             p.draft_review_repositories,
             p.head_owners,
             p.no_merge,
+            p.maintainers,
             p.operator_paths,
             p.stale_days,
         ])
@@ -19496,6 +19497,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
         "reviewPools": ["claude"], "reviewDispatchRepositories": [repo],
         "draftReviewRepositories": [repo], "headOwners": ["cgwalters-forge"],
         "noMerge": [repo], "operatorPaths": [".github/pass.json", ".github/agentic-job/"],
+        "maintainers": ["CGWALTERS-FORGE/BOOTC"],
         "staleDays": 7, "mergeAuthors": ["updater[bot]"], "toilFixPool": "openai",
         "conflictFixPool": "claude", "mergeQueue": {"tries": 2}, "rebaseRounds": 1,
     });
@@ -19524,6 +19526,13 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
         (json!({"quietWaits": "true"}), false),
         (json!({"noMerge": [null]}), false),
         (json!({"noMerge": ["o/*"]}), false),
+        (json!({"maintainers": ["o/*"]}), false),
+        (json!({"maintainers": ["o/unfollowed"]}), false),
+        (json!({"maintainers": [{"org": "cgwalters-forge"}]}), false),
+        (
+            json!({"maintainers": vec![repo; POLL_REPOSITORY_LIMIT + 1]}),
+            false,
+        ),
         (json!({"headOwners": ["not a login"]}), false),
         (json!({"operatorPaths": ["a/../b"]}), false),
         (json!({"staleDays": 31}), false),
@@ -23529,6 +23538,171 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                 "{name} {source} queue={queued}"
             );
         }
+    }
+}
+
+#[test]
+fn handed_over_prs_get_no_follow_up() {
+    const OWNED: &str = "cgwalters-forge/ours";
+    const HANDED: &str = "cgwalters-forge/handed";
+    let log = format!("pr: skipped 1 handed-over repositories: {HANDED}");
+    let follow = [OWNED.to_owned(), HANDED.to_owned()];
+    for (action_first, mergeable, red, shared, action) in [
+        (false, "MERGEABLE", false, false, "merge"),
+        (true, "MERGEABLE", false, false, "merge"),
+        (false, "CONFLICTING", false, false, "rebase"),
+        (false, "MERGEABLE", true, false, "fix"),
+        (false, "MERGEABLE", false, true, "skip"),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let mut items = Vec::new();
+        for (repo, number) in [(OWNED, 1), (HANDED, 2)] {
+            let mut fields = json!({"mergeable": mergeable, "reviews": {
+                "nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
+                    "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
+                "pageInfo": {"hasPreviousPage": false}}});
+            if red {
+                fields["commits"] = json!({"nodes": [{"commit": {
+                    "oid": "abc", "committedDate": forge.replay.now.format(&Rfc3339).unwrap(),
+                    "message": "Do half the thing", "statusCheckRollup": {"contexts": {
+                        "nodes": [{"__typename": "StatusContext", "context": "ci", "state": "FAILURE"}],
+                        "pageInfo": {"hasNextPage": false}}}}}]});
+            }
+            if shared && repo == OWNED {
+                fields["mergeStateStatus"] = json!("BEHIND");
+            }
+            followed(&mut forge.replay, (repo, number), fields, json!([]));
+            if shared && repo == OWNED {
+                let key = graphql_key(
+                    poll::SHARED_HEAD_QUERY,
+                    &json!({"owner": "cgwalters-forge",
+                    "name": "ours", "number": 1, "pulls": poll::SHARED_HEAD_READS}),
+                );
+                let response = forge
+                    .replay
+                    .requests
+                    .iter_mut()
+                    .find(|e| e["request"] == key)
+                    .unwrap();
+                response["answer"]["data"]["repository"]["pullRequest"]["headRef"]["associatedPullRequests"]
+                    ["nodes"] = json!([{"number": 2, "repository": {"nameWithOwner": HANDED}}]);
+            }
+            if red {
+                answer(
+                    &mut forge.replay,
+                    &format!("repos/{repo}/rules/branches/main"),
+                )["body"] = json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]);
+            }
+            items.push(
+                json!({"repository_url": format!("{API_ROOT}repos/{repo}"), "number": number,
+                "pull_request": {}, "user": {"login": "cgwalters-bot"}}),
+            );
+        }
+        let mut settings: Value = serde_json::from_str(CONFIG).unwrap();
+        settings["wip"] = json!(0);
+        settings["follow"] = json!([{"org": "cgwalters-forge", "forks": false}]);
+        settings["pr"] = json!({"actionFirst": action_first, "fixPools": ["claude"],
+            "rebaseRounds": 1, "maintainers": [HANDED.to_ascii_uppercase()]});
+        for (path, body) in [
+            ("user".into(), json!({"login": "cgwalters-bot"})),
+            (
+                format!("repos/{OWNED}"),
+                json!({"allow_rebase_merge": true}),
+            ),
+            (
+                "orgs/cgwalters-forge/repos?type=public&sort=full_name&per_page=100&page=1".into(),
+                json!(
+                    follow
+                        .iter()
+                        .map(|repo| json!({"full_name": repo, "fork": false,
+                    "private": false, "archived": false}))
+                        .collect::<Vec<_>>()
+                ),
+            ),
+        ] {
+            forge
+                .replay
+                .requests
+                .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+                "answer": {"status": 200, "link": null, "body": body}}));
+        }
+        let cfg = Config::parse_sources(&settings.to_string()).unwrap();
+        let resolved = cfg.resolve(&forge, &mut Vec::new()).unwrap().unwrap();
+        assert!(resolved.follow.iter().any(|r| r == HANDED));
+        settings["pr"]["maintainers"] = json!(["cgwalters-forge/missing"]);
+        let invalid = Config::parse_sources(&settings.to_string()).unwrap();
+        let error = invalid.resolve(&forge, &mut Vec::new()).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("cgwalters-forge/missing is not followed")
+        );
+        let mut poll_cfg = resolved.poll(None);
+        let path = poll::action_first::approved_path(&poll_cfg);
+        forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+            "answer": {"status": 200, "body": {"incomplete_results": false, "total_count": 2, "items": items}}}));
+        forge.replay.requests.push(json!({"request": graphql_key(poll::action_first::SCREEN,
+            &json!({"owner": "cgwalters-forge", "name": "ours"})), "answer": {"data": {"repository": {
+                "pullRequests": {"nodes": [], "pageInfo": {"hasNextPage": false}}}}}}));
+        forge.replay.requests.push(
+            json!({"request": graphql_key(poll::MERGE, &json!({"id": "PR_1", "head": "abc"})),
+            "answer": {"data": {"mergePullRequest": {"clientMutationId": null}}}}),
+        );
+        for report in [preview(&cfg, &forge.replay), apply(&forge, &cfg)] {
+            assert_eq!(report.failures, 0, "{action}: {:?}", report.lines);
+            assert_eq!(report.lines.iter().filter(|line| *line == &log).count(), 1);
+            let step = if action == "merge" {
+                format!("merge {OWNED}#1:")
+            } else {
+                format!("{OWNED}#1 abc {action}:")
+            };
+            assert!(
+                report.lines.iter().any(|line| line.contains(&step)),
+                "{:?}",
+                report.lines
+            );
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .all(|line| !line.contains(&format!("{HANDED}#2")))
+            );
+        }
+        // Standalone polling reads the same policy but has no stage-2 pre-turn.
+        poll_cfg.policy.action_first = false;
+        for live in [false, true] {
+            let outcome = poll::run(
+                &forge,
+                &forge,
+                &poll_cfg,
+                State::default(),
+                &[],
+                &follow,
+                live.then(|| poll::Apply {
+                    dispatcher: &forge,
+                    workflow: "dispatch.yml".into(),
+                    pools: vec!["claude".into()],
+                    git_ref: None,
+                }),
+                forge.replay.now,
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(outcome.lines.iter().filter(|line| *line == &log).count(), 1);
+            assert_eq!(outcome.steps.len(), 1, "{:?}", outcome.lines);
+            assert_eq!(outcome.steps[0].repository, OWNED);
+            assert_eq!(outcome.steps[0].action, action);
+            if shared {
+                assert!(outcome.steps[0].reason.contains("handed-over pull request"));
+            }
+        }
+        assert!(forge.writes.borrow().iter().all(|(_, url, body)| {
+            let body = body.to_string();
+            !url.contains(HANDED)
+                && !body.contains(HANDED)
+                && !body.contains("PR_2")
+                && (!shared || !body.contains("updatePullRequestBranch"))
+        }));
     }
 }
 

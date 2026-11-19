@@ -5889,6 +5889,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
         let mut poll = config.poll(fresh.as_ref());
+        if let Some(line) = poll.policy.handover_line() {
+            self.line(line);
+        }
         if config.promote.as_ref().is_some_and(|p| p.publish) {
             match crate::promote::targets(&self.client, config) {
                 Ok(targets) => poll.policy.publication_forks = targets,

@@ -24,6 +24,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         outcome: &mut Outcome,
     ) -> Result<()> {
         outcome.approved_read = true;
+        if !self.config.policy.maintainers.is_empty()
+            && follow
+                .iter()
+                .all(|repo| self.config.policy.handed_over(repo))
+        {
+            return Ok(());
+        }
         let response = self.get(&approved_path(self.config))?;
         ensure!(
             response["incomplete_results"] == false
@@ -51,6 +58,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 "approved PR search has an invalid PR identity"
             );
             if let Some(&repo) = follow.iter().find(|r| r.eq_ignore_ascii_case(repo))
+                && !self.config.policy.handed_over(repo)
                 && self.config.ours(repo)
                 && self.envelope.as_ref().is_none_or(|e| e.admits(repo))
             {

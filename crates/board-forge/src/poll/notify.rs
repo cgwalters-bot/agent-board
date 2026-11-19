@@ -315,8 +315,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 text(&issue, "/html_url")
             )));
         }
-        let comments = self.thread_comments(repo, number)?;
         let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
+        if pull && self.config.policy.handed_over(repo) {
+            return Ok(Err("the repository has its own PR maintainer".into()));
+        }
+        let comments = self.thread_comments(repo, number)?;
         let said = self.said(repo, number, &comments, pull, OffsetDateTime::UNIX_EPOCH)?;
         Ok(Ok(SearchedHistory {
             issue,
@@ -430,6 +433,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 let Some((repo, number)) = subject(thread) else {
                     continue;
                 };
+                // Leave these unread for the repository's own maintainer.
+                if text(thread, "/subject/type") == "PullRequest"
+                    && self.config.policy.handed_over(&repo)
+                {
+                    continue;
+                }
                 let reason = text(thread, "/reason");
                 if !settings.reasons.contains(reason)
                     || (self.config.policy.notification_intake.is_none()

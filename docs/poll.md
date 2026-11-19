@@ -642,7 +642,7 @@ configuration`, decides nothing there, and goes on.
 The file's top level also takes the keys of the pass's
 [`pr`](pass.md) that change what the poll decides, read by the same code with
 the same names, types, defaults, bounds and meaning, so one `pr` block gives one
-policy either way: `checkReruns`, `unstall`, `directionFirst` (`operatorComments`
+policy either way: `maintainers`, `checkReruns`, `unstall`, `directionFirst` (`operatorComments`
 and `notifications` read before the followed repositories rather than after
 them), `ownerBranches`, `ownSpaceOnly`,
 `foldRounds`, `reviewPools`, `reviewDispatchRepositories`,
@@ -655,6 +655,20 @@ leaves a work repository unfollowed, so no work repository's pull requests go
 unseen. A standalone poll has no work repositories, so it checks nothing of the
 kind: `unstall` acts on the pull requests of its `follow` list only, and those of
 a repository left out of it are still never seen.
+
+`maintainers` is a top-level list in `agent-board.json` (`pr.maintainers` in
+`pass.json`). It prevents the central poll from competing with a repository's
+own PR maintainer. Entries must be exact `OWNER/REPO` names (no globs or
+organization objects) in the resolved `follow` list, matched without regard to
+case. Omit the key or use `[]` to keep ordinary follow-up. Preview and apply
+both log one summary of the handover and take no PR steps there, even for a
+single-PR selection. In particular there are no rounds, reruns, merge or
+queue actions, unstall, markers, or status comments from PR follow-up.
+Activity and maintainer-report queue reads still include the repositories,
+and the pass's Status, holds, promotion and sessions keep their usual scope.
+Drain in-flight central rounds before enabling an applying maintainer; this
+setting does not cancel existing runs or disable the pass's separate
+`fixPlans` scheduling. Check pending fix plans before handover as well.
 
 ### Maintainer report
 
