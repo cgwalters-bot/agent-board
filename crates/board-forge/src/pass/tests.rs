@@ -631,7 +631,7 @@ struct ConditionalFixture(Replay);
 
 /// The same histories via REST, including timestamps used to bind GraphQL's
 /// editor evidence. No private usage or holds history is copied into these.
-fn rest_comment_pages(replay: &mut Replay) {
+pub(super) fn rest_comment_pages(replay: &mut Replay) {
     let mut pages = Vec::new();
     for entry in &replay.requests {
         if entry["request"]["graphql"] != fnv(plan::COMMENTS_QUERY)
@@ -1144,10 +1144,13 @@ impl crate::github::GraphQl for ConditionalFixture {
 
 /// Replay the same server state with synthetic ETags. This measures the
 /// transport opportunity, not GitHub's actual validator availability or costs.
-struct ConditionalRecording<T = Replay> {
-    replay: T,
-    reads: RefCell<BTreeMap<String, usize>>,
-    traffic: RefCell<Vec<(String, bool)>>,
+pub(super) struct ConditionalRecording<T = Replay> {
+    pub(super) replay: T,
+    pub(super) reads: RefCell<BTreeMap<String, usize>>,
+    pub(super) traffic: RefCell<Vec<(String, bool)>>,
+    /// A transport that names no credential context while still answering
+    /// validators with 304s.
+    pub(super) contextless: Cell<bool>,
 }
 
 impl<T> ConditionalRecording<T> {
@@ -1169,8 +1172,15 @@ impl<T: Rest> Rest for ConditionalRecording<T> {
         Some(self.reads.borrow().values().sum())
     }
 
+    /// The inner transport's identity where it names one (a test rotating
+    /// credentials), else one fixed recorded identity; none when contextless.
     fn cache_context(&self) -> Option<String> {
-        Some("recorded-identity".into())
+        if self.contextless.get() {
+            return None;
+        }
+        self.replay
+            .cache_context()
+            .or_else(|| Some("recorded-identity".into()))
     }
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
@@ -1391,6 +1401,7 @@ fn response_cache_recorded_steady_state_comparison() {
         replay,
         reads: RefCell::default(),
         traffic: RefCell::default(),
+        contextless: Cell::default(),
     };
     let config = config(json!({"state": ".state/poll.json"}));
     let pass = |state| {
@@ -1499,6 +1510,7 @@ fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
             replay: Forge::new(None, false),
             reads: RefCell::default(),
             traffic: RefCell::default(),
+            contextless: Cell::default(),
         };
         rest_comment_pages(&mut forge.replay.replay);
         let mut state = State::default();
@@ -1578,6 +1590,7 @@ fn response_cache_applying_rechecks_concurrent_start_holds() {
             replay: Forge::new(None, false),
             reads: RefCell::default(),
             traffic: RefCell::default(),
+            contextless: Cell::default(),
         };
         rest_comment_pages(&mut forge.replay.replay);
         let seed = cached_pass(&forge, &config, State::default(), false);
@@ -1694,6 +1707,7 @@ fn response_cache_applying_ambiguous_dispatch_is_not_replayed() {
             replay: Forge::new(Some("/dispatches"), false),
             reads: RefCell::default(),
             traffic: RefCell::default(),
+            contextless: Cell::default(),
         };
         rest_comment_pages(&mut forge.replay.replay);
         only(&mut forge.replay.replay, &["cgwalters-forge/tracker#446"]);
@@ -1771,6 +1785,7 @@ fn response_cache_applying_rechecks_merge_and_label_holds() {
                     replay: Forge::new(None, false),
                     reads: RefCell::default(),
                     traffic: RefCell::default(),
+                    contextless: Cell::default(),
                 };
                 let (fields, comments) = if action == "merge" {
                     (
@@ -2864,6 +2879,7 @@ fn rest_root_attribution_counts_reads_without_reusing_them() {
         replay,
         reads: RefCell::default(),
         traffic: RefCell::default(),
+        contextless: Cell::default(),
     };
     let bounds = Bounds::new(50, Instant::now() + Duration::from_secs(60));
     *bounds.root_reads.borrow_mut() = Some(RootReads::default());
@@ -17623,6 +17639,69 @@ fn lean_reads_carry_unchanged_cooldowns_without_reading_them() {
     assert!(next_state(&without).carried_holds.is_empty());
 }
 
+#[test]
+fn lean_reads_preview_rereads_when_the_scope_cannot_be_verified() {
+    let (mut forge, mut cfg) = capped_forge(
+        (Some(2), Some(2), "implement"),
+        (false, |_: &mut _, _: &mut _| {}),
+    );
+    silent(&mut forge.replay, &[], &[]);
+    rest_comment_pages(&mut forge.replay);
+    cfg.lean_reads = true;
+    cfg.state = Some("pass-state.json".into());
+    let now = forge.replay.now;
+    let forge = ConditionalRecording {
+        replay: forge,
+        reads: RefCell::default(),
+        traffic: RefCell::default(),
+        contextless: Cell::default(),
+    };
+    let preview = |cfg: &Config, state| {
+        block(decision::preview(
+            &forge,
+            &forge,
+            cfg,
+            state,
+            Limits::default(),
+            now,
+        ))
+        .unwrap()
+    };
+    let issue = "cgwalters-forge/tracker#446";
+    let cap_reuse = |preview: &decision::Preview| {
+        preview
+            .snapshot
+            .holds
+            .iter()
+            .find(|h| h.decision.kind == HoldKind::OpenPrCap)
+            .unwrap()
+            .reused
+    };
+    let first = preview(&cfg, State::default());
+    assert!(first.state.response_scope.is_some());
+    assert!(first.state.carried_holds.contains_key(issue));
+    let warm = preview(&cfg, first.state.clone());
+    assert_eq!(cap_reuse(&warm), Some(lean::Reused::Plan));
+
+    forge.contextless.set(true);
+    let cold = preview(&cfg, first.state.clone());
+    assert_eq!(cap_reuse(&cold), None);
+    assert!(cold.state.response_scope.is_none());
+    assert!(cold.state.carried_holds.is_empty());
+
+    // An older unscoped state might already contain hold evidence.
+    let mut unscoped = first.state;
+    unscoped.response_scope = None;
+    let cold = preview(&cfg, unscoped.clone());
+    assert_eq!(cap_reuse(&cold), None);
+    assert!(cold.state.carried_holds.is_empty());
+
+    cfg.state = None;
+    let without_path = preview(&cfg, unscoped);
+    assert_eq!(cap_reuse(&without_path), None);
+    assert!(without_path.state.carried_holds.contains_key(issue));
+}
+
 /// A carried open-pr-cap hold asks its repository's count again: it holds
 /// while the count is at the cap, and a pull request landing releases it at
 /// once, read whole and started.
@@ -22961,7 +23040,12 @@ fn ready_pull_with_a_failed_continuation_replay() {
 /// open pull request there, as stage 2 reads it once `repo` is followed:
 /// mergeable, unreviewed, with no checks, committed when the recording was
 /// made and with its fields replaced by `change`, and `comments` on it.
-fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, comments: Value) {
+pub(super) fn followed(
+    replay: &mut Replay,
+    (repo, number): (&str, u64),
+    change: Value,
+    comments: Value,
+) {
     let committed = replay.now.format(&Rfc3339).unwrap();
     let mut pull = json!({
         "id": format!("PR_{number}"), "number": number,
