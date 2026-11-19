@@ -305,6 +305,9 @@ pub struct Hold {
     /// How many items its release lets go: its own, or those a blocker
     /// holds ([`Self::releases`]); `act_now`'s `unblocks` ([`ActNow`]).
     pub releases: usize,
+    /// What it took from an earlier pass's read, where `leanReads` carried
+    /// it ([`super::lean`]).
+    pub reused: Option<super::lean::Reused>,
 }
 
 impl Hold {
@@ -315,6 +318,15 @@ impl Hold {
             reason: reason.into(),
             operator: kind.operator(),
             releases: 1,
+            reused: None,
+        }
+    }
+
+    /// The same hold, taking `reused` from an earlier pass's read.
+    pub fn reused(self, reused: super::lean::Reused) -> Self {
+        Self {
+            reused: Some(reused),
+            ..self
         }
     }
 
@@ -403,6 +415,7 @@ impl Entry {
             carried: false,
             watched: false,
             releases: self.hold.releases,
+            reused: self.hold.reused,
         }
     }
 }
@@ -656,6 +669,9 @@ pub struct Published {
     /// epic; not published, and zero where carried.
     #[serde(skip)]
     pub releases: usize,
+    /// [`Hold::reused`]; not published.
+    #[serde(skip)]
+    pub reused: Option<super::lean::Reused>,
 }
 
 /// What makes two passes' holds the same: the item, whether it is an epic,
@@ -726,6 +742,7 @@ fn not_live(epic: &ItemRef, children: &[&Entry]) -> Published {
         carried: false,
         watched: false,
         releases: children.len(),
+        reused: None,
     }
 }
 
@@ -1058,6 +1075,7 @@ pub fn alarm(snapshot: &mut Snapshot, previous: Option<&Value>, watch: &Watch) -
         carried: false,
         watched: false,
         releases: 1,
+        reused: None,
     };
     let mut lines = Vec::new();
     let mut holds = Vec::with_capacity(snapshot.holds.len());
@@ -4783,6 +4801,7 @@ mod tests {
             carried: false,
             watched: false,
             releases: 1,
+            reused: None,
         };
         snapshot
             .holds

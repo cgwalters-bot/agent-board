@@ -1894,6 +1894,12 @@ pub struct State {
     /// scan resumes after it, so that the stops of a few passes cover the
     /// board. None scans in order. Losing it only starts the scan over.
     pub scan_cursor: Option<String>,
+    /// The pass's `leanReads` ([`crate::pass::lean`]): stage 4's holds held
+    /// again while the board shows their candidates unchanged, by issue key,
+    /// at most [`crate::pass::lean::CARRY_LIMIT`]. They hold and never
+    /// start; a pass without the option, or another response scope, drops
+    /// them. Losing them costs each candidate one whole read.
+    pub carried_holds: BTreeMap<String, crate::pass::lean::Carried>,
     /// Repository updated-issue watermarks; discovery only, never authority.
     pub issue_intake: BTreeMap<String, String>,
     /// Optional holds descendant context left unread at the publication share.
@@ -1938,6 +1944,7 @@ impl State {
             self.pass_responses.clear();
             // Decided under another configuration or identity.
             self.quiet_waits.clear();
+            self.carried_holds.clear();
             self.response_scope = Some(scope.to_owned());
         }
     }
@@ -1970,6 +1977,7 @@ impl State {
                     "action_first_cursor",
                     "action_first_positions",
                     "scan_cursor",
+                    "carried_holds",
                     "issue_intake",
                     "holds_pending",
                     "holds_summary_cursor",
@@ -2160,6 +2168,7 @@ impl State {
                     .context("poll state scan_cursor is not an issue")
             })
             .transpose()?;
+        let carried_holds = crate::pass::lean::from_json(object.get("carried_holds"))?;
         let authored_cursor = cursor("authored_cursor")?;
         let issue_intake: BTreeMap<String, String> = object
             .get("issue_intake")
@@ -2225,6 +2234,7 @@ impl State {
             action_first_cursor,
             action_first_positions,
             scan_cursor,
+            carried_holds,
             issue_intake,
             holds_pending,
             holds_summary_cursor,
@@ -2295,6 +2305,9 @@ impl State {
         }
         if let Some(cursor) = &self.scan_cursor {
             state["scan_cursor"] = cursor.as_str().into();
+        }
+        if !self.carried_holds.is_empty() {
+            state["carried_holds"] = json!(self.carried_holds);
         }
         if !self.issue_intake.is_empty() {
             state["issue_intake"] = json!(self.issue_intake);
@@ -10640,6 +10653,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         action_first_positions,
         // The pass's, kept by the pass ([`crate::pass::run`]).
         scan_cursor: None,
+        carried_holds: BTreeMap::new(),
         issue_intake: BTreeMap::new(),
         holds_pending: Vec::new(),
         holds_summary_cursor: None,
@@ -14223,7 +14237,13 @@ mod tests {
         with_cursor["follow_cursor"] = json!("o/r");
         with_cursor["authored_cursor"] = json!("u/r");
         with_cursor["scan_cursor"] = json!("o/r#12");
+        with_cursor["carried_holds"] = json!({
+            "o/r#12": {"facts": "a".repeat(64), "until": "2026-10-16T11:50:00Z",
+                "kind": "triage-cooldown", "reason": "triaged again from then"},
+            "o/r#13": {"facts": "b".repeat(64), "until": "2026-10-16T11:50:00Z",
+                "kind": "open-pr-cap", "repository": "o/s"}});
         let state = State::from_json(&with_cursor).unwrap();
+        assert_eq!(state.carried_holds.len(), 2);
         assert_eq!(state.follow_cursor.as_deref(), Some("o/r"));
         assert_eq!(state.authored_cursor.as_deref(), Some("u/r"));
         assert_eq!(state.scan_cursor.as_deref(), Some("o/r#12"));
@@ -14250,6 +14270,17 @@ mod tests {
         let state = State::from_json(&with_maintain).unwrap();
         assert_eq!(state.maintain.as_ref().map(|d| d.done), Some(true));
         assert_eq!(state.to_json(), with_maintain);
+        // `item`'s carried hold of `kind`, with `field` set to `value`.
+        let carried = |item: &str, kind: &str, field: &str, value: Value| {
+            let mut entry = json!({"facts": "a".repeat(64), "until": "2026-10-16T11:50:00Z",
+                "kind": kind});
+            match kind {
+                "open-pr-cap" => entry["repository"] = json!("o/s"),
+                _ => entry["reason"] = json!("why"),
+            }
+            entry[field] = value;
+            Value::Object(serde_json::Map::from_iter([(item.to_owned(), entry)]))
+        };
         for (field, value) in [
             ("schema", json!("agent-board/poll-state/v0")),
             ("follow_cursor", json!("not a repository")),
@@ -14257,6 +14288,72 @@ mod tests {
             ("authored_cursor", json!("not a repository")),
             ("scan_cursor", json!("o/r")),
             ("scan_cursor", json!("o/r#0")),
+            ("carried_holds", json!([])),
+            (
+                "carried_holds",
+                carried("O/r#1", "triage-cooldown", "kind", json!("triage-cooldown")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r", "triage-cooldown", "kind", json!("triage-cooldown")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#0", "triage-cooldown", "kind", json!("triage-cooldown")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#1", "pr-open", "kind", json!("pr-open")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#1", "triage-cooldown", "repository", json!("o/s")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#1", "triage-cooldown", "reason", json!("")),
+            ),
+            (
+                "carried_holds",
+                carried(
+                    "o/r#1",
+                    "triage-cooldown",
+                    "reason",
+                    json!("x".repeat(1001)),
+                ),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#1", "open-pr-cap", "repository", json!("o")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#1", "open-pr-cap", "reason", json!("why")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#1", "open-pr-cap", "secret", json!("o/s")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#1", "triage-cooldown", "facts", json!("ab")),
+            ),
+            (
+                "carried_holds",
+                carried("o/r#1", "triage-cooldown", "until", json!("later")),
+            ),
+            (
+                "carried_holds",
+                Value::Object(
+                    (1..=crate::pass::lean::CARRY_LIMIT + 1)
+                        .map(|n| {
+                            let kind = json!("triage-cooldown");
+                            let one = carried("o/r#1", "triage-cooldown", "kind", kind);
+                            (format!("o/r#{n}"), one["o/r#1"].clone())
+                        })
+                        .collect(),
+                ),
+            ),
             ("notify_since", json!("yesterday")),
             ("notify_since", json!(1)),
             ("notify_before", json!(true)),

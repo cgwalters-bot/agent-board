@@ -730,6 +730,11 @@ pub struct Config {
     /// reading assignment history, leaving request headroom for ready work.
     #[serde(default)]
     pub read_free_holds: bool,
+    /// Off by default: stage 4 holds a candidate again without reading it
+    /// while the board shows it unchanged since the last pass held it
+    /// ([`lean`]).
+    #[serde(default)]
+    pub lean_reads: bool,
     /// Off at 0: else an issue still open after its implement plan's run
     /// ended is triaged again this many days after the plan's dispatch
     /// record ([`Scheduler::replan`]).
@@ -2390,7 +2395,8 @@ pub struct Facts {
     pub promotion: Option<Promotion>,
     pub created: OffsetDateTime,
     /// When anything about it last changed, read only where
-    /// [`Config::revisit`] is set ([`board_query`]).
+    /// [`Config::revisit`], [`Config::sweep`] or [`Config::lean_reads`] is
+    /// set ([`board_query`]).
     pub updated: Option<OffsetDateTime>,
     pub author: Option<String>,
     pub labels: Vec<String>,
@@ -4185,6 +4191,9 @@ pub struct Report {
     /// `state` for the next pass to resume after; none at the walk's end,
     /// and the last pass's where this one scanned nothing.
     pub scan_cursor: Option<String>,
+    /// `leanReads`' holds for the next pass to carry ([`lean`]), where stage
+    /// 4 walked its candidates; none keeps the last pass's.
+    pub carried_holds: Option<BTreeMap<String, lean::Carried>>,
     pub failures: usize,
     /// Each counted GitHub operation failure, including its reason.
     pub failed_operations: Vec<String>,
@@ -4470,7 +4479,15 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
             .push(format!("writes saved by edit: {}", store.saved));
     }
     if config.state.is_some() {
+        // A pass without the option drops them; one whose stage 4 walked
+        // no candidate keeps the last pass's.
+        let carried = match report.carried_holds.take() {
+            Some(carried) => carried,
+            None if config.lean_reads => previous.carried_holds.clone(),
+            None => BTreeMap::new(),
+        };
         let state = report.state.get_or_insert(previous);
+        state.carried_holds = carried;
         if state.interval_seconds == 0 {
             state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
         }
@@ -4560,6 +4577,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         unread: 0,
         budget_stop: None,
         scan_cursor: state.scan_cursor.clone(),
+        lean: RefCell::new(lean::Lean::new(state.carried_holds.clone(), now)),
         ended: RefCell::new(BTreeMap::new()),
         kept: RefCell::default(),
         read_pulls: RefCell::default(),
@@ -5270,6 +5288,8 @@ struct Scheduler<'a, C> {
     /// Where the last pass's scan stopped ([`poll::State::scan_cursor`]):
     /// this pass's scan resumes after it ([`Self::start`]).
     scan_cursor: Option<String>,
+    /// `leanReads`' carried holds ([`lean`]).
+    lean: RefCell<lean::Lean>,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
     ended: RefCell<BTreeMap<u64, bool>>,
     /// The reads of stage 4's look ahead at overlaps ([`Self::kept`]).
@@ -6763,8 +6783,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     return Ok(Step::Hold(held));
                 }
                 }
+                s.lean_begin(facts);
                 s.consider_waiting(facts, board, slots, snapshot, target)
             }));
+            self.lean_end(&step);
             if matches!(step, Ok(Step::Capped(_))) {
                 ready.get_or_insert_with(|| issue.clone());
             }
@@ -6875,6 +6897,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         } else if let Some(last) = last {
             self.report.scan_cursor = Some(last);
         }
+        self.lean_report();
         if taken == 0
             && let Some(first) = first
         {
@@ -7293,7 +7316,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn board(&self) -> Result<BoardRead> {
         let board = self.config.github_board().context("no GitHub board")?;
         let config = self.config;
-        let revisit = config.revisit.is_some() || config.sweep.is_some();
+        let revisit = config.revisit.is_some() || config.sweep.is_some() || config.lean_reads;
         let query = board_query(revisit, config.assign_holds);
         let mut cursor = Value::Null;
         let mut options = None;
@@ -8064,6 +8087,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         ) {
             return Ok(Step::Hold(held));
         }
+        // The board's facts held it, or now its comments may.
+        if let Some(step) = self.lean_carried(&facts, board) {
+            return Ok(step);
+        }
         let issue = &facts.issue;
         let comments = plan::issue_comments(&self.client, issue)?;
         if config.skip_active_work {
@@ -8360,7 +8387,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let past = match self.pr_pressure((&dest.repository, &plan.kind), past.as_deref()) {
             pressure::Pressure::Clear => String::new(),
             pressure::Pressure::Past(note) => note,
-            pressure::Pressure::Held(held) => return Ok(Step::Hold(held)),
+            pressure::Pressure::Held(held) => {
+                // Its own plan, not another issue's whose facts are read.
+                if source == *issue && failed.is_none() {
+                    let at = (None, Some(dest.repository.as_str()));
+                    self.lean_carry(held.kind, &held.reason, at);
+                }
+                return Ok(Step::Hold(held));
+            }
         };
         if let Some(run) = failed {
             return self.rerun(
@@ -8758,7 +8792,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// does: the coordinator's own reason in the plan, or work that outranks
     /// landing, at the board's top Priority or under the epic focus.
     fn past_cap(&self, facts: &Facts, board: &BoardRead, plan: &plan::JobPlan) -> Option<String> {
-        if let Some(why) = &plan.past_cap {
+        self.past_cap_of(facts, board, plan.past_cap.as_deref())
+    }
+
+    /// [`Self::past_cap`] of a plan whose `past_cap` says `said`.
+    fn past_cap_of(&self, facts: &Facts, board: &BoardRead, said: Option<&str>) -> Option<String> {
+        if let Some(why) = said {
             return Some(format!("the plan says {why:?}"));
         }
         if let Some(p) = facts.priority.as_ref().filter(|_| at_top(facts, board)) {
@@ -9219,6 +9258,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let why = format!(
                 "{said}; triaged again from {from_due}{changed}, or once {operator} comments"
             );
+            self.lean_carry(HoldKind::TriageCooldown, &why, (Some(due), None));
             return Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)));
         }
         if let Some(carried) = carried
@@ -9245,6 +9285,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let why = format!(
                 "{said}; nothing changed since its triage, triaged again once something does, or once {operator} comments"
             );
+            self.lean_carry(HoldKind::TriageCooldown, &why, (None, None));
             return Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)));
         }
         self.triage(read, AGAIN, (snapshot, target, slots))
@@ -9823,9 +9864,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if self.now >= due {
             return Ok(None);
         }
-        let due = due.format(&Rfc3339).unwrap_or_default();
+        let from = due.format(&Rfc3339).unwrap_or_default();
         let why =
-            format!("{said}; nothing changed since, triaged from {due}, or once anyone comments");
+            format!("{said}; nothing changed since, triaged from {from}, or once anyone comments");
+        self.lean_carry(HoldKind::TriageCooldown, &why, (Some(due), None));
         Ok(Some(Step::Hold(Hold::new(HoldKind::TriageCooldown, why))))
     }
 
@@ -9874,11 +9916,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if self.now >= due {
             return self.triage(read, REPLAN, context);
         }
-        let due = due.format(&Rfc3339).unwrap_or_default();
+        let from = due.format(&Rfc3339).unwrap_or_default();
         let why = format!(
-            "plan {id} was dispatched already, {}; re-planned from {due}",
+            "plan {id} was dispatched already, {}; re-planned from {from}",
             record.url
         );
+        self.lean_carry(HoldKind::TriageCooldown, &why, (Some(due), None));
         Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)))
     }
 
@@ -10713,6 +10756,7 @@ pub mod holds;
 
 pub mod decision;
 mod intake;
+pub mod lean;
 pub mod lease;
 mod living;
 pub mod maintain;

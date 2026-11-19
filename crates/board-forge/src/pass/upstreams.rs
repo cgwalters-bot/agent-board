@@ -5,7 +5,7 @@ use super::*;
 pub(super) const REPLAN: &str = "The board pass asks a triage run to re-plan: upstream completed";
 
 impl<C: Rest + Transport> Scheduler<'_, C> {
-    fn upstream_fork(&self, repository: &str) -> bool {
+    pub(super) fn upstream_fork(&self, repository: &str) -> bool {
         self.config
             .promote
             .as_ref()

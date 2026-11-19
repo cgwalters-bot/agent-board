@@ -152,6 +152,10 @@ pub struct Hold {
     pub decision: holds::Published,
     /// Carried evidence was not re-observed by this pass.
     pub carried: bool,
+    /// Where `leanReads` carried it, what was not re-observed: the whole
+    /// decision, or the plan with this pass's open pull request count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused: Option<super::lean::Reused>,
 }
 
 /// A bounded decision projection. Missing sections mean unavailable, never
@@ -244,7 +248,7 @@ pub async fn preview<C: Rest + Transport + crate::github::GraphQl + Broker>(
     from_report(report, now)
 }
 
-fn from_report(report: Report, now: OffsetDateTime) -> Result<Snapshot> {
+pub(super) fn from_report(report: Report, now: OffsetDateTime) -> Result<Snapshot> {
     let observation = report
         .observation
         .context("preview did not reach decision observation")?;
@@ -351,7 +355,8 @@ fn from_report(report: Report, now: OffsetDateTime) -> Result<Snapshot> {
             .holds
             .into_iter()
             .map(|decision| Hold {
-                carried: decision.carried,
+                carried: decision.carried || decision.reused.is_some(),
+                reused: decision.reused,
                 decision,
             })
             .collect(),
