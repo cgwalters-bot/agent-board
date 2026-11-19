@@ -311,6 +311,7 @@ fn pass_reservations_race_with_admission_and_bind_only_the_named_run() {
             pool: "claude",
             now: now(),
             sent: Cell::new(false),
+            status: Cell::new(None),
             reserved: RefCell::new(None),
             rerun,
         };
@@ -348,6 +349,7 @@ fn ambiguous_dispatch_keeps_its_reservation() {
         pool: "claude",
         now: now(),
         sent: Cell::new(false),
+        status: Cell::new(None),
         reserved: RefCell::new(None),
         rerun: None,
     };

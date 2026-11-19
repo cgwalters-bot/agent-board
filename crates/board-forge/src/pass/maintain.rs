@@ -604,8 +604,6 @@ enum Start {
     /// Started, or sent and perhaps started, with the posted plan's id;
     /// none in a preview or where only the plan is printed.
     Posted(Option<String>),
-    /// Waits on capacity the later stages' runs take: WIP or a hold.
-    Waits,
     /// This pass cannot start it, whatever the later stages leave: its
     /// requests, a cap, or a plan already posted today.
     Deferred,
@@ -745,13 +743,36 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             )
         });
         let all: Vec<String> = config.pools.0.iter().map(|(n, _)| n.clone()).collect();
-        let mut started = 0;
-        // Whether the other stages leave the digest its share of each pool:
-        // only while it waits on capacity their runs would take, not where
-        // this pass cannot admit it anyway (agent-board#803).
+        let pool = self.choose_pool(own.as_ref(), &all);
+        // When reserving scheduling, establish that the digest fits even if
+        // no pool is selectable. Otherwise an exhausted discovery share can
+        // look like a digest waiting for inference, and hold later starts.
+        let issue = ItemRef {
+            host: DEFAULT_HOST.into(),
+            repository: on.0.into(),
+            number: on.1,
+        };
+        let writes = record_writes(comment.as_ref());
+        let mut dry = None;
+        let mut target = None;
         let mut waits = true;
-        match self.choose_pool(own.as_ref(), &all) {
-            Ok(pool) => {
+        if config.reserve_scheduling || pool.is_ok() {
+            dry = match self.public(on.0) {
+                Ok(true) => None,
+                Ok(false) => Some(format!("{} is not public", on.0)),
+                Err(error) if budget_spent(&error) => return Err(error),
+                Err(error) => Some(format!("cannot read whether {} is public: {error:#}", on.0)),
+            };
+            if dry.is_none() {
+                (target, waits) =
+                    self.digest_admission(&issue, git_ref, writes, from, pool.as_deref().ok())?;
+            } else if config.reserve_scheduling {
+                waits = false;
+            }
+        }
+        let mut started = 0;
+        match pool {
+            Ok(pool) if dry.is_some() || target.is_some() => {
                 let more = changed.len() - review.len();
                 let plan = json!({
                     "schema": JOB_PLAN_SCHEMA, "repo": on.0, "item": on.1,
@@ -759,32 +780,18 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     "brief": self.directed(brief(config, maintain, from.date(), &repos, review, more)),
                 });
                 plan::JobPlan::from_json(&plan).context("the digest's plan")?;
-                let issue = ItemRef {
-                    host: DEFAULT_HOST.into(),
-                    repository: on.0.into(),
-                    number: on.1,
-                };
-                let repo = on.0;
-                let dry = match self.public(repo) {
-                    Ok(true) => None,
-                    Ok(false) => Some(format!("{repo} is not public")),
-                    Err(error) if error.is::<ShareSpent>() => return Err(error),
-                    Err(error) => Some(format!("cannot read whether {repo} is public: {error:#}")),
-                };
-                let public = dry.is_none();
+                let public = target.is_some();
                 // The plan's id where it was posted, if it was started, or
                 // sent and perhaps started; a plan only is posted nowhere.
-                let posted = match dry {
-                    Some(why) => {
+                let posted = match (target, dry) {
+                    (Some(target), _) => self.start_digest(&issue, &pool, &plan, &target)?,
+                    (None, Some(why)) => {
                         self.line(format!("maintain: plan only; {why}: {plan}"));
                         Start::Posted(None)
                     }
-                    None => {
-                        let writes = record_writes(comment.as_ref());
-                        self.start_digest(&issue, &pool, &plan, git_ref, writes)?
-                    }
+                    (None, None) => Start::Deferred,
                 };
-                waits = !matches!(posted, Start::Deferred);
+                waits &= !matches!(posted, Start::Deferred);
                 if let Start::Posted(id) = posted {
                     let record = json!({"schema": PLAN_SCHEMA, "from": stamp, "heads": acknowledged,
                         "pending": {"plan": id, "heads": pending}, "plan": plan});
@@ -798,6 +805,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 }
             }
             Err(why) => self.line(format!("maintain: no pool: {why}")),
+            Ok(_) => {}
         }
         let done = self.report.maintain.as_ref().is_some_and(|d| d.done);
         if let (Some(snapshot), false, true) = (snapshot, done, waits) {
@@ -842,62 +850,61 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         Ok(())
     }
 
-    /// Starts the digest's `plan` on `issue` in `pool` as stage 4 starts a
-    /// triage run: within WIP and the budget, and `--max-dispatch`, posted
-    /// as a writer's plan and dispatched by the plan protocol. The heads are
-    /// recorded after it, so `--max-writes` must leave those `writes` too,
-    /// or the next pass would start it again. Whether it started, or was
-    /// sent and perhaps started, with the posted plan's id; a preview says
-    /// it would, and posts none.
-    fn start_digest(
+    /// Read admission facts within discovery's share before checking that
+    /// the whole start and its receipt fit in the remaining pass budget.
+    /// The boolean says whether later stages should leave inference headroom.
+    fn digest_admission(
         &mut self,
         issue: &ItemRef,
-        pool: &str,
-        plan: &Value,
         git_ref: &str,
         writes: usize,
-    ) -> Result<Start> {
-        let line = format!(
-            "maintain: start {DIGEST_KIND} {} pool={pool}",
-            issue.display()
-        );
-        if let Some(why) = self.budget_hold(1.0) {
-            self.line(format!("maintain: {why}; the digest waits"));
-            return Ok(Start::Waits);
+        from: OffsetDateTime,
+        pool: Option<&str>,
+    ) -> Result<(Option<Target>, bool)> {
+        let mut held = self.budget_hold(1.0);
+        if held.is_none() && self.apply {
+            held = match self.other_pass() {
+                Ok(other) => other.map(|url| format!("another pass is in progress, {url}")),
+                Err(error) if budget_spent(&error) => return Err(error),
+                Err(error) => Some(format!(
+                    "whether another pass is in progress is unknown: {error:#}"
+                )),
+            };
         }
-        if let Some(why) = self.other_holds() {
+        if !self.config.reserve_scheduling
+            && let Some(why) = held.as_ref()
+        {
             self.line(format!("maintain: {why}; the digest waits"));
-            return Ok(Start::Waits);
+            return Ok((None, true));
         }
         let target = self.config.target(git_ref);
         target.validate()?;
         let (active, _) = self.runs(&target)?;
         let wip = self.config.wip as usize;
         if active.len() >= wip {
-            self.line(format!(
-                "maintain: wip: {} of {wip} runs active; the digest waits",
-                active.len()
-            ));
-            return Ok(Start::Waits);
+            held.get_or_insert_with(|| format!("wip: {} of {wip} runs active", active.len()));
+            if !self.config.reserve_scheduling {
+                self.line(format!(
+                    "maintain: wip: {} of {wip} runs active; the digest waits",
+                    active.len()
+                ));
+                return Ok((None, true));
+            }
         }
         for (kind, n) in [(Kind::Dispatch, 1), (Kind::Write, writes)] {
-            if let Some(held) = self.caps.check_many(kind, n) {
-                self.line(format!("{held}: {line}"));
-                return Ok(Start::Deferred);
+            if let Some(cap) = self.caps.check_many(kind, n) {
+                let pool = pool.map_or(String::new(), |pool| format!(" pool={pool}"));
+                self.line(format!(
+                    "{cap}: maintain: start {DIGEST_KIND} {}{pool}",
+                    issue.display()
+                ));
+                return Ok((None, false));
             }
         }
         // Do not adopt heads from discovered plans, which a run can forge.
         // They may nevertheless veto a fresh start: after a failed record
         // write, an existing research plan is evidence that a start might
         // already have happened today. This can only deny work.
-        let from = due_from(
-            self.now,
-            self.config
-                .maintain
-                .as_ref()
-                .context("maintain disabled")?
-                .hour_utc,
-        )?;
         let writers = self.writers();
         let comments = plan::issue_comments(&self.client, issue)?;
         if comments.iter().any(|c| {
@@ -907,7 +914,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     .is_ok_and(|p| p.is_some_and(|p| p.kind == DIGEST_KIND))
         }) {
             self.line("maintain: a research plan already exists today; the digest waits".into());
-            return Ok(Start::Deferred);
+            return Ok((None, false));
         }
         let bounds = self.client.bounds;
         if self.config.reserve_scheduling {
@@ -924,9 +931,41 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     "budget: maintain stopped; a digest start and record need {needed} requests, {} left, before the time bound",
                     bounds.left.get()
                 ));
-                return Ok(Start::Deferred);
+                return Ok((None, false));
             }
-            bounds.finishing.set(true);
+            // Dispatch reads the comment history twice (including the claim
+            // readback) and checks the viewer. Finishing cannot bypass the
+            // GraphQL point limit; use the same estimate as the budget.
+            let points = (2 * plan::PLAN_COMMENT_PAGES as u64 + 1) * QUERY_POINTS;
+            if let Some(limit) = bounds.graphql_limit.get()
+                && limit.saturating_sub(bounds.points.get()) < points
+            {
+                self.line(format!("budget: maintain stopped; a digest start needs room for {points} estimated GraphQL points"));
+                return Ok((None, false));
+            }
+        }
+        if let Some(why) = held {
+            self.line(format!("maintain: {why}; the digest waits"));
+            return Ok((None, true));
+        }
+        Ok((Some(target), true))
+    }
+
+    /// Post, dispatch and record an admitted digest without the discovery
+    /// share interrupting it. The pass-wide request and finish bounds apply.
+    fn start_digest(
+        &mut self,
+        issue: &ItemRef,
+        pool: &str,
+        plan: &Value,
+        target: &Target,
+    ) -> Result<Start> {
+        let line = format!(
+            "maintain: start {DIGEST_KIND} {} pool={pool}",
+            issue.display()
+        );
+        if self.config.reserve_scheduling {
+            self.client.bounds.finishing.set(true);
         }
         self.caps.count(Kind::Dispatch);
         if !self.apply {
@@ -960,7 +999,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             client: &dispatcher,
             maybe_started: Cell::new(false),
         };
-        let done = plan::dispatch_with(&self.client, &attempt, issue, &writers, &target, options);
+        let done = plan::dispatch_with(&self.client, &attempt, issue, &writers, target, options);
         let maybe_started =
             attempt.maybe_started.get() && (!self.config.leases || dispatcher.sent.get());
         match done {

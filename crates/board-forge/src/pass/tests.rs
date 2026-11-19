@@ -1274,7 +1274,8 @@ fn persisted_cache_revalidates_an_unchanged_recorded_pass() {
     assert_eq!(first.failures + second.failures, 0, "{:?}", second.lines);
     assert_eq!(first.lines, second.lines);
     assert_eq!(second.spent.requests, 7);
-    assert_eq!(second.spent.revalidated, 5);
+    // Five run reads plus the pacing snapshot for the early WIP outcome.
+    assert_eq!(second.spent.revalidated, 6);
     assert_eq!(
         first.spent.requests,
         second.spent.requests + second.spent.revalidated
@@ -1683,6 +1684,12 @@ fn response_cache_applying_ambiguous_dispatch_is_not_replayed() {
                 .any(|l| l.contains("connection reset during POST") && l.contains("/dispatches"))
         );
         assert_eq!(forge.replay.dispatches(), ["cgwalters-forge/tracker#446"]);
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(
+                "schedule: claude under pace; no confirmed start: dispatch unconfirmed for cgwalters-forge/tracker#446"
+            )),
+            "{:#?}", report.lines
+        );
         let mut state = State::from_json(&report.state.unwrap().to_json()).unwrap();
         // The final mutation lost its reply. No pre-mutation validator survives.
         assert!(state.responses.is_empty(), "{:?}", state.responses.keys());
@@ -1692,6 +1699,30 @@ fn response_cache_applying_ambiguous_dispatch_is_not_replayed() {
         assert_eq!(again.failures, 0, "{:?}", again.lines);
         assert_eq!(*forge.replay.writes.borrow(), writes);
         assert!(again.spent.requests > 0);
+    }
+}
+
+#[test]
+fn scheduling_outcome_distinguishes_refusal_from_failed_receipt() {
+    for (status, fail, expected) in [
+        (Some(404), None, "no start: start failed for"),
+        (
+            None,
+            Some("PATCH https://api.github.com/repos/cgwalters-forge/tracker/issues/comments/"),
+            "started",
+        ),
+    ] {
+        let mut forge = Forge::new(fail, false);
+        forge.dispatch_status = status;
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        let report = apply(&forge, &config(json!({"wip": 3})));
+        let expected =
+            format!("schedule: claude under pace; {expected} cgwalters-forge/tracker#446");
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(&expected)),
+            "{:#?}",
+            report.lines
+        );
     }
 }
 
@@ -2588,12 +2619,16 @@ const STARTED: &[&str] = &[
     "wip: no slot left; 270 more candidate(s) wait",
 ];
 
-/// The last line of scheduling, before stage 4b's and the Status stage's.
+/// The last scheduling decision before the pool outcomes and later stages.
 fn last_scheduled(report: &Report) -> &str {
     let lines = report.lines.iter().rev();
     lines
         .map(String::as_str)
-        .find(|l| !l.starts_with("status") && !l.starts_with("promote: "))
+        .find(|l| {
+            !(l.starts_with("status")
+                || l.starts_with("promote: ")
+                || l.starts_with("schedule: ") && l.contains(" under pace;"))
+        })
         .unwrap()
 }
 
@@ -2658,6 +2693,7 @@ fn replay_idle_board_starts_work() {
     expected.extend(not_live.iter().map(String::as_str));
     // No epic is planned, so stage 4 has every slot.
     expected.extend(STARTED);
+    expected.push("schedule: claude under pace; would start cgwalters-forge/tracker#446, cgwalters-forge/tracker#459, cgwalters-forge/tracker#533, cgwalters-forge/agent-board#40, cgwalters-forge/agent-board#44, cgwalters-forge/tracker#540");
     // No promote section: stage 4b is off. The recording's whole-board read
     // is an empty board: the Status stage has its own recording.
     expected.push("promote: off");
@@ -3727,7 +3763,12 @@ fn scheduling_retries_concurrency_after_maintain_spends_its_share() {
 /// digest pass after pass (agent-board#803).
 #[test]
 fn scheduling_reserve_admits_a_whole_digest_before_posting_its_plan() {
-    for (limit, starts) in [(110, false), (200, true), (PASS_REQUEST_LIMIT, true)] {
+    for (limit, short_points, starts) in [
+        (110, false, false),
+        (200, false, true),
+        (200, true, false),
+        (PASS_REQUEST_LIMIT, false, true),
+    ] {
         let (mut cfg, mut replay) = maintained(9, vec![], 40.0);
         cfg.reserve_scheduling = true;
         cfg.work_repositories.clear();
@@ -3742,7 +3783,34 @@ fn scheduling_reserve_admits_a_whole_digest_before_posting_its_plan() {
             .requests
             .push(json!({"request": {"get": format!("{API_ROOT}user")},
             "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
-        let report = apply_within(&forge, &cfg, limit);
+        let bounds = std::rc::Rc::new(Bounds::new(limit, Instant::now() + Duration::from_secs(60)));
+        if short_points {
+            let injected = bounds.clone();
+            forge.on_get = Some(Box::new(move |url, _| {
+                if injected.stage.get() == Stage::Maintain
+                    && url == format!("{API_ROOT}repos/cgwalters-forge/bot-ops")
+                {
+                    // The final discovery read (duplicate-plan check) can
+                    // finish, but dispatch's GraphQL reads cannot begin.
+                    injected
+                        .graphql_limit
+                        .set(Some(injected.points.get() + QUERY_POINTS));
+                }
+            }));
+        }
+        let report = block(run_within(
+            &forge,
+            &forge,
+            &cfg,
+            (
+                State::default(),
+                Mode::Actions(&own()),
+                Limits::default(),
+                forge.replay.now,
+            ),
+            &bounds,
+        ))
+        .unwrap();
         assert_eq!(report.failures, 0, "limit {limit}: {:?}", report.lines);
         assert_eq!(!forge.dispatches().is_empty(), starts, "{:?}", report.lines);
         let plans = forge
@@ -3751,6 +3819,13 @@ fn scheduling_reserve_admits_a_whole_digest_before_posting_its_plan() {
             .filter(|body| plan::fenced_json(body, PLAN_FENCE).unwrap().is_some())
             .count();
         assert_eq!(plans, usize::from(starts));
+        assert_eq!(
+            forge
+                .comments_on("cgwalters-forge/bot-ops", 9)
+                .iter()
+                .any(|body| body.starts_with(maintain::PLAN_MARKER)),
+            starts
+        );
         assert_eq!(report.maintain.unwrap().done, starts);
         if !starts {
             assert!(
@@ -3761,7 +3836,117 @@ fn scheduling_reserve_admits_a_whole_digest_before_posting_its_plan() {
                 "{:?}",
                 report.lines
             );
+            if short_points {
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("estimated GraphQL points"))
+                );
+            }
         }
+    }
+}
+
+#[test]
+fn due_digest_at_discovery_share_leaves_inference_to_scheduling() {
+    let (mut cfg, mut replay) = maintained(9, vec![], 45.0);
+    cfg.reserve_scheduling = true;
+    cfg.epics = None;
+    digest_visibility(&mut replay, visible(true));
+    let mut forge = Forge {
+        replay,
+        ..Forge::new(None, false)
+    };
+    let bounds = std::rc::Rc::new(Bounds::new(250, Instant::now() + Duration::from_secs(60)));
+    let injected = bounds.clone();
+    forge.on_get = Some(Box::new(move |url, _| {
+        if injected.stage.get() == Stage::Maintain
+            && url == format!("{API_ROOT}repos/cgwalters-forge/bot-ops")
+        {
+            // Sources were discovered and the digest is due. Spend the
+            // rest of discovery's share before the overlap check, leaving
+            // the whole-pass headroom untouched for the later stages.
+            injected.left.set(injected.kept.get() + WRITE_RESERVE);
+        }
+    }));
+    let report = block(run_within(
+        &forge,
+        &forge,
+        &cfg,
+        (
+            State::default(),
+            Mode::Actions(&own()),
+            Limits::default(),
+            forge.replay.now,
+        ),
+        &bounds,
+    ))
+    .unwrap();
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    for prefix in [
+        "maintain: digest due:",
+        "budget: maintain stopped at its share",
+        "schedule: claude under pace; started cgwalters-forge/tracker#459",
+    ] {
+        assert!(
+            report.lines.iter().any(|line| line.starts_with(prefix)),
+            "{prefix}: {:#?}",
+            report.lines
+        );
+    }
+    assert!(!report.maintain.unwrap().done);
+    assert!(forge.comments_on("cgwalters-forge/bot-ops", 9).is_empty());
+}
+
+#[test]
+fn scheduling_outcomes_name_early_wip_and_dispatch_cap() {
+    let mut replay = without_epics(replay());
+    only(
+        &mut replay,
+        &["cgwalters-forge/tracker#446", "cgwalters-forge/tracker#459"],
+    );
+    let mut snapshot = usage(&mut replay);
+    snapshot["pools"]["openai"]["hold"] = false.into();
+    snapshot["pools"]["openai"]["used_percent"] = 1.into();
+    set_usage(&mut replay, &snapshot);
+    for (wip, why) in [
+        (2, "2 of 2 runs active; 0 candidate(s) unread"),
+        (
+            3,
+            "a start was held by a dispatch or write cap; 1 candidate(s) unread, first deferred cgwalters-forge/tracker#459",
+        ),
+    ] {
+        let cfg = config(json!({"wip": wip}));
+        let report = block(run(
+            &replay,
+            &replay,
+            &cfg,
+            State::default(),
+            (
+                Mode::Preview,
+                Limits {
+                    dispatch: Some(0),
+                    ..Limits::default()
+                },
+            ),
+            replay.now,
+        ))
+        .unwrap();
+        let outcomes: Vec<_> = report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("schedule: ") && l.contains(" under pace;"))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                &format!("schedule: claude under pace; no start: {why}"),
+                &format!("schedule: openai under pace; no start: {why}")
+            ],
+            "{:#?}",
+            report.lines
+        );
     }
 }
 
@@ -3918,6 +4103,7 @@ fn triage_scope_epics_triages_only_epic_children() {
         "revisit: 1 due, seed 1792768510, drawn: cgwalters-forge/agentic-job#188 (weight 4)"
             .to_owned(),
         "start revisit cgwalters-forge/agentic-job#188 pool=claude".to_owned(),
+        "schedule: claude under pace; would start cgwalters-forge/tracker#446, cgwalters-forge/tracker#459, cgwalters-forge/tracker#527, cgwalters-forge/tracker#533, cgwalters-forge/agentic-job#188".to_owned(),
     ];
     let epics = vec![
         "candidates: 5 (0 opened by others, 0 outside a live epic, 4 unparented: run only with a plan)".to_owned(),
@@ -3928,6 +4114,7 @@ fn triage_scope_epics_triages_only_epic_children() {
         implement.to_owned(),
         outside(533),
         "revisit: none of 5 candidate(s) is due".to_owned(),
+        "schedule: claude under pace; would start cgwalters-forge/tracker#446, cgwalters-forge/tracker#527".to_owned(),
     ];
     for (setting, expected) in [
         (json!(true), &all),
@@ -10584,6 +10771,16 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         ))
         .unwrap();
         assert_eq!(second.failures, 0, "{name}: {:#?}", second.lines);
+        if name == "a newer implement plan in the cooldown starts at once" {
+            let plan = added.last().unwrap();
+            let id = plan::comment_id(text(plan, "/url")).unwrap();
+            assert!(second.lines.iter().any(|line| line.starts_with(&format!(
+                "start implement cgwalters-forge/tracker#446 plan={id}@"
+            ))));
+            assert!(second.lines.iter().any(|line| {
+                line.starts_with("schedule: claude under pace; started cgwalters-forge/tracker#446")
+            }));
+        }
         // The store indexes the verdict the line names, never a visitor's.
         if let Some(said) = expected.split(": triage verdict ").nth(1) {
             let said = said.split(',').next().unwrap();
@@ -14729,9 +14926,16 @@ fn revisit_off_changes_nothing() {
     let on = config(json!({"wip": 12, "revisit": {"perPass": 1, "afterDays": 14}}));
     let report = preview(&on, &edited);
     let rest: Vec<&String> = (report.lines.iter())
-        .filter(|l| !l.contains("revisit"))
+        .filter(|l| !l.contains("revisit") && !l.contains(" under pace;"))
         .collect();
-    assert_eq!(rest, before.lines.iter().collect::<Vec<_>>());
+    assert_eq!(
+        rest,
+        before
+            .lines
+            .iter()
+            .filter(|l| !l.contains(" under pace;"))
+            .collect::<Vec<_>>()
+    );
     let started = "start revisit cgwalters-forge/agentic-job#188 pool=claude";
     assert!(
         report.lines.iter().any(|l| l == started),
@@ -16956,7 +17160,6 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             0,
             0,
             &[
-                "idle: claude is under pace and nothing started; stage 4's budget left 9 candidate(s) unread, first cgwalters-forge/tracker#446",
                 "schedule: no candidate started; first candidate cgwalters-forge/tracker#446: stopped: budget: 105 requests left, only what a start may take (109); first ready to start: none",
             ],
         ),
@@ -16982,6 +17185,31 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             report.lines
         );
         assert_eq!(forge.dispatches().len(), started, "limit {limit}");
+        let outcomes: Vec<_> = report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("schedule: claude under pace;"))
+            .collect();
+        let expected = if started == 0 {
+            "schedule: claude under pace; no start: budget: 105 requests left, only what a start may take (109); 9 candidate(s) unread, first deferred cgwalters-forge/tracker#446".into()
+        } else {
+            format!(
+                "schedule: claude under pace; started {}",
+                forge.dispatches().join(", ")
+            )
+        };
+        let [outcome] = outcomes.as_slice() else {
+            panic!("limit {limit}: {outcomes:?}")
+        };
+        if started == 0 {
+            assert_eq!(**outcome, expected);
+        } else {
+            assert!(
+                outcome.starts_with(&format!("{expected}; "))
+                    && outcome.contains(" candidate(s) unread, first deferred "),
+                "{outcome}"
+            );
+        }
         if started > 0 {
             let holds = (report.lines.iter())
                 .filter(|l| l.starts_with("hold cgwalters-forge/"))
@@ -18519,6 +18747,14 @@ fn implement_takes_the_paced_pool() {
             .unwrap();
         assert_eq!(sent["inputs"]["kind"], "implement");
         assert_eq!(sent["inputs"]["pool"], expected);
+        let account = mix::account(expected).unwrap_or(expected);
+        assert!(
+            report.lines.contains(&format!(
+                "schedule: {account} under pace; started cgwalters-forge/tracker#446"
+            )),
+            "{:#?}",
+            report.lines
+        );
         assert_eq!(sent["ref"], "main");
     }
 }
@@ -18592,7 +18828,34 @@ fn mixed_start_keeps_model_in_plan_dispatch_and_log() {
                     .any(|body| body.replace(' ', "").contains("\"pool\":\"fable\""))
             );
         }
+        let account = mix::account(expected).unwrap_or(expected);
+        assert!(
+            report.lines.contains(&format!(
+                "schedule: {account} under pace; started cgwalters-forge/tracker#446"
+            )),
+            "{:#?}",
+            report.lines
+        );
     }
+}
+
+#[test]
+fn scheduling_outcome_keeps_standalone_fable_pool() {
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    unpooled(&mut forge.replay);
+    let mut snapshot = usage(&mut forge.replay);
+    snapshot["pools"]["fable"] = snapshot["pools"]["claude"].clone();
+    set_usage(&mut forge.replay, &snapshot);
+    let cfg = config(json!({"wip": 3, "pools": {"fable": {}}, "planPools": ["fable"]}));
+    let report = apply(&forge, &cfg);
+    assert!(
+        report
+            .lines
+            .contains(&"schedule: fable under pace; started cgwalters-forge/tracker#446".into()),
+        "{:#?}",
+        report.lines
+    );
 }
 
 #[test]
