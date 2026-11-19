@@ -17364,6 +17364,367 @@ fn read_free_holds_keep_unproven_facts_on_the_normal_path() {
     }
 }
 
+/// A pass of `forge` from `state` at the recording's clock, applying where
+/// `apply`, its failures none.
+fn pass_state(forge: &Forge, cfg: &Config, state: State, apply: bool) -> Report {
+    let own = own();
+    let mode = if apply {
+        Mode::Actions(&own)
+    } else {
+        Mode::Preview
+    };
+    let now = forge.replay.now;
+    let report = block(run(
+        forge,
+        forge,
+        cfg,
+        state,
+        (mode, Limits::default()),
+        now,
+    ))
+    .unwrap();
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    report
+}
+
+/// Tracker `number`'s board `updatedAt`, as [`silent`] reads it, moved to
+/// the recording's clock: a comment, edit or label since.
+fn touched(replay: &mut Replay, number: u64) {
+    let now = replay.now.format(&Rfc3339).unwrap();
+    edited(replay, number, |node| {
+        node["content"]["updatedAt"] = now.as_str().into();
+    });
+}
+
+/// Tracker `number`'s board item, as [`silent`] reads it, `edit`ed.
+fn edited(replay: &mut Replay, number: u64, edit: impl Fn(&mut Value)) {
+    let updated = fnv(&board_query(true, false));
+    for entry in &mut replay.requests {
+        if entry["request"]["graphql"] != updated.as_str() {
+            continue;
+        }
+        let nodes = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+        for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+            if node["content"]["number"] == number {
+                edit(node);
+            }
+        }
+    }
+}
+
+/// The `reused` of the structured preview holds of `kind` of `report`, made
+/// at `now`, and whether each says it was `carried`.
+fn reused_holds(
+    report: Report,
+    now: OffsetDateTime,
+    kind: HoldKind,
+) -> Vec<(Option<lean::Reused>, bool)> {
+    let snapshot = decision::from_report(report, now).unwrap();
+    (snapshot.holds.iter())
+        .filter(|h| h.decision.kind == kind)
+        .map(|h| (h.reused, h.carried))
+        .collect()
+}
+
+/// `report`'s hold lines.
+fn hold_lines(report: &Report) -> Vec<&String> {
+    (report.lines.iter())
+        .filter(|l| l.starts_with("hold "))
+        .collect()
+}
+
+/// agent-board#1110: tracker's pass spent 1098 requests reading candidates
+/// it then held on their comments, 72 of them on a triage cooldown. With
+/// `leanReads`, a candidate the last pass held so is held again, the same,
+/// without a read while the board shows it unchanged; one whose
+/// `updatedAt` moved is read whole. Without it every pass reads them all.
+#[test]
+fn lean_reads_carry_unchanged_cooldowns_without_reading_them() {
+    let mut passes = Vec::new();
+    let mut started = Vec::new();
+    for lean in [false, true] {
+        let mut forge = Forge::new(None, false);
+        silent(&mut forge.replay, &[], &[]);
+        // The pages lack the pass's own comments, which GraphQL reads.
+        rest_comment_pages(&mut forge.replay);
+        let cfg = config(json!({"triageFollowUpDays": 1, "state": "pass-state.json",
+            "leanReads": lean}));
+        let first = pass_state(&forge, &cfg, State::default(), true);
+        started = forge.dispatches();
+        assert_eq!(started.len(), 4, "{:#?}", first.lines);
+        // Each triage run's record holds its issue, carried from here.
+        let held = pass_state(&forge, &cfg, next_state(&first), true);
+        let carried = pass_state(&forge, &cfg, next_state(&held), true);
+        touched(&mut forge.replay, 446);
+        let changed = pass_state(&forge, &cfg, next_state(&carried), true);
+        assert_eq!(forge.dispatches(), started, "{:#?}", changed.lines);
+        passes.push([held, carried, changed]);
+    }
+    let [off, on] = [&passes[0], &passes[1]];
+    let cooling = |report: &Report| {
+        let lines = hold_lines(report);
+        (lines.iter())
+            .filter(|l| l.contains("gave no verdict; triaged again from"))
+            .count()
+    };
+    assert_eq!(cooling(&on[0]), started.len(), "{:#?}", on[0].lines);
+    // tracker#446 first, which the last pass reads whole.
+    assert_eq!(started[0], FIRST[0]);
+    let reads = |report: &Report| {
+        (started[..2].iter())
+            .map(|item| report.spent.by_cause.get(item).copied().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    for (n, name) in ["held", "carried", "changed"].into_iter().enumerate() {
+        eprintln!(
+            "{name}: leanReads off {}\n{name}: leanReads on {}",
+            off[n].summary_line(),
+            on[n].summary_line()
+        );
+        // The same decisions, from fewer reads.
+        assert_eq!(hold_lines(&off[n]), hold_lines(&on[n]), "{name}");
+        assert!(off[n].spent.requests >= on[n].spent.requests, "{name}");
+        assert!(reads(&off[n]).iter().all(|n| *n > 0), "{name}");
+    }
+    let carried_line = |report: &Report| {
+        (report.lines.iter())
+            .find(|l| l.contains("hold(s) carried from an earlier read"))
+            .cloned()
+    };
+    assert_eq!(carried_line(&on[0]), None);
+    assert_eq!(reads(&on[0]).iter().filter(|n| **n > 0).count(), 2);
+    let line = |n: usize| {
+        format!(
+            "schedule: {n} hold(s) carried from an earlier read, their board facts unchanged since"
+        )
+    };
+    assert_eq!(carried_line(&on[1]), Some(line(started.len())));
+    assert_eq!(reads(&on[1]), [0, 0]);
+    assert!(on[1].spent.requests + 2 * started.len() <= off[1].spent.requests);
+    // tracker#446 moved and is read whole; the rest stay carried.
+    assert_eq!(carried_line(&on[2]), Some(line(started.len() - 1)));
+    assert!(reads(&on[2])[0] > 0 && reads(&on[2])[1] == 0);
+    let state = next_state(&on[2]);
+    assert_eq!(state.carried_holds.len(), started.len());
+    assert!(next_state(&off[2]).carried_holds.is_empty());
+    // A pass without the option drops what one with it carried.
+    let mut forge = Forge::new(None, false);
+    rest_comment_pages(&mut forge.replay);
+    let cfg = config(json!({"triageFollowUpDays": 1, "state": "pass-state.json"}));
+    let without = pass_state(&forge, &cfg, state, false);
+    assert!(next_state(&without).carried_holds.is_empty());
+}
+
+/// A carried open-pr-cap hold asks its repository's count again: it holds
+/// while the count is at the cap, and a pull request landing releases it at
+/// once, read whole and started.
+#[test]
+fn lean_reads_ask_a_carried_open_pr_cap_of_the_count_again() {
+    let (mut forge, mut cfg) = capped_forge(
+        (Some(2), Some(2), "implement"),
+        (false, |_: &mut _, _: &mut _| {}),
+    );
+    silent(&mut forge.replay, &[], &[]);
+    rest_comment_pages(&mut forge.replay);
+    cfg.lean_reads = true;
+    cfg.state = Some("pass-state.json".into());
+    let issue = "cgwalters-forge/tracker#446";
+    let reason = "open-pr-cap: cgwalters-forge/tracker has 2/2 open bot PRs; landing is the cheaper win; a plan's past_cap starts it anyway";
+    let first = pass_state(&forge, &cfg, State::default(), false);
+    let second = pass_state(&forge, &cfg, next_state(&first), false);
+    for report in [&first, &second] {
+        let held = (report.holds.iter()).find(|e| e.hold.kind == HoldKind::OpenPrCap);
+        assert_eq!(held.map(|e| e.hold.reason.as_str()), Some(reason));
+        assert!(
+            report.lines.contains(&"open-pr-cap: at the cap: cgwalters-forge/tracker 2/2; their implement plans wait for the bot's pull requests to land or close".to_owned()),
+            "{:#?}",
+            report.lines
+        );
+        assert_eq!(
+            report
+                .accepted_plans
+                .borrow()
+                .get(issue)
+                .map(String::as_str),
+            Some("implement")
+        );
+    }
+    // The second read only the count.
+    let reads = |report: &Report| report.spent.by_cause.get(issue).copied().unwrap_or(0);
+    eprintln!(
+        "open-pr-cap read {}, carried {}",
+        reads(&first),
+        reads(&second)
+    );
+    assert!(reads(&first) > 1);
+    assert_eq!(reads(&second), 1);
+    // The structured preview says the second took its plan from the first.
+    let now = forge.replay.now;
+    let cap = HoldKind::OpenPrCap;
+    let second_state = next_state(&second);
+    assert_eq!(reused_holds(first, now, cap), [(None, false)]);
+    let plan = Some(lean::Reused::Plan);
+    assert_eq!(reused_holds(second, now, cap), [(plan, true)]);
+    // One naming a repository outside `work`, at the cap too, is read
+    // whole rather than counted there.
+    let pulls = format!("{API_ROOT}repos/cgwalters-forge/tracker/pulls?state=open&per_page=100");
+    let elsewhere = "cgwalters-forge/elsewhere";
+    let mut forged = forge.replay.requests.clone();
+    forged.retain(|entry| entry["request"]["get"] == pulls.as_str());
+    for entry in &mut forged {
+        entry["request"]["get"] = pulls.replace("cgwalters-forge/tracker", elsewhere).into();
+    }
+    forge.replay.requests.extend(forged);
+    let mut state = second_state.clone();
+    let entry = state.carried_holds.get_mut(issue).unwrap();
+    entry.repository = Some(elsewhere.into());
+    let read = pass_state(&forge, &cfg, state, false);
+    assert!(reads(&read) > 1, "{:#?}", read.lines);
+    assert_eq!(reused_holds(read, now, cap), [(None, false)]);
+    for entry in &mut forge.replay.requests {
+        if entry["request"]["get"] == pulls.as_str() {
+            entry["answer"]["body"].as_array_mut().unwrap().remove(0);
+        }
+    }
+    let landed = pass_state(&forge, &cfg, second_state, false);
+    assert!(
+        (landed.lines.iter()).any(|l| l.starts_with(&format!("start implement {issue}"))),
+        "{:#?}",
+        landed.lines
+    );
+    assert!(!next_state(&landed).carried_holds.contains_key(issue));
+}
+
+/// The reads of tracker as a promotion fork `config` names, its board's
+/// issues linking no upstream and handed off nowhere.
+fn upstream_fork(replay: &mut Replay, config: &Config) {
+    const FORK: &str = "cgwalters-forge/tracker";
+    let mut answers = vec![(
+        format!("repos/{FORK}"),
+        json!({"full_name": FORK, "fork": true, "topics": ["bot-midstream"],
+            "custom_properties": {"origin": "fork"},
+            "parent": {"full_name": "other-org/project"}}),
+    )];
+    let board = fnv(&board_query(true, false));
+    let numbers: BTreeSet<u64> = (replay.requests.iter())
+        .filter(|entry| entry["request"]["graphql"] == board.as_str())
+        .filter_map(|entry| entry["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes"))
+        .flat_map(|nodes| nodes.as_array().into_iter().flatten())
+        .filter_map(|node| node["content"]["number"].as_u64())
+        .collect();
+    for number in numbers {
+        answers.push((
+            format!("repos/{FORK}/issues/{number}"),
+            json!({"number": number, "repository_url": format!("{API_ROOT}repos/{FORK}"),
+                "body": "No link"}),
+        ));
+        let timeline = format!("repos/{FORK}/issues/{number}/timeline?per_page=100&page=1");
+        answers.push((timeline, json!([])));
+    }
+    for (path, body) in answers {
+        replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+            "answer": {"status": 200, "link": null, "body": body}}));
+    }
+    struct Empty;
+    impl Transport for Empty {
+        fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+            Ok(json!({"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}))
+        }
+    }
+    let recorder = Recorder::new(&Empty);
+    crate::promote::awaiting::candidates(&recorder, config, FORK).unwrap();
+    let fixture = serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap();
+    (replay.requests).extend(Replay::from_json(&fixture).unwrap().requests);
+}
+
+/// A carried cooldown is read whole where only the board's Priority of it
+/// changed, its `updatedAt` the same; and nothing is carried in a pass with
+/// `reruns`, `starts` or `skipActiveWork`, which hold on more than its
+/// comments, or of an issue in an upstream fork. What is carried says so in
+/// the structured preview.
+#[test]
+fn lean_reads_read_whole_on_board_changes_and_excluded_options() {
+    let mut forge = Forge::new(None, false);
+    silent(&mut forge.replay, &[], &[]);
+    rest_comment_pages(&mut forge.replay);
+    let settings = json!({"triageFollowUpDays": 1, "state": "pass-state.json",
+        "leanReads": true});
+    let cfg = config(settings.clone());
+    let first = pass_state(&forge, &cfg, State::default(), true);
+    let started = forge.dispatches();
+    assert_eq!(started.len(), 4, "{:#?}", first.lines);
+    let held = pass_state(&forge, &cfg, next_state(&first), true);
+    let state = next_state(&held);
+    assert_eq!(state.carried_holds.len(), started.len());
+    let reads = |report: &Report| {
+        (started.iter())
+            .map(|item| report.spent.by_cause.get(item).copied().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    let carried = |report: &Report| {
+        (report.lines.iter()).any(|l| l.contains("hold(s) carried from an earlier read"))
+    };
+    let now = forge.replay.now;
+    let cooldown = HoldKind::TriageCooldown;
+    let report = pass_state(&forge, &cfg, state.clone(), false);
+    assert_eq!(reads(&report), vec![0; started.len()]);
+    let hold = (Some(lean::Reused::Hold), true);
+    assert_eq!(
+        reused_holds(report, now, cooldown),
+        vec![hold; started.len()]
+    );
+    failed(&mut forge.replay, vec![]);
+    newest_runs(&mut forge.replay, vec![], vec![]);
+    // Its upstream's completion replans it, which the board never shows.
+    let promote = json!({"promote": {"forks": {"cgwalters-forge/tracker":
+            {"upstream": "other-org/project", "base": "main"}},
+        "signoff": {"name": "Operator", "email": "operator@example.invalid"},
+        "policyRepository": "cgwalters-forge/tracker"}});
+    for option in [
+        json!({"reruns": true}),
+        json!({"starts": {}}),
+        json!({"skipActiveWork": true}),
+        promote.clone(),
+    ] {
+        let mut settings = settings.clone();
+        (settings.as_object_mut().unwrap()).extend(option.as_object().unwrap().clone());
+        let cfg = config(settings);
+        // Only the fork's issues where the fork is the option.
+        let fork = option == promote;
+        if fork {
+            upstream_fork(&mut forge.replay, &cfg);
+        }
+        let excluded: Vec<bool> = (started.iter())
+            .map(|item| !fork || item.starts_with("cgwalters-forge/tracker#"))
+            .collect();
+        let report = pass_state(&forge, &cfg, state.clone(), false);
+        let read: Vec<bool> = reads(&report).iter().map(|n| *n > 0).collect();
+        assert_eq!(read, excluded, "{option}: {:#?}", report.lines);
+        assert_eq!(carried(&report), fork, "{option}: {:#?}", report.lines);
+        let holds = reused_holds(report, now, cooldown);
+        let count = |of| holds.iter().filter(|h| **h == of).count();
+        let whole = excluded.iter().filter(|e| **e).count();
+        let counts = (count((None, false)), count(hold));
+        assert_eq!(counts, (whole, started.len() - whole), "{option}");
+    }
+    // tracker#446 moved to another Priority with nothing else.
+    assert_eq!(started[0], FIRST[0]);
+    edited(&mut forge.replay, 446, |node| {
+        let other = if node["priority"]["name"] == "P0" {
+            "P1"
+        } else {
+            "P0"
+        };
+        node["priority"] = json!({"name": other});
+    });
+    let report = pass_state(&forge, &cfg, state, false);
+    let read = reads(&report);
+    assert!(read[0] > 0 && read[1..].iter().all(|n| *n == 0), "{read:?}");
+    assert!(carried(&report));
+}
+
 /// The recorded board as read with its issues' assignees, `logins` each,
 /// and `unread` more past them.
 fn board_assignees(replay: &mut Replay, (logins, unread): (&[&str], usize)) {
@@ -17490,6 +17851,23 @@ fn capped_pass(
     (cap, count, kind): (Option<usize>, Option<usize>, &str),
     (epics, edit): (bool, impl Fn(&mut Replay, &mut Value)),
 ) -> Report {
+    let (forge, cfg) = capped_forge((cap, count, kind), (epics, edit));
+    block(run(
+        &forge,
+        &forge,
+        &cfg,
+        State::default(),
+        (Mode::Preview, Limits::default()),
+        forge.replay.now,
+    ))
+    .unwrap()
+}
+
+/// [`capped_pass`]'s forge and configuration.
+fn capped_forge(
+    (cap, count, kind): (Option<usize>, Option<usize>, &str),
+    (epics, edit): (bool, impl Fn(&mut Replay, &mut Value)),
+) -> (Forge, Config) {
     let mut settings = json!({"wip":3});
     let mut forge = Forge::new(None, false);
     if epics {
@@ -17509,15 +17887,7 @@ fn capped_pass(
     fixture.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/pulls?state=open&per_page=100")},"answer":{"status":status,"body":pulls,"link":null}}));
     let mut cfg = config(settings);
     cfg.open_pr_cap = cap;
-    block(run(
-        &forge,
-        &forge,
-        &cfg,
-        State::default(),
-        (Mode::Preview, Limits::default()),
-        forge.replay.now,
-    ))
-    .unwrap()
+    (forge, cfg)
 }
 
 #[test]

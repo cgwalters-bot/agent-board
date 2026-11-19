@@ -64,6 +64,7 @@ fn hold(n: u64, kind: HoldKind, reason: &str, operator: bool) -> Published {
         carried: false,
         watched: false,
         releases: 1,
+        reused: None,
     }
 }
 

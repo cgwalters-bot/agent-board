@@ -148,7 +148,7 @@ opt-ins, not every optional key. The GitHub catalog consists of:
 - Boolean switches: `notifications`, `issueIntake`, `reserveScheduling`,
   `poolHeadroom`, `skipActiveWork`, `idleReplan`, `existingChildPlans`,
   `researchPlans`, `fixPlans`, `sessionPlans`, `triageClose`, `replanInvalid`, `operatorQuestionsOnly`,
-  `reserveOperator`, `assignHolds`, `readFreeHolds`, `bodyPlans`, `leases`,
+  `reserveOperator`, `assignHolds`, `readFreeHolds`, `leanReads`, `bodyPlans`, `leases`,
   `reruns`, `reapOverdueRuns`, `cleanupHistory`, `topDown`, `usage.probe`,
   `holds.needsYou`, `holds.approvalEvidence`, `holds.actNow`, `holds.passView`,
   `holds.today`, `holds.epicFocus`, `epics.close`, `epics.inWorkRepositories`,
@@ -363,6 +363,57 @@ applying pass kept. A binary older than this one refuses a state file with
 `quiet_waits`; set `pr.quietWaits: false` to stop writing them, or delete the
 file to roll back. Without a `state` setting nothing is kept between passes,
 so the option decides nothing.
+
+## Lean reads (GitHub)
+
+The concrete failure `leanReads` stops is scheduling spending the pass on
+candidates it then holds. tracker's pass of 2026-11-19 (agent-board#1110) spent
+1098 of its 2019 requests in stage 4 and admitted nothing: 72 candidates were
+on a triage cooldown and 50 at `openPrCap`, each read whole (comments, plan,
+body) to find that out again. The option is GitHub-only and off unless set to
+`true`. With it:
+
+- A candidate stage 4 held on a triage cooldown (a follow-up, an earlier
+  verdict or a replan waiting for its days, or nothing changed since its
+  triage), or on its own implement plan's repository at `openPrCap`, is kept
+  in the poll state under `carried_holds` with a digest of the board's facts
+  of it: `updatedAt`, labels, assignees, Status, Priority, Why, parent and
+  closing pull requests. While the next passes read the same facts, they hold
+  it again without reading its comments, plan or body: the cooldown with its
+  reason as read, the cap only where its repository is still in `work` and
+  writable and its count, read once a pass, still holds it. The candidate's
+  own hold checks (closed, labels, Blocked,
+  dependencies, open pull requests, runs in flight) and its epic's still come
+  first. A comment, edit, label or assignment moves `updatedAt` and reads it
+  whole. What the board does not show waits at most four hours, or until the
+  cooldown ends if sooner: a pull request merging without closing the issue,
+  or an edit of its epic's text. Holds read from a plan on another issue,
+  issues in a promotion fork or midstream (whose upstream's completion
+  replans them), and passes with `reruns`, `starts` or `skipActiveWork`,
+  carry nothing. Stage 4
+  says how many it carried (`schedule: N hold(s) carried from an earlier
+  read, their board facts unchanged since`), and the structured preview and
+  the [per-repository work](#per-repository-work) mark each such hold
+  `"carried": true` with `"reused": "hold"` (the
+  cooldown as read) or `"reused": "plan"` (the accepted plan as read, the
+  open pull request count this pass's).
+- Stage 4 names the repositories at the cap (`open-pr-cap: at the cap:
+  OWNER/REPO 7/6, ...`).
+
+The state keeps at most 2,000 entries, validated on load. A cooldown's entry
+keeps its reason, at most 1,000 bytes; an open-pr-cap entry keeps the
+repository whose count is asked again. The state file is already trusted (see
+[persisting conditional responses](#persisting-conditional-responses)); a
+forged entry can only hold a candidate, for at most four hours and only while
+the board shows the facts it names, never start one. A pass without the option,
+or with another configuration or token, drops them. A binary older than this
+one refuses a state file with `carried_holds`; set `leanReads: false` or
+delete the file to roll back. Without `state` nothing is carried. The response
+cache's scope covers the whole configuration, so the first pass of a binary
+with this option, set or not, starts with cold reads and no `quiet_waits`, as
+after any new configuration field. A caller that
+publishes a filtered copy of its state, as tracker does, carries them only once
+that copy keeps `carried_holds` for its public repositories (agent-board#1048).
 
 ## Local GitHub credentials
 
@@ -1617,7 +1668,9 @@ Every followed or work repository has a section. PR kinds are `fix`,
 `held`. `taken` distinguishes decisions executed (or previewed) this pass
 from work left by caps or admission. `head` binds PR observations to the
 head read. `accepted-plan` entries have `plan_kind`; issue and epic holds
-have `hold_kind`, `reason`, `operator` and `carried`. A held issue whose plan
+have `hold_kind`, `reason`, `operator` and `carried`, and `reused` where
+[lean reads](#lean-reads-github) took it from an earlier pass's read; a
+`plan_kind` with `"reused": "plan"` is that read's plan. A held issue whose plan
 stage 4 accepted stays one `held` entry that keeps `plan_kind`, and is
 counted under both `held` and `accepted-plan`, so `counts` can sum past
 `count`. Global holds remain in
@@ -6153,6 +6206,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, one refused for news since the verdict waiting as `needs-close`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `readFreeHolds` | GitHub only: apply board-proven holds before assignment reads, leaving request budget for ready candidates; no cached holds or new eligibility; `false` |
+| `leanReads` | GitHub only: hold an unchanged candidate's triage cooldown or open-pr-cap again without reading it while the board shows it unchanged, see [lean reads](#lean-reads-github); `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `existingChildPlans` | GitHub only: let an epic plan post a dispatchable job plan on an existing open child via `post_job_plan`; existing repository, claim and write bounds remain; `false`. See [epic plans](epic-plans.md). |
 | `reserveOperator` | GitHub only: every triage brief states the `operatorAsk` bar for `needs-operator`, a `needs-design` verdict is planned rather than asked, and with `assignHolds` a verdict whose assignment the bot took off is triaged again rather than assigned again, see [reserving the operator](#reserving-the-operator); needs `triageFollowUpDays` and `operatorAsk`; `false` |

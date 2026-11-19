@@ -64,8 +64,13 @@ pub(super) fn snapshot(
                 let mut row = json!({
                     "kind":"held", "hold_kind":hold.kind, "operator":hold.operator,
                     "reason":hold.reason.chars().take(500).collect::<String>(),
-                    "carried":hold.carried,
+                    "carried":hold.carried || hold.reused.is_some(),
                 });
+                // What `leanReads` took from an earlier pass's read, as the
+                // structured preview says it.
+                if let Some(reused) = hold.reused {
+                    row["reused"] = json!(reused);
+                }
                 // A hold does not withdraw the plan stage 4 accepted.
                 let item = item.to_ascii_lowercase();
                 if let Some(kind) = items.get(&item).and_then(|r| r.get("plan_kind")) {
@@ -156,6 +161,7 @@ mod tests {
             carried: false,
             watched: false,
             releases: 1,
+            reused: None,
         };
         let followed = (vec![], BTreeSet::from(["o/other".into()]));
         let upstreams = BTreeMap::from([(
@@ -173,7 +179,14 @@ mod tests {
             Some(&followed),
             &steps,
             &plans,
-            &[hold("o/other#9"), hold("o/work#2")],
+            &[
+                hold("o/other#9"),
+                hold("o/work#2"),
+                holds::Published {
+                    reused: Some(lean::Reused::Plan),
+                    ..hold("o/work#3")
+                },
+            ],
             &upstreams,
         );
         assert_eq!(
@@ -202,6 +215,16 @@ mod tests {
         assert_eq!(other["items"][1]["upstream"]["state"], "open");
         let held = &work["repositories"]["o/work"]["items"][0];
         assert!(held.get("plan_kind").is_none(), "{held}");
+        assert_eq!(
+            (&held["carried"], held.get("reused")),
+            (&json!(false), None)
+        );
+        // One `leanReads` carried says what it took from an earlier read.
+        let reused = &work["repositories"]["o/work"]["items"][1];
+        assert_eq!(
+            (&reused["carried"], &reused["reused"]),
+            (&json!(true), &json!("plan"))
+        );
         let mut document = holds::snapshot(&[], "2026-11-05T12:00:00Z".into(), Default::default());
         document.dispatchable_work = Some(work.clone());
         let (_, body) = holds::fit(document.clone()).unwrap();

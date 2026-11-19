@@ -1477,6 +1477,7 @@ mod tests {
             carried: false,
             watched: false,
             releases: 1,
+            reused: None,
         });
         snapshot.holds[0].reason = "x".into();
         let size = holds::render(&snapshot).unwrap().chars().count();
@@ -1602,6 +1603,7 @@ mod tests {
             carried: false,
             watched: false,
             releases: 1,
+            reused: None,
         };
         snapshot.holds = (1..=40)
             .map(|n| hold(n, true))
