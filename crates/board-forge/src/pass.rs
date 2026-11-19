@@ -3785,24 +3785,28 @@ impl<C: Rest> Rest for Budget<'_, C> {
         }
         let class = endpoint_class(url);
         self.spend(false, &class)?;
-        let cacheable = validator.is_none()
-            && self.bounds.shared_responses.borrow().enabled
+        let scoped = self.bounds.shared_responses.borrow().enabled;
+        let current_scope = scoped
             && self.inner.cache_context().is_some_and(|context| {
                 self.bounds.shared_responses.borrow().context.as_ref() == Some(&context)
-            })
+            });
+        // A validator supplied by the poll can also belong to the captured
+        // scope. After rotation, neither it nor a shared entry may get a 304.
+        let cacheable = validator.is_none()
+            && current_scope
             && !self.bounds.starting.get()
             && !self.bounds.finishing.get()
             && url.starts_with(API_ROOT)
             && !url.contains('#');
         let enabled = validator.is_none()
             && self.bounds.cache_enabled.get()
-            && (!self.bounds.shared_responses.borrow().enabled || cacheable)
+            && (!scoped || cacheable)
             && !self.bounds.starting.get()
             && !self.bounds.finishing.get();
         let cached = if cacheable {
             self.bounds.shared_responses.borrow_mut().get(url)
         } else {
-            (enabled && !self.bounds.shared_responses.borrow().enabled)
+            (enabled && !scoped)
                 .then(|| self.bounds.responses.borrow().get(url).cloned())
                 .flatten()
         }
@@ -3830,10 +3834,10 @@ impl<C: Rest> Rest for Budget<'_, C> {
                         .map(|v| ("If-Modified-Since", v))
                 })
         });
-        let validator = condition.or(validator);
-        let result = self.observe(self.inner.get(url, validator));
+        let sent_validator = condition.or(validator.filter(|_| !scoped || current_scope));
+        let result = self.observe(self.inner.get(url, sent_validator));
         let before = self.bounds.revalidated.get();
-        if validator.is_some() && result.as_ref().is_ok_and(|r| r.status == 304) {
+        if sent_validator.is_some() && result.as_ref().is_ok_and(|r| r.status == 304) {
             self.bounds.refund(&class);
             self.bounds.shared_responses.borrow_mut().modified += 1;
         }
@@ -3841,7 +3845,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
             &class,
             url,
             self.bounds.revalidated.get() != before,
-            validator.is_none()
+            sent_validator.is_none()
                 && !self.bounds.starting.get()
                 && !self.bounds.finishing.get()
                 && self.bounds.stage.get() != Stage::Holds
@@ -4301,6 +4305,10 @@ pub struct Report {
     pub failures: usize,
     /// Each counted GitHub operation failure, including its reason.
     pub failed_operations: Vec<String>,
+    /// The transports' sends during the pass, retries included
+    /// ([`Rest::network_requests`]), separate from the charged requests in
+    /// `spent`; none without a counting transport.
+    pub network_sends: Option<usize>,
     pub state: Option<State>,
     pub holds: Vec<Entry>,
     /// The WIP limit and count and the pass's summary, published with
@@ -4534,16 +4542,13 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     *bounds.publication_summary_cursor.borrow_mut() = state.holds_summary_cursor.clone();
     // No context means no persistent shared cache (including recordings and
     // transports without an authenticated identity). The old poll stays usable.
-    let scope = config
-        .state
-        .as_ref()
-        .and_then(|_| client.cache_context())
-        .map(|context| {
-            format!(
-                "{:x}",
-                Sha256::digest(format!("agent-board/responses/v1\0{context}\0{config:?}"))
-            )
-        });
+    let context = config.state.as_ref().and_then(|_| client.cache_context());
+    let scope = context.as_ref().map(|context| {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("agent-board/responses/v1\0{context}\0{config:?}"))
+        )
+    });
     if let Some(scope) = &scope {
         state.bind_responses(scope);
         if state.interval_seconds == 0 {
@@ -4551,13 +4556,17 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         }
         let mut responses = bounds.shared_responses.borrow_mut();
         responses.enabled = true;
-        responses.context = client.cache_context();
+        responses.context = context;
         responses.entries = state
             .responses
             .iter()
             .filter(|(key, _)| key.ends_with(cache::REPRESENTATION))
             .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect();
+    } else {
+        // Responses bound to a context this transport cannot confirm are
+        // neither reused nor carried on under their old scope.
+        state.unbind_responses();
     }
     let network = || {
         let reads = client.network_requests()?;
@@ -4598,6 +4607,9 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     .await;
     lines.append(&mut report.lines);
     report.lines = lines;
+    report.network_sends = network()
+        .zip(network_before)
+        .map(|(after, before)| after.saturating_sub(before));
     if let Some(scope) = scope {
         let responses = bounds.shared_responses.borrow();
         if report.state.is_none() {
@@ -4614,7 +4626,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         report.lines.push(format!(
             "cache: hits {}, misses {}, 304s {}, network sends {} (including retries), charged requests {}, GraphQL points {}",
             responses.hits, responses.misses, responses.modified,
-            network().zip(network_before).map(|(after, before)| after.saturating_sub(before).to_string()).unwrap_or_else(|| "unavailable".into()),
+            report.network_sends.map(|sends| sends.to_string()).unwrap_or_else(|| "unavailable".into()),
             bounds.limit.get().saturating_sub(bounds.left.get()), bounds.points.get()
         ));
     }

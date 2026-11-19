@@ -33,6 +33,16 @@ pub(crate) fn intact(entry: &Value) -> bool {
             .is_none_or(|digest| seal(entry.clone())["digest"] == *digest)
 }
 
+/// Whether a response may join the index: an intact API representation,
+/// sealed where the state is `signed` (every scoped state is; only an older
+/// unscoped file may hold unsigned entries). The one predicate for decoded
+/// files and for states carried in memory between previews.
+pub(crate) fn admissible(url: &str, entry: &Value, signed: bool) -> bool {
+    url.starts_with(API_ROOT)
+        && intact(entry)
+        && (!signed || entry.get("digest").is_some_and(Value::is_string))
+}
+
 /// Eviction affects responses only, never pending asks, receipts or accounting.
 pub(crate) fn bound(entries: &mut BTreeMap<String, Value>) {
     let before = entries.len();

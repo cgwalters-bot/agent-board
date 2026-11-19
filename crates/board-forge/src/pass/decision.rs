@@ -6,6 +6,7 @@
 //! persistence, publication, background loop or deployment policy lives here.
 
 use super::*;
+use std::sync::OnceLock;
 
 pub const SCHEMA: &str = "agent-board/decision/v1";
 /// Reuse the existing single-comment projection bound, independently of whether
@@ -14,15 +15,51 @@ pub const MAX_PROJECTION_CHARS: usize = holds::MAX_COMMENT_CHARS;
 pub const MAX_POOLS: usize = 16;
 
 /// A conservative read-only adapter. It forwards only GETs, bounded downloads,
-/// broker reads and GraphQL documents without a `mutation` token. Accounting
+/// broker reads and GraphQL documents without a `mutation` token, plus the
+/// two counters the shared response cache binds to: the credential context
+/// (a digest, never the credential) and the transport's send count. Accounting
 /// callbacks are deliberately not forwarded: they are not reads.
 pub struct ReadOnly<'a, C> {
     inner: &'a C,
+    scope: Option<CredentialScope<C>>,
 }
 
 impl<'a, C> ReadOnly<'a, C> {
     pub fn new(inner: &'a C) -> Self {
-        Self { inner }
+        Self { inner, scope: None }
+    }
+
+    fn check_credential(&self) -> Result<()> {
+        if let Some(scope) = &self.scope {
+            scope.observe(self.inner);
+            ensure!(
+                scope.changed.get().is_none(),
+                "preview credential context changed; retry with a stable transport"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One preview must not return decisions or state made under a different
+/// primary credential. Once a change is seen, switching back isn't enough.
+struct CredentialScope<C> {
+    read: fn(&C) -> Option<String>,
+    initial: OnceLock<Option<String>>,
+    changed: OnceLock<()>,
+}
+
+impl<C> CredentialScope<C> {
+    fn observe(&self, client: &C) -> Option<String> {
+        if self.changed.get().is_some() {
+            return None;
+        }
+        let context = (self.read)(client);
+        if self.initial.get_or_init(|| context.clone()) != &context {
+            self.changed.get_or_init(|| ());
+            return None;
+        }
+        context
     }
 }
 
@@ -40,7 +77,19 @@ fn query_only(query: &str) -> Result<()> {
 }
 
 impl<C: Rest> Rest for ReadOnly<'_, C> {
+    fn network_requests(&self) -> Option<usize> {
+        self.inner.network_requests()
+    }
+
+    fn cache_context(&self) -> Option<String> {
+        match &self.scope {
+            Some(scope) => scope.observe(self.inner),
+            None => self.inner.cache_context(),
+        }
+    }
+
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        self.check_credential()?;
         self.inner.get(url, validator)
     }
 
@@ -51,10 +100,12 @@ impl<C: Rest> Rest for ReadOnly<'_, C> {
             method == "GET",
             "read-only decision transport rejects {method}"
         );
+        self.check_credential()?;
         self.inner.send("GET", url, body)
     }
 
     fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        self.check_credential()?;
         self.inner.download(url, limit)
     }
 }
@@ -62,6 +113,7 @@ impl<C: Rest> Rest for ReadOnly<'_, C> {
 impl<C: Transport> Transport for ReadOnly<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         query_only(query)?;
+        self.check_credential()?;
         self.inner.graphql(query, variables)
     }
 }
@@ -69,6 +121,7 @@ impl<C: Transport> Transport for ReadOnly<'_, C> {
 impl<C: crate::github::GraphQl> crate::github::GraphQl for ReadOnly<'_, C> {
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         query_only(query)?;
+        self.check_credential()?;
         self.inner.graphql(query, variables).await
     }
 }
@@ -223,9 +276,40 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     }
 }
 
+/// One read-only preview's decisions and what the next one may reuse.
+pub struct Preview {
+    pub snapshot: Snapshot,
+    /// The pass's state as it would keep it: the disposable response index
+    /// bound to this credential context and configuration, plus the cursors
+    /// the applying pass carries. Passing it to the next preview makes that
+    /// one warm. Losing only its responses costs reads; losing the whole
+    /// state also loses those cursors and retained intake, which can change
+    /// what the next preview scans. With a `state` path, invalid disposable
+    /// responses are discarded, but invalid durable state fails the preview. A
+    /// failed preview returns none: a caller that must carry on past one
+    /// keeps a copy. Persisting it, and keeping
+    /// it as private as the responses it holds, is the caller's job: the
+    /// library writes no file. A transport without a credential context
+    /// binds no responses or quiet waits, so none come back. Without a
+    /// configured `state` path the input comes back unchanged, but its cached
+    /// responses, quiet waits and carried holds are not used. Change
+    /// watermarks loaded from the caller's store are returned unchanged;
+    /// previewing does not advance that store's discovery state.
+    pub state: State,
+    /// What the pass spent: charged requests, refunded 304s and GraphQL points.
+    pub spent: Spent,
+    /// The transports' sends, retries included, which a warm preview saves
+    /// separately from charged requests; none where the transport does not
+    /// count ([`Rest::network_requests`]).
+    pub network_sends: Option<usize>,
+}
+
 /// Explicit opt-in library invocation; no CLI option, local state write or
 /// persistent service is enabled. Config, state, transports and clock belong to
 /// the caller. Existing pass request/time bounds and caps still apply.
+/// A stateful preview fails if it observes a change in the primary transport's
+/// cache context. That transport must bind each context check to the credential
+/// used for the REST or GraphQL request, including retries.
 pub async fn preview<C: Rest + Transport + crate::github::GraphQl + Broker>(
     client: &C,
     dispatcher: &C,
@@ -233,19 +317,104 @@ pub async fn preview<C: Rest + Transport + crate::github::GraphQl + Broker>(
     state: State,
     limits: Limits,
     now: OffsetDateTime,
-) -> Result<Snapshot> {
-    let client = ReadOnly::new(client);
+) -> Result<Preview> {
+    let mut guarded = ReadOnly::new(client);
+    if config.state.is_some() {
+        guarded.scope = Some(CredentialScope {
+            read: C::cache_context,
+            initial: OnceLock::new(),
+            changed: OnceLock::new(),
+        });
+    }
+    // One transport stays one, so the pass counts its sends once.
+    let same = std::ptr::eq(client, dispatcher);
     let dispatcher = ReadOnly::new(dispatcher);
+    // With a `state` path the pass always returns a state; without one it
+    // keeps none, so the input goes back as it came.
+    let (state, unchanged) = match config.state {
+        Some(_) => (carried(state)?, None),
+        None => {
+            let mut input = state.clone();
+            discard_cached_evidence(&mut input);
+            (input, Some(state))
+        }
+    };
+    let changes = state.changes.clone();
     let report = super::run(
-        &client,
-        &dispatcher,
+        &guarded,
+        if same { &guarded } else { &dispatcher },
         config,
         state,
         (Mode::Preview, limits),
         now,
     )
-    .await?;
-    from_report(report, now)
+    .await;
+    // The pass reports many read failures as observations. An identity change
+    // is not a partial observation: discard the entire result and its state.
+    guarded.check_credential()?;
+    let mut report = report?;
+    let state = match unchanged {
+        Some(state) => state,
+        None => {
+            let mut state = report.state.take().context("preview returned no state")?;
+            // The changes stage consumes its input, reporting new watermarks
+            // separately for the store. Keep the caller's discovery state.
+            state.changes = changes;
+            // Unbound responses, quiet waits and carried holds are not safe
+            // to reuse in another preview.
+            if state.response_scope.is_none() {
+                discard_cached_evidence(&mut state);
+            } else {
+                for entry in state.pass_responses.values_mut() {
+                    *entry = cache::seal(std::mem::take(entry));
+                }
+            }
+            state
+        }
+    };
+    let spent = std::mem::take(&mut report.spent);
+    let network_sends = report.network_sends;
+    Ok(Preview {
+        snapshot: from_report(report, now)?,
+        state,
+        spent,
+        network_sends,
+    })
+}
+
+/// Without a verified scope, keep durable state but never reuse evidence from
+/// an earlier preview or poll. A 304 cannot confirm the credential scope.
+fn discard_cached_evidence(state: &mut State) {
+    state.response_scope = None;
+    state.responses.clear();
+    state.pass_responses.clear();
+    state.quiet_waits.clear();
+    state.carried_holds.clear();
+}
+
+/// Drop invalid disposable pass entries before the legacy decoder, which
+/// still enforces the cache bounds and validates durable state.
+fn carried(mut state: State) -> Result<State> {
+    if state.interval_seconds == 0 {
+        state.interval_seconds = crate::poll::MIN_INTERVAL_SECONDS;
+    }
+    // A REST 304 cannot attest to GraphQL's editor identity, which the
+    // legacy pass response map can carry without an integrity check.
+    state.pass_responses.retain(|url, entry| {
+        let keep = cache::admissible(url, entry, true);
+        if !keep {
+            eprintln!("cache: invalid disposable pass response discarded; cold read");
+        }
+        keep
+    });
+    // Read from the caller's store, never from the file.
+    let changes = state.changes.take();
+    let mut checked = State::from_json(&state.to_json()).context("carried preview state")?;
+    checked.changes = changes;
+    if checked.response_scope.is_none() {
+        discard_cached_evidence(&mut checked);
+    }
+    Ok(checked)
 }
 
 pub(super) fn from_report(report: Report, now: OffsetDateTime) -> Result<Snapshot> {
@@ -374,15 +543,39 @@ pub(super) fn from_report(report: Report, now: OffsetDateTime) -> Result<Snapsho
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{block, config, replay};
+    use super::super::tests::{
+        ConditionalRecording, block, config, followed, replay, rest_comment_pages,
+    };
     use super::*;
 
     struct Spy {
         replay: Replay,
         effects: Cell<usize>,
+        /// Identity 0 lets the recording wrapper supply its default context.
+        identity: Cell<u64>,
+        rotate_to: Cell<Option<u64>>,
+    }
+
+    impl Spy {
+        fn new(replay: Replay) -> Self {
+            Self {
+                replay,
+                effects: Cell::new(0),
+                identity: Cell::new(0),
+                rotate_to: Cell::new(None),
+            }
+        }
     }
 
     impl Rest for Spy {
+        fn cache_context(&self) -> Option<String> {
+            let identity = self.identity.get();
+            if let Some(next) = self.rotate_to.take() {
+                self.identity.set(next);
+            }
+            (identity != 0).then(|| identity.to_string())
+        }
+
         fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
             self.replay.get(url, validator)
         }
@@ -432,10 +625,7 @@ mod tests {
 
     #[test]
     fn rejection_precedes_transport_for_every_effect_path() {
-        let spy = Spy {
-            replay: replay(),
-            effects: Cell::new(0),
-        };
+        let spy = Spy::new(replay());
         let client = ReadOnly::new(&spy);
         for (method, path) in [
             ("POST", "issues/1/comments"),
@@ -511,10 +701,7 @@ mod tests {
                 recording.now,
             ))
             .unwrap();
-            let spy = Spy {
-                replay: recording,
-                effects: Cell::new(0),
-            };
+            let spy = Spy::new(recording);
             let client = ReadOnly::new(&spy);
             let guarded = block(run(
                 &client,
@@ -528,7 +715,7 @@ mod tests {
             assert_eq!(plain.lines, guarded.lines, "{scenario}");
             assert_eq!(plain.summary_line(), guarded.summary_line(), "{scenario}");
             let expected = from_report(plain, spy.replay.now).unwrap();
-            let snapshot = block(preview(
+            let previewed = block(preview(
                 &spy,
                 &spy,
                 &config,
@@ -537,7 +724,11 @@ mod tests {
                 spy.replay.now,
             ))
             .unwrap();
+            let snapshot = previewed.snapshot;
             assert_eq!(snapshot, expected, "{scenario}");
+            // Without a `state` path no responses are carried.
+            assert!(previewed.state.responses.is_empty(), "{scenario}");
+            assert_eq!(previewed.state.response_scope, None, "{scenario}");
             assert_eq!(
                 serde_json::to_string(&snapshot).unwrap(),
                 serde_json::to_string(
@@ -550,6 +741,7 @@ mod tests {
                         spy.replay.now
                     ))
                     .unwrap()
+                    .snapshot
                 )
                 .unwrap()
             );
@@ -670,10 +862,7 @@ mod tests {
                 json!({"usage":{"repository":"cgwalters-forge/bot-ops", "issue":1,
                 "url":"https://broker.invalid/usage"}}),
             );
-            let spy = Spy {
-                replay: recording,
-                effects: Cell::new(0),
-            };
+            let spy = Spy::new(recording);
             let snapshot = block(preview(
                 &spy,
                 &spy,
@@ -682,7 +871,8 @@ mod tests {
                 Limits::default(),
                 spy.replay.now,
             ))
-            .unwrap();
+            .unwrap()
+            .snapshot;
             let computed = OffsetDateTime::parse(
                 snapshot.provenance.usage_computed_at.as_deref().unwrap(),
                 &Rfc3339,
@@ -734,5 +924,416 @@ mod tests {
         assert_eq!(snapshot.pools.len(), MAX_POOLS);
         assert_eq!(snapshot.pools_omitted, 3);
         assert!(!snapshot.complete);
+    }
+
+    /// A consumer carries the returned state from one preview to the next.
+    /// The warm one decides the same at the same clock with fewer sends and
+    /// charged requests; a lost, corrupt or rescoped index only costs reads.
+    #[test]
+    fn carried_preview_state_is_warm_only_within_its_scope() {
+        let mut recording = replay();
+        rest_comment_pages(&mut recording);
+        let forge = ConditionalRecording {
+            replay: Spy::new(recording),
+            reads: RefCell::default(),
+            traffic: RefCell::default(),
+            contextless: Cell::default(),
+        };
+        // The same decisions and reads under another configuration.
+        let [config, other_config] =
+            [".state/poll.json", ".state/other.json"].map(|path| config(json!({"state": path})));
+        let now = forge.replay.replay.now;
+        let run = |config: &Config, state: State| {
+            let before: usize = forge.reads.borrow().values().sum();
+            let previewed = block(preview(
+                &forge,
+                &forge,
+                config,
+                state,
+                Limits::default(),
+                now,
+            ))
+            .unwrap();
+            let sends: usize = forge.reads.borrow().values().sum();
+            assert_eq!(previewed.snapshot.failures, 0);
+            // One transport behind both roles is counted once.
+            assert_eq!(previewed.network_sends, Some(sends - before));
+            (previewed, sends - before)
+        };
+        let sealed = |state: &State| {
+            state
+                .responses
+                .iter()
+                .all(|(url, entry)| cache::admissible(url, entry, true))
+        };
+        let (cold, cold_sends) = run(&config, State::default());
+        assert!(!cold.state.responses.is_empty());
+        assert!(!cold.state.pass_responses.is_empty());
+        assert!(sealed(&cold.state));
+        // The returned state is what a caller persists, and it decodes whole.
+        assert_eq!(State::from_json(&cold.state.to_json()).unwrap(), cold.state);
+        let (warm, warm_sends) = run(&config, cold.state.clone());
+        assert_eq!(warm.snapshot, cold.snapshot);
+        assert_eq!(warm.state.response_scope, cold.state.response_scope);
+        assert!(warm_sends < cold_sends, "{warm_sends} < {cold_sends}");
+        assert!(warm.spent.requests < cold.spent.requests);
+        assert!(warm.spent.revalidated > cold.spent.revalidated);
+        let mut lost = cold.state.clone();
+        lost.responses.clear();
+        let mut corrupt = cold.state.clone();
+        for entry in corrupt.responses.values_mut() {
+            entry["body"] = json!("tampered after sealing");
+        }
+        let mut unsigned = cold.state.clone();
+        for entry in unsigned.responses.values_mut() {
+            entry.as_object_mut().unwrap().remove("digest");
+        }
+        for (case, config, state, identity) in [
+            ("lost", &config, lost, 0),
+            ("corrupt", &config, corrupt, 0),
+            ("unsigned", &config, unsigned, 0),
+            ("other configuration", &other_config, cold.state.clone(), 0),
+            ("other credential", &config, cold.state.clone(), 1),
+        ] {
+            forge.replay.identity.set(identity);
+            let (again, sends) = run(config, state);
+            assert_eq!(again.snapshot, cold.snapshot, "{case}");
+            assert_eq!(sends, cold_sends, "{case}");
+            assert_eq!(again.spent.requests, cold.spent.requests, "{case}");
+            assert!(sealed(&again.state), "{case}");
+            assert_eq!(
+                again.state.response_scope == cold.state.response_scope,
+                !case.starts_with("other"),
+                "{case}"
+            );
+        }
+        forge.replay.identity.set(0);
+        // Scoped, then contextless, then scoped again: a transport that names
+        // no context reads as cold as one given no state, even though it
+        // answers validators, and hands back nothing to reuse under any scope.
+        forge.contextless.set(true);
+        let (baseline, contextless_sends) = run(&config, State::default());
+        let (contextless, sends) = run(&config, cold.state.clone());
+        assert_eq!(contextless.snapshot, cold.snapshot);
+        assert_eq!(sends, contextless_sends);
+        assert_eq!(contextless.spent.requests, baseline.spent.requests);
+        assert_eq!(contextless.spent.revalidated, baseline.spent.revalidated);
+        assert!(contextless.state.responses.is_empty());
+        assert!(contextless.state.pass_responses.is_empty());
+        assert_eq!(contextless.state.response_scope, None);
+        forge.contextless.set(false);
+        let (rescoped, sends) = run(&config, contextless.state);
+        assert_eq!(rescoped.snapshot, cold.snapshot);
+        assert_eq!(sends, cold_sends);
+        assert_eq!(rescoped.spent.requests, cold.spent.requests);
+        assert_eq!(rescoped.state.response_scope, cold.state.response_scope);
+        // The poll's own unsuffixed responses are checked as a file's are.
+        let mut tampered = cold.state.clone();
+        for (url, entry) in &cold.state.responses {
+            if let Some(url) = url.strip_suffix(cache::REPRESENTATION) {
+                let mut entry = entry.clone();
+                entry["body"] = json!("tampered after sealing");
+                tampered.responses.insert(url.to_owned(), entry);
+            }
+        }
+        assert!(tampered.responses.len() > cold.state.responses.len());
+        assert_eq!(carried(tampered).unwrap().responses, cold.state.responses);
+        // Without a `state` path the input comes back as it went in, even
+        // where the pass follows work and would carry poll state.
+        let follow = super::super::tests::config(json!({"follow": ["cgwalters-forge/tracker"],
+            "pr": {"fixPools": ["claude"]}}));
+        assert!(follow.state.is_none());
+        let unchanged = block(preview(
+            &forge,
+            &forge,
+            &follow,
+            warm.state.clone(),
+            Limits::default(),
+            now,
+        ))
+        .unwrap();
+        assert_eq!(unchanged.state, warm.state);
+        assert_eq!(forge.replay.effects.get(), 0);
+        assert!(
+            forge
+                .traffic
+                .borrow()
+                .iter()
+                .all(|(request, _)| request.starts_with("GET ") || request.starts_with("LIVE "))
+        );
+    }
+
+    #[test]
+    fn no_state_preview_ignores_unscoped_poll_responses() {
+        const REPO: &str = "cgwalters-forge/agentic-job";
+        let mut recording = replay();
+        followed(&mut recording, (REPO, 9), json!({}), json!([]));
+        let now = recording.now;
+        let forge = ConditionalRecording {
+            replay: Spy::new(recording),
+            reads: RefCell::default(),
+            traffic: RefCell::default(),
+            contextless: Cell::default(),
+        };
+        let config = config(json!({"wip":0, "follow":[REPO], "pr":{"fixPools":["claude"]}}));
+        assert!(config.state.is_none());
+        let url = format!("{API_ROOT}repos/{REPO}/pulls?state=open&per_page=100");
+        let etag = forge.get(&url, None).unwrap().etag.unwrap();
+        // The earlier credential saw no open PRs. The new one sees PR 9,
+        // but the transport will answer the old validator with 304.
+        let legacy = State::from_json(&json!({
+            "schema": crate::poll::POLL_STATE_SCHEMA,
+            "interval_seconds": crate::poll::MIN_INTERVAL_SECONDS,
+            "responses": {(&url): {"etag": etag, "body": []}},
+        }))
+        .unwrap();
+        assert_eq!(legacy.response_scope, None);
+        assert!(legacy.responses.contains_key(&url));
+        forge.replay.identity.set(1);
+        assert_eq!(
+            forge
+                .get(&url, Some(("If-None-Match", &etag)))
+                .unwrap()
+                .status,
+            304
+        );
+        let run = |state| {
+            block(preview(
+                &forge,
+                &forge,
+                &config,
+                state,
+                Limits::default(),
+                now,
+            ))
+            .unwrap()
+        };
+        let cold = run(State::default());
+        forge.traffic.borrow_mut().clear();
+        let previewed = run(legacy.clone());
+        let traffic = forge.traffic.borrow();
+        let request = format!("GET {url}");
+        assert_eq!(
+            traffic
+                .iter()
+                .filter(|(key, _)| key == &request)
+                .map(|(_, conditional)| *conditional)
+                .collect::<Vec<_>>(),
+            [false],
+        );
+        assert_eq!(previewed.snapshot, cold.snapshot);
+        assert_eq!(previewed.state, legacy);
+    }
+
+    #[test]
+    fn carried_comment_editor_is_not_reused_after_a_rest_304() {
+        let mut recording = replay();
+        rest_comment_pages(&mut recording);
+        let now = recording.now;
+        let forge = ConditionalRecording {
+            replay: recording,
+            reads: RefCell::default(),
+            traffic: RefCell::default(),
+            contextless: Cell::default(),
+        };
+        let config = config(json!({"state": ".state/poll.json"}));
+        let preview = |state| {
+            block(preview(
+                &forge,
+                &forge,
+                &config,
+                state,
+                Limits::default(),
+                now,
+            ))
+            .unwrap()
+        };
+        let cold = preview(State::default());
+        let mut carried = cold.state.clone();
+        // Keep the separate, sealed REST entry untouched.
+        let (url, entry) = carried
+            .pass_responses
+            .iter_mut()
+            .find(|(_, entry)| {
+                entry["comment_evidence"]
+                    .pointer("/repository/issue/comments/nodes/0")
+                    .is_some()
+            })
+            .unwrap();
+        let baseline_entry = entry.clone();
+        let rest = format!("GET {url}");
+        assert!(cache::admissible(
+            url,
+            &carried.responses[&format!("{url}{}", cache::REPRESENTATION)],
+            true
+        ));
+        let comments = format!("GraphQL {}", plan::COMMENTS_QUERY);
+        let url = url.clone();
+        let reads = |state| {
+            forge.reads.borrow_mut().clear();
+            forge.traffic.borrow_mut().clear();
+            let warm = preview(state);
+            assert!(forge.traffic.borrow().contains(&(rest.clone(), true)));
+            assert_eq!(warm.snapshot, cold.snapshot);
+            forge.reads.borrow().get(&comments).copied().unwrap_or(0)
+        };
+        let warm_reads = reads(cold.state.clone());
+        let mut tampered = baseline_entry.clone();
+        tampered["comment_evidence"]["repository"]["issue"]["comments"]["nodes"][0]["editor"] =
+            json!({"login": "tampered-editor"});
+        let without = |field| {
+            let mut entry = baseline_entry.clone();
+            entry.as_object_mut().unwrap().remove(field);
+            entry
+        };
+        for (case, entry) in [
+            ("tampered editor", tampered),
+            ("missing digest", without("digest")),
+            ("missing body", without("body")),
+        ] {
+            carried.pass_responses.insert(url.clone(), entry);
+            assert_eq!(reads(carried.clone()), warm_reads + 1, "{case}");
+        }
+        carried.interval_seconds = -1;
+        let error = super::carried(carried).unwrap_err();
+        assert!(format!("{error:#}").contains("interval_seconds is missing or out of bounds"));
+    }
+
+    #[test]
+    fn preview_keeps_the_callers_pending_checks() {
+        use crate::changes::{diff, format_time};
+
+        const REPO: &str = "cgwalters-forge/agentic-job";
+        let now = replay().now;
+        let since = format_time(now - diff::FIRST_WINDOW).unwrap();
+        let listing = format!(
+            "{API_ROOT}repos/{REPO}/issues?state=all&sort=updated&direction=asc&since={since}&per_page=100"
+        );
+        let query = diff::detail_query(&[9]);
+        let request = graphql_key(
+            &query,
+            &json!({"owner":"cgwalters-forge", "name":"agentic-job", "since":since}),
+        );
+        let changes = diff::State {
+            pending: [format!("{REPO}#9")].into(),
+            ..diff::State::default()
+        };
+        let mut state = State {
+            changes: Some(changes.clone()),
+            ..State::default()
+        };
+        let config = config(
+            json!({"state":".state/poll.json", "store":".state/changes.db",
+            "changeSweepHours":6, "wip":0, "follow":[REPO],
+            "pr":{"noMerge":[REPO], "fixPools":["claude"]}}),
+        );
+        for body in [json!([{"number":9}]), json!([])] {
+            let mut recording = replay();
+            followed(&mut recording, (REPO, 9), json!({}), json!([]));
+            recording.requests.extend([
+                json!({"request":{"get":listing}, "answer":{"status":200, "body":body}}),
+                json!({"request":request, "answer":{"data":{"repository":{"i0":{
+                    "__typename":"PullRequest", "number":9, "title":"Pending checks",
+                    "url":format!("https://github.com/{REPO}/pull/9"), "state":"OPEN",
+                    "createdAt":since, "updatedAt":since, "merged":false,
+                    "timelineItems":{"nodes":[], "pageInfo":{"hasNextPage":false}},
+                    "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING"}}}]}
+                }}}}}),
+            ]);
+            let forge = ConditionalRecording {
+                replay: recording,
+                reads: RefCell::default(),
+                traffic: RefCell::default(),
+                contextless: Cell::default(),
+            };
+            let previewed = block(preview(
+                &forge,
+                &forge,
+                &config,
+                state,
+                Limits::default(),
+                now,
+            ))
+            .unwrap();
+            assert_eq!(
+                forge.reads.borrow().get(&format!("GraphQL {query}")),
+                Some(&1)
+            );
+            state = previewed.state;
+            assert_eq!(state.changes, Some(changes.clone()));
+        }
+    }
+
+    #[test]
+    fn quiet_pull_requests_require_a_stable_preview_scope() {
+        const REPO: &str = "cgwalters-forge/agentic-job";
+        let mut recording = replay();
+        let now = recording.now;
+        let updated = now.format(&Rfc3339).unwrap();
+        followed(
+            &mut recording,
+            (REPO, 9),
+            json!({"isDraft":true, "updatedAt":updated}),
+            json!([]),
+        );
+        let listing = format!("{API_ROOT}repos/{REPO}/pulls?state=open&per_page=100");
+        let listed = recording
+            .requests
+            .iter_mut()
+            .find(|r| r["request"]["get"] == listing)
+            .unwrap();
+        listed["answer"]["body"][0]["head"] = json!({"sha":"abc"});
+        listed["answer"]["body"][0]["updated_at"] = json!(updated);
+        let forge = ConditionalRecording {
+            replay: Spy::new(recording),
+            reads: RefCell::default(),
+            traffic: RefCell::default(),
+            contextless: Cell::default(),
+        };
+        let config = config(json!({"state":".state/poll.json", "wip":0, "follow":[REPO],
+            "pr":{"fixPools":["claude"], "noMerge":[REPO], "quietWaits":true}}));
+        let reads = format!("GraphQL {}", poll::PULL_QUERY);
+        let preview = |state| {
+            block(preview(
+                &forge,
+                &forge,
+                &config,
+                state,
+                Limits::default(),
+                now,
+            ))
+        };
+        // Confirm this unchanged listing can replay the wait when scoped.
+        let scoped = preview(State::default()).unwrap();
+        assert!(scoped.state.quiet_waits.contains_key(&format!("{REPO}#9")));
+        let warm = preview(scoped.state.clone()).unwrap();
+        assert_eq!(forge.reads.borrow()[&reads], 1);
+
+        // Rotate to B after capturing A's namespace. Don't send validators or
+        // return a snapshot or state for this mixed-credential preview.
+        forge.traffic.borrow_mut().clear();
+        forge.replay.rotate_to.set(Some(1));
+        let Err(error) = preview(scoped.state.clone()) else {
+            panic!("rotated preview returned decisions or state");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("preview credential context changed")
+        );
+        assert_eq!(forge.replay.identity.get(), 1);
+        assert!(forge.traffic.borrow().is_empty());
+        forge.replay.identity.set(0);
+        let retried = preview(scoped.state).unwrap();
+        assert_eq!(retried.snapshot, warm.snapshot);
+        assert_eq!(forge.reads.borrow()[&reads], 1);
+
+        forge.contextless.set(true);
+        let first = preview(State::default()).unwrap();
+        assert_eq!(forge.reads.borrow()[&reads], 2);
+        let second = preview(first.state).unwrap();
+        assert_eq!(forge.reads.borrow()[&reads], 3);
+        assert!(second.state.quiet_waits.is_empty());
+        assert_eq!(first.snapshot, second.snapshot);
     }
 }

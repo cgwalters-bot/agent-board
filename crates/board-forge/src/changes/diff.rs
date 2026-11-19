@@ -625,7 +625,7 @@ fn list(client: &impl Rest, url: &str, validator: Option<(&str, &str)>) -> Resul
 }
 
 /// One request's query: each of `numbers` under its own alias.
-fn detail_query(numbers: &[u64]) -> String {
+pub(crate) fn detail_query(numbers: &[u64]) -> String {
     let mut query = String::from(
         "query($owner:String!,$name:String!,$since:DateTime!){repository(owner:$owner,name:$name){",
     );

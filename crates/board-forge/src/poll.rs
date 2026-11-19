@@ -1703,7 +1703,10 @@ pub trait Rest {
     }
 
     /// Opaque binding to the API host, representation and credential context.
-    /// Implementations must never return the credential itself.
+    /// Implementations must never return the credential itself. A transport
+    /// that opts into scoped caching must bind the live context check to the
+    /// credential actually used by the ensuing GET (including retries). If it
+    /// cannot prevent rotation between that check and the request, return None.
     fn cache_context(&self) -> Option<String> {
         None
     }
@@ -2007,6 +2010,18 @@ impl State {
         }
     }
 
+    /// Discard scoped responses where no credential context can confirm the
+    /// scope: a 304 is not an identity check. Other state survives, as above.
+    pub fn unbind_responses(&mut self) {
+        if self.response_scope.take().is_some() {
+            eprintln!("cache: no credential context to confirm the response scope; cold reads");
+            self.responses.clear();
+            self.pass_responses.clear();
+            self.quiet_waits.clear();
+            self.carried_holds.clear();
+        }
+    }
+
     pub fn from_json(value: &Value) -> Result<Self> {
         let object = value.as_object().context("poll state is not an object")?;
         ensure!(
@@ -2057,17 +2072,14 @@ impl State {
             .and_then(Value::as_i64)
             .filter(|s| (MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(s))
             .context("poll state interval_seconds is missing or out of bounds")?;
+        let signed = object.get("response_scope").is_some_and(Value::is_string);
         let mut responses = object
             .get("responses")
             .and_then(Value::as_object)
             .into_iter()
             .flat_map(|responses| responses.iter())
             .filter_map(|(url, entry)| {
-                if !url.starts_with(API_ROOT)
-                    || !crate::pass::cache::intact(entry)
-                    || (object.get("response_scope").is_some_and(Value::is_string)
-                        && !entry.get("digest").is_some_and(Value::is_string))
-                {
+                if !crate::pass::cache::admissible(url, entry, signed) {
                     eprintln!("cache: invalid disposable response discarded; cold read");
                     return None;
                 }
