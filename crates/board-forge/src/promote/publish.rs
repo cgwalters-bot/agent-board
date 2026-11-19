@@ -1,8 +1,15 @@
 //! Publication never moves the approved ref or closes a fork PR. The fork PR's
 //! one bot status comment is the receipt a retry reads first: a confirmed
-//! publication is skipped or text-updated without rebuilding its head, a
-//! partial one resumes from the branch it already pushed, and a candidate
-//! that holds never stops the candidates after it.
+//! publication is skipped or text-updated without rebuilding its head, and a
+//! partial one resumes from the branch it already pushed. Validation computes
+//! the PR's own commits once ([`rewrite::Commits`]); replay, the receipts and
+//! every confirmation use the suffix that remains after the upstream comparison.
+//! A receipt records those commits and the
+//! upstream commit they were validated or replayed on, and a publication is
+//! resumed, confirmed or skipped only while it records exactly the approved
+//! commits and upstream still contains that commit; an older receipt without
+//! that record only for a direct publication the current comparison proves.
+//! A candidate that holds never stops the candidates after it.
 use super::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,9 +30,31 @@ struct Promoting {
     approved_oid: String,
     published_oid: String,
     published_branch: String,
+    /// Absent on older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut: Option<rewrite::Cut>,
     /// Preserve the existing PR and exact old branch head across partial repairs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous: Option<handoff::Record>,
+}
+
+/// The upstream commit a recorded publication sits on, once its record shows
+/// it carries exactly the approved commits and upstream still contains it.
+/// Returns the upstream tip that contains it.
+fn recorded_onto(
+    client: &impl Rest,
+    target: &pass::promote::Fork,
+    cut: Option<&rewrite::Cut>,
+    commits: &rewrite::Commits,
+) -> Result<(String, String)> {
+    let cut = cut.filter(|cut| commits.recorded(cut) && oid(&cut.onto));
+    hold!(
+        cut.is_some(),
+        "publication does not record the approved commits; inspect and migrate it manually"
+    );
+    let onto = cut.context("missing publication cut")?.onto.clone();
+    let tip = tip_containing(client, target, &onto)?;
+    Ok((onto, tip))
 }
 
 /// What the candidate's receipt records, once the bot is known to have
@@ -50,20 +79,44 @@ enum Step {
 struct Publication {
     published: String,
     branch: String,
-    /// The upstream base the head was rebuilt on this invocation; push the
-    /// branch before publishing. None resumes a branch already pushed.
+    /// The upstream tip that must still be current at the write boundary.
     base: Option<String>,
+    /// The upstream commit on which the PR's commits were validated or
+    /// replayed. Upstream must still contain it when the PR write returns,
+    /// or the publication stays unconfirmed.
+    onto: String,
+    rewrite: Option<Rewritten>,
     existing: Option<Value>,
     previous: Option<handoff::Record>,
+}
+
+struct Rewritten {
+    push: bool,
+}
+
+/// The PR's own commits, computed once by the first validation, and the
+/// upstream facts of the latest one.
+struct Range {
+    commits: rewrite::Commits,
+    behind: u64,
+    /// Publishing the approved head itself would carry exactly `commits`.
+    direct: bool,
+    /// The upstream tip compared.
+    base: String,
 }
 
 struct Prepared {
     fresh: Value,
     /// The head the operator approved; approval and the receipt name it.
     head: String,
+    /// When `head` was first pushed: the fork base must not move after it.
+    introduced: OffsetDateTime,
+    /// What the receipts record of the publication.
+    cut: rewrite::Cut,
     /// `fresh` with the published head and branch.
     publication: Value,
     what: Publication,
+    confirmed: bool,
     /// The status comment to edit to pending first, else one is created.
     receipt: Option<u64>,
 }
@@ -199,7 +252,7 @@ fn prepare<C: Rest + Transport>(
     git: &mut impl rewrite::Rewrite,
 ) -> Result<Step> {
     let number = pull["number"].as_u64().context("invalid pull number")?;
-    let command = validate(client, config, repo, target, pull, now)?;
+    let (command, first) = validate(client, config, repo, target, pull, now, None)?;
     // No mutation until the *entire* evidence chain has been read again,
     // including uncached policy and PR-specific provenance.
     let fresh = get(client, &format!("repos/{repo}/pulls/{number}"))?;
@@ -220,10 +273,20 @@ fn prepare<C: Rest + Transport>(
             "fork PR {key} changed before publication; retry with fresh evidence"
         );
     }
-    let current = validate(client, config, repo, target, &fresh, now)?;
+    // Do not reread the fork range. Check the unchanged fork base and head,
+    // then select the suffix against the fresh upstream comparison.
+    let (current, range) = validate(
+        client,
+        config,
+        repo,
+        target,
+        &fresh,
+        now,
+        Some(first.commits),
+    )?;
     ensure!(
         current == command,
-        "operator command changed before publication"
+        "operator authorization changed before publication"
     );
     let body = authorized_promotion_body(client, config, repo, &fresh, &target.upstream, &command)?;
     let head = command.head;
@@ -272,16 +335,21 @@ fn prepare<C: Rest + Transport>(
     let mut confirmed = false;
     let what = match recorded {
         Receipt::Confirmed(record) if record.approved_oid == head => {
-            ensure!(
-                record.schema == handoff::SCHEMA
-                    && record.fork_repository == repo
-                    && record.fork_pr == number
-                    && record.upstream_repository == target.upstream
-                    && record.upstream_pr > 0
-                    && oid(&record.published_oid),
-                "publication receipt names another publication"
-            );
+            handoff::verify_record(repo, target, &fresh, &record)?;
             branch_of(&record.published_branch)?;
+            // The same head may carry other commits under another fork base,
+            // and an upstream rewind adds old upstream commits to a published
+            // range. An older receipt records neither; only a direct
+            // publication that the current comparison proves is reused.
+            let onto = if record.cut.is_some() {
+                recorded_onto(client, target, record.cut.as_ref(), &range.commits)?.0
+            } else {
+                hold!(
+                    range.direct && record.published_oid == head,
+                    "confirmed publication does not record the approved commits; inspect and migrate it manually"
+                );
+                range.base.clone()
+            };
             let existing =
                 upstream_pulls(client, &target.upstream, owner, &record.published_branch)?;
             ensure!(existing.len() <= 1, "multiple upstream pull requests");
@@ -294,6 +362,8 @@ fn prepare<C: Rest + Transport>(
                 published: record.published_oid,
                 branch: record.published_branch,
                 base: None,
+                onto,
+                rewrite: None,
                 existing: Some(pr),
                 previous: None,
             }
@@ -305,6 +375,7 @@ fn prepare<C: Rest + Transport>(
                 (repo, target),
                 &fresh,
                 &head,
+                &range,
                 &record,
                 None,
                 max_writes,
@@ -319,6 +390,10 @@ fn prepare<C: Rest + Transport>(
                 record.approved_oid == head,
                 "unfinished repair publication needs its approved head restored"
             );
+            hold!(
+                record.published_branch != original_branch || range.direct,
+                "pending direct repair carries fork-only commits; manual migration required"
+            );
             let previous = record
                 .previous
                 .as_ref()
@@ -329,6 +404,7 @@ fn prepare<C: Rest + Transport>(
                 (repo, target),
                 &fresh,
                 &head,
+                &range,
                 previous,
                 Some(&record),
                 max_writes,
@@ -344,45 +420,119 @@ fn prepare<C: Rest + Transport>(
                 "publication receipt names an invalid head"
             );
             branch_of(&record.published_branch)?;
-            match ref_head(client, head_repo, &record.published_branch)? {
-                Some(sha) if sha == record.published_oid => {
-                    // Pushed; the upstream PR may or may not have followed. One
-                    // opened from the original branch meanwhile holds, as for
-                    // a rebuild: never a second upstream PR for one head.
-                    ensure!(
-                        record.published_branch == original_branch
-                            || upstream_pulls(client, &target.upstream, owner, original_branch)?
-                                .is_empty(),
-                        "existing upstream PR needs manual migration before rewriting"
-                    );
+            let resume = if record.published_branch == original_branch {
+                // An old pending direct receipt is not authority to create a PR.
+                // Recover only one that is already there, and only if the head
+                // carries exactly the PR's commits, as any record says.
+                if range.direct
+                    && record.published_oid == head
+                    && record
+                        .cut
+                        .as_ref()
+                        .is_none_or(|cut| range.commits.recorded(cut))
+                {
                     let existing =
-                        upstream_pulls(client, &target.upstream, owner, &record.published_branch)?;
+                        upstream_pulls(client, &target.upstream, owner, original_branch)?;
                     ensure!(existing.len() <= 1, "multiple upstream pull requests");
-                    Publication {
-                        published: record.published_oid,
-                        branch: record.published_branch,
-                        base: None,
-                        existing: existing.into_iter().next(),
-                        previous: None,
-                    }
+                    existing
+                        .into_iter()
+                        .next()
+                        .map(|pr| {
+                            ensure!(
+                                pr["user"]["login"]
+                                    .as_str()
+                                    .is_some_and(|login| login.eq_ignore_ascii_case(&config.bot)),
+                                "existing direct publication is not bot-authored"
+                            );
+                            Ok(Publication {
+                                published: head.clone(),
+                                branch: original_branch.into(),
+                                base: None,
+                                // The comparison that proved no fork-only
+                                // commits; an upstream rewind can undo that.
+                                onto: range.base.clone(),
+                                rewrite: None,
+                                existing: Some(pr),
+                                previous: None,
+                            })
+                        })
+                        .transpose()?
+                } else {
+                    None
                 }
-                Some(_) => anyhow::bail!(
-                    "publication branch {} exists at another head; delete it to publish again",
-                    record.published_branch
-                ),
-                // Nothing was pushed: publish again, under a new receipt.
+            } else {
+                match ref_head(client, head_repo, &record.published_branch)? {
+                    Some(sha) if sha == record.published_oid => {
+                        let (onto, tip) =
+                            recorded_onto(client, target, record.cut.as_ref(), &range.commits)?;
+                        // Pushed; the upstream PR may or may not have followed. One
+                        // opened from the original branch meanwhile holds, as for
+                        // a rebuild: never a second upstream PR for one head.
+                        ensure!(
+                            upstream_pulls(client, &target.upstream, owner, original_branch)?
+                                .is_empty(),
+                            "existing upstream PR needs manual migration before rewriting"
+                        );
+                        let existing = upstream_pulls(
+                            client,
+                            &target.upstream,
+                            owner,
+                            &record.published_branch,
+                        )?;
+                        ensure!(existing.len() <= 1, "multiple upstream pull requests");
+                        Some(Publication {
+                            published: record.published_oid,
+                            branch: record.published_branch,
+                            base: Some(tip),
+                            onto,
+                            rewrite: Some(Rewritten { push: false }),
+                            existing: existing.into_iter().next(),
+                            previous: None,
+                        })
+                    }
+                    Some(_) => anyhow::bail!(
+                        "publication branch {} exists at another head; delete it to publish again",
+                        record.published_branch
+                    ),
+                    // Nothing was pushed: publish again, under a new receipt.
+                    None => None,
+                }
+            };
+            match resume {
+                Some(what) => what,
                 None => {
-                    match rebuild(client, config, target, &fresh, &head, max_writes, git, None)? {
+                    match rebuild(
+                        client, config, target, &fresh, &head, &range, max_writes, git, None,
+                    )? {
                         Ok(what) => what,
                         Err(needed) => return Ok(Step::Held(held(repo, number, needed))),
                     }
                 }
             }
         }
-        _ => match rebuild(client, config, target, &fresh, &head, max_writes, git, None)? {
-            Ok(what) => what,
-            Err(needed) => return Ok(Step::Held(held(repo, number, needed))),
-        },
+        recorded => {
+            if let Receipt::Pending(record) = &recorded
+                && record.published_branch != original_branch
+            {
+                // An earlier head's unfinished rewrite may have opened its
+                // upstream PR before the receipt was confirmed. A rebuild for
+                // this head checks only its own branches and would open another.
+                branch_of(&record.published_branch)?;
+                ensure!(
+                    upstream_pulls(client, &target.upstream, owner, &record.published_branch)?
+                        .is_empty(),
+                    "unfinished publication of earlier head {} has an upstream PR on {}; migrate it manually",
+                    record.approved_oid,
+                    record.published_branch
+                );
+            }
+            match rebuild(
+                client, config, target, &fresh, &head, &range, max_writes, git, None,
+            )? {
+                Ok(what) => what,
+                Err(needed) => return Ok(Step::Held(held(repo, number, needed))),
+            }
+        }
     };
     let mut publication = fresh.clone();
     publication["body"] = json!(body);
@@ -408,15 +558,22 @@ fn prepare<C: Rest + Transport>(
             )));
         }
     }
-    let needed = STEP_WRITES + usize::from(what.base.is_some());
+    let needed = if confirmed {
+        1
+    } else {
+        STEP_WRITES + usize::from(what.rewrite.as_ref().is_some_and(|r| r.push))
+    };
     if max_writes < needed {
         return Ok(Step::Held(held(repo, number, needed)));
     }
     Ok(Step::Publish(Box::new(Prepared {
         fresh,
         head,
+        introduced: command.introduced,
+        cut: range.commits.cut(&what.onto),
         publication,
         what,
+        confirmed,
         receipt,
     })))
 }
@@ -438,6 +595,7 @@ fn repair<C: Rest + Transport>(
     (repo, target): (&str, &pass::promote::Fork),
     fresh: &Value,
     head: &str,
+    range: &Range,
     previous: &handoff::Record,
     pending: Option<&Promoting>,
     max_writes: usize,
@@ -475,10 +633,25 @@ fn repair<C: Rest + Transport>(
         "repair publication is no longer open"
     );
     if let Some(pending) = pending.filter(|p| p.published_oid == observed.published_oid) {
+        let (base, onto, rewrite) = if pending.published_branch != original {
+            let (onto, tip) = recorded_onto(client, target, pending.cut.as_ref(), &range.commits)?;
+            (Some(tip), onto, Some(Rewritten { push: false }))
+        } else {
+            hold!(
+                pending
+                    .cut
+                    .as_ref()
+                    .is_none_or(|cut| range.commits.recorded(cut)),
+                "publication does not record the approved commits; inspect and migrate it manually"
+            );
+            (None, range.base.clone(), None)
+        };
         return Ok(Ok(Publication {
             published: pending.published_oid.clone(),
             branch: pending.published_branch.clone(),
-            base: None,
+            base,
+            onto,
+            rewrite,
             existing: Some(pr),
             previous: Some(observed),
         }));
@@ -489,6 +662,7 @@ fn repair<C: Rest + Transport>(
         target,
         fresh,
         head,
+        range,
         max_writes,
         git,
         Some(&observed),
@@ -516,6 +690,7 @@ fn rebuild<C: Rest + Transport>(
     target: &pass::promote::Fork,
     fresh: &Value,
     head: &str,
+    range: &Range,
     max_writes: usize,
     git: &mut impl rewrite::Rewrite,
     previous: Option<&handoff::Record>,
@@ -529,44 +704,22 @@ fn rebuild<C: Rest + Transport>(
     let head_repo = fresh["head"]["repo"]["full_name"]
         .as_str()
         .context("missing head repository")?;
-    let mut compare = comparison(
-        client,
-        &format!(
-            "repos/{}/compare/{}...{}",
-            target.upstream,
-            encode(&target.base),
-            encode(&format!("{owner}:{original_branch}"))
-        ),
-        head,
-    )?;
-    compare["base_commit"] = get(
-        client,
-        &format!(
-            "repos/{}/branches/{}",
-            target.upstream,
-            encode(&target.base)
-        ),
-    )?["commit"]
-        .clone();
-    let (_, _, missing) = signoff_gate(config, &compare, head)?;
+    let (_, _, missing) = signoff_gate(config, &range.commits)?;
     let rewriting = missing > 0
-        || compare["behind_by"].as_u64().context("missing behind_by")? > 0
+        || range.behind > 0
+        || !range.direct
         || previous.is_some_and(|r| r.published_branch != original_branch);
     let needed = STEP_WRITES + usize::from(rewriting);
     if max_writes < needed {
         return Ok(Err(needed));
     }
-    let (published, branch, base) = if rewriting {
+    let (published, branch) = if rewriting {
         ensure!(
             upstream_pulls(client, &target.upstream, owner, original_branch)?.is_empty(),
             "existing upstream PR needs manual migration before rewriting"
         );
-        let base = compare["base_commit"]["sha"]
-            .as_str()
-            .filter(|s| oid(s))
-            .context("invalid publication base")?
-            .to_owned();
-        let (published, branch) = git.prepare(config, target, fresh, &compare)?;
+        let (published, branch) =
+            git.prepare(config, target, fresh, &range.commits, &range.base)?;
         let branch = previous.map_or(branch, |r| r.published_branch.clone());
         // The branch name is the approved head's. One from an earlier base,
         // or a partial publication without a receipt, holds here, not after
@@ -577,19 +730,25 @@ fn rebuild<C: Rest + Transport>(
                 "publication branch {branch} exists at another head (an earlier upstream base?); delete it to publish again"
             );
         }
-        (published, branch, Some(base))
+        (published, branch)
     } else {
-        (head.to_owned(), original_branch.to_owned(), None)
+        (head.to_owned(), original_branch.to_owned())
     };
     let existing = upstream_pulls(client, &target.upstream, owner, &branch)?;
     ensure!(existing.len() <= 1, "multiple upstream pull requests");
     Ok(Ok(Publication {
         published,
         branch,
-        base,
+        base: Some(range.base.clone()),
+        onto: range.base.clone(),
+        rewrite: rewriting.then_some(Rewritten { push: true }),
         existing: existing.into_iter().next(),
         previous: previous.cloned().filter(|_| rewriting),
     }))
+}
+
+fn upstream_tip(client: &impl Rest, target: &pass::promote::Fork) -> Result<String> {
+    branch_tip(client, &target.upstream, &target.base)
 }
 
 /// The receipt's record. One with a machine record steers a retry, so the
@@ -669,8 +828,11 @@ fn publish<C: Rest + Transport>(
     let Prepared {
         fresh,
         head,
+        introduced,
+        cut,
         publication,
         what,
+        confirmed,
         receipt,
     } = prepared;
     let number = fresh["number"].as_u64().context("invalid pull number")?;
@@ -687,6 +849,7 @@ fn publish<C: Rest + Transport>(
             approved_oid: head.clone(),
             published_oid: what.published.clone(),
             published_branch: what.branch.clone(),
+            cut: Some(cut.clone()),
             previous: what.previous.clone(),
         })?
     );
@@ -694,14 +857,19 @@ fn publish<C: Rest + Transport>(
         "Promoting approved head {head} to {}.\n\n{STATUS}\n\n{record}",
         target.upstream
     );
-    let status_id = if let Some(id) = receipt {
+    let status_id = if confirmed {
+        // A text-only update cannot change the confirmed publication's
+        // identity. Keep its receipt intact across either outcome of PATCH.
+        ensure!(what.existing.is_some(), "missing confirmed upstream PR");
+        None
+    } else if let Some(id) = receipt {
         send(
             client,
             "PATCH",
             &format!("repos/{repo}/issues/comments/{id}"),
             json!({"body":pending}),
         )?;
-        id
+        Some(id)
     } else {
         let receipt = send(
             client,
@@ -709,10 +877,12 @@ fn publish<C: Rest + Transport>(
             &format!("repos/{repo}/issues/{number}/comments"),
             json!({"body":pending}),
         )?;
-        receipt["id"]
-            .as_u64()
-            .filter(|n| *n > 0)
-            .context("missing promote status comment id")?
+        Some(
+            receipt["id"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .context("missing promote status comment id")?,
+        )
     };
     // Recheck the approved branch at the publication boundary.
     // Rewrites only create a new ref; they never move this one.
@@ -732,25 +902,33 @@ fn publish<C: Rest + Transport>(
             reference["object"]["sha"] == head,
             "branch moved before publication"
         );
-        if let Some(base) = &what.base {
-            let live = get(
-                client,
-                &format!(
-                    "repos/{}/branches/{}",
-                    target.upstream,
-                    encode(&target.base)
-                ),
-            )?;
-            ensure!(
-                live["commit"]["sha"] == *base,
-                "upstream base moved before publication; retry"
+        let check_fork = || -> Result<()> {
+            hold!(
+                base_settled(client, repo, &fresh, introduced)? == cut.fork_base,
+                "fork base tip changed before publication; retry with fresh evidence"
             );
+            Ok(())
+        };
+        let check_upstream = || -> Result<()> {
+            if let Some(base) = &what.base {
+                hold!(
+                    upstream_tip(client, target)? == *base,
+                    "upstream base moved before publication; retry"
+                );
+            }
+            Ok(())
+        };
+        check_fork()?;
+        let push = what.rewrite.as_ref().is_some_and(|r| r.push);
+        if push {
+            check_upstream()?;
             git.publish(
                 head_repo,
                 &what.branch,
                 &what.published,
                 what.previous.as_ref().map(|r| r.published_oid.as_str()),
             )?;
+            check_fork()?;
         }
         let reference = get(
             client,
@@ -760,6 +938,7 @@ fn publish<C: Rest + Transport>(
             reference["object"]["sha"] == what.published,
             "publication branch moved"
         );
+        check_upstream()?;
         let text = json!({"title":publication["title"], "body":publication["body"]});
         let published = if let Some(pr) = &what.existing {
             let n = pr["number"]
@@ -808,6 +987,10 @@ fn publish<C: Rest + Transport>(
             published["title"] == publication["title"] && published["body"] == publication["body"],
             "upstream returned different text"
         );
+        // A successful PR write is not proof the range's base still belongs
+        // to upstream. Leave the receipt pending if upstream rewound during
+        // the write, on a first attempt as on a retry.
+        tip_containing(client, target, &what.onto)?;
         let n = published["number"]
             .as_u64()
             .filter(|n| *n > 0)
@@ -818,6 +1001,13 @@ fn publish<C: Rest + Transport>(
     let (url, upstream_number) = match result {
         Ok(url) => url,
         Err(error) => {
+            let Some(status_id) = status_id else {
+                // The confirmed receipt stays as it was.
+                if error.is::<Held>() {
+                    return Ok(format!("hold promote {repo}#{number}: {error:#}"));
+                }
+                return Err(error);
+            };
             // The record stays: the next invocation resumes this head.
             let body = format!(
                 "Publication of approved head {head} was not confirmed: {error:#}. Re-run to observe upstream before retrying.\n\n{STATUS}\n\n{record}"
@@ -837,12 +1027,16 @@ fn publish<C: Rest + Transport>(
             return Err(error);
         }
     };
+    let Some(status_id) = status_id else {
+        return Ok(format!("promoted {repo}#{number} -> {url} head={head}"));
+    };
     let mut body = handoff::success(
         repo,
         &fresh,
         &publication,
         &target.upstream,
         upstream_number,
+        Some(&cut),
     )?;
     if what.published != head {
         body.push_str(&format!(
@@ -866,7 +1060,8 @@ fn validate(
     target: &pass::promote::Fork,
     pull: &Value,
     now: OffsetDateTime,
-) -> Result<Command> {
+    prior: Option<rewrite::Commits>,
+) -> Result<(Command, Range)> {
     let metadata = get(client, &format!("repos/{repo}"))?;
     let legacy = config.promote.as_ref().and_then(|settings| {
         settings
@@ -893,33 +1088,48 @@ fn validate(
     // An authenticated command alone must not ready a head the operator never
     // approved. A later COMMENTED review does not cancel a deciding review.
     let reviews = pages(client, &format!("repos/{repo}/pulls/{number}/reviews"))?;
-    let decision = reviews.iter().rev().find(|r| {
-        r["user"]["login"]
-            .as_str()
-            .is_some_and(|s| s.eq_ignore_ascii_case(&config.operator))
-            && r["state"] != "COMMENTED"
-    });
-    ensure!(
-        decision.is_some_and(|r| r["state"] == "APPROVED" && r["commit_id"] == command.head),
-        "operator has not approved the current head"
-    );
+    reviews
+        .iter()
+        .rev()
+        .find(|r| {
+            r["user"]["login"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&config.operator))
+                && r["state"] != "COMMENTED"
+        })
+        .filter(|r| r["state"] == "APPROVED" && r["commit_id"] == command.head)
+        .context("operator has not approved the current head")?;
+    // The same cut preview reports: fixed before any review of the head.
     let gate = gates_impl(
         client,
         config,
         repo,
         pull,
-        &target.upstream,
-        &target.base,
-        false,
+        (&target.upstream, &target.base),
+        command.introduced,
+        Mode::Publication(prior),
     )?;
-    let Gates::Ready { .. } = gate else {
+    let Gates::Ready {
+        behind,
+        direct,
+        tip,
+        commits,
+        ..
+    } = gate
+    else {
         anyhow::bail!("publication gates incomplete")
     };
     match policy::gate(client, config, &target.upstream)? {
         policy::Permitted::BotOk => {}
         policy::Permitted::HumanText => provenance::verify(client, config, repo, pull, &command)?,
     }
-    Ok(command)
+    let range = Range {
+        commits,
+        behind,
+        direct,
+        base: tip.context("unpinned publication base")?,
+    };
+    Ok((command, range))
 }
 
 /// The upstream PR is open at the published head, from the fork's head

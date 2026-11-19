@@ -366,10 +366,18 @@ work, without weakening the current-head authorization boundary.
 * **Candidate read gates.** Only after command/head evidence passes, read in
   order: all upstream PRs for the head repository owner's branch (same open
   head is already promoted; different, closed or merged holds); upstream-base
-  comparison (zero ahead holds; a behind head whose commits form a linear
-  bot- or operator-authored chain is reported ready after a publication rebase,
-  whose conflict only `--apply` finds and holds; the awaiting queue still holds
-  it); the issue's accepted plan's `stacks_on`; DCO facts from required
+  comparison (zero ahead holds); the PR's own commits, those on the head that
+  its fork base does not reach, read once from a fork comparison at the base
+  tip set and selected before the head was first pushed, so every review of
+  that head showed this range. A later retarget or tip move holds until a new
+  head is pushed and approved: a review submitted after the move may still
+  come from a diff loaded before it. The upstream comparison may omit a prefix it already reaches;
+  revalidation selects the remaining suffix from the original fork range.
+  A head that is behind, or carries the fork's own commits, is
+  reported ready after a publication rebase when its own commits form a linear
+  bot- or operator-authored chain; only `--apply` finds and holds a conflict,
+  and the awaiting queue still holds it. Then the issue's accepted plan's
+  `stacks_on`; DCO facts from required
   base-branch checks or base-head check runs; and unchanged title/body text.
   This prevents duplicate publication, stale bases, unmerged dependencies,
    unsafe sign-off rewrites and references changing meaning upstream. Only a
@@ -528,9 +536,10 @@ work, without weakening the current-head authorization boundary.
   an older generated-by trailer. The only allowed rewrite adds the
   operator's sign-off and cleanly rebases onto the current upstream base.
   A behind approved head needs no fresh approval after a clean rebase; a
-  conflict holds without publishing. Rewriting requires a linear chain of
-  commits by the bot or operator; other authors and merge commits hold.
-  Original authors, author dates and existing trailers are preserved.
+  conflict holds without publishing. Rewriting requires the PR's own commits
+  to be a linear chain by the bot or operator; other authors and merge commits
+  hold. The fork's own marker and merge commits under them are never
+  published. Original authors, author dates and existing trailers are preserved.
 * **Noise.** The upstream repository gets the pull request and nothing else.
   The fork pull request, first-party, gets readable state with its machine
   detail alongside ([bookkeeping](#bookkeeping)).
@@ -557,10 +566,18 @@ work, without weakening the current-head authorization boundary.
   or update the title/body of the unique open same-head upstream PR. Send the
   fork title/body bytes unchanged but for the source line, including for
   human-text; add no attribution or sign-off paragraph. Existing readiness is unchanged. There is no ready,
-  merge, reopen or approved-ref update operation. If any commit lacks the
-  configured operator trailer, or the head is behind, Git replays every commit
-  onto the observed upstream base and adds the trailer wherever missing,
-  regardless of detected DCO checks. It creates a deterministic
+  merge, reopen or approved-ref update operation. If any of the PR's remaining
+  commits lacks the configured operator trailer, the head is behind, or it
+  carries the fork's own commits, Git replays only the PR's remaining commits onto
+  the observed upstream base and adds the trailer wherever missing,
+  regardless of detected DCO checks. The fork receipt records those commits
+  and the upstream commit they were validated or replayed on. A retry
+  resumes, confirms or skips a publication only while it records exactly the
+  approved commits and upstream still contains that commit (an older receipt
+  without that record only for a direct publication the current comparison
+  proves); the handoff
+  treats an open publication with such a record as current only while
+  upstream still contains it. It creates a deterministic
   `bot/promote/APPROVED_OID` branch in the same head repository,
    initially creating rather than overwriting a ref. The approved fork branch remains untouched;
   approval and human-text provenance stay bound to that original head. The

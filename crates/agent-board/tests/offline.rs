@@ -3855,14 +3855,62 @@ fn pass_replay_with_promote_discovery_is_read_only() {
 fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
     use board_forge::{
         github::Transport,
-        pass::{Recorder, Replay},
+        pass::{Config, Recorder, Replay},
+        poll::{Rest, RestResponse},
     };
-    struct NoPlan;
-    impl Transport for NoPlan {
-        fn graphql(&self, _: &str, _: Value) -> anyhow::Result<Value> {
-            Ok(
-                serde_json::json!({"repository":{"issue":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}),
-            )
+    struct Scenario<'a> {
+        replay: &'a Replay,
+        base: &'a Value,
+    }
+    impl Transport for Scenario<'_> {
+        fn graphql(&self, query: &str, variables: Value) -> anyhow::Result<Value> {
+            if query.contains("BASE_REF_CHANGED_EVENT") {
+                Ok(
+                    serde_json::json!({"repository":{"nameWithOwner":"cgwalters-forge/composefs-rs",
+                    "pullRequest":{"number":34,"baseRefName":"main","baseRef":{"target":{"oid":self.base}},"baseChange":{"nodes":[]}}}}),
+                )
+            } else if variables["number"] == 31 {
+                Ok(
+                    serde_json::json!({"repository":{"issue":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}),
+                )
+            } else {
+                self.replay.graphql(query, variables)
+            }
+        }
+    }
+    impl Rest for Scenario<'_> {
+        fn get(&self, url: &str, validator: Option<(&str, &str)>) -> anyhow::Result<RestResponse> {
+            let fork = format!(
+                "https://api.github.com/repos/cgwalters-forge/composefs-rs/compare/{}...",
+                self.base.as_str().unwrap_or_default()
+            );
+            if !url.starts_with(&fork) {
+                return self.replay.get(url, validator);
+            }
+            // The fork base is the upstream merge base: every upstream row is
+            // the PR's own.
+            let upstream = self
+                .replay
+                .requests
+                .iter()
+                .find(|e| {
+                    e["request"]["get"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("composefs/composefs-rs/compare/main..."))
+                })
+                .unwrap();
+            let mut body = upstream["answer"]["body"].clone();
+            body["base_commit"] = serde_json::json!({"sha": self.base});
+            Ok(RestResponse {
+                status: 200,
+                etag: None,
+                last_modified: None,
+                link: None,
+                body,
+            })
+        }
+        fn send(&self, method: &str, url: &str, body: &Value) -> anyhow::Result<(u16, Value)> {
+            self.replay.send(method, url, body)
         }
     }
     let mut replay = Replay::from_json(
@@ -3892,6 +3940,7 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
     // recording predates this source-body read.
     replay.requests.push(serde_json::json!({"request":{"get":"https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/31"},
         "answer":{"status":200,"body":{"number":31,"repository_url":"https://api.github.com/repos/cgwalters-forge/composefs-rs","body":"A fork issue."}}}));
+    let mut base = Value::Null;
     for e in &mut replay.requests {
         let url = e["request"]["get"].as_str().unwrap_or_default().to_owned();
         if url == "https://api.github.com/repos/cgwalters-forge/composefs-rs" {
@@ -3912,6 +3961,7 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
             p["body"] =
                 "Implement slice.\n\nPart of https://github.com/cgwalters-forge/composefs-rs/issues/31"
                     .into();
+            base = p["base"]["sha"].clone();
             e["answer"]["body"] = serde_json::json!([p]);
         } else if url.contains("/issues/34/comments?") {
             e["answer"]["body"] = serde_json::json!([{"id":1,"user":{"login":"cgwalters"},"body":"/promote","created_at":"2026-10-23T00:00:00Z","updated_at":"2026-10-23T00:00:00Z"}]);
@@ -3925,23 +3975,25 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
             e["answer"]["data"]["repository"]["pullRequest"]["comments"]["nodes"] = serde_json::json!([{"url":"https://github.com/cgwalters-forge/composefs-rs/pull/34#issuecomment-1","author":{"login":"cgwalters"},"createdAt":"2026-10-23T00:00:00Z","lastEditedAt":null,"editor":null}]);
         }
     }
-    let recorder = Recorder::new(&NoPlan);
-    let issue =
-        board_forge::parse_github_item("cgwalters-forge/composefs-rs#31", None, "github.com")
-            .unwrap();
-    board_forge::plan::issue_comments(&recorder, &issue).unwrap();
-    replay.requests.extend(
-        Replay::from_json(&serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap())
-            .unwrap()
-            .requests,
-    );
+    replay.requests.push(serde_json::json!({"request":{"get":"https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fmain&direction=desc&per_page=1"},
+        "answer":{"status":200,"body":[{"ref":"refs/heads/main","after":base,"timestamp":"2026-10-22T00:00:00Z"}]}}));
+    let config = Config::parse(include_str!("../../../fixtures/promote/config.json")).unwrap();
+    let record_scenario = |replay: &Replay| {
+        let scenario = Scenario {
+            replay,
+            base: &base,
+        };
+        let recorder = Recorder::new(&scenario);
+        board_forge::promote::preview(&recorder, &config, replay.now).unwrap();
+        recorder.fixture(replay.now).unwrap()
+    };
     let dir = std::env::temp_dir().join(format!(
         "agent-board-promote-scenario-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("scenario.json");
-    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"schema":"agent-board/pass-replay/v1","now":replay.now.format(&time::format_description::well_known::Rfc3339).unwrap(),"requests":replay.requests})).unwrap()).unwrap();
+    std::fs::write(&path, record_scenario(&replay)).unwrap();
     let output = command()
         .args([
             "promote",
@@ -4049,7 +4101,7 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
                 .unwrap();
             e["answer"]["data"]["repository"]["pullRequest"]["editor"] = Value::Null;
         }
-        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"schema":"agent-board/pass-replay/v1","now":replay.now.format(&time::format_description::well_known::Rfc3339).unwrap(),"requests":replay.requests})).unwrap()).unwrap();
+        std::fs::write(&path, record_scenario(&replay)).unwrap();
         let output = command()
             .args([
                 "promote",
