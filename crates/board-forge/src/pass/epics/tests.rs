@@ -1152,6 +1152,9 @@ struct Forge {
     receipt_fails: Cell<bool>,
     minimized: RefCell<BTreeSet<String>>,
     minimize_fails: Cell<bool>,
+    status_fails: Cell<bool>,
+    status_loses_reply: Cell<bool>,
+    history_edit: Cell<Option<u64>>,
 }
 
 impl Forge {
@@ -1170,6 +1173,9 @@ impl Forge {
             receipt_fails: Cell::new(false),
             minimized: RefCell::new(BTreeSet::new()),
             minimize_fails: Cell::new(false),
+            status_fails: Cell::new(false),
+            status_loses_reply: Cell::new(false),
+            history_edit: Cell::new(None),
         }
     }
 
@@ -1221,6 +1227,15 @@ impl Rest for Forge {
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         let path = url.trim_start_matches(API_ROOT);
         self.kept(format!("{method} {path}"), body.clone());
+        if self.status_fails.get()
+            && method == "PATCH"
+            && text(body, "/body").starts_with(living::MARKER)
+        {
+            return Ok((
+                500,
+                json!({"message":"temporary status publication failure"}),
+            ));
+        }
         if self.receipt_fails.get()
             && method == "PATCH"
             && text(body, "/body").contains("Applied [this epic plan]")
@@ -1250,6 +1265,11 @@ impl Rest for Forge {
                     node["body"] = body["body"].clone();
                 }
             }
+            if text(body, "/body").starts_with(living::MARKER)
+                && self.status_loses_reply.replace(false)
+            {
+                bail!("status PATCH committed but reply was lost");
+            }
         }
         Ok((200, json!({"id": id})))
     }
@@ -1263,24 +1283,35 @@ impl crate::github::GraphQl for Forge {
 
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        if query == living::HISTORY_STATE {
+        let history_node = |id: &str| {
             let added = self.added.borrow();
             let mut node = added
                 .iter()
-                .find(|n| {
-                    plan::comment_id(text(n, "/url"))
-                        .map(|id| id.to_string())
-                        .as_deref()
-                        == variables["id"].as_str()
-                })
+                .find(|n| plan::comment_id(text(n, "/url")) == id.parse().ok())
                 .unwrap()
                 .clone();
-            node["isMinimized"] = self
-                .minimized
-                .borrow()
-                .contains(text(&variables, "/id"))
-                .into();
-            return Ok(json!({"node":node}));
+            if self
+                .history_edit
+                .get()
+                .is_some_and(|edit| id.parse() == Ok(edit))
+            {
+                node["lastEditedAt"] = node["createdAt"].clone();
+                node["editor"] = json!({"login":"foreign"});
+            }
+            node["isMinimized"] = self.minimized.borrow().contains(id).into();
+            node
+        };
+        if query == living::HISTORY_STATE {
+            return Ok(json!({"node":history_node(text(&variables, "/id"))}));
+        }
+        if query == living::HISTORY_GROUP {
+            let nodes: Vec<_> = variables["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| history_node(id.as_str().unwrap()))
+                .collect();
+            return Ok(json!({"nodes":nodes}));
         }
         if query == living::MINIMIZED {
             return Ok(
@@ -2132,6 +2163,334 @@ fn living_historical_cleanup_is_opt_in_bounded_and_retryable() {
             assert!(!forge.minimized.borrow().contains("600"));
         }
     }
+}
+
+#[test]
+fn living_legacy_cleanup_requires_a_complete_published_pair() {
+    const STATUS: &str = "2026-10-23T13:41:31Z: Applied.";
+    const RECEIPT: &str = "<!-- agent-board-epic-apply: 10@2026-10-23T13:34:49Z -->";
+    const BASELINE: &str =
+        "<!-- agent-board-epic-fingerprint: [[\"cgwalters-forge/tracker#891\",\"OPEN\"]] -->";
+    for (case, expected) in [
+        ("complete", 2),
+        ("off", 0),
+        ("preview", 0),
+        ("foreign author", 0),
+        ("foreign editor", 0),
+        ("unknown editor", 0),
+        ("missing editor fact", 0),
+        ("unmatched", 0),
+        ("two fingerprints", 0),
+        ("two receipts", 0),
+        ("other claim", 0),
+        ("unreadable claim", 0),
+        ("malformed", 0),
+        ("mixed", 0),
+        ("stopped", 0),
+        ("incomplete pages", 0),
+        ("import before publication", 0),
+        ("edit after staged import", 0),
+        ("failed publication", 0),
+        ("lost publication reply and deleted source", 0),
+        ("failed minimize", 0),
+        ("partial", 1),
+        ("edit after partial", 1),
+        ("visitor after partial", 1),
+        ("edit during revalidation", 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let mut replay = replay();
+        unfinished(&mut replay);
+        unapplied(&mut replay);
+        let mut forge = Forge::new(replay);
+        let mut settings = json!({"livingStatus":path});
+        let first = local_with(&forge, 10, settings.clone());
+        assert_eq!(first.failures, 0, "{case}: {:?}", first.lines);
+
+        let receipt =
+            format!("{RECEIPT}\n{STATUS}\n- Action 1: linked cgwalters-forge/tracker#891.");
+        let fingerprint = format!("{BASELINE}\n{STATUS}");
+        let mut r = posted(&forge.replay, 890, 600, "cgwalters-bot", 3, &receipt);
+        let mut f = posted(&forge.replay, 890, 601, "cgwalters-bot", 2, &fingerprint);
+        match case {
+            "foreign author" => f["author"] = json!({"login":"cgwalters"}),
+            "foreign editor" | "unknown editor" => {
+                f["lastEditedAt"] = f["createdAt"].clone();
+                f["editor"] = if case == "foreign editor" {
+                    json!({"login":"cgwalters"})
+                } else {
+                    Value::Null
+                };
+            }
+            "missing editor fact" => {
+                f.as_object_mut().unwrap().remove("editor");
+            }
+            "unmatched" => f["body"] = fingerprint.replace("13:41", "13:42").into(),
+            "malformed" => f["body"] = fingerprint.replace("OPEN", "UNKNOWN").into(),
+            "mixed" => {
+                r["body"] = format!("{receipt}\n```agent-board-epic-apply\n{{}}\n```").into()
+            }
+            "stopped" => {
+                r["body"] = receipt
+                    .replace("Applied.", "Stopped after a failed request")
+                    .into()
+            }
+            "two fingerprints" | "two receipts" | "other claim" | "unreadable claim" => {
+                let (bot, body) = match case {
+                    "two fingerprints" => ("cgwalters", fingerprint.as_str()),
+                    "two receipts" => ("cgwalters-bot", receipt.as_str()),
+                    "unreadable claim" => (
+                        "cgwalters",
+                        "```agent-board-epic-apply\n{\"plan\":\"2@2026-10-23T13:34:49Z\"}\n```",
+                    ),
+                    _ => ("cgwalters", RECEIPT),
+                };
+                forge
+                    .added
+                    .borrow_mut()
+                    .push(posted(&forge.replay, 890, 602, bot, 1, body));
+            }
+            "incomplete pages" => {
+                let entry = forge
+                    .replay
+                    .requests
+                    .iter_mut()
+                    .find(|e| e["request"].to_string().contains(COMMENTS_890))
+                    .unwrap();
+                entry["answer"]["data"]["repository"]["issue"]["comments"]["pageInfo"] =
+                    json!({"hasNextPage":true,"endCursor":"missing"});
+            }
+            "failed publication" => forge.status_fails.set(true),
+            "lost publication reply and deleted source" => forge.status_loses_reply.set(true),
+            "failed minimize" => forge.minimize_fails.set(true),
+            "edit during revalidation" => forge.history_edit.set(Some(601)),
+            _ => {}
+        }
+        forge.added.borrow_mut().extend([r.clone(), f.clone()]);
+        settings["cleanupHistory"] = (case != "off").into();
+        let before = forge.written().len();
+        let saved = std::fs::read(&path).unwrap();
+        let report = if case == "preview" {
+            block(run(
+                &forge,
+                &forge,
+                &config(settings.clone()),
+                State::default(),
+                (Mode::Preview, Limits::default()),
+                forge.replay.now,
+            ))
+            .unwrap()
+        } else {
+            let cap = match case {
+                "import before publication" | "edit after staged import" => 0,
+                "partial" | "edit after partial" | "visitor after partial" => 2,
+                _ => 10,
+            };
+            local_with(&forge, cap, settings.clone())
+        };
+        assert_eq!(
+            forge.minimized.borrow().len(),
+            expected,
+            "{case}: {:?}",
+            report.lines
+        );
+        assert!(
+            report.lines.contains(&"writes saved by edit: 0".into()),
+            "{case}"
+        );
+        let writes = forge.written();
+        assert!(
+            writes[before..].iter().all(|w| w
+                .starts_with("PATCH repos/cgwalters-forge/tracker/issues/comments/")
+                || w == "graphql minimizeComment"),
+            "{case}: {writes:?}"
+        );
+        if case == "preview" {
+            assert_eq!(writes.len(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert_eq!(
+                report
+                    .lines
+                    .iter()
+                    .filter(|l| l.contains("would minimize OUTDATED")
+                        && (l.ends_with("-600") || l.ends_with("-601")))
+                    .count(),
+                2
+            );
+        }
+        if expected != 0
+            || matches!(
+                case,
+                "import before publication"
+                    | "edit after staged import"
+                    | "failed publication"
+                    | "lost publication reply and deleted source"
+                    | "failed minimize"
+                    | "edit during revalidation"
+            )
+        {
+            let ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let archived: Vec<_> = ledger["entries"]["cgwalters-forge/tracker#890"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| {
+                    ["600", "601"]
+                        .iter()
+                        .any(|id| text(n, "/url").ends_with(&format!("-{id}")))
+                })
+                .collect();
+            assert_eq!(archived, [&r, &f], "{case}");
+            if case == "lost publication reply and deleted source" {
+                let mut added = forge.added.borrow_mut();
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("status PATCH committed but reply was lost")),
+                    "{:?}",
+                    report.lines
+                );
+                let sent = forge.writes.borrow()[before].1["body"].clone();
+                assert!(added.iter().any(|n| n["body"] == sent));
+                assert_ne!(
+                    ledger["entries"]["cgwalters-forge/tracker#890"]["published"],
+                    sent
+                );
+                added.retain(|n| {
+                    !text(n, "/url").contains("/issues/890#issuecomment-")
+                        || (!text(n, "/body").starts_with(living::MARKER) && n["url"] != r["url"])
+                });
+                drop(added);
+                settings["cleanupHistory"] = false.into();
+                let report = local_with(&forge, 10, settings);
+                assert!(report.lines.iter().any(|l| l.contains("archived legacy apply evidence changed or is missing")), "{:?}", report.lines);
+                assert_eq!(forge.written().len(), writes.len(), "{case}");
+                continue;
+            }
+            if case == "visitor after partial" {
+                forge.added.borrow_mut().push(posted(
+                    &forge.replay,
+                    890,
+                    602,
+                    "visitor",
+                    1,
+                    &fingerprint,
+                ));
+                let report = local_with(&forge, 10, settings);
+                assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
+                assert_eq!(
+                    *forge.minimized.borrow(),
+                    BTreeSet::from(["600".into(), "601".into()]),
+                    "{case}"
+                );
+                continue;
+            }
+            if matches!(case, "edit after partial" | "edit after staged import") {
+                let mut added = forge.added.borrow_mut();
+                let fingerprint = added
+                    .iter_mut()
+                    .find(|n| text(n, "/url").ends_with("-601"))
+                    .unwrap();
+                fingerprint["body"] = fingerprint["body"]
+                    .as_str()
+                    .unwrap()
+                    .replace("OPEN", "CLOSED")
+                    .into();
+                fingerprint["lastEditedAt"] = forge.replay.now.format(&Rfc3339).unwrap().into();
+                fingerprint["editor"] = json!({"login":"cgwalters-bot"});
+                drop(added);
+                let report = local_with(&forge, 10, settings);
+                if case == "edit after partial" {
+                    assert!(report.failures > 0, "{case}: {:?}", report.lines);
+                    assert_eq!(forge.written().len(), writes.len(), "{case}");
+                } else {
+                    // No public status covered the import, so the corrected
+                    // sources are judged afresh rather than refused.
+                    assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
+                    assert_eq!(forge.minimized.borrow().len(), 2, "{case}");
+                }
+                continue;
+            }
+            forge.status_fails.set(false);
+            forge.minimize_fails.set(false);
+            forge.history_edit.set(None);
+            let report = local_with(&forge, 10, settings.clone());
+            assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
+            assert_eq!(
+                *forge.minimized.borrow(),
+                BTreeSet::from(["600".into(), "601".into()]),
+                "{case}: {:?}",
+                report.lines
+            );
+            let before = forge.written().len();
+            let report = local_with(&forge, 10, settings);
+            assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
+            assert_eq!(forge.written().len(), before, "{case}: {:?}", report.lines);
+        }
+    }
+}
+
+#[test]
+fn living_legacy_cleanup_links_to_the_full_recorded_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let mut replay = replay();
+    unfinished(&mut replay);
+    let mut pair = Vec::new();
+    comments(&mut replay, COMMENTS_890).retain(|node| {
+        if text(node, "/body").starts_with("<!-- agent-board-epic-apply: ")
+            || text(node, "/body").starts_with("<!-- agent-board-epic-fingerprint: ")
+        {
+            pair.push(node.clone());
+            false
+        } else {
+            true
+        }
+    });
+    assert_eq!(pair.len(), 2);
+    let settings = json!({"livingStatus":path,"cleanupHistory":true});
+    let forge = Forge::new(replay);
+    forge.added.borrow_mut().extend(pair.clone());
+    forge.added.borrow_mut().push(posted(
+        &forge.replay,
+        890,
+        900,
+        "cgwalters-bot",
+        0,
+        living::MARKER,
+    ));
+    let report = local_with(&forge, 10, settings.clone());
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert_eq!(
+        forge.written(),
+        [
+            "PATCH repos/cgwalters-forge/tracker/issues/comments/900",
+            "graphql minimizeComment",
+            "graphql minimizeComment"
+        ]
+    );
+    // The real log is longer than Last apply can show. Preserve the completion
+    // and point readers to the unchanged original for the remaining actions.
+    let published = text(&forge.writes.borrow()[0].1, "/body").to_owned();
+    let apply = published.split("### Last apply\n").nth(1).unwrap();
+    assert!(apply.contains("Applied.\n- Action 1: "), "{published}");
+    assert!(
+        apply.contains(&format!(
+            "Action log shortened; [read the full receipt]({}).",
+            text(&pair[0], "/url")
+        )),
+        "{published}"
+    );
+    let ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        ledger["entries"]["cgwalters-forge/tracker#890"]["records"],
+        json!(pair)
+    );
+    let report = local_with(&forge, 10, settings);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert_eq!(forge.written().len(), 3, "{:?}", report.lines);
 }
 
 #[test]

@@ -13,6 +13,7 @@ pub(super) const MINIMIZE: &str = "mutation($id: ID!) { minimizeComment(input: {
 pub(super) const MINIMIZED: &str =
     "query($id: ID!) { node(id: $id) { ... on IssueComment { isMinimized } } }";
 pub(super) const HISTORY_STATE: &str = "query($id: ID!) { node(id: $id) { ... on IssueComment { url body createdAt lastEditedAt author { login } editor { login } isMinimized } } }";
+pub(super) const HISTORY_GROUP: &str = "query($ids: [ID!]!) { nodes(ids: $ids) { ... on IssueComment { url body createdAt lastEditedAt author { login } editor { login } isMinimized } } }";
 const SCHEMA: &str = "agent-board/status/v1";
 const MAX_RECORDS: usize = 1000;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -35,6 +36,28 @@ struct Entry {
     // A confirmed minimization stays done even if a person later restores it.
     #[serde(default)]
     minimized: BTreeSet<u64>,
+    // Split sources covered by an attempted or observed status publication.
+    // Before a send is attempted, the import is redone on each scan.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    archived: BTreeSet<u64>,
+}
+
+impl Entry {
+    fn protect_split_records(&mut self) {
+        self.archived.extend(
+            self.records
+                .iter()
+                .filter(|r| is_split_record(r))
+                .filter_map(|r| plan::comment_id(text(r, "/url"))),
+        );
+    }
+
+    fn archive_published(&mut self) {
+        let state = state_id(self);
+        if self.published.as_deref().and_then(state_reference) == Some(state.as_str()) {
+            self.protect_split_records();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -473,10 +496,22 @@ mod tests {
 
     #[test]
     fn historical_plans_require_complete_trusted_coverage_and_publication() {
-        for (name, edit, expected) in [
-            ("superseded", None, 1),
-            ("foreign newer plan", Some("foreign"), 0),
-            ("unknown newer editor", Some(""), 0),
+        for (name, edit, split, expected) in [
+            ("superseded", None, "", 1),
+            ("foreign newer plan", Some("foreign"), "", 0),
+            ("unknown newer editor", Some(""), "", 0),
+            (
+                "split claim on plan",
+                None,
+                "<!-- agent-board-epic-apply: 10@2026-10-01T00:00:00Z -->\n",
+                0,
+            ),
+            (
+                "split fingerprint on plan",
+                None,
+                "<!-- agent-board-epic-fingerprint: [] -->\n",
+                0,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("ledger.json");
@@ -487,7 +522,7 @@ mod tests {
             let old = node(
                 10,
                 "2026-10-01T00:00:00Z",
-                format!("Old.\n```{}\n{plan}\n```", plan::PLAN_FENCE),
+                format!("{split}Old.\n```{}\n{plan}\n```", plan::PLAN_FENCE),
             );
             let mut current = node(
                 20,
@@ -651,6 +686,217 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pairs_hold_on_competing_or_unreadable_claims() {
+        let node = |id, author, body: &str| json!({"url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),"body":body,"createdAt":format!("2026-10-01T00:00:{id:02}Z"),"lastEditedAt":null,"author":{"login":author},"editor":null});
+        let receipt = node(
+            10,
+            "bot",
+            "<!-- agent-board-epic-apply: 1@2026-10-01T00:00:00Z -->\n2026-10-02T00:00:00Z: Applied.\n- Action 1: linked o/r#2.",
+        );
+        let fingerprint = node(
+            20,
+            "bot",
+            "<!-- agent-board-epic-fingerprint: [[\"o/r#2\",\"OPEN\"]] -->\n2026-10-02T00:00:00Z: Applied.",
+        );
+        let claim = format!(
+            "Applying.\n```{}\n{}\n```",
+            epic_apply::APPLY_MARKER,
+            serde_json::to_string(&epic_apply::Detail::new(
+                "1@2026-10-01T00:00:00Z",
+                epic_apply::Outcome::Applied
+            ))
+            .unwrap()
+        );
+        let unreadable = format!("```{}\n{{}}\n```", epic_apply::APPLY_MARKER);
+        let other_plan = "2@2026-10-01T00:00:00Z";
+        let fence = |detail: Value| format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER);
+        let mut wrong_schema = json!(epic_apply::Detail::new(
+            other_plan,
+            epic_apply::Outcome::Applied
+        ));
+        let mut foreign_edit = node(30, "operator", &fence(wrong_schema.clone()));
+        foreign_edit["lastEditedAt"] = foreign_edit["createdAt"].clone();
+        foreign_edit["editor"] = json!({"login":"visitor"});
+        wrong_schema["schema"] = "unsupported".into();
+        for (name, live, records, expected) in [
+            ("unique", vec![], vec![], 1),
+            (
+                "archived pair",
+                vec![],
+                vec![receipt.clone(), fingerprint.clone()],
+                1,
+            ),
+            ("live claim", vec![node(30, "bot", &claim)], vec![], 0),
+            ("ledger-only claim", vec![], vec![node(5, "bot", &claim)], 0),
+            (
+                "unreadable operator claim",
+                vec![node(30, "operator", &unreadable)],
+                vec![],
+                0,
+            ),
+            (
+                "unreadable ledger claim",
+                vec![],
+                vec![node(5, "bot", &unreadable)],
+                0,
+            ),
+            (
+                "partial detail for another plan",
+                vec![node(30, "operator", &fence(json!({"plan":other_plan})))],
+                vec![],
+                0,
+            ),
+            (
+                "wrong schema for another plan",
+                vec![],
+                vec![node(5, "bot", &fence(wrong_schema))],
+                0,
+            ),
+            (
+                "foreign edit to a claim for another plan",
+                vec![foreign_edit.clone()],
+                vec![],
+                0,
+            ),
+            (
+                "valid claim for another plan",
+                vec![node(30, "OPERATOR", text(&foreign_edit, "/body"))],
+                vec![],
+                1,
+            ),
+            (
+                "visitor cannot veto the pair",
+                vec![
+                    node(25, "visitor", text(&fingerprint, "/body")),
+                    node(30, "visitor", &unreadable),
+                ],
+                vec![],
+                1,
+            ),
+        ] {
+            let history: Vec<_> = [receipt.clone(), fingerprint.clone()]
+                .into_iter()
+                .chain(live)
+                .collect();
+            let pairs = legacy_pairs(&history, &records, "o/r#1", "bot", &["bot", "operator"]);
+            assert_eq!(pairs.len(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn legacy_reader_keeps_source_order_and_refuses_missing_or_changed_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let path = path.to_str().unwrap();
+        let vars = json!({"owner":"o","name":"r","number":1,"after":null});
+        let later = json!({"owner":"o","name":"r","number":1,"after":"next"});
+        let page = |nodes, more| json!({"repository":{"issue":{"comments":{"nodes":nodes,"pageInfo":{"hasNextPage":more,"endCursor":"next"}}}}});
+        let node = |id, body| json!({"url":format!("https://github.com/o/r/issues/1#issuecomment-{id}"),"body":body,"createdAt":"2026-10-01T00:00:00Z","lastEditedAt":null,"author":{"login":"bot"},"editor":null});
+        let status = node(30, MARKER);
+        let mut receipt = node(
+            10,
+            "<!-- agent-board-epic-apply: 1@2026-10-01T00:00:00Z -->\n2026-10-02T00:00:00Z: Applied.\n- Action 1: linked o/r#2.",
+        );
+        receipt["lastEditedAt"] = "2026-10-02T00:00:00Z".into();
+        receipt["editor"] = json!({"login":"bot"});
+        let fingerprint = node(
+            20,
+            "<!-- agent-board-epic-fingerprint: [[\"o/r#2\",\"OPEN\"]] -->\n2026-10-02T00:00:00Z: Applied.",
+        );
+        let read = |nodes: Vec<Value>| {
+            let parsed: Vec<_> = nodes.iter().map(|n| plan::comment(n).unwrap()).collect();
+            epic_apply::receipts(&parsed, &["bot", "operator"])
+        };
+        let before = read(vec![receipt.clone(), fingerprint.clone()]);
+        assert_eq!(before.0[0].detail.fingerprint.as_ref().unwrap().len(), 1);
+        let mut store = Store::load(path, "bot", at()).unwrap();
+        store.cleanup = true;
+        store
+            .expand(&vars, &mut page(json!([status, receipt]), true))
+            .unwrap();
+        assert!(store.historical(false).is_empty());
+        assert!(store.ledger.entries["o/r#1"].records.is_empty());
+        store
+            .expand(&later, &mut page(json!([fingerprint]), false))
+            .unwrap();
+        assert!(store.historical(true).is_empty());
+        let pending = store.pending().pop().unwrap();
+        assert!(
+            text(&pending.body, "/body").contains(
+                "### Last apply\n2026-10-02T00:00:00Z: Applied.\n- Action 1: linked o/r#2."
+            )
+        );
+        store.acknowledge(&pending).unwrap();
+        assert_eq!(store.historical(true).len(), 2);
+        store.minimized("o/r#1", 10).unwrap();
+        let mut status = status;
+        status["body"] = pending.body["body"].clone();
+
+        for (case, ledger_path, status_present, source, succeeds) in [
+            (
+                "restart with minimized prefix",
+                path,
+                true,
+                Some(fingerprint.clone()),
+                true,
+            ),
+            (
+                "status deleted",
+                path,
+                false,
+                Some(fingerprint.clone()),
+                true,
+            ),
+            ("source deleted", path, true, None, false),
+            ("both status and source deleted", path, false, None, false),
+            (
+                "missing ledger",
+                dir.path().join("missing").to_str().unwrap(),
+                true,
+                Some(fingerprint.clone()),
+                false,
+            ),
+        ] {
+            let mut restored = Store::load(ledger_path, "bot", at()).unwrap();
+            let mut first = page(
+                json!(if status_present {
+                    vec![status.clone(), receipt.clone()]
+                } else {
+                    vec![receipt.clone()]
+                }),
+                true,
+            );
+            let mut last = page(json!(source.into_iter().collect::<Vec<_>>()), false);
+            let result = restored
+                .expand(&vars, &mut first)
+                .and_then(|()| restored.expand(&later, &mut last));
+            assert_eq!(result.is_ok(), succeeds, "{case}: {result:?}");
+            if succeeds {
+                let nodes = [first, last]
+                    .into_iter()
+                    .flat_map(|p| {
+                        p["repository"]["issue"]["comments"]["nodes"]
+                            .as_array()
+                            .unwrap()
+                            .clone()
+                    })
+                    .collect();
+                assert_eq!(read(nodes), before);
+                assert_eq!(
+                    restored.ledger.entries["o/r#1"].records,
+                    [receipt.clone(), fingerprint.clone()]
+                );
+                if !status_present {
+                    let pending = restored.pending().pop().unwrap();
+                    assert_eq!(pending.method, "POST");
+                    assert_eq!(pending.body["body"], status["body"]);
+                    assert!(restored.historical(true).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn historical_later_page_replaces_cached_receipt_before_emission() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::load(
@@ -803,6 +1049,7 @@ pub(super) struct Store {
     duplicates: BTreeMap<String, BTreeSet<u64>>,
     discovered: BTreeMap<String, u64>,
     written: BTreeSet<String>,
+    pub operator: Option<String>,
     pub cleanup: bool,
     pub read_only: bool,
     history: BTreeMap<String, Vec<Value>>,
@@ -869,6 +1116,15 @@ fn kind(body: &str) -> Option<&'static str> {
     }
 }
 
+/// A split legacy receipt has no fence, but its completion and action lines
+/// must stay visible once its sources are minimized.
+fn section_kind(record: &Value) -> Option<&'static str> {
+    kind(text(record, "/body")).or_else(|| {
+        (is_split_record(record) && legacy_marker(record) == Some(epic_apply::APPLY_MARKER))
+            .then_some("Last apply")
+    })
+}
+
 fn identity(body: &str) -> Result<Option<String>> {
     if kind(body) == Some("Last apply") {
         let detail = plan::fenced_json(body, epic_apply::APPLY_MARKER)?;
@@ -910,18 +1166,11 @@ fn public_body(entry: &Entry) -> String {
             .records
             .iter()
             .rev()
-            .find(|r| kind(r["body"].as_str().unwrap_or_default()) == Some(section))
+            .find(|r| section_kind(r) == Some(section))
         {
             // Only the prose before a machine fence is public. Neither receipt
             // actions nor fingerprints are copied into hidden HTML comments.
-            let body = record["body"].as_str().unwrap_or_default();
-            let prose = body.split("```").next().unwrap_or_default();
-            let prose = prose
-                .lines()
-                .filter(|l| !l.starts_with("<!-- "))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let prose: String = prose.chars().take(DISPLAY_CHARS).collect();
+            let prose = status_prose(record);
             out.push_str(&format!("\n### {section}\n{}\n", prose.trim()));
         } else if let Some(prose) = entry.prose.get(section) {
             out.push_str(&format!("\n### {section}\n{prose}\n"));
@@ -940,6 +1189,41 @@ fn public_body(entry: &Entry) -> String {
     }
     out.push_str(&format!("\n{STATE}{} -->", state_id(entry)));
     out
+}
+
+fn status_prose(record: &Value) -> String {
+    let body = text(record, "/body");
+    if is_split_record(record) {
+        let prose = body
+            .lines()
+            .skip(1)
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if prose.chars().count() <= DISPLAY_CHARS {
+            return prose;
+        }
+        // Cut at a line boundary and leave room to point to the unchanged
+        // original, which is still readable after reversible minimization.
+        let url = text(record, "/url");
+        let notice = format!("\n\nAction log shortened; [read the full receipt]({url}).");
+        let prefix: String = prose
+            .chars()
+            .take(DISPLAY_CHARS.saturating_sub(notice.chars().count()))
+            .collect();
+        let lines = prefix.rsplit_once('\n').map_or("", |(lines, _)| lines);
+        return format!("{lines}{notice}");
+    }
+    body.split("```")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with("<!-- "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(DISPLAY_CHARS)
+        .collect()
 }
 
 fn marked(body: &str) -> bool {
@@ -1045,6 +1329,7 @@ impl Store {
             duplicates: BTreeMap::new(),
             discovered: BTreeMap::new(),
             written: BTreeSet::new(),
+            operator: None,
             cleanup: false,
             read_only: false,
             history: BTreeMap::new(),
@@ -1214,6 +1499,7 @@ impl Store {
             Some(id) => format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
             None => url.to_owned(),
         };
+        entry.protect_split_records();
         self.save()?;
         Ok(Some(Write {
             key,
@@ -1309,9 +1595,12 @@ impl Store {
             .entries
             .iter()
             .filter_map(|(key, entry)| {
-                // A tracking-only status can be created after a complete comment
-                // scan. Reconciliation scans again before sending this POST.
-                if entry.id.is_none() && entry.pulls.is_none() {
+                // A missing status can be recreated from verified legacy sources
+                // even without a pull inventory. Reconciliation scans again
+                // before sending this POST.
+                let repair_legacy =
+                    self.complete.contains(key) && entry.records.iter().any(is_split_record);
+                if entry.id.is_none() && entry.pulls.is_none() && !repair_legacy {
                     return None;
                 }
                 let body = public_body(entry);
@@ -1342,12 +1631,25 @@ impl Store {
         crate::github::parse_github_issue(&write.key, None, DEFAULT_HOST)
     }
 
-    pub fn acknowledge(&mut self, write: &Write) -> Result<()> {
-        self.ledger
+    /// A write may have landed even if the response is lost. Persist the
+    /// replay guard first; it does not by itself authorize minimization.
+    pub fn start_publication(&mut self, write: &Write) -> Result<()> {
+        let entry = self
+            .ledger
             .entries
             .get_mut(&write.key)
-            .context("missing status entry")?
-            .published = write.body["body"].as_str().map(str::to_owned);
+            .context("missing status entry")?;
+        if entry.records.iter().any(is_split_record) {
+            entry.protect_split_records();
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn acknowledge(&mut self, write: &Write) -> Result<()> {
+        let entry = (self.ledger.entries.get_mut(&write.key)).context("missing status entry")?;
+        entry.published = write.body["body"].as_str().map(str::to_owned);
+        entry.archive_published();
         self.save()
     }
 
@@ -1402,13 +1704,14 @@ impl Store {
             .get(&key)
             .map(|e| e.records.clone())
             .unwrap_or_default();
+        let archived_legacy = previous_records.iter().any(is_split_record);
         if variables["after"].is_null() {
             self.discovered.remove(&key);
             self.duplicates.remove(&key);
             self.history.remove(&key);
             self.complete.remove(&key);
         }
-        if self.cleanup {
+        if self.cleanup || archived_legacy {
             let history = self.history.entry(key.clone()).or_default();
             ensure!(
                 history.len() + nodes.len() <= MAX_RECORDS,
@@ -1540,15 +1843,39 @@ impl Store {
             entry.id = None;
             entry.published = None;
         }
-        if self.cleanup && complete && self.discovered.contains_key(&key) {
+        if complete && (archived_legacy || (self.cleanup && self.discovered.contains_key(&key))) {
+            let history = &self.history[&key];
             let entry = self
                 .ledger
                 .entries
                 .get_mut(&key)
                 .context("missing discovered status")?;
-            // Import only self-contained protocols. Keep the original URL and
-            // timestamps: relocation would change logical plan/replay identity.
-            for node in &self.history[&key] {
+            // GitHub still returns minimized comments in the issue connection.
+            // Keep those live positions for the legacy reader's forward search.
+            // If either published source vanishes or changes, neither guess its
+            // old fingerprint nor drop the apply claim and allow replay.
+            if archived_legacy {
+                entry.archive_published();
+                // A publication may have landed without an acknowledgement.
+                // Judge an import never sent to the forge again from its sources.
+                entry.records.retain(|r| {
+                    !is_split_record(r)
+                        || plan::comment_id(text(r, "/url")).is_some_and(|id| {
+                            entry.archived.contains(&id) || entry.minimized.contains(&id)
+                        })
+                });
+                let positions: Option<Vec<_>> = entry
+                    .records
+                    .iter()
+                    .filter(|r| is_split_record(r))
+                    .map(|r| history.iter().position(|node| same_record(r, node)))
+                    .collect();
+                ensure!(
+                    positions.is_some_and(|p| p.windows(2).all(|w| w[0] < w[1])),
+                    "archived legacy apply evidence changed or is missing for {key}; inspect both sources before continuing"
+                );
+            }
+            for node in history.iter().filter(|_| self.cleanup) {
                 if let Some(source) = trusted_history(node, &key, &self.ledger.bot) {
                     if let Some(saved) = entry.records.iter_mut().find(|r| same_origin(r, node)) {
                         // Recovery edits target the living status, leaving the
@@ -1562,10 +1889,38 @@ impl Store {
                     }
                 }
             }
+            // Import the pair as one durable update, or neither member. Keep
+            // both original nodes, not a reconstructed receipt or fingerprint.
+            if self.cleanup
+                && authoritative_history(history, entry, &key, &self.ledger.bot).is_some()
+            {
+                let bot = &self.ledger.bot;
+                let writers = [bot.as_str(), self.operator.as_deref().unwrap_or(bot)];
+                for pair in legacy_pairs(history, &entry.records, &key, bot, &writers) {
+                    if pair.iter().any(|node| {
+                        entry
+                            .records
+                            .iter()
+                            .any(|r| r["url"] == node["url"] && !same_record(r, node))
+                    }) {
+                        continue;
+                    }
+                    for node in pair {
+                        if !entry.records.iter().any(|r| same_record(r, node)) {
+                            entry.records.push(node.clone());
+                        }
+                    }
+                }
+            }
             entry.records.sort_by_key(|r| {
-                plan::comment(r)
-                    .ok()
-                    .map(|c| (c.changed, plan::comment_id(&c.url)))
+                plan::comment(r).ok().map(|c| {
+                    let at = if is_split_record(r) {
+                        c.created
+                    } else {
+                        c.changed
+                    };
+                    (at, plan::comment_id(&c.url))
+                })
             });
         }
         // A read immediately after our write may not show the status yet.
@@ -1603,13 +1958,15 @@ impl Store {
                     .records
                     .iter()
                     .filter(|r| {
-                        (if self.cleanup {
-                            // Do not emit a cached revision before a later
-                            // page can supply its newer historical source.
-                            complete
-                        } else {
-                            variables["after"].is_null() || !previous_records.contains(r)
-                        }) && !sources.contains(r)
+                        !is_split_record(r)
+                            && (if self.cleanup {
+                                // Do not emit a cached revision before a later
+                                // page can supply its newer historical source.
+                                complete
+                            } else {
+                                variables["after"].is_null() || !previous_records.contains(r)
+                            })
+                            && !sources.contains(r)
                             && !withdrawn(r)
                     })
                     .cloned(),
@@ -1633,10 +1990,10 @@ impl Store {
             .collect()
     }
 
-    /// Only exact, authenticated records covered by the authoritative
-    /// ledger are eligible. Uncovered history is evidence, not garbage: leave it
-    /// visible rather than guessing at legacy multi-comment replay protocols.
-    pub fn historical(&self, published: bool) -> Vec<(String, Value)> {
+    /// Only exact, authenticated records covered by the authoritative ledger
+    /// are eligible. Legacy members must both have coverage, even on retries
+    /// after their partner was already minimized.
+    pub fn historical(&self, published: bool) -> Vec<(String, Value, Option<Value>)> {
         if !self.cleanup {
             return Vec::new();
         }
@@ -1651,6 +2008,29 @@ impl Store {
                 continue;
             }
             let history = &self.history[key];
+            if authoritative_history(history, entry, key, &self.ledger.bot).is_some() {
+                let bot = &self.ledger.bot;
+                let writers = [bot.as_str(), self.operator.as_deref().unwrap_or(bot)];
+                for [receipt, fingerprint] in
+                    legacy_pairs(history, &entry.records, key, bot, &writers)
+                {
+                    // Minimize only what a confirmed public status covered.
+                    if [receipt, fingerprint].iter().all(|node| {
+                        entry.records.iter().any(|r| same_record(r, node))
+                            && (!published
+                                || plan::comment_id(text(node, "/url"))
+                                    .is_some_and(|id| entry.archived.contains(&id)))
+                    }) {
+                        for (node, partner) in [(receipt, fingerprint), (fingerprint, receipt)] {
+                            if !plan::comment_id(text(node, "/url"))
+                                .is_some_and(|id| entry.minimized.contains(&id))
+                            {
+                                out.push((key.clone(), node.clone(), Some(partner.clone())));
+                            }
+                        }
+                    }
+                }
+            }
             for node in history {
                 let Some(comment) = trusted_history(node, key, &self.ledger.bot) else {
                     continue;
@@ -1709,10 +2089,20 @@ impl Store {
                         continue;
                     }
                 }
-                out.push((key.clone(), node.clone()));
+                out.push((key.clone(), node.clone(), None));
             }
         }
         out
+    }
+
+    pub fn authoritative_source(&self, key: &str) -> Option<Value> {
+        authoritative_history(
+            self.history.get(key)?,
+            self.ledger.entries.get(key)?,
+            key,
+            &self.ledger.bot,
+        )
+        .cloned()
     }
 
     pub fn minimized(&mut self, key: &str, id: u64) -> Result<()> {
@@ -1726,11 +2116,131 @@ impl Store {
     }
 }
 
-fn trusted_history(node: &Value, key: &str, bot: &str) -> Option<plan::Comment> {
+fn history_comment(node: &Value, key: &str, bot: &str) -> Option<plan::Comment> {
     // Absent facts are not evidence of an unedited comment.
     node.get("lastEditedAt")?;
     node.get("editor")?;
     let comment = plan::comment(node).ok()?;
+    let (repo, number) = key.rsplit_once('#')?;
+    let id = plan::comment_id(&comment.url).filter(|id| *id > 0)?;
+    (plan::written_by(&comment, bot)
+        && (comment.edited || node["editor"].is_null())
+        && comment.url == format!("https://github.com/{repo}/issues/{number}#issuecomment-{id}"))
+    .then_some(comment)
+}
+
+fn authoritative_history<'a>(
+    history: &'a [Value],
+    entry: &Entry,
+    key: &str,
+    bot: &str,
+) -> Option<&'a Value> {
+    history.iter().find(|node| {
+        marked(text(node, "/body"))
+            && plan::comment_id(text(node, "/url")) == entry.id
+            && history_comment(node, key, bot).is_some()
+    })
+}
+
+/// Recognize protocol-shaped text even with a malformed marker, so it can
+/// veto an ambiguous match but cannot authorize a minimization.
+fn legacy_marker(node: &Value) -> Option<&'static str> {
+    [epic_apply::APPLY_MARKER, epic_apply::FINGERPRINT_MARKER]
+        .into_iter()
+        .find(|m| text(node, "/body").starts_with(&format!("<!-- {m}")))
+}
+
+fn is_split_record(node: &Value) -> bool {
+    legacy_marker(node).is_some() && !plan::has_fence(text(node, "/body"), epic_apply::APPLY_MARKER)
+}
+
+/// Uniqueness covers every claim the apply reader can see: live comments and
+/// ledger records, whose receipts the public status shows only as prose.
+fn legacy_pairs<'a>(
+    history: &'a [Value],
+    records: &[Value],
+    key: &str,
+    bot: &str,
+    writers: &[&str],
+) -> Vec<[&'a Value; 2]> {
+    let mut ordered = BTreeMap::<_, (Vec<_>, Vec<_>)>::new();
+    let mut urls = BTreeSet::new();
+    for node in history {
+        // Duplicated pagination is not complete coverage.
+        if node["body"].as_str().is_none()
+            || plan::comment_id(text(node, "/url")).is_none()
+            || !urls.insert(text(node, "/url"))
+        {
+            return Vec::new();
+        }
+    }
+    let accepted =
+        |node: &Value| epic_apply::claim_writer(node["author"]["login"].as_str(), writers);
+    // The bot's public status is expanded into its ledger records before
+    // replay sees it. Keep live comment order for legacy fingerprint lookup.
+    let comments = history
+        .iter()
+        .filter(|n| {
+            !(marked(text(n, "/body")) && text(n, "/author/login").eq_ignore_ascii_case(bot))
+        })
+        .chain(
+            records
+                .iter()
+                .filter(|r| !history.iter().any(|n| same_record(r, n))),
+        )
+        .filter(|n| accepted(n))
+        .map(plan::comment)
+        .collect::<Result<Vec<_>>>();
+    let Ok(comments) = comments else {
+        return Vec::new();
+    };
+    let (receipts, unread) = epic_apply::receipts(&comments, writers);
+    if !unread.is_empty() {
+        return Vec::new();
+    }
+    let mut claims = BTreeMap::<_, Vec<_>>::new();
+    for receipt in &receipts {
+        claims
+            .entry(receipt.detail.plan.as_str())
+            .or_default()
+            .push(receipt.url.as_str());
+    }
+    for (index, node) in history.iter().enumerate().filter(|(_, n)| accepted(n)) {
+        let body = text(node, "/body");
+        if let Some(marker) = legacy_marker(node)
+            && let Some(status) = body.lines().nth(1)
+        {
+            let (receipts, fingerprints) = ordered.entry(status.trim_end()).or_default();
+            if marker == epic_apply::APPLY_MARKER {
+                receipts.push((index, node));
+            } else {
+                fingerprints.push((index, node));
+            }
+        }
+    }
+    ordered
+        .into_values()
+        .filter_map(|(receipts, fingerprints)| {
+            let ([(r, receipt)], [(f, fingerprint)]) =
+                (receipts.as_slice(), fingerprints.as_slice())
+            else {
+                return None;
+            };
+            let plan = epic_apply::legacy_plan(text(receipt, "/body").lines().next()?)?;
+            if r >= f || claims.get(plan).map(Vec::as_slice) != Some(&[text(receipt, "/url")]) {
+                return None;
+            }
+            let r = history_comment(receipt, key, bot)?;
+            let f = history_comment(fingerprint, key, bot)?;
+            ((r.created, plan::comment_id(&r.url)) < (f.created, plan::comment_id(&f.url))
+                && epic_apply::completed_legacy_pair(&r, &f))
+            .then_some([*receipt, *fingerprint])
+        })
+        .collect()
+}
+
+fn trusted_history(node: &Value, key: &str, bot: &str) -> Option<plan::Comment> {
+    let comment = history_comment(node, key, bot)?;
     let protocols = [
         comment.body.starts_with("<!-- agent-board-dispatch: "),
         plan::has_fence(&comment.body, epic_apply::APPLY_MARKER),
@@ -1741,15 +2251,13 @@ fn trusted_history(node: &Value, key: &str, bot: &str) -> Option<plan::Comment> 
         return None;
     }
     let (repo, number) = key.rsplit_once('#')?;
-    if !plan::written_by(&comment, bot)
-        || !comment.url.starts_with(&format!(
-            "https://github.com/{repo}/issues/{number}#issuecomment-"
-        ))
-        || plan::comment_id(&comment.url).is_none()
-    {
+    let kind = kind(&comment.body)?;
+    // A split marker is never a self-contained record; only modern apply
+    // receipts may carry one, checked below.
+    if legacy_marker(node).is_some() && kind != "Last apply" {
         return None;
     }
-    match kind(&comment.body)? {
+    match kind {
         "Last dispatch" => {
             let identity = comment
                 .body
@@ -1763,8 +2271,31 @@ fn trusted_history(node: &Value, key: &str, bot: &str) -> Option<plan::Comment> 
         }
         "Last apply" => {
             let (receipts, unread) = epic_apply::receipts(std::slice::from_ref(&comment), &[bot]);
-            if receipts.len() != 1 || !unread.is_empty() {
+            let [receipt] = receipts.as_slice() else {
                 return None;
+            };
+            if !unread.is_empty() {
+                return None;
+            }
+            // Modern receipts retain the older claim marker for compatibility.
+            // That deliberate overlap is distinct from a split protocol mixed
+            // with a machine fence or a different claim.
+            if let Some(marker) = legacy_marker(node) {
+                let mut lines = comment.body.lines();
+                if marker != epic_apply::APPLY_MARKER
+                    || lines.next().and_then(epic_apply::legacy_plan) != Some(&receipt.detail.plan)
+                    || !lines.next().is_some_and(|header| {
+                        [
+                            "Applying [this epic plan](",
+                            "Applied [this epic plan](",
+                            "Stopped applying [this epic plan](",
+                        ]
+                        .iter()
+                        .any(|prefix| header.starts_with(prefix))
+                    })
+                {
+                    return None;
+                }
             }
         }
         "Current plan" => {
@@ -1779,7 +2310,7 @@ fn trusted_history(node: &Value, key: &str, bot: &str) -> Option<plan::Comment> 
     Some(comment)
 }
 
-fn same_record(a: &Value, b: &Value) -> bool {
+pub(super) fn same_record(a: &Value, b: &Value) -> bool {
     [
         "url",
         "body",

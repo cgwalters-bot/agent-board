@@ -1063,12 +1063,49 @@ identities and full replay guards, not just the last displayed prose. Missing ed
 facts, unknown/foreign editors, mixed protocols and unrecognized or malformed
 records are not admitted. Historical job plans need a strictly newer trusted plan;
 ambiguous plan evidence holds plan cleanup. The current plan and authoritative
-status are never minimized. Legacy split apply/fingerprint protocols and epic-plan
-comments remain visible: this slice does not establish their complete coverage.
+status are never minimized.
+
+Legacy split epic applies are eligible only for a complete `Applied.` receipt
+with a timestamped plan identity and completion line, followed in comment order
+by exactly one separate fingerprint with that same completion line. The ledger
+keeps both original comments and their provenance, not a converted receipt. Both
+must independently be authored by the bot and either explicitly unedited or last
+edited by the bot. Supported action lines are issue creation, comment POST, issue
+PATCH, link, enrollment, Priority, and already-closed confirmations. The
+fingerprint must be a sorted, unique list of lowercase issue references and
+`OPEN`/`CLOSED` states. Its completion line can stand alone or repeat the receipt's
+exact action log. Bare/in-flight claims, stopped applies, competing claims or
+matches, unmatched fingerprints, mixed or malformed content, and human or
+unverified edits are not cleaned up. A competing claim can be another live
+comment or a receipt kept only in the ledger. An unreadable claim by the operator
+or bot holds the issue's pairs, just as it holds apply replay. Other authors'
+comments do not compete. A split marker on any other record keeps that record
+visible too. Epic-plan cleanup is deferred.
+
+When the latest apply is a split receipt, the public status shows its completion
+and action lines under **Last apply**. If the action log does not fit, the status
+notes that it was shortened and links to the full original receipt.
+
+GitHub still returns minimized comments to receipt readers. The reader keeps the
+sources in their original order, without adding a second copy from the ledger.
+On a later complete scan, if either archived source is missing or changed after a
+confirmed public status covered the import, the pass refuses that history rather
+than dropping the claim or reviving a superseded fingerprint. This also holds if
+publication was interrupted after it was attempted. Restore or inspect the
+original evidence before applying on the issue again. An import for which no
+status write was attempted is dropped and judged again from its sources.
+If only the status is missing and the archived sources still match, the pass can
+recreate the status; no further minimization occurs without publication.
+A new competing comment does not invalidate unchanged sources for readers, but
+does hold further minimization of the pair.
 
 Cleanup waits until the ledger is synced and its authoritative public status edit
 is confirmed. Each candidate is re-read with its ownership, editor, body and
-identity facts before reversible **OUTDATED** minimization. Nothing is deleted.
+identity facts before reversible **OUTDATED** minimization. For split receipts,
+that final read checks both sources and the authoritative status together.
+Uniqueness is checked on the preceding bounded history scan; a concurrent
+comment can arrive after it. GitHub does not offer a conditional minimization,
+so the reads and mutation are not atomic. Nothing is deleted.
 The existing request/time limits and write caps include publication, failed writes
 and minimizations. Ledger limits refuse growth rather than evicting replay guards;
 incomplete pagination holds cleanup. Interrupted publication or minimization can

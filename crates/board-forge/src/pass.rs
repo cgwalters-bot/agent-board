@@ -4376,6 +4376,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if let Some(path) = &config.living_status {
         living::check_paths(path, config.state.as_deref())?;
         let mut store = living::Store::load(path, &config.bot, now)?;
+        store.operator = Some(config.operator.clone());
         store.cleanup = config.cleanup_history;
         store.read_only = matches!(mode, Mode::Preview);
         *bounds.living.borrow_mut() = Some(store);
@@ -5458,6 +5459,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 else {
                     return Ok(());
                 };
+                if let Some(store) = self.client.bounds.living.borrow_mut().as_mut() {
+                    store.start_publication(write)?;
+                }
                 self.caps.count(Kind::Write);
                 let mut response =
                     plan::send(&self.client, write.method, &write.url, &write.body, 0)?;
@@ -5530,8 +5534,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .as_ref()
             .map(|store| store.historical(self.apply))
             .unwrap_or_default();
-        for (key, candidate) in candidates {
-            let id = plan::comment_id(text(&candidate, "/url")).unwrap_or_default();
+        for (key, candidate, partner) in candidates {
             if !self.apply {
                 self.line(format!(
                     "living status: would minimize OUTDATED {}",
@@ -5558,49 +5561,60 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         store
                             .historical(true)
                             .iter()
-                            .any(|(k, n)| k == &key && n == &candidate)
+                            .any(|(k, n, p)| k == &key && n == &candidate && p == &partner)
                     })
                 {
                     return Ok(());
                 }
-                let (repo, _) = key.rsplit_once('#').context("cleanup issue key")?;
-                let response = self.client.get(
-                    &format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
-                    None,
-                )?;
-                ensure!(
-                    response.status == 200,
-                    "cleanup lookup: HTTP {}",
-                    response.status
-                );
-                let node = response.body["node_id"]
-                    .as_str()
-                    .context("cleanup node id missing")?;
-                let fresh = self
-                    .client
-                    .graphql(living::HISTORY_STATE, json!({"id":node}))?;
-                let fresh = &fresh["node"];
-                // Revalidate all admission facts, not just author or body. A
-                // foreign edit after discovery must not hide changed evidence.
-                for field in [
-                    "url",
-                    "body",
-                    "createdAt",
-                    "lastEditedAt",
-                    "author",
-                    "editor",
-                ] {
+                let (id, node) = self.history_node_id(&key, &candidate)?;
+                let minimized = if let Some(partner) = &partner {
+                    let status = self
+                        .client
+                        .bounds
+                        .living
+                        .borrow()
+                        .as_ref()
+                        .and_then(|store| store.authoritative_source(&key))
+                        .context("authoritative status source missing")?;
+                    let (_, partner_id) = self.history_node_id(&key, partner)?;
+                    let (_, status_id) = self.history_node_id(&key, &status)?;
+                    // One read, so a change during the other node lookups
+                    // cannot slip between the three evidence checks.
+                    let fresh = self.client.graphql(
+                        living::HISTORY_GROUP,
+                        json!({"ids":[node,partner_id,status_id]}),
+                    )?;
+                    let Some([target, other, published]) =
+                        fresh["nodes"].as_array().map(Vec::as_slice)
+                    else {
+                        bail!("cleanup pair lookup returned incomplete evidence");
+                    };
+                    Self::check_history_state(other, partner)?;
                     ensure!(
-                        fresh.get(field) == candidate.get(field),
-                        "cleanup comment changed: {field}"
+                        !Self::check_history_state(published, &status)?,
+                        "authoritative status is minimized"
                     );
+                    Self::check_history_state(target, &candidate)?
+                } else {
+                    let fresh = self
+                        .client
+                        .graphql(living::HISTORY_STATE, json!({"id":node}))?;
+                    Self::check_history_state(&fresh["node"], &candidate)?
+                };
+                if self
+                    .other_holds()
+                    .or_else(|| self.caps.check(Kind::Write))
+                    .is_some()
+                {
+                    return Ok(());
                 }
-                let minimized = fresh["isMinimized"]
-                    .as_bool()
-                    .context("cleanup minimized state missing")?;
                 if !minimized {
                     self.caps.count(Kind::Write);
-                    self.client.graphql(living::MINIMIZE, json!({"id":node}))?;
+                    let result = self.client.graphql(living::MINIMIZE, json!({"id":node}))?;
+                    ensure!(
+                        result["minimizeComment"].is_object(),
+                        "cleanup minimization was not confirmed"
+                    );
                     self.line(format!(
                         "living status: minimized OUTDATED {}",
                         text(&candidate, "/url")
@@ -5615,6 +5629,36 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.report.error("living status cleanup", &error);
             }
         }
+    }
+
+    fn history_node_id(&self, key: &str, candidate: &Value) -> Result<(u64, String)> {
+        let id = plan::comment_id(text(candidate, "/url")).context("cleanup comment id missing")?;
+        let (repo, _) = key.rsplit_once('#').context("cleanup issue key")?;
+        let response = self.client.get(
+            &format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
+            None,
+        )?;
+        ensure!(
+            response.status == 200,
+            "cleanup lookup: HTTP {}",
+            response.status
+        );
+        let node = response.body["node_id"]
+            .as_str()
+            .context("cleanup node id missing")?;
+        Ok((id, node.into()))
+    }
+
+    fn check_history_state(fresh: &Value, candidate: &Value) -> Result<bool> {
+        // A foreign edit after discovery must not hide changed evidence.
+        ensure!(
+            living::same_record(fresh, candidate),
+            "cleanup comment {} changed",
+            text(candidate, "/url")
+        );
+        fresh["isMinimized"]
+            .as_bool()
+            .context("cleanup minimized state missing")
     }
 
     fn harness_policy(&self) -> Option<&HarnessPolicy> {

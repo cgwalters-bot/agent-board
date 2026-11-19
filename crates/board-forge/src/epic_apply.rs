@@ -446,6 +446,10 @@ pub struct Receipt {
     pub detail: Detail,
 }
 
+pub(crate) fn claim_writer(login: Option<&str>, claimers: &[&str]) -> bool {
+    login.is_some_and(|a| claimers.iter().any(|w| w.eq_ignore_ascii_case(a)))
+}
+
 /// The receipts on an epic by `claimers`, in comment order (this format's,
 /// and the older hidden-marker claims with their fingerprint comments), and
 /// the URLs of those that look like receipts but cannot be read: a fence
@@ -453,9 +457,7 @@ pub struct Receipt {
 /// else. Each unreadable one may claim any plan, so none may be applied past
 /// it. Unknown fields are ignored, so a later build's receipts still claim.
 pub fn receipts(comments: &[Comment], claimers: &[&str]) -> (Vec<Receipt>, Vec<String>) {
-    let claimer = |login: Option<&str>| {
-        login.is_some_and(|a| claimers.iter().any(|w| w.eq_ignore_ascii_case(a)))
-    };
+    let claimer = |login| claim_writer(login, claimers);
     let trusted: Vec<&Comment> = (comments.iter())
         .filter(|c| claimer(c.author.as_deref()))
         .collect();
@@ -500,11 +502,7 @@ pub fn receipts(comments: &[Comment], claimers: &[&str]) -> (Vec<Receipt>, Vec<S
 /// separate comment after it, whose second line is the same.
 fn legacy(comment: &Comment, after: &[&Comment]) -> Option<Detail> {
     let mut lines = comment.body.lines();
-    let plan = lines
-        .next()?
-        .trim_end()
-        .strip_prefix(&format!("<!-- {APPLY_MARKER}: "))?
-        .strip_suffix(" -->")?;
+    let plan = legacy_plan(lines.next()?)?;
     let status = lines.next().unwrap_or_default().trim_end();
     let outcome = if status.ends_with(": Applied.") {
         Outcome::Applied
@@ -574,6 +572,106 @@ fn legacy(comment: &Comment, after: &[&Comment]) -> Option<Detail> {
             serde_json::from_str(json.trim_end().strip_suffix(" -->")?).ok()
         });
     Some(detail)
+}
+
+pub(crate) fn legacy_plan(marker: &str) -> Option<&str> {
+    marker
+        .trim_end()
+        .strip_prefix(&format!("<!-- {APPLY_MARKER}: "))?
+        .strip_suffix(" -->")
+}
+
+/// Narrower than the replay reader: reversible cleanup must not hide prose,
+/// unknown writes, or a malformed marker that the permissive reader skips.
+/// Pair uniqueness and ownership must be established by the caller separately.
+pub(crate) fn completed_legacy_pair(receipt: &Comment, fingerprint: &Comment) -> bool {
+    use time::format_description::well_known::Rfc3339;
+
+    let Some(detail) = legacy(receipt, &[fingerprint]) else {
+        return false;
+    };
+    let Some((id, at)) = detail.plan.split_once('@') else {
+        return false;
+    };
+    let mut lines = receipt.body.lines();
+    if !id.parse::<u64>().is_ok_and(|id| id > 0)
+        || OffsetDateTime::parse(at, &Rfc3339).is_err()
+        || detail.outcome != Outcome::Applied
+        || !lines.nth(1).is_some_and(|status| {
+            status
+                .trim_end()
+                .strip_suffix(": Applied.")
+                .is_some_and(|at| OffsetDateTime::parse(at, &Rfc3339).is_ok())
+        })
+    {
+        return false;
+    }
+    // Some releases repeated the full completion log on the fingerprint.
+    // Accept that exact mirror, but never hide extra or diverging prose.
+    let mut fingerprint_log = fingerprint.body.lines().skip(2).peekable();
+    if fingerprint_log.peek().is_some() && !fingerprint_log.eq(lines.clone()) {
+        return false;
+    }
+    let issue = |s: &str| IssueRef::parse(s).is_ok_and(|i| i.number > 0 && i.to_string() == s);
+    let mut previous = 0usize;
+    for line in lines {
+        let Some((n, write)) = line
+            .trim_end()
+            .strip_prefix("- Action ")
+            .and_then(|rest| rest.split_once(": "))
+        else {
+            return false;
+        };
+        let Ok(n) = n.parse::<usize>() else {
+            return false;
+        };
+        if n == 0 || n < previous {
+            return false;
+        }
+        previous = n;
+        let valid = if let Some(path) = write.strip_prefix("POST ") {
+            if let Some(repo) = path
+                .strip_prefix("repos/")
+                .and_then(|p| p.strip_suffix("/issues"))
+            {
+                issue(&format!("{repo}#1"))
+            } else {
+                path.ends_with("/comments") && rest_issue(path).is_some_and(|i| i.number > 0)
+            }
+        } else if let Some(path) = write.strip_prefix("PATCH ") {
+            !path.ends_with("/comments") && rest_issue(path).is_some_and(|i| i.number > 0)
+        } else if let Some(target) = write
+            .strip_prefix("linked ")
+            .or_else(|| write.strip_prefix("enrolled "))
+        {
+            target.strip_suffix('.').is_some_and(issue)
+        } else if let Some(set) = write.strip_prefix("set ") {
+            set.strip_suffix('.')
+                .and_then(|s| s.split_once(" Priority="))
+                .is_some_and(|(target, priority)| {
+                    issue(target)
+                        && priority
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        && !priority.is_empty()
+                })
+        } else {
+            write
+                .strip_suffix(" is already closed; nothing to do.")
+                .is_some_and(issue)
+        };
+        if !valid {
+            return false;
+        }
+    }
+    detail.fingerprint.is_some_and(|pairs| {
+        pairs.windows(2).all(|w| w[0].0 < w[1].0)
+            && pairs.iter().all(|(target, state)| {
+                issue(target)
+                    && target == &target.to_ascii_lowercase()
+                    && matches!(state.as_str(), "OPEN" | "CLOSED")
+            })
+    })
 }
 
 /// The claims of plan `id` by the operator or the bot, by comment id: the
@@ -2993,6 +3091,53 @@ mod tests {
             bot_comment(4, claim, "cgwalters"),
             bot_comment(5, stopped, "visitor"),
         ];
+        for (description, receipt, baseline, eligible) in [
+            (
+                "completed",
+                applied.to_owned(),
+                fingerprint.to_owned(),
+                true,
+            ),
+            (
+                "mirrored log",
+                applied.to_owned(),
+                format!(
+                    "{fingerprint}\n{}",
+                    applied.lines().skip(2).collect::<Vec<_>>().join("\n")
+                ),
+                true,
+            ),
+            ("stopped", stopped.to_owned(), fingerprint.to_owned(), false),
+            ("in flight", claim.to_owned(), fingerprint.to_owned(), false),
+            (
+                "mixed",
+                format!("{applied}\n```agent-board-epic-plan\n{{}}\n```"),
+                fingerprint.to_owned(),
+                false,
+            ),
+            (
+                "unknown write",
+                format!("{applied}\n- Action 5: unknown write"),
+                fingerprint.to_owned(),
+                false,
+            ),
+            (
+                "bad issue state",
+                applied.to_owned(),
+                fingerprint.replace("CLOSED", "UNKNOWN"),
+                false,
+            ),
+            (
+                "prose on fingerprint",
+                applied.to_owned(),
+                format!("{fingerprint}\nExtra text."),
+                false,
+            ),
+        ] {
+            let r = bot_comment(1, &receipt, "cgwalters-bot");
+            let f = bot_comment(2, &baseline, "cgwalters-bot");
+            assert_eq!(completed_legacy_pair(&r, &f), eligible, "{description}");
+        }
         let (found, _) = receipts(&comments, &["cgwalters", "cgwalters-bot"]);
         let summary: Vec<_> = (found.iter())
             .map(|r| (r.id, r.detail.plan.as_str(), r.detail.outcome))
