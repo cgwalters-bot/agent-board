@@ -660,7 +660,9 @@ a repository left out of it are still never seen.
 
 `maintainerReport` is absent by default: no report reads or writes. Set it to
 `{"repository": "OWNER/REPO", "issue": 1356}` in the trusted caller's
-`agent-board.json` to publish a machine-readable readout after each poll pass.
+`agent-board.json` to publish a machine-readable readout after each standalone
+`poll` pass. The hosted `pass` builds its poll policy from defaults and its `pr`
+keys, which have no `maintainerReport`.
 The target must be an issue, not a pull request. A private destination works
 with any follow set. A **public** destination is allowed only when GitHub
 confirms that every repository in the resolved follow set is public. This
@@ -672,8 +674,10 @@ client, conditional response cache and request budget. A non-public repository
 or an unsuccessful or ambiguous visibility read refuses publication with a
 poll error naming the repository, without changing any pull request decision.
 
-This is a point-in-time repository visibility check, not a content audit. It
-does not redact report text (such as reasons that mention other repositories),
+Reasons are free text that can name and describe repositories outside the
+follow set, such as a private dependency under `holdDependencies`, so a report
+to a public destination omits every step and wait `reason` and sets
+`"reasons_omitted": true`. The visibility check is point-in-time: it does not
 prevent visibility changes between the check and the write, or remove an older
 comment if a followed repository later becomes private. Use a private
 destination if the report may contain information that should not be public.
@@ -684,8 +688,7 @@ edits it only when the full body changes. It ignores another author's marker.
 Like the holds publisher this is an edited snapshot, not an event log; callers
 should serialize passes targeting the same issue to avoid racing creation.
 The generated time is part of the content, so a later pass normally updates it.
-Publication runs last within the poll's 500-request budget and, under `pass`,
-counts as one write under `--max-writes`. A refused read or write is reported
+Publication runs last within the poll's 500-request budget. A refused read or write is reported
 as a poll error, not a reason to undo or reconsider PR steps. A body over
 60,000 bytes is refused rather than silently publishing a partial inventory.
 
@@ -714,7 +717,8 @@ The [JSON schema](maintainer-report.schema.json) defines the block.
 `repositories` is the sorted, deduplicated followed set, not the activity-only
 watch set. `pull_requests` groups the open PRs already listed this pass by the
 poll's action (`merge`, `wait`, `skip`, `fix`, `needs-human`, etc.). Each entry
-has repository, number, observed head, action, reason and `ran`: whether the
+has repository, number, observed head, action, reason (omitted for a public
+destination) and `ran`: whether the
 step was taken, or would be in preview, not a claim that GitHub has finished
 merging it. Caps or a refused step leave `ran` false. Other authors are skips;
 listed PRs not decided are `unobserved`. Repositories outside this pass's

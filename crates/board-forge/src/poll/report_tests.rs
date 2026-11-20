@@ -205,6 +205,38 @@ fn maintainer_report_publication_requires_every_followed_repository_to_be_public
 }
 
 #[test]
+fn public_maintainer_report_omits_reasons_naming_unfollowed_repositories() {
+    // A dependency outside the follow set, possibly private, closed unmerged.
+    let (mut fake, mut cfg) = dependency_fixture();
+    cfg.policy.maintainer_report = maintainer_config().policy.maintainer_report;
+    cfg.policy.maintainer_report.as_mut().unwrap().repository = REPO.into();
+    fake.pulls.get_mut(&470).unwrap()["isDraft"] = true.into();
+    fake.page("repos/other/repo/issues/12", None, None, json!({"number":12,"state":"closed","pull_request":{}}));
+    fake.page("repos/other/repo/pulls/12", None, None, json!({"number":12,"state":"closed","merged":false}));
+    dependency_record(&mut fake, json!({"update_head":"","released":false,"reason":"blocked by other/repo#12"}));
+    let issue = format!("repos/{REPO}/issues/1356");
+    fake.page(&issue, None, None, json!({}));
+    fake.page(&format!("{issue}/comments?per_page=100"), None, None, json!([]));
+    for (visibility, public) in [("private", false), ("public", true)] {
+        fake.page(&format!("repos/{REPO}"), None, None,
+            json!({"private": !public, "visibility": visibility}));
+        fake.writes.borrow_mut().clear();
+        let out = dependency_pass(&fake, &cfg, true, None);
+        assert_eq!(out.errors, 0, "{visibility}: {:?}", out.lines);
+        assert!(out.waits.iter().any(|w| w.reason.contains("other/repo#12")), "{visibility}");
+        let writes = fake.writes.borrow();
+        let body = writes.iter().find(|(url, _)| *url == format!("POST {API_ROOT}{issue}/comments"))
+            .map(|(_, body)| text(body, "/body").to_owned()).expect(visibility);
+        assert_eq!(body.contains("other/repo"), !public, "{visibility}");
+        let snapshot = report_json(&body);
+        assert_eq!(snapshot["needs_human"][0]["kind"], "needs-human");
+        assert_eq!(snapshot["needs_human"][0].get("reason").is_some(), !public);
+        assert_eq!(snapshot["pull_requests"]["needs-human"][0].get("reason").is_some(), !public);
+        assert_eq!(snapshot.get("reasons_omitted").is_some(), public);
+    }
+}
+
+#[test]
 fn maintainer_report_reserves_publication_requests_before_reading_queues() {
     // Model the hosted client's read share, which does not charge writes to
     // that share. Both REST and GraphQL reads use it.

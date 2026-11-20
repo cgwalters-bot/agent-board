@@ -62,7 +62,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["repository", "number", "head", "kind", "reason"],
+        "required": ["repository", "number", "head", "kind"],
         "properties": {
           "repository": {"type": "string"},
           "number": {"type": "integer", "minimum": 1},
@@ -73,13 +73,25 @@
       }
     },
     "undecided_repositories": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
-    "errors": {"type": "integer", "minimum": 0}
+    "errors": {"type": "integer", "minimum": 0},
+    "reasons_omitted": {
+      "description": "Present for a public destination, whose report leaves out every free-text step and wait reason.",
+      "const": true
+    }
+  },
+  "if": {"required": ["reasons_omitted"]},
+  "else": {
+    "properties": {
+      "pull_requests": {"additionalProperties": {"items": {"required": ["reason"]}}},
+      "merge_queue_events": {"items": {"properties": {"step": {"required": ["reason"]}}}},
+      "needs_human": {"items": {"required": ["reason"]}}
+    }
   },
   "$defs": {
     "pull": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "number", "head", "action", "reason", "ran"],
+      "required": ["repository", "number", "head", "action", "ran"],
       "properties": {
         "repository": {"type": "string"},
         "number": {"type": "integer", "minimum": 1},

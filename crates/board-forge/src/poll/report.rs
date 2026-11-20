@@ -89,6 +89,7 @@ impl Pull {
 fn render(
     now: OffsetDateTime,
     apply: bool,
+    public: bool,
     follow: &BTreeSet<&String>,
     pulls: &BTreeMap<(String, u64), Pull>,
     queues: &BTreeMap<&String, Value>,
@@ -130,6 +131,35 @@ fn render(
     if !supervisor.is_empty() {
         snapshot["needs_supervisor"] = json!(supervisor);
     }
+    if public {
+        // Reasons are free text that can name and describe repositories outside
+        // the confirmed-public follow set, such as a private dependency.
+        let snapshot = snapshot.as_object_mut().context("report snapshot")?;
+        let mut steps: Vec<&mut Value> = Vec::new();
+        for (key, value) in snapshot.iter_mut() {
+            match (key.as_str(), value) {
+                ("pull_requests", Value::Object(groups)) => {
+                    steps.extend(
+                        groups
+                            .values_mut()
+                            .filter_map(Value::as_array_mut)
+                            .flatten(),
+                    );
+                }
+                ("needs_human" | "needs_supervisor", Value::Array(items)) => steps.extend(items),
+                ("merge_queue_events", Value::Array(items)) => {
+                    steps.extend(items.iter_mut().map(|e| &mut e["step"]));
+                }
+                _ => {}
+            }
+        }
+        for step in steps {
+            if let Some(step) = step.as_object_mut() {
+                step.remove("reason");
+            }
+        }
+        snapshot.insert("reasons_omitted".into(), Value::Bool(true));
+    }
     // Escape backticks in JSON strings so repository-controlled reasons cannot
     // close the protocol fence. JSON readers recover the original text.
     let json = serde_json::to_string_pretty(&snapshot)?.replace('`', "\\u0060");
@@ -147,12 +177,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return;
         };
         // Spend the required visibility reads before any optional queue reads.
-        if self.apply.is_some()
-            && let Err(error) = self.check_report_visibility(&at.repository, follow)
-        {
-            outcome.error("maintainer report", &error);
-            return;
-        }
+        let public = match self.apply {
+            None => false,
+            Some(_) => match self.check_report_visibility(&at.repository, follow) {
+                Ok(public) => public,
+                Err(error) => {
+                    outcome.error("maintainer report", &error);
+                    return;
+                }
+            },
+        };
         // Deferred review starts now have their final outcome; labelled skips
         // also use the poll's existing state rather than reclassifying anything.
         for step in &outcome.steps {
@@ -183,6 +217,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let body = render(
                 self.now,
                 self.apply.is_some(),
+                public,
                 follow,
                 &self.report_pulls,
                 &queues,
@@ -241,32 +276,39 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(Value::Array(entries))
     }
 
-    fn check_report_visibility(&mut self, repo: &str, follow: &BTreeSet<&String>) -> Result<()> {
+    /// Whether the destination is public; an error where publishing there could
+    /// disclose a followed repository that is not confirmed public.
+    fn check_report_visibility(&mut self, repo: &str, follow: &BTreeSet<&String>) -> Result<bool> {
         let destination = self.report_repository(repo)?;
-        match (
-            destination["private"].as_bool(),
-            destination.get("visibility"),
-        ) {
-            (Some(true), None) => {} // Keep accepting the existing private flag.
-            (Some(true), Some(visibility))
-                if visibility == "private" || visibility == "internal" => {}
-            (Some(false), Some(visibility)) if visibility == "public" => {
-                // The report names even undecided repositories. Check the whole
-                // follow set, reusing the destination read if it is followed.
-                let mut checked = BTreeSet::from([repo.to_ascii_lowercase()]);
-                for repo in follow {
-                    if checked.insert(repo.to_ascii_lowercase()) {
-                        let source = self.report_repository(repo)?;
-                        ensure!(
-                            source["private"] == false && source["visibility"] == "public",
-                            "{repo} is not confirmed public; refusing to publish to a public repository"
-                        );
-                    }
+        Ok(
+            match (
+                destination["private"].as_bool(),
+                destination.get("visibility"),
+            ) {
+                (Some(true), None) => false, // Keep accepting the existing private flag.
+                (Some(true), Some(visibility))
+                    if visibility == "private" || visibility == "internal" =>
+                {
+                    false
                 }
-            }
-            _ => bail!("{repo}: cannot confirm maintainer report destination visibility"),
-        }
-        Ok(())
+                (Some(false), Some(visibility)) if visibility == "public" => {
+                    // The report names even undecided repositories. Check the whole
+                    // follow set, reusing the destination read if it is followed.
+                    let mut checked = BTreeSet::from([repo.to_ascii_lowercase()]);
+                    for repo in follow {
+                        if checked.insert(repo.to_ascii_lowercase()) {
+                            let source = self.report_repository(repo)?;
+                            ensure!(
+                                source["private"] == false && source["visibility"] == "public",
+                                "{repo} is not confirmed public; refusing to publish to a public repository"
+                            );
+                        }
+                    }
+                    true
+                }
+                _ => bail!("{repo}: cannot confirm maintainer report destination visibility"),
+            },
+        )
     }
 
     fn report_repository(&mut self, repo: &str) -> Result<Value> {
@@ -351,6 +393,7 @@ mod tests {
         let body = render(
             OffsetDateTime::UNIX_EPOCH,
             false,
+            false,
             &BTreeSet::new(),
             &pulls,
             &BTreeMap::new(),
@@ -371,6 +414,7 @@ mod tests {
         assert!(
             render(
                 OffsetDateTime::UNIX_EPOCH,
+                false,
                 false,
                 &BTreeSet::new(),
                 &pulls,
