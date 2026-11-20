@@ -83,6 +83,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
         "holds.approvalEvidence",
         "holds.actNow",
         "holds.passView",
+        "holds.passes",
         "holds.today",
         "holds.epicFocus",
         "epics.close",

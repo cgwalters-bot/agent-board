@@ -258,6 +258,7 @@
     "holds.approvalEvidence": {"verdict": "refused", "reason": "evidence comes from stage 2's GitHub pull request reads; the reviews source is off on Forgejo"},
     "holds.actNow": {"verdict": "refused", "reason": "only the GitHub scheduler's needs-you step ranks it, beside the approval evidence it reads; the Forgejo publisher does not"},
     "holds.passView": {"verdict": "refused", "reason": "starts and runs in flight come from GitHub's dispatch answers and workflow run listings"},
+    "holds.passes": {"verdict": "refused", "reason": "starts and runs in flight come from GitHub's dispatch answers and workflow run listings, and the comment is found again by GitHub's author login"},
     "holds.today": {"verdict": "refused", "reason": "daily changes and cost use GitHub's project and Actions APIs"},
     "holds.epicFocus": {"verdict": "refused", "reason": "P0 and progress come from the GitHub board's Priority and native sub-issues"},
     "holds.requestShare": {"verdict": "native", "forgejo": "the same share of the pass's request limit"},

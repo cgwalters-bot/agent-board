@@ -11,6 +11,15 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The pass's new GitHub-only `holds.passes` (off unless set, needs `holds`)
+  publishes the pass history (`agent-board/passes/v1`), what each of the
+  last ten passes did, as the bot's own comment on the holds issue after
+  every stage, whatever they did: each stage's outcome, each start the
+  dispatch answer confirmed or left uncertain, each item that did not start
+  and why, and the pools' pace with its reading's clock. Diagnostics stay
+  in the run log. Applying passes name their `GITHUB_RUN_ATTEMPT`
+  (agent-board#1015).
+
 - The pass's new GitHub-only `changeSweepHours` (off at 0, needs `store`
   and `state`) runs the changes diff as stage 0 from watermarks kept in the
   store, and stage 2 then visits only the pull requests it lists, every one

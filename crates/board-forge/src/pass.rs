@@ -1284,6 +1284,11 @@ pub struct HoldsAt {
     /// passes, the pools' pace and the runs in flight, to the snapshot.
     #[serde(default, rename = "passView")]
     pub pass_view: bool,
+    /// Off unless set: publishes the pass history ([`history::SCHEMA`]),
+    /// what each of the last passes did, as the bot's own comment beside
+    /// the hold snapshot, whatever the pass's stages did.
+    #[serde(default)]
+    pub passes: bool,
     /// Off unless set: private UTC-day activity and yesterday's list-price cost.
     #[serde(default)]
     pub today: bool,
@@ -2983,6 +2988,8 @@ struct Bounds {
     start_kind: RefCell<String>,
     /// The runs started whose dispatch named them, for the pass view.
     started: RefCell<Vec<view::Run>>,
+    /// Every start asked for, or in a preview planned, for the pass history.
+    starts: RefCell<Vec<history::Start>>,
     routing: RefCell<Option<routing::Routing>>,
     /// The pass's requests: [`PASS_REQUEST_LIMIT`], or its share of the
     /// token's headroom ([`Self::size`]).
@@ -3051,6 +3058,7 @@ impl Bounds {
             effects: RefCell::default(),
             start_kind: RefCell::default(),
             started: RefCell::default(),
+            starts: RefCell::default(),
             routing: RefCell::default(),
             limit: Cell::new(limit),
             left: Cell::new(limit),
@@ -3618,6 +3626,19 @@ impl<C> Budget<'_, C> {
         }
     }
 
+    /// The kind of the start a dispatch `body` asks for: the stage's
+    /// ([`Rest::start_kind`]), or else the plan's, a review's without one.
+    fn start_kind_of(&self, body: &Value) -> String {
+        let context = self.bounds.start_kind.borrow();
+        match context.is_empty() {
+            true => body["inputs"]["kind"]
+                .as_str()
+                .unwrap_or("review")
+                .to_owned(),
+            false => context.clone(),
+        }
+    }
+
     fn publication_read(&self, key: &str) -> Option<KeptRead> {
         (self.bounds.stage.get() == Stage::Holds)
             .then(|| self.bounds.publication_reads.borrow().get(key).cloned())
@@ -3956,14 +3977,23 @@ impl<C: Rest> Rest for Budget<'_, C> {
             .as_ref()
             .map(|w| (w.method, w.url.as_str(), &w.body))
             .unwrap_or((method, url, body));
-        if method == "POST"
-            && url.ends_with("/dispatches")
-            && let Some(pool) = body["inputs"]["pool"].as_str()
-        {
+        let dispatch = method == "POST" && url.ends_with("/dispatches");
+        if dispatch && let Some(pool) = body["inputs"]["pool"].as_str() {
             // Count attempts too: a lost response may still have started a run.
             self.preview_pool_start(pool);
         }
-        let mut response = self.observe(self.inner.send(method, url, body))?;
+        let sent = self.observe(self.inner.send(method, url, body));
+        // The answer decides the start's state for the pass history.
+        if dispatch && let Some(state) = history::start_state(&sent) {
+            let run = sent
+                .as_ref()
+                .ok()
+                .and_then(|(_, body)| body["workflow_run_id"].as_u64());
+            let kind = self.start_kind_of(body);
+            let on = (dispatch_caller(url), &body["inputs"]);
+            self.bounds.record_start(state, on, &kind, run);
+        }
+        let mut response = sent?;
         if let Some(write) = &prepared
             && let Some(store) = self.bounds.living.borrow_mut().as_mut()
         {
@@ -3993,28 +4023,18 @@ impl<C: Rest> Rest for Budget<'_, C> {
             if method == "POST"
                 && (url.ends_with("/dispatches") || url.ends_with("/rerun-failed-jobs"))
             {
-                let context = self.bounds.start_kind.borrow();
-                let kind = if context.is_empty() {
-                    body["inputs"]["kind"].as_str().unwrap_or("review")
-                } else {
-                    context.as_str()
-                };
-                *effects.starts.entry(kind.to_owned()).or_default() += 1;
+                let kind = self.start_kind_of(body);
+                *effects.starts.entry(kind.clone()).or_default() += 1;
                 let pool = body["inputs"]["pool"].as_str().unwrap_or("unknown");
                 today::add_pool(&mut effects.starts_by_pool, pool, 1);
-                // `repos/OWNER/REPO/actions/workflows/WORKFLOW/dispatches`.
-                let path = url.strip_prefix(API_ROOT).unwrap_or(url);
-                let caller = path.strip_prefix("repos/").and_then(|p| {
-                    let (caller, _) = p.split_once("/actions/")?;
-                    Some(caller)
-                });
                 let inputs = &body["inputs"];
                 let number = text(inputs, "/item").parse().ok();
                 let run = response.1["workflow_run_id"].as_u64();
-                if let (Some(caller), Some(number), Some(id)) = (caller, number, run) {
+                if let (Some(caller), Some(number), Some(id)) = (dispatch_caller(url), number, run)
+                {
                     let item = (text(inputs, "/repo"), number);
                     let pool = inputs["pool"].as_str();
-                    let start = view::Run::new(item, kind, pool, (caller, id), None);
+                    let start = view::Run::new(item, &kind, pool, (caller, id), None);
                     self.bounds.started.borrow_mut().extend(start);
                 }
             }
@@ -4324,6 +4344,13 @@ pub struct Report {
     pub failures: usize,
     /// Each counted GitHub operation failure, including its reason.
     pub failed_operations: Vec<String>,
+    /// The operations the budget deferred (`… deferred: budget`).
+    pub deferred: usize,
+    /// Each stage's outcome, for the pass history ([`history::Sections`]).
+    sections: history::Sections,
+    /// The pass history document this pass built, published with
+    /// `holds.passes` by an applying pass ([`history::document`]).
+    pub passes: Option<Value>,
     pub state: Option<State>,
     pub holds: Vec<Entry>,
     /// The WIP limit and count and the pass's summary, published with
@@ -4349,6 +4376,7 @@ impl Report {
 
     fn error_line(&mut self, operation: &str, error: &anyhow::Error, line: String) {
         if budget_spent(error) {
+            self.deferred += 1;
             self.lines.push(format!("{operation} deferred: budget"));
         } else {
             self.failure(line);
@@ -4439,6 +4467,9 @@ pub struct PassRun {
     pub repository: String,
     /// `GITHUB_RUN_ID`.
     pub id: u64,
+    /// `GITHUB_RUN_ATTEMPT`, 1 where unset: the pass history names the
+    /// attempt, as a re-run's record is another's.
+    pub attempt: u64,
 }
 
 /// Whether a pass writes, and how it is kept from racing another.
@@ -4713,18 +4744,6 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         inner: dispatcher,
         bounds,
     };
-    // Every stage that starts runs starts them from the same ref.
-    let git_ref = match &config.dispatch_ref {
-        Some(git_ref) => git_ref.clone(),
-        None if !config.follows() && !config.work() && config.maintain.is_none() => String::new(),
-        None => match default_branch(&client, &config.dispatch_repo) {
-            Ok(branch) => branch,
-            Err(error) => {
-                report.error("dispatch ref", &error);
-                return report;
-            }
-        },
-    };
     let mut scheduler = Scheduler {
         client,
         dispatcher,
@@ -4781,127 +4800,149 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         quiet: None,
         changes: None,
     };
-    if config.pull.is_some() {
-        // No refresh publication, maintenance, reaping, board reconciliation or
-        // scheduling: only the selected PR may receive a forge step. Pacing
-        // reads the existing snapshot; WIP/leases still use the full census.
-        bounds.enter(Stage::PullRequests);
-        scheduler.follow(state, &git_ref, 0);
-        return report;
-    }
-    match scheduler.direction() {
-        Ok(direction) => scheduler.direction = direction,
-        Err(error) => {
-            scheduler.report.error("direction", &error);
+    scheduler.section(Some(Stage::Setup));
+    // The stages, each its section of the pass history, which is published
+    // after them however they end.
+    'stages: {
+        // Every stage that starts runs starts them from the same ref.
+        let git_ref = match &config.dispatch_ref {
+            Some(git_ref) => git_ref.clone(),
+            None if !config.follows() && !config.work() && config.maintain.is_none() => {
+                String::new()
+            }
+            None => match default_branch(&scheduler.client, &config.dispatch_repo) {
+                Ok(branch) => branch,
+                Err(error) => {
+                    scheduler.report.error("dispatch ref", &error);
+                    break 'stages;
+                }
+            },
+        };
+        if config.pull.is_some() {
+            // No refresh publication, maintenance, reaping, board reconciliation or
+            // scheduling: only the selected PR may receive a forge step. Pacing
+            // reads the existing snapshot; WIP/leases still use the full census.
+            scheduler.enter(Stage::PullRequests, 0);
+            scheduler.follow(state, &git_ref, 0);
+            break 'stages;
+        }
+        match scheduler.direction() {
+            Ok(direction) => scheduler.direction = direction,
+            Err(error) => {
+                scheduler.report.error("direction", &error);
+            }
+        }
+        // Stage 0: what changed since the last pass, which stage 2 walks,
+        // within its share.
+        let mut state = state;
+        let after_changes = (bounds.left.get()).saturating_sub(bounds.share(CHANGES_SHARE));
+        scheduler.enter(Stage::Changes, after_changes);
+        scheduler.changes(&mut state);
+        if let Some(line) = bounds.share_line() {
+            scheduler.line(line);
+        }
+        // Stage 1: usage from the broker, which this pass's runs pace by, pull
+        // requests' included, and the next pass if it cannot read the broker.
+        scheduler.enter(Stage::Usage, 0);
+        scheduler.refresh();
+        if let Err(error) = scheduler.reap_overdue(&git_ref) {
+            scheduler.report.error("reap", &error);
+        }
+        // The maintain digest, planned while it is due, which the later stages
+        // leave its share for.
+        if state.interval_seconds == 0 {
+            state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
+        }
+        let (after_pulls, after_epics) = kept_shares(config, bounds);
+        scheduler.enter(
+            Stage::Maintain,
+            if config.reserve_scheduling {
+                after_pulls
+            } else {
+                0
+            },
+        );
+        if config.notifications {
+            // A due digest must leave the operator intake its turn too.
+            bounds.kept.set(bounds.kept.get().max(OPERATOR_REQUESTS));
+        }
+        let maintained = scheduler.maintain(state.maintain.take(), &git_ref);
+        if let Some(line) = bounds.share_line() {
+            scheduler.line(line);
+        }
+        // Without stage 2's state, the incoming one keeps the maintain stage's.
+        let kept = scheduler.report.maintain.is_some().then(|| state.clone());
+        // Stage 2: pull request follow-up, today's poll, within its share.
+        scheduler.enter(Stage::PullRequests, after_pulls);
+        let mut earlier = maintained + scheduler.follow(state, &git_ref, maintained);
+        if let Some(line) = bounds.share_line() {
+            scheduler.line(line);
+        }
+        if let Some(day) = scheduler.report.maintain.clone() {
+            let state = (scheduler.report.state).get_or_insert_with(|| kept.unwrap_or_default());
+            state.maintain = Some(day);
+        }
+        // Stage 3: epic plans applied, applies recovered, an epic planned. Its
+        // starts take their slots before stage 4's.
+        scheduler.enter(Stage::Epics, after_epics);
+        earlier += scheduler.epics(earlier, &git_ref);
+        if let Some(line) = bounds.share_line() {
+            scheduler.line(line);
+        }
+        // Stage 4: choose and start work.
+        scheduler.enter(Stage::Schedule, 0);
+        if let Some(line) = bounds.starved_line() {
+            scheduler.line(line);
+        }
+        if let Err(error) = scheduler.schedule(earlier, &git_ref) {
+            scheduler.holds_whole = false;
+            scheduler.report.error("schedule", &error);
+        }
+        scheduler.focus_unjudged();
+        scheduler.refresh_pull_links();
+        // Stage 4b: read-only visibility into approved fork PRs, never publication.
+        scheduler.promote();
+        // Stage 5: board Status from the facts read, this pass's starts included.
+        // No start comes after stage 4, so it and the holds spend what is left.
+        bounds.reserve.set(0);
+        scheduler.enter(Stage::Status, 0);
+        if let Err(error) = scheduler.status(&git_ref).await {
+            scheduler.report.error("status", &error);
+        }
+        for notice in bounds.handoff_notices.borrow().iter() {
+            scheduler.line(notice.clone());
+        }
+        // Stages 3 and 4's holds, unless either failed outright: they would be
+        // partial.
+        scheduler.reconcile_living();
+        scheduler.cleanup_history();
+        bounds.publication_share.set(config.holds_share());
+        scheduler.enter(Stage::Holds, 0);
+        if scheduler.holds_whole {
+            scheduler.publish_holds();
+        } else if scheduler.config.holds.is_some() {
+            let why = "stage 3 or 4 stopped part way, so they would be partial";
+            scheduler.line(format!("holds: not published; {why}"));
+        }
+        scheduler.session_comparison();
+        if !apply {
+            scheduler.observe_decision();
+        }
+        // Last, the cost reports. Opted-in sizing covers their requests too;
+        // the default keeps the historical independent cost-stage allowance.
+        if bounds.rate_limited.borrow().is_none() {
+            let within = (now, apply, bounds.admit_by);
+            if config.request_share.is_some() {
+                scheduler.enter(Stage::Cost, 0);
+                cost::stage(&scheduler.client, config, within, caps, scheduler.report);
+            } else {
+                scheduler.section(Some(Stage::Cost));
+                cost::stage(unbudgeted, config, within, caps, scheduler.report);
+            }
         }
     }
-    // Stage 0: what changed since the last pass, which stage 2 walks,
-    // within its share.
-    let mut state = state;
-    let after_changes = (bounds.left.get()).saturating_sub(bounds.share(CHANGES_SHARE));
-    bounds.enter_keeping(Stage::Changes, after_changes);
-    scheduler.changes(&mut state);
-    if let Some(line) = bounds.share_line() {
-        scheduler.line(line);
-    }
-    // Stage 1: usage from the broker, which this pass's runs pace by, pull
-    // requests' included, and the next pass if it cannot read the broker.
-    bounds.enter(Stage::Usage);
-    scheduler.refresh();
-    if let Err(error) = scheduler.reap_overdue(&git_ref) {
-        scheduler.report.error("reap", &error);
-    }
-    // The maintain digest, planned while it is due, which the later stages
-    // leave its share for.
-    if state.interval_seconds == 0 {
-        state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
-    }
-    let (after_pulls, after_epics) = kept_shares(config, bounds);
-    bounds.enter_keeping(
-        Stage::Maintain,
-        if config.reserve_scheduling {
-            after_pulls
-        } else {
-            0
-        },
-    );
-    if config.notifications {
-        // A due digest must leave the operator intake its turn too.
-        bounds.kept.set(bounds.kept.get().max(OPERATOR_REQUESTS));
-    }
-    let maintained = scheduler.maintain(state.maintain.take(), &git_ref);
-    if let Some(line) = bounds.share_line() {
-        scheduler.line(line);
-    }
-    // Without stage 2's state, the incoming one keeps the maintain stage's.
-    let kept = scheduler.report.maintain.is_some().then(|| state.clone());
-    // Stage 2: pull request follow-up, today's poll, within its share.
-    bounds.enter_keeping(Stage::PullRequests, after_pulls);
-    let mut earlier = maintained + scheduler.follow(state, &git_ref, maintained);
-    if let Some(line) = bounds.share_line() {
-        scheduler.line(line);
-    }
-    if let Some(day) = scheduler.report.maintain.clone() {
-        let state = (scheduler.report.state).get_or_insert_with(|| kept.unwrap_or_default());
-        state.maintain = Some(day);
-    }
-    // Stage 3: epic plans applied, applies recovered, an epic planned. Its
-    // starts take their slots before stage 4's.
-    bounds.enter_keeping(Stage::Epics, after_epics);
-    earlier += scheduler.epics(earlier, &git_ref);
-    if let Some(line) = bounds.share_line() {
-        scheduler.line(line);
-    }
-    // Stage 4: choose and start work.
-    bounds.enter(Stage::Schedule);
-    if let Some(line) = bounds.starved_line() {
-        scheduler.line(line);
-    }
-    if let Err(error) = scheduler.schedule(earlier, &git_ref) {
-        scheduler.holds_whole = false;
-        scheduler.report.error("schedule", &error);
-    }
-    scheduler.focus_unjudged();
-    scheduler.refresh_pull_links();
-    // Stage 4b: read-only visibility into approved fork PRs, never publication.
-    scheduler.promote();
-    // Stage 5: board Status from the facts read, this pass's starts included.
-    // No start comes after stage 4, so it and the holds spend what is left.
-    bounds.reserve.set(0);
-    bounds.enter(Stage::Status);
-    if let Err(error) = scheduler.status(&git_ref).await {
-        scheduler.report.error("status", &error);
-    }
-    for notice in bounds.handoff_notices.borrow().iter() {
-        scheduler.line(notice.clone());
-    }
-    // Stages 3 and 4's holds, unless either failed outright: they would be
-    // partial.
-    scheduler.reconcile_living();
-    scheduler.cleanup_history();
-    bounds.publication_share.set(config.holds_share());
-    bounds.enter(Stage::Holds);
-    if scheduler.holds_whole {
-        scheduler.publish_holds();
-    } else if scheduler.config.holds.is_some() {
-        let why = "stage 3 or 4 stopped part way, so they would be partial";
-        scheduler.line(format!("holds: not published; {why}"));
-    }
-    scheduler.session_comparison();
-    if !apply {
-        scheduler.observe_decision();
-    }
-    // Last, the cost reports. Opted-in sizing covers their requests too;
-    // the default keeps the historical independent cost-stage allowance.
-    if bounds.rate_limited.borrow().is_none() {
-        let within = (now, apply, bounds.admit_by);
-        if config.request_share.is_some() {
-            bounds.enter(Stage::Cost);
-            cost::stage(&scheduler.client, config, within, caps, scheduler.report);
-        } else {
-            cost::stage(unbudgeted, config, within, caps, scheduler.report);
-        }
-    }
+    // The pass history, with `holds.passes`, whatever the stages did.
+    scheduler.publish_passes();
     if let Some(routing) = bounds.routing.borrow_mut().as_mut() {
         report.lines.append(&mut routing.lines);
     }
@@ -5123,6 +5164,16 @@ fn bot_comments(
     client: &impl Rest,
     bot: &str,
     on: (&str, u64),
+    what: (&[&str], &str),
+    limit: (bool, usize),
+) -> Result<(Vec<Value>, usize)> {
+    bot_comments_with(|url| client.get(url, None), bot, on, what, limit)
+}
+
+fn bot_comments_with(
+    read: impl Fn(&str) -> Result<RestResponse>,
+    bot: &str,
+    on: (&str, u64),
     (markers, what): (&[&str], &str),
     (first, pages): (bool, usize),
 ) -> Result<(Vec<Value>, usize)> {
@@ -5131,7 +5182,7 @@ fn bot_comments(
     let mut kept = Vec::new();
     let mut seen = 0;
     for _ in 0..pages {
-        let response = client.get(&url, None)?;
+        let response = read(&url)?;
         ensure!(
             response.status == 200,
             "reading the {what}: GitHub HTTP status {}",
@@ -6510,6 +6561,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         .planned_starts
                         .entry(step.action.to_owned())
                         .or_default() += 1;
+                    let pull = ItemRef {
+                        host: DEFAULT_HOST.into(),
+                        repository: step.repository.clone(),
+                        number: step.number,
+                    };
+                    self.client.bounds.preview_start(&pull, step.action, None);
                 }
             }
         }
@@ -7177,6 +7234,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .planned_starts
                 .entry(kind.to_owned())
                 .or_default() += 1;
+            if let Some(item) = holds.first() {
+                let pool = line_pool(&line);
+                self.client.bounds.preview_start(item, kind, pool);
+            }
         }
         self.probed(slots, &line);
         // Sent or planned: a failed start may have dispatched.
@@ -10596,6 +10657,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 }
 
+/// The caller a dispatch `url` names:
+/// `repos/OWNER/REPO/actions/workflows/WORKFLOW/dispatches`.
+fn dispatch_caller(url: &str) -> Option<&str> {
+    let path = url.strip_prefix(API_ROOT).unwrap_or(url);
+    let (caller, _) = path.strip_prefix("repos/")?.split_once("/actions/")?;
+    Some(caller)
+}
+
 /// The run id in a started line's `run=` URL, where GitHub named the run.
 fn run_id(line: &str) -> Option<u64> {
     line.split(" run=").nth(1)?.rsplit('/').next()?.parse().ok()
@@ -10975,6 +11044,7 @@ mod cost;
 pub(crate) mod epics;
 mod focus;
 pub mod guidance;
+mod history;
 pub mod holds;
 
 pub mod decision;

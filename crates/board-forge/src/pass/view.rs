@@ -21,7 +21,7 @@ const MAX_POOLS: usize = 16;
 /// control app calls one older than an hour stale.
 pub(super) const REFRESH_MINUTES: i64 = 30;
 /// The holds of every new run, which the view counts as `capped`.
-const CAPS: &[HoldKind] = &[HoldKind::Wip, HoldKind::Pools, HoldKind::Budget];
+pub(super) const CAPS: &[HoldKind] = &[HoldKind::Wip, HoldKind::Pools, HoldKind::Budget];
 
 /// An agent run on an item: one the pass started, or one in flight.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,11 +45,6 @@ impl Run {
         (caller, id): (&str, u64),
         started_at: Option<&str>,
     ) -> Option<Self> {
-        let named = |r: &str| {
-            crate::supervise::word_repo(r)
-                && r.len() <= 201
-                && r.split('/').all(|s| s != "." && s != "..")
-        };
         if !named(repository) || !named(caller) || number == 0 || id == 0 {
             return None;
         }
@@ -84,9 +79,17 @@ impl Run {
     }
 }
 
+/// Whether the reader takes `repository`, `OWNER/REPO`, as one, and not
+/// for a path.
+pub(super) fn named(repository: &str) -> bool {
+    crate::supervise::word_repo(repository)
+        && repository.len() <= 201
+        && repository.split('/').all(|s| s != "." && s != "..")
+}
+
 /// `name` where the reader takes it as a kind or pool:
 /// `[a-z][a-z0-9-]{0,31}`.
-fn token(name: &str) -> Option<String> {
+pub(super) fn token(name: &str) -> Option<String> {
     let mut chars = name.chars();
     let first = chars.next().is_some_and(|c| c.is_ascii_lowercase());
     let rest = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');

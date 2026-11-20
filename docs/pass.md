@@ -151,7 +151,7 @@ opt-ins, not every optional key. The GitHub catalog consists of:
   `reserveOperator`, `assignHolds`, `readFreeHolds`, `leanReads`, `bodyPlans`, `leases`,
   `reruns`, `reapOverdueRuns`, `cleanupHistory`, `topDown`, `usage.probe`,
   `holds.needsYou`, `holds.approvalEvidence`, `holds.actNow`, `holds.passView`,
-  `holds.today`, `holds.epicFocus`, `epics.close`, `epics.inWorkRepositories`,
+  `holds.passes`, `holds.today`, `holds.epicFocus`, `epics.close`, `epics.inWorkRepositories`,
   `sessions.apply`, `promote.onApproval`,
   `revisit.repairQuestions`, and the false-default boolean fields of the shared
   `PrOptions` metadata (including `pr.agentRecovery`). `pr.directionFirst` is
@@ -1865,6 +1865,95 @@ or needs-you card: first its older passes, then the newest pass's last
 starts and reasons, counted in its `omitted`, then the last runs in flight,
 counted in the view's. Only where even that leaves no room is it left out
 whole. The pass's line says `holds: published URL, with the pass view`.
+
+#### Pass history
+
+With `holds.passes` set (off unless set; GitHub only; agent-board#1015), the
+pass publishes what it did as the bot's own comment on the holds issue,
+beside the hold snapshot and apart from it: the comment starts with
+`<!-- agent-board-passes v1 -->` and carries one `json` fence of
+`agent-board/passes/v1`, what the control app's Status panel reads (review
+`src/github/passes.ts`). The hold snapshot is written only where stages 3
+and 4 decided every hold; the pass attempts to publish history after the
+stages, even if one fails, provided configuration resolution succeeded. The
+[fixtures](../fixtures/passes/) are what the producer emits for a pass that
+[failed](../fixtures/passes/failed.json) at its setup, one that was
+[partial](../fixtures/passes/partial.json), and a
+[preview](../fixtures/passes/preview.json); their test builds them.
+
+```json
+{"schema":"agent-board/passes/v1","published_at":"2026-11-05T12:00:00Z","retention":10,"omitted":0,
+"passes":[{"run":{"repository":"o/runner","id":43,"attempt":1},"started_at":"2026-11-05T12:00:00Z","finished_at":"2026-11-05T12:00:00Z","mode":"actions","result":"partial",
+ "sections":[{"name":"pull-requests","outcome":"failed","error":"Stage failed; see the run log."},{"name":"schedule","outcome":"cut-short","error":null}],
+"starts":[{"state":"confirmed","item":"o/work#2","kind":"triage","pool":"claude","run":null}],
+"no_start":[{"reason":"held","item":"o/work#3","until":null,"cap":null,"hold":"needs-human"}],
+"candidates":{"read":6,"unread":9,"ready":0},"omitted":{"sections":0,"starts":0,"no_start":0}}],
+"pools":{"observed_at":"2026-11-05T11:58:00Z","complete":true,"omitted":0,"items":[{"pool":"claude","observed_at":"2026-11-05T11:57:30Z","used_percent":45.4,"allowed_percent":50.0,"resets_at":"2026-11-05T13:00:00Z","held":false,"ready":null}]},
+"in_flight":{"observed_at":"2026-11-05T12:00:00Z","complete":true,"omitted":0,"runs":[{"item":"o/work#1","kind":"fix","pool":"unknown","run":{"repository":"o/runner","id":101},"since":"2026-11-05T11:00:00Z"}],"prs":[]}}
+```
+
+Everything comes from the pass's own decision sites, never from its log.
+Publication requires a private repository and the bot's token for both
+creation and updates. `passes` has this pass first, then the published
+history's valid records that finished within the last 7 days, at most 10
+in all; `omitted` counts the records this publication left out, by shape,
+age, number or size, and
+a record's absence is no proof a pass did not run: a killed pass or a
+failed write leaves a gap. A record has:
+
+- `run`, the Actions run (`GITHUB_RUN_ATTEMPT` names the attempt, 1 where
+  unset) or null outside one; `started_at` and `finished_at`, both the
+  pass's clock, which reads no other; `mode`, `actions`, `preview` or
+  `local`.
+- `sections`, one per stage in order, each `ok`, `failed`, `skipped` (never
+  entered: the pass stopped before it) or `cut-short` (a read its share or
+  the budget refused, a step the budget deferred, or the rate-limit breaker),
+  judged by the failures counted while the stage ran. A failed section's
+   `error` is a fixed summary directing readers to the run log. Diagnostic
+   text is never copied into history; other sections have a null `error`.
+- `result`: `failure` where a stage failed before stage 4 ran, `partial`
+  where one failed or was cut short, else `success`.
+- `starts`, at most 20: each dispatch sent, `confirmed` where GitHub
+  accepted it (its `run` null where the answer named none), `uncertain`
+  where the answer was lost or was an error GitHub may have acted on, and
+  in a preview `preview`, never sent. A refused dispatch (a 4xx, a rate
+  limit the client gave up on, or no authentication) is no start. A rerun
+  of failed jobs and the maintain digest's run are previewed but not yet
+  among an applying pass's starts: their dispatches name no item. Kinds and
+  pools are tokens the reader takes, a pool it would not null.
+- `no_start`, at most 20: `no-ready-work` where stage 4 ran whole with a
+  slot free and started nothing, `capped` with `cap` `wip`, `pools` or
+  `budget` for the holds of every new run, and `held` with the item and its
+  hold's kind for each item hold, never the hold's reason, so no spend
+  amount appears. No reason has an `until`: the pass records no re-plan
+  time.
+- `candidates`: stage 4's candidates read, unread and ready to start, or
+  null where it did not read the board. `omitted` counts the sections,
+  starts and reasons left out of each list.
+
+`pools` is the usage snapshot the pass read, or null where it read none:
+its clock, whether every configured pool has an entry, and each pool's own
+reading's clock, use and allowance in percent to one decimal, reset and
+hold, each null where the snapshot has none; `ready` is null, as ready work
+is not counted by pool. `in_flight` lists at most 50 of the caller's runs
+the pass listed, each with its start as `since`, or is null where it listed
+none; `prs` is empty, as queue and review waits are not exported yet.
+
+The JSON is kept within 48 KiB: past it the oldest record's last no-start
+reason or start goes first, counted in its `omitted`, then, once no record
+has details, the oldest whole record, counted in the document's, then the
+last run in flight. The write is one step within the holds' publication
+share and `--max-writes`, after the cost stage. The transport can retry
+explicit rate-limit refusals but not ambiguous writes. History uses the same
+overlap gate as holds; neither publishes while another pass is active or the
+gate cannot tell. The pass rereads the first comment page before writing and
+does not append if it is full. It carries only valid records from the exact
+body verified to be the bot's last edit (or original unedited comment).
+Confirmed foreign edits are not carried; an inconclusive check leaves the
+comment alone. The pass logs `passes: published URL`, or why not.
+A preview says `passes: publish to R#N; a preview does not write it`.
+Local applies lack an Actions run for the overlap check and do not publish
+history. A `--pull` pass does not publish history either.
 
 #### Epic focus
 
@@ -6298,6 +6387,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `holds.approvalEvidence` | Add stage 2's head-bound [approval evidence](#approval-evidence-optional-v2-extension) to the needs-you list; needs `holds.needsYou`, GitHub only; `false` |
 | `holds.actNow` | Add the [Act now](#act-now-optional-v2-extension) shortlist to the needs-you list; needs `holds.needsYou` and `holds.approvalEvidence`, GitHub only; `false` |
 | `holds.passView` | Add the [pass view](#pass-view) (`agent-board/pass-view/v1`): the last passes, pool pace and runs in flight; needs `holds`, GitHub only; `false` |
+| `holds.passes` | Publish the [pass history](#pass-history) (`agent-board/passes/v1`), what each of the last passes did, as the bot's own comment on the holds issue, whatever the stages did; needs `holds`, GitHub only; `false` |
 | `holds.today` | Add [today's activity](#today) (`agent-board/today/v1`): UTC-day changes and starts, yesterday's private cost; needs `holds`, GitHub only; `false` |
 | `holds.epicFocus` | Add the [epic focus](#epic-focus) (`agent-board/epic-focus/v1`): each open P0 epic's progress, runs and blockers; needs `holds` and `epics`, a GitHub board only; `false` |
 | `holds.requestShare` | The percentage, 1–50, of the pass's request limit that [holds publication](#what-is-built) may spend, still within what work left; `15` |
