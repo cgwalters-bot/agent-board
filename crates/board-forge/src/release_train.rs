@@ -33,6 +33,10 @@ pub const CACHE_SCHEMA: &str = "agent-board.release-train-cache.v1";
 const NOTES_LIMIT: usize = 30_000;
 const SECURE_HOST_PIN: &str = "secure-host/Containerfile.pin";
 const SECURE_HOST_IMAGE: &str = "ghcr.io/cgwalters-forge/secure-host";
+/// The secure-host action the wrappers pin, and the release-tag forwarder
+/// in the release's source checkout that the pin replaces.
+const SECURE_HOST_ACTION: &str = "cgwalters-forge/actions/secure-host";
+const LOCAL_SECURE_HOST: &str = "./.agentic-job-source/secure-host";
 // Repeated reference strings could otherwise multiply full YAML parses during
 // scalar selection. Refuse excessive edit work, never a partial pin bump.
 const MAX_WORKFLOW_REFERENCES: usize = 128;
@@ -112,8 +116,8 @@ fn repin_host_line(text: &mut String, merge: &str) -> Result<usize> {
     // Current wrappers check out policy's source for prepare and run.
     // Only this local forwarder is replaced; keep the checkout and all
     // inputs on the step untouched.
-    let local = "./.agentic-job-source/secure-host";
-    let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
+    let local = LOCAL_SECURE_HOST;
+    let replacement = format!("{SECURE_HOST_ACTION}@{merge}");
     let mut from = 0;
     while let Some(at) = text[from..].find(local) {
         let start = from + at;
@@ -138,7 +142,7 @@ fn repin_host_line(text: &mut String, merge: &str) -> Result<usize> {
             if !pin_boundary(&text[end + len..]) {
                 return stall("unrecognized secure-host action pin suffix");
             }
-            let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
+            let replacement = format!("{SECURE_HOST_ACTION}@{merge}");
             text.replace_range(start..end + len, &replacement);
             from = start + replacement.len();
             found += 1;
@@ -261,6 +265,92 @@ fn caller_workflow(text: &str) -> Result<serde_yaml_ng::Value> {
         .context("expand caller workflow YAML merges")?;
     Ok(value)
 }
+
+type Yaml = serde_yaml_ng::Value;
+
+/// A reusable workflow that a followed workflow calls.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WrapperCall {
+    repository: String,
+    path: String,
+    /// Same-commit calls inherit the enclosing commit. Calls to the
+    /// wrappers' `FOLLOWED_BRANCH` instead use the root branch snapshot,
+    /// even inside a SHA-pinned call; all other calls name a commit.
+    reference: Option<String>,
+}
+
+/// GitHub's two spellings of a reusable workflow at the caller's commit.
+const SAME_COMMIT_CALLS: [&str; 2] = ["./", "$/"];
+
+const WORKFLOW_LOCK: &str = ".github/workflows/actions.lock";
+
+/// YAML is used only to discover reusable calls, never to compare workflows.
+/// A call whose commit cannot be resolved is an error, so it holds the train.
+fn wrapper_calls(text: &str, repository: &str, wrappers: &str) -> Result<BTreeSet<WrapperCall>> {
+    let workflow: Yaml = serde_yaml_ng::from_str(text).context("decode wrapper workflow YAML")?;
+    let callable = match workflow.get("on") {
+        Some(Yaml::String(event)) => event == "workflow_call",
+        Some(Yaml::Sequence(events)) => events.iter().any(|e| e.as_str() == Some("workflow_call")),
+        Some(Yaml::Mapping(events)) => events.contains_key("workflow_call"),
+        _ => false,
+    };
+    ensure!(callable, "wrapper does not declare on: workflow_call");
+    let jobs = workflow
+        .get("jobs")
+        .and_then(Yaml::as_mapping)
+        .context("wrapper workflow has no jobs mapping")?;
+    let mut calls = BTreeSet::new();
+    for (id, job) in jobs {
+        let id = id.as_str().context("wrapper job ID is not a string")?;
+        let Some(uses) = job.get("uses") else {
+            continue;
+        };
+        let uses = uses
+            .as_str()
+            .with_context(|| format!("job {id} uses no reusable workflow name"))?;
+        let call = if let Some(path) = SAME_COMMIT_CALLS.iter().find_map(|p| uses.strip_prefix(p)) {
+            ensure!(
+                workflow_file(path),
+                "unsupported reusable workflow in job {id}: {uses}"
+            );
+            WrapperCall {
+                repository: repository.into(),
+                path: path.into(),
+                reference: None,
+            }
+        } else {
+            let (owner, name, path, reference) = uses
+                .split_once('@')
+                .and_then(|(target, reference)| {
+                    let (owner, rest) = target.split_once('/')?;
+                    let (name, path) = rest.split_once('/')?;
+                    Some((owner, name, path, reference))
+                })
+                .filter(|(_, _, path, _)| workflow_file(path))
+                .with_context(|| format!("unsupported reusable workflow in job {id}: {uses}"))?;
+            let called = format!("{owner}/{name}");
+            validate_repository(&called).with_context(|| format!("job {id}"))?;
+            let follows = called.eq_ignore_ascii_case(wrappers) && reference == FOLLOWED_BRANCH;
+            // Another branch or a tag may move without the wrappers changing.
+            ensure!(
+                follows || full_sha(reference),
+                "unresolved reusable workflow ref in job {id}: {uses}"
+            );
+            WrapperCall {
+                repository: if follows { wrappers.into() } else { called },
+                path: path.into(),
+                reference: Some(reference.into()),
+            }
+        };
+        calls.insert(call);
+    }
+    Ok(calls)
+}
+
+/// Only workflow blobs and the lockfile are relevant; a non-regular entry is
+/// present but cannot establish equality. In particular, Contents can return a
+/// symlink target's bytes as if it were a regular file, so use Git tree entries.
+type FollowerTree = BTreeMap<String, Option<String>>;
 
 fn set_caller_pins(value: &mut serde_yaml_ng::Value, wrappers: &Target, to: &str) {
     if let Some(jobs) = value
@@ -445,7 +535,12 @@ impl Api for Client {
         match response.status {
             200 => Ok(json!({"body": response.body, "etag": response.etag})),
             304 if validator.is_some() => previous.cloned().context("304 without cached discovery"),
-            status => anyhow::bail!("GET {path}: HTTP {status}"),
+            status => Err(Http {
+                method: "GET".into(),
+                path: path.into(),
+                status,
+            }
+            .into()),
         }
     }
 
@@ -1308,9 +1403,16 @@ struct Pass<'a> {
     used_reads: BTreeSet<String>,
     read_bytes: usize,
     callers: Vec<Target>,
-    /// Once checked, why callers at `FOLLOWED_BRANCH` may not run the merged
-    /// wrappers bump, if they may not.
-    followed: Option<Option<String>>,
+    /// Once checked, the wrappers' `FOLLOWED_BRANCH` head.
+    followed_head: Option<String>,
+    /// By wrapper path, once checked, why callers at `FOLLOWED_BRANCH` may
+    /// not run the merged wrappers bump, if they may not.
+    followed: BTreeMap<String, Option<String>>,
+    /// Branch snapshots of the wrappers' workflow blobs, keyed by commit.
+    follower_trees: BTreeMap<String, Option<FollowerTree>>,
+    /// Reusable calls and deterministic inspection failures, keyed
+    /// by repository, commit and path and shared by all roots in this pass.
+    wrapper_reads: BTreeMap<(String, String, String), Option<BTreeSet<WrapperCall>>>,
 }
 
 /// One pass: prints its decisions to `out`, a line each, and with `apply`
@@ -1354,7 +1456,10 @@ pub fn pass_with_cache(
         used_reads: BTreeSet::new(),
         read_bytes: 0,
         callers: vec![],
-        followed: None,
+        followed_head: None,
+        followed: BTreeMap::new(),
+        follower_trees: BTreeMap::new(),
+        wrapper_reads: BTreeMap::new(),
     }
     .run();
     crate::pass::cache::bound(&mut cache.0);
@@ -1386,17 +1491,22 @@ impl Pass<'_> {
         );
         self.requests += 1;
         let entry = self.api.discovery_get(path, previous)?;
+        self.account_discovery_response(&entry)?;
         let body = entry["body"].clone();
-        self.read_bytes += entry.to_string().len();
-        ensure!(
-            self.read_bytes <= crate::pass::cache::MAX_BYTES,
-            "discovery response byte budget exhausted"
-        );
         self.reads
             .0
             .insert(key.clone(), crate::pass::cache::seal(entry));
         self.used_reads.insert(key);
         Ok(body)
+    }
+
+    fn account_discovery_response(&mut self, entry: &Value) -> Result<()> {
+        self.read_bytes += entry.to_string().len();
+        ensure!(
+            self.read_bytes <= crate::pass::cache::MAX_BYTES,
+            "discovery response byte budget exhausted"
+        );
+        Ok(())
     }
 
     /// REST inventories are not search results. A full page always requires
@@ -1546,7 +1656,7 @@ impl Pass<'_> {
                     .collect();
                 for (wrapper, pin) in records {
                     if pin == FOLLOWED_BRANCH {
-                        self.follow(merge)?;
+                        self.follow(merge, &wrapper)?;
                     } else {
                         edits = true;
                     }
@@ -1617,17 +1727,107 @@ impl Pass<'_> {
         Ok(callers)
     }
 
-    /// Checks, once a pass, what callers at the wrappers' `FOLLOWED_BRANCH`
-    /// run. It must be the wrappers' default branch, whose review gate the
-    /// bump `merge` passed, with no tag of that name, which GitHub would run
-    /// in its place; otherwise the train stalls, as no caller edit can fix
-    /// it. Ancestry would not show a later revert, so the branch head's
-    /// workflows, all a caller or nested reusable workflow can run from
-    /// it, must be the bump's; otherwise the train cannot close.
-    fn follow(&mut self, merge: &str) -> Result<()> {
-        if self.followed.is_some() {
+    /// Checks, once a pass for each `wrapper`, what callers of it at the
+    /// wrappers' `FOLLOWED_BRANCH` run. Ancestry would not show a later
+    /// revert, so the wrapper and the workflows it calls, transitively, must
+    /// have the same blobs as at `merge`, as must the wrappers' lockfile.
+    /// Changes to other workflows, such as CI, do not hold it.
+    fn follow(&mut self, merge: &str, wrapper: &str) -> Result<()> {
+        if self.followed.contains_key(wrapper) {
             return Ok(());
         }
+        let head = match self.followed_head.clone() {
+            Some(head) => head,
+            None => self.followed_head()?,
+        };
+        let repo = self.config.wrappers.repository.clone();
+        let why = self
+            .follower_mismatch(merge, &head, &repo, wrapper)?
+            .map(|reason| format!("callers follow {repo}@{FOLLOWED_BRANCH}: {reason}"));
+        self.followed.insert(wrapper.to_owned(), why);
+        Ok(())
+    }
+
+    /// Reasons here can be posted to a public tracker. Never interpolate any
+    /// name or error from transitive reads, even for paths in the wrappers.
+    fn follower_mismatch(
+        &mut self,
+        merge: &str,
+        head: &str,
+        repo: &str,
+        wrapper: &str,
+    ) -> Result<Option<&'static str>> {
+        if head != merge {
+            for at in [head, merge] {
+                self.read_follower_tree(repo, at)?;
+            }
+            let [Some(live_tree), Some(bump_tree)] =
+                [head, merge].map(|at| self.follower_trees.get(at).and_then(Option::as_ref))
+            else {
+                return Ok(Some("cannot inspect the wrappers' workflow tree"));
+            };
+            // Other repositories are traversed only at identical immutable refs
+            // on both sides, so only the wrappers can have a different lockfile.
+            match (live_tree.get(WORKFLOW_LOCK), bump_tree.get(WORKFLOW_LOCK)) {
+                (None, None) => (),
+                (Some(Some(live)), Some(Some(bump))) if live == bump => (),
+                _ => {
+                    return Ok(Some(
+                        "workflow dependency lockfile differs or is not a regular file",
+                    ));
+                }
+            }
+        }
+
+        // Even an identical snapshot can call a reusable workflow at a mutable ref.
+        let mut todo = vec![(
+            repo.to_owned(),
+            wrapper.to_owned(),
+            head.to_owned(),
+            merge.to_owned(),
+        )];
+        let mut seen = BTreeSet::new();
+        while let Some(node) = todo.pop() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            let (owner, path, live, bump) = node;
+            if live != bump {
+                let [actual, expected] = [&live, &bump].map(|at| {
+                    self.follower_trees
+                        .get(at)
+                        .and_then(Option::as_ref)?
+                        .get(&path)?
+                        .as_ref()
+                });
+                if actual.is_none() || actual != expected {
+                    return Ok(Some(
+                        "a reachable workflow differs from the bump or is missing",
+                    ));
+                }
+            }
+            let Some(calls) = self.read_wrapper_calls(&owner, &bump, &path)? else {
+                return Ok(Some("cannot inspect a reachable workflow"));
+            };
+            // Both sides have identical definitions. Read SHA-pinned calls
+            // too, as they may call back into the wrappers' branch.
+            for call in calls {
+                let (a, b) = match call.reference.as_deref() {
+                    None => (live.clone(), bump.clone()),
+                    Some(FOLLOWED_BRANCH) => (head.to_owned(), merge.to_owned()),
+                    Some(sha) => (sha.to_owned(), sha.to_owned()),
+                };
+                todo.push((call.repository, call.path, a, b));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The wrappers' `FOLLOWED_BRANCH` head. It must be their default
+    /// branch, whose review gate the bump passed, with no tag of that name,
+    /// which GitHub would run in its place; otherwise the train stalls, as
+    /// no caller edit can fix it.
+    fn followed_head(&mut self) -> Result<String> {
         let repo = self.config.wrappers.repository.clone();
         let base = self.default_branch(&repo)?;
         if base != FOLLOWED_BRANCH {
@@ -1650,22 +1850,89 @@ impl Pass<'_> {
         )?;
         ensure!(full_sha(&head), "invalid {FOLLOWED_BRANCH} head for {repo}");
         self.log(&format!("wrappers {repo}@{FOLLOWED_BRANCH} {head}"))?;
-        let changed =
-            head != merge && self.workflows(&repo, &head)? != self.workflows(&repo, merge)?;
-        self.followed = Some(changed.then(|| format!(
-            "callers follow {repo}@{FOLLOWED_BRANCH}, whose workflows at {head} differ from the wrappers' pin bump {merge}; if they still run this release, close this issue instead"
-        )));
+        self.followed_head = Some(head.clone());
+        Ok(head)
+    }
+
+    fn read_follower_tree(&mut self, repo: &str, at: &str) -> Result<()> {
+        if self.follower_trees.contains_key(at) {
+            return Ok(());
+        }
+        let tree = self.follower_read(&format!("/repos/{repo}/git/trees/{at}?recursive=1"))?;
+        let entries = tree
+            .filter(|tree| tree["truncated"] == false)
+            .and_then(|tree| {
+                let mut entries = BTreeMap::new();
+                for entry in tree["tree"].as_array()? {
+                    let path = entry["path"].as_str()?;
+                    if !workflow_file(path) && path != WORKFLOW_LOCK {
+                        continue;
+                    }
+                    let blob = entry["sha"].as_str().filter(|sha| {
+                        full_sha(sha)
+                            && entry["type"] == "blob"
+                            && matches!(entry["mode"].as_str(), Some("100644" | "100755"))
+                    });
+                    entries.insert(path.to_owned(), blob.map(str::to_owned));
+                }
+                Some(entries)
+            });
+        self.follower_trees.insert(at.to_owned(), entries);
         Ok(())
     }
 
-    /// The tree of `repo`'s `.github/workflows` at commit `at`.
-    fn workflows(&mut self, repo: &str, at: &str) -> Result<String> {
-        let listing = self.get(&format!("/repos/{repo}/contents/.github?ref={at}"))?;
-        let dir = list(&listing)?
-            .iter()
-            .find(|e| e["name"] == "workflows" && e["type"] == "dir")
-            .with_context(|| format!("{repo} has no .github/workflows at {at}"))?;
-        string(dir, "/sha")
+    /// Follower data can be private. Memoize only in the pass and strip any
+    /// request detail from failures, including the errors printed by the CLI.
+    fn follower_read(&mut self, path: &str) -> Result<Option<Value>> {
+        ensure!(
+            self.requests < REQUEST_LIMIT,
+            "request budget exhausted during discovery"
+        );
+        self.requests += 1;
+        match self.api.discovery_get(path, None) {
+            Ok(mut entry) => {
+                self.account_discovery_response(&entry)?;
+                Ok(Some(entry["body"].take()))
+            }
+            Err(e)
+                if e.is::<crate::github::NotFound>() || matches!(status(&e), Some(404 | 410)) =>
+            {
+                Ok(None)
+            }
+            Err(_) => anyhow::bail!("cannot read follower data from GitHub"),
+        }
+    }
+
+    /// A missing, undecodable or unreadable YAML workflow holds only the
+    /// followers. Reads share discovery's request and byte budget; transport
+    /// and budget failures still abort the pass.
+    fn read_wrapper_calls(
+        &mut self,
+        repo: &str,
+        at: &str,
+        path: &str,
+    ) -> Result<Option<BTreeSet<WrapperCall>>> {
+        let key = (repo.to_owned(), at.to_owned(), path.to_owned());
+        if let Some(found) = self.wrapper_reads.get(&key) {
+            return Ok(found.clone());
+        }
+        ensure!(
+            full_sha(at),
+            "follower workflow ref must be a full commit SHA"
+        );
+        if validate_repository(repo).is_err() || validate_path(path).is_err() {
+            return Ok(None);
+        }
+        let encoded = path.split('/').map(encode).collect::<Vec<_>>().join("/");
+        let found =
+            match self.follower_read(&format!("/repos/{repo}/contents/{encoded}?ref={at}"))? {
+                Some(file) if file["encoding"] == "base64" => decode(&file["content"])
+                    .and_then(|text| wrapper_calls(&text, repo, &self.config.wrappers.repository))
+                    .ok(),
+                _ => None,
+            };
+        self.wrapper_reads.insert(key, found.clone());
+        Ok(found)
     }
 
     fn discovery_contents(&mut self, repo: &str, sha: &str, path: &str) -> Result<String> {
@@ -2296,9 +2563,9 @@ impl Pass<'_> {
                             "{}:{path} no longer pins a configured wrapper",
                             caller.repository
                         );
-                        for (at, len, _) in pins {
+                        for (at, len, wrapper) in pins {
                             match &content[at..at + len] {
-                                FOLLOWED_BRANCH => self.follow(merge)?,
+                                FOLLOWED_BRANCH => self.follow(merge, &wrapper)?,
                                 pin => current &= pin == merge,
                             }
                         }
@@ -2317,7 +2584,7 @@ impl Pass<'_> {
                     }
                     facts.callers.push((caller.repository, pr));
                 }
-                facts.followers = self.followed.clone().flatten();
+                facts.followers = self.followed.values().flatten().next().cloned();
             }
             Ok(())
         })();

@@ -54,6 +54,16 @@ fn decoded(path: &str) -> String {
 }
 
 impl Api for Fake {
+    fn discovery_get(&self, path: &str, _previous: Option<&Value>) -> Result<Value> {
+        let body = self.request("GET", path, &Value::Null)?;
+        match body["follower_error"].as_str() {
+            Some("not-found") => Err(anyhow::Error::from(crate::github::NotFound)
+                .context(format!("GET {path}: GitHub HTTP status 404"))),
+            Some("transport") => anyhow::bail!("GET {path}: private API error"),
+            _ => Ok(json!({"body": body})),
+        }
+    }
+
     fn secure_host_digest(&self, version: &str, source: &str, workflow: &str) -> Result<String> {
         let responses = self.responses.borrow();
         let image = responses
@@ -434,6 +444,14 @@ fn optional_host_stage_waits_for_review_and_is_off_by_default() {
 
 /// The pass's lines, then its writes; or its error.
 fn replay(fixture: &Value, apply: bool) -> Result<String, String> {
+    replay_with_cache(fixture, apply, &mut crate::prune::Cache::default())
+}
+
+fn replay_with_cache(
+    fixture: &Value,
+    apply: bool,
+    cache: &mut crate::prune::Cache,
+) -> Result<String, String> {
     let config = Config::from_json(&fixture["config"]).unwrap();
     let now = parse_time(fixture["now"].as_str().unwrap()).unwrap();
     let fake = Fake {
@@ -445,7 +463,7 @@ fn replay(fixture: &Value, apply: bool) -> Result<String, String> {
         now: fixture["now"].as_str().unwrap().into(),
     };
     let mut out = vec![];
-    let result = pass(&fake, &config, apply, now, &mut out);
+    let result = pass_with_cache(&fake, &config, apply, now, &mut out, cache);
     let mut text = String::from_utf8(out).unwrap();
     for write in fake.writes.borrow().iter() {
         text.push_str(write);
@@ -1034,18 +1052,278 @@ fn callers_following_the_wrappers_main_hold_done_until_it_serves_the_bump() {
     let wrappers = "/repos/cgwalters-forge/actions";
     let followed = "cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@main";
     let ahead = "4".repeat(40);
-    let (bumped, reverted) = ("5".repeat(40), "6".repeat(40));
-    let differ = "whose workflows at";
-    for (main, workflows, tag, base, current, expected) in [
-        (WRAPPER_MERGE, &reverted, None, "main", true, "v0.6.4: done"),
-        (&ahead, &bumped, None, "main", true, "v0.6.4: done"),
-        // Ahead of the bump, but a later commit reverted it.
-        (&ahead, &reverted, None, "main", true, differ),
-        // Pinned callers still get their PRs meanwhile.
-        (&ahead, &reverted, None, "main", false, "v0.6.4: callers"),
+    let (release, host) = ("5".repeat(40), "6".repeat(40));
+    let private = "example/private-helper";
+    let private_job = "private_source_job";
+    let private_call = "example/private-callee/.github/workflows/inner.yml@private-tag";
+    // The review wrapper and the agent workflow it calls, as the bump left
+    // them and as later commits on main may have changed them.
+    let helper = "7".repeat(40);
+    let workflows = |served: &str| {
+        // Even a job or a step after the release may stop or redirect it.
+        let lint = if served == "unrelated-job" {
+            "  lint:\n    runs-on: ubuntu-26.04\n    steps:\n      - uses: cgwalters-forge/actions/admit@main\n"
+        } else {
+            ""
+        };
+        let trailing = if served == "trailing" {
+            format!("      - uses: actions/upload-artifact@{}\n", "2".repeat(40))
+        } else {
+            String::new()
+        };
+        // Even formatting changes in a reachable file are conservative holds.
+        let comment = if served == "comment-only" {
+            "# Reformatted.\n"
+        } else {
+            ""
+        };
+        let pin = if served == "reverted" {
+            CALLER_HEAD
+        } else {
+            release.as_str()
+        };
+        let action = match served {
+            "nested" | "remote" | "dollar" | "callback" => LOCAL_SECURE_HOST.to_owned(),
+            _ => format!("{SECURE_HOST_ACTION}@{host}"),
+        };
+        let agent = match served {
+            "remote" | "remote-bumped" => format!("cgwalters-forge/actions/{HOST_WRAPPER}@main"),
+            "old-edge" => format!("cgwalters-forge/actions/{HOST_WRAPPER}@{CALLER_HEAD}"),
+            "dollar" | "dollar-bumped" => format!("$/{HOST_WRAPPER}"),
+            // Another repository's workflow calling back into the wrappers.
+            "callback" | "callback-bumped" => {
+                format!("cgwalters-forge/agentic-job/.github/workflows/helper.yml@{helper}")
+            }
+            "tagged" => "cgwalters-forge/agentic-job/.github/workflows/helper.yml@v1".into(),
+            "private-tag" | "inaccessible-helper" | "private-transport" => {
+                format!("{private}/.github/workflows/helper.yml@{helper}")
+            }
+            _ => format!("./{HOST_WRAPPER}"),
+        };
+        let agent_use = if served == "merge-key" {
+            format!("<<: {{uses: {agent}}}")
+        } else {
+            format!("uses: {agent}")
+        };
+        let (live, disabled) = if served == "swapped" {
+            (CALLER_HEAD, release.as_str())
+        } else {
+            (pin, CALLER_HEAD)
+        };
+        let source = if matches!(served, "old-source" | "old-first-dynamic") {
+            CALLER_HEAD
+        } else {
+            // As in fixtures/release-train/host-wrapper.yml.
+            "${{ inputs.source-sha }}"
+        };
+        // A step before the release actions may switch their source or skip
+        // them, and a call input may select the callee's source.
+        let history_step = if served == "history-before-host" {
+            "      - run: agentic-job review history\n"
+        } else {
+            ""
+        };
+        let call_source = if served == "old-call-source" {
+            CALLER_HEAD
+        } else {
+            release.as_str()
+        };
+        // Release jobs keep all their prerequisites, not just those their
+        // condition names.
+        let needs = if served == "dropped-need" {
+            "[policy]"
+        } else {
+            "[policy, agent]"
+        };
+        let policy = "${{ toJSON(needs.policy.outputs) }}";
+        let (review_event, admit_if) = match served {
+            "required-input" => (
+                "{workflow_call: {inputs: {new-input: {type: string, required: true}}}}",
+                "",
+            ),
+            "required-secret" => (
+                "{workflow_call: {secrets: {new-secret: {required: true}}}}",
+                "",
+            ),
+            "optional-input" => (
+                "{workflow_call: {inputs: {new-input: {type: string, required: false}}}}",
+                "",
+            ),
+            "skipped-admit" => ("workflow_call", "    if: ${{ false }}\n"),
+            _ => ("workflow_call", ""),
+        };
+        // Workflow settings and prerequisite job bodies may stop the release.
+        let permissions = if served == "no-permissions" {
+            "permissions: {}\n"
+        } else {
+            ""
+        };
+        let admit_run = if served == "failing-admit" {
+            "exit 1"
+        } else {
+            "'true'"
+        };
+        let review = if matches!(served, "pinless" | "missing-root") {
+            format!("on: workflow_call\njobs:\n  agent:\n    uses: {agent}\n")
+        } else {
+            format!(
+                "{comment}on: {review_event}\n{permissions}jobs:\n  admit:\n{admit_if}    runs-on: ubuntu-26.04\n    steps:\n      - run: {admit_run}\n  policy:\n    needs: admit\n    uses: cgwalters-forge/agentic-job/.github/workflows/policy.yml@{live}\n    with:\n      outputs: add_comment,noop\n  compat:\n    if: ${{{{ false }}}}\n    uses: cgwalters-forge/agentic-job/.github/workflows/policy.yml@{disabled}\n  agent:\n    needs: policy\n    {agent_use}\n    with:\n      policy: {policy}\n      source-sha: {call_source}\n  apply:\n    needs: {needs}\n    if: ${{{{ always() && needs.policy.result == 'success' }}}}\n    uses: cgwalters-forge/agentic-job/.github/workflows/apply.yml@{release}\n{lint}"
+            )
+        };
+        let checkout = "1".repeat(40);
+        let event = if served == "not-callable" {
+            "push"
+        } else {
+            "workflow_call"
+        };
+        let archive = if served == "old-image" {
+            "        with:\n          image-archive: previous-release.tar\n"
+        } else {
+            ""
+        };
+        let overwrite = match served {
+            "old-source-overwrite" => ".agentic-job-source/.",
+            "dynamic-overwrite" => "${{ inputs.checkout-path }}",
+            _ => "",
+        };
+        let overwrite = if overwrite.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "      - uses: actions/checkout@{checkout}\n        with:\n          path: {overwrite}\n          repository: ${{{{ fromJSON(inputs.policy).source-repository }}}}\n          ref: {CALLER_HEAD}\n"
+            )
+        };
+        let source_path = if matches!(served, "first-dynamic" | "old-first-dynamic") {
+            "${{ inputs.checkout-path }}"
+        } else {
+            ".agentic-job-source"
+        };
+        [
+            (".github/workflows/cgwalters-review.yml", review),
+            (
+                HOST_WRAPPER,
+                if served == "pinless-leaf" {
+                    "on: {workflow_call: null}\njobs:\n  agent:\n    steps:\n      - run: 'true'\n"
+                        .into()
+                } else {
+                    format!(
+                        "on: [{event}]\njobs:\n  agent:\n    steps:\n      - uses: actions/checkout@{checkout}\n      - uses: actions/checkout@{CALLER_HEAD}\n        with:\n          path: {source_path}\n          repository: ${{{{ fromJSON(inputs.policy).source-repository }}}}\n          ref: {source}\n{overwrite}      - uses: ./.agentic-job-source/prepare\n{history_step}      - uses: {action}\n{archive}{trailing}"
+                    )
+                },
+            ),
+        ]
+    };
+    let differs = "a reachable workflow differs";
+    let cannot_inspect = "cannot inspect a reachable workflow";
+    let lock_differs = "workflow dependency lockfile differs";
+    for (main, served, tag, base, current, expected) in [
+        // The branch still serves the bump's own commit.
         (
             WRAPPER_MERGE,
-            &bumped,
+            "reverted",
+            None,
+            "main",
+            true,
+            "v0.6.4: done",
+        ),
+        (WRAPPER_MERGE, "tagged", None, "main", true, cannot_inspect),
+        (&ahead, "bumped", None, "main", true, "v0.6.4: done"),
+        (&ahead, "lock-only", None, "main", true, lock_differs),
+        (&ahead, "lock-added", None, "main", true, lock_differs),
+        (&ahead, "lock-removed", None, "main", true, lock_differs),
+        (&ahead, "lock-unchanged", None, "main", true, "v0.6.4: done"),
+        (&ahead, "merge-key", None, "main", true, differs),
+        (&ahead, "symlink", None, "main", true, differs),
+        (
+            &ahead,
+            "truncated-tree",
+            None,
+            "main",
+            true,
+            "cannot inspect the wrappers' workflow tree",
+        ),
+        (&ahead, "private-tag", None, "main", true, cannot_inspect),
+        (
+            &ahead,
+            "inaccessible-helper",
+            None,
+            "main",
+            false,
+            "v0.6.4: callers",
+        ),
+        (
+            &ahead,
+            "private-transport",
+            None,
+            "main",
+            true,
+            "cannot read follower data from GitHub",
+        ),
+        (
+            &ahead,
+            "inaccessible-helper",
+            None,
+            "main",
+            true,
+            cannot_inspect,
+        ),
+        (&ahead, "comment-only", None, "main", true, differs),
+        // Ahead of the bump with only an unrelated workflow added.
+        (&ahead, "unrelated", None, "main", true, "v0.6.4: done"),
+        (
+            &ahead,
+            "callback-bumped",
+            None,
+            "main",
+            true,
+            "v0.6.4: done",
+        ),
+        // Ahead of the bump, but a later commit reverted it.
+        (&ahead, "reverted", None, "main", true, differs),
+        (&ahead, "nested", None, "main", true, differs),
+        (&ahead, "dollar", None, "main", true, differs),
+        // Called from the wrappers' main rather than locally, or through
+        // another repository.
+        (&ahead, "remote", None, "main", true, differs),
+        (&ahead, "callback", None, "main", true, differs),
+        (&ahead, "tagged", None, "main", true, cannot_inspect),
+        (&ahead, "unrelated-job", None, "main", true, differs),
+        (&ahead, "trailing", None, "main", true, differs),
+        (&ahead, "old-edge", None, "main", true, differs),
+        (&ahead, "old-source", None, "main", true, differs),
+        (&ahead, "old-first-dynamic", None, "main", true, differs),
+        (&ahead, "skipped-admit", None, "main", true, differs),
+        (&ahead, "required-input", None, "main", true, differs),
+        (&ahead, "required-secret", None, "main", true, differs),
+        (&ahead, "optional-input", None, "main", true, differs),
+        (&ahead, "old-call-source", None, "main", true, differs),
+        (&ahead, "dropped-need", None, "main", true, differs),
+        (&ahead, "no-permissions", None, "main", true, differs),
+        (&ahead, "failing-admit", None, "main", true, differs),
+        (&ahead, "history-before-host", None, "main", true, differs),
+        (&ahead, "not-base64", None, "main", true, cannot_inspect),
+        (&ahead, "not-utf8", None, "main", true, cannot_inspect),
+        (&ahead, "old-source-overwrite", None, "main", true, differs),
+        (&ahead, "dynamic-overwrite", None, "main", true, differs),
+        (&ahead, "old-image", None, "main", true, differs),
+        (&ahead, "not-callable", None, "main", true, differs),
+        (&ahead, "swapped", None, "main", true, differs),
+        (&ahead, "missing-root", None, "main", true, differs),
+        (&ahead, "pinless-leaf", None, "main", true, differs),
+        (&ahead, "invalid-yaml", None, "main", true, cannot_inspect),
+        (
+            &ahead,
+            "invalid-yaml",
+            None,
+            "main",
+            false,
+            "v0.6.4: callers",
+        ),
+        // Pinned callers still get their PRs meanwhile.
+        (&ahead, "reverted", None, "main", false, "v0.6.4: callers"),
+        (
+            WRAPPER_MERGE,
+            "bumped",
             None,
             "main",
             false,
@@ -1053,7 +1331,7 @@ fn callers_following_the_wrappers_main_hold_done_until_it_serves_the_bump() {
         ),
         (
             WRAPPER_MERGE,
-            &bumped,
+            "bumped",
             Some("refs/tags/main"),
             "main",
             true,
@@ -1061,7 +1339,7 @@ fn callers_following_the_wrappers_main_hold_done_until_it_serves_the_bump() {
         ),
         (
             WRAPPER_MERGE,
-            &bumped,
+            "bumped",
             Some("refs/tags/main-old"),
             "main",
             true,
@@ -1069,7 +1347,7 @@ fn callers_following_the_wrappers_main_hold_done_until_it_serves_the_bump() {
         ),
         (
             WRAPPER_MERGE,
-            &bumped,
+            "bumped",
             None,
             "trunk",
             true,
@@ -1096,14 +1374,112 @@ fn callers_following_the_wrappers_main_hold_done_until_it_serves_the_bump() {
             r[format!("{wrappers}/git/matching-refs/tags/main")] =
                 json!(tag.iter().map(|t| json!({"ref": t})).collect::<Vec<_>>());
             r[format!("{wrappers}/git/ref/heads/main")] = json!({"object": {"sha": main}});
-            for (at, tree) in [(WRAPPER_MERGE, &bumped), (&ahead, workflows)] {
-                r[format!("{wrappers}/contents/.github?ref={at}")] = json!([
-                    {"name": "dependabot.yml", "type": "file", "sha": "7".repeat(40)},
-                    {"name": "workflows", "type": "dir", "sha": tree}
-                ]);
+            // The release's workflows the wrappers call, and the helper that
+            // calls back into the wrappers' main.
+            let release_repo = "/repos/cgwalters-forge/agentic-job/contents/.github/workflows";
+            for (file, at) in [
+                ("policy.yml", release.as_str()),
+                ("policy.yml", CALLER_HEAD),
+                ("apply.yml", release.as_str()),
+            ] {
+                r[format!("{release_repo}/{file}?ref={at}")] = json!({"encoding": "base64",
+                    "content": base64("on: workflow_call\njobs: {}\n")});
             }
-            let out = replay(&f, apply).unwrap();
-            assert!(out.contains(expected), "{out}");
+            r[format!("{release_repo}/helper.yml?ref={helper}")] = json!({"encoding": "base64",
+                "content": base64(&format!("on: workflow_call\njobs:\n  agent:\n    uses: cgwalters-forge/actions/{HOST_WRAPPER}@main\n"))});
+            let bumped = match served {
+                "remote" => "remote-bumped",
+                "dollar" => "dollar-bumped",
+                "callback" | "callback-bumped" => "callback-bumped",
+                "tagged" | "private-tag" | "inaccessible-helper" | "private-transport" => served,
+                "old-first-dynamic" => "first-dynamic",
+                "missing-root" => "pinless",
+                "pinless-leaf" => "pinless-leaf",
+                _ => "bumped",
+            };
+            let private_path =
+                format!("/repos/{private}/contents/.github/workflows/helper.yml?ref={helper}");
+            match served {
+                "private-tag" => {
+                    r[private_path] = json!({"encoding": "base64",
+                    "content": base64(&format!("on: workflow_call\njobs:\n  {private_job}:\n    uses: {private_call}\n"))})
+                }
+                "inaccessible-helper" => r[private_path] = json!({"follower_error": "not-found"}),
+                "private-transport" => r[private_path] = json!({"follower_error": "transport"}),
+                _ => (),
+            }
+            for (at, version) in [(WRAPPER_MERGE, bumped), (&ahead, served)] {
+                // Fixture blob IDs are derived from the exact content, like a
+                // Git tree, so formatting-only changes get different IDs too.
+                let entry = |path: &str, bytes: &str| {
+                    use std::hash::{DefaultHasher, Hash, Hasher};
+                    let mut hash = DefaultHasher::new();
+                    bytes.hash(&mut hash);
+                    json!({"path": path, "type": "blob", "mode": "100644",
+                        "sha": format!("{:040x}", hash.finish())})
+                };
+                let mut tree = Vec::new();
+                match served {
+                    "lock-only" => tree.push(entry(WORKFLOW_LOCK, at)),
+                    "lock-unchanged" => tree.push(entry(WORKFLOW_LOCK, "lock")),
+                    "lock-added" if at == ahead => tree.push(entry(WORKFLOW_LOCK, "lock")),
+                    "lock-removed" if at == WRAPPER_MERGE => {
+                        tree.push(entry(WORKFLOW_LOCK, "lock"))
+                    }
+                    "unrelated" if at == ahead => {
+                        tree.push(entry(".github/workflows/ci.yml", "on: push"))
+                    }
+                    _ => (),
+                }
+                for (path, mut content) in workflows(version) {
+                    if at == ahead
+                        && ((served == "missing-root" && path != HOST_WRAPPER)
+                            || (served == "pinless-leaf" && path == HOST_WRAPPER))
+                    {
+                        r[format!("{wrappers}/contents/{path}?ref={at}")] = Value::Null;
+                        continue;
+                    }
+                    if served == "invalid-yaml" && path == HOST_WRAPPER {
+                        content = "jobs: [".into();
+                    }
+                    let mut blob = entry(path, &content);
+                    if at == ahead && served == "symlink" && path == HOST_WRAPPER {
+                        blob["mode"] = json!("120000");
+                    }
+                    tree.push(blob);
+                    let mut file = json!({"encoding": "base64", "content": base64(&content)});
+                    if at == WRAPPER_MERGE && path == HOST_WRAPPER {
+                        match served {
+                            "not-base64" => file["encoding"] = json!("none"),
+                            "not-utf8" => file["content"] = json!("/w=="),
+                            _ => (),
+                        }
+                    }
+                    r[format!("{wrappers}/contents/{path}?ref={at}")] = file;
+                }
+                r[format!("{wrappers}/git/trees/{at}?recursive=1")] = json!({
+                    "truncated": at == ahead && served == "truncated-tree", "tree": tree,
+                });
+            }
+            let mut cache = crate::prune::Cache::default();
+            let out = replay_with_cache(&f, apply, &mut cache);
+            assert!(cache.0.keys().all(|key| !key.contains(private)));
+            if served == "private-transport" {
+                // The CLI prints the full error chain, not just the top error.
+                assert_eq!(out.unwrap_err(), expected);
+                continue;
+            }
+            let out = out.unwrap();
+            assert!(
+                out.contains(expected),
+                "{served}: expected {expected}\n{out}"
+            );
+            assert!(
+                [private, private_job, private_call]
+                    .iter()
+                    .all(|s| !out.contains(s)),
+                "{served}: private details in output\n{out}"
+            );
             if tag == Some("refs/tags/main") || base != "main" {
                 assert!(!out.contains("v0.6.4: "), "{out}");
                 continue;
@@ -1425,7 +1801,10 @@ fn inventories_paginate_and_never_accept_partial_coverage() {
         used_reads: BTreeSet::new(),
         read_bytes: 0,
         callers: vec![],
-        followed: None,
+        followed_head: None,
+        followed: BTreeMap::new(),
+        follower_trees: BTreeMap::new(),
+        wrapper_reads: BTreeMap::new(),
     };
     assert!(
         pass.inventory("/orgs/example/repos?type=all")

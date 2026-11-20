@@ -84,9 +84,21 @@ commit SHA or `main`; other paths and repositories do not count. A caller at
 with only such callers needs no fork. The train stalls unless `main` is the
 wrappers' default branch and has no same-named tag, which GitHub would run in
 its place. Pinned callers still get their PRs, but the train stalls instead of
-closing while the wrappers' `.github/workflows` at `main` differ from the
-merged wrappers bump's, as a later commit may have reverted it; any workflow
-change there counts, so check what they run and close the issue by hand. The output
+closing if a followed workflow or the wrappers' `.github/workflows/actions.lock`
+has changed since the merged bump. The train compares Git blobs, so even a
+comment edit inside a followed workflow holds it. Edits to unreachable workflow
+files, such as the wrappers' own CI, do not. It follows reusable calls
+transitively, including into other repositories. Same-commit calls (`./` or
+`$/`) inherit the enclosing commit, calls to the wrappers at `main` use the
+branch and bump snapshots, and SHA pins use the same commit on both sides.
+The train's credential needs Contents read access to these workflows, even if
+GitHub Actions can run them through private workflow sharing. Other refs, or
+missing, inaccessible, undecodable or non-callable workflows, hold followers.
+Follower reads are memoized for the pass only. Public stall comments and fatal
+read diagnostics omit transitive paths and source details. The train does
+not inspect the implementation of step actions, such as a composite action at
+`main`. After a stall, check what the callers run before closing the issue by
+hand. The output
 is sorted by repository, file, wrapper path and current pin. Multiple files
 and different pins in one repository produce one PR. Already-current files
 need no edit or PR.
@@ -185,6 +197,8 @@ Existing configurations continue to work before that cleanup. No discovery
 enablement key is needed. Optionally append `--cache "$RUNNER_TEMP/release-train-cache.json"`
 to the workflow's `agent-board release-train` invocation and restore/save that
 file using its existing cache mechanism; no cache wiring is required for correctness.
+Do not share this cache with untrusted jobs: inventory reads can include private
+repositories even though follower inspection does not persist its reads.
 After deployment run a read-only preview with the bot's token and verify that
 the org-site workflow and its real fork are included before applying. The
 historical recordings predate discovery and contain no inventory/tree/fork
