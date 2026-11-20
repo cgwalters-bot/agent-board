@@ -645,7 +645,7 @@ the same names, types, defaults, bounds and meaning, so one `pr` block gives one
 policy either way: `maintainers`, `checkReruns`, `unstall`, `directionFirst` (`operatorComments`
 and `notifications` read before the followed repositories rather than after
 them), `ownerBranches`, `ownSpaceOnly`,
-`foldRounds`, `reviewPools`, `reviewDispatchRepositories`,
+`foldRounds`, `readyApproved`, `reviewPools`, `reviewDispatchRepositories`,
 `draftReviewRepositories`, `headOwners`, `noMerge`, `operatorPaths`,
 `staleDays` and `fixRounds`, besides `mergeAuthors`, `toilFixPool`, `conflictFixPool`,
 `mergeQueue` and `rebaseRounds` above. As in the pass, `reviewPools` needs
@@ -1390,6 +1390,25 @@ in the pass's `pr.noMerge`, where a draft is the finished state: its fix
 and rebase rounds run as for any other (a conflict is rebased without the
 approval the review job never gives a draft), and once clean and green it
 waits with `a midstream draft, waiting for promotion`, unlabelled.
+With the pass's `pr.readyApproved: true` (off by default; a standalone poll's
+`readyApproved`), the bot's draft with no checkpoint in our own space whose
+head is approved (the operator's review, or the review job's verdict where it
+counts) and whose checks are green is marked ready instead, one write
+(`ready: … -> marked ready`), and the merge step takes it on a later pass
+with every gate of any approved pull request (agent-board#1125). A draft
+without current-head approval still goes to `needs-human`, even with
+`reviewPools`: configuring a pool doesn't admit a draft for review.
+So does one approved before its base last changed, or before it was last
+converted to draft. Once a person (or an unknown actor) returns it to draft, only
+the operator's later approval readies it; where the bot did, a counting approval
+after the conversion does. Before writing, the poll verifies the same draft,
+head, base and review evidence and repeats the decision with fresh checks,
+labels and checkpoint text. A newly observed hold or incomplete read stops it.
+Drafts handled by `draftReviewRepositories` go through draft classification
+instead, even if the operator has approved the current head.
+An existing `needs-human` hold is not cleared by approval. If the draft is
+complete and the hold is no longer needed, remove the label or mark it ready
+manually.
 Such a draft whose description, or once a continuation round ran on its
 branch the head commit's message, says `partial work`, `incomplete`,
 `untested`, `not tested` or that something could not be or was not run is

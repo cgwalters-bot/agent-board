@@ -114,7 +114,9 @@ pub(super) fn apply_with<C: Rest + Transport>(
                 .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot)),
             "publication credential must authenticate as configured bot"
         );
-        for (repo, target) in &targets(client, config)? {
+        let mut held = Vec::new();
+        let mut published = false;
+        'forks: for (repo, target) in &targets(client, config)? {
             // Reuse the pass's bounded hint query: ordinary waiting drafts
             // spend no per-PR reads. Hints never replace fresh authorization.
             let candidates = awaiting::candidates(client, config, repo).with_context(|| {
@@ -166,7 +168,7 @@ pub(super) fn apply_with<C: Rest + Transport>(
                         }
                         Ok(Step::Held(line)) => {
                             lines.push(line);
-                            return Ok(());
+                            break 'forks;
                         }
                         Err(error) if pass::budget_spent(&error) => {
                             return Err(error.context(pending()));
@@ -175,16 +177,119 @@ pub(super) fn apply_with<C: Rest + Transport>(
                             if error.is::<ScopeFailure>() {
                                 return Err(error);
                             }
-                            lines.push(format!("hold promote {repo}#{number}: {error:#}"));
+                            let why = format!("{error:#}");
+                            lines.push(format!("hold promote {repo}#{number}: {why}"));
+                            let head = pull["head"]["sha"].as_str().filter(|h| oid(h));
+                            if let Some(head) =
+                                head.filter(|_| settings.hold_comments && holds(&error))
+                            {
+                                held.push((repo.clone(), number, head.to_owned()));
+                            }
                             continue;
                         }
                     };
                 lines.push(publish(client, (repo, target), git, *prepared).with_context(pending)?);
-                return Ok(());
+                published = true;
+                break 'forks;
             }
+        }
+        if settings.hold_comments && !published {
+            hold_comments(client, config, &held, max_writes, lines)?;
         }
         Ok(())
     })
+}
+
+/// Only the validated head and fixed public text go on the fork. Diagnostics
+/// can include private policy data and belong in the promotion log only.
+fn hold_body(head: &str) -> String {
+    format!(
+        "{HOLD_COMMENT}{head} -->\n\nA promote run held head {head} because a promotion requirement was not met. See the promote job log for details."
+    )
+}
+
+/// Only the exact diagnostic format is editable as a hold. A marker prefixed
+/// to a receipt must not hide it or let a diagnostic overwrite it.
+fn is_hold_body(body: &str) -> bool {
+    body.lines()
+        .next()
+        .and_then(|line| line.strip_prefix(HOLD_COMMENT)?.strip_suffix(" -->"))
+        .is_some_and(|head| oid(head) && body == hold_body(head))
+}
+
+/// With `promote.holdComments`, says on each fork PR in `held` that its
+/// promotion holds: one bot comment, posted once and edited only when its
+/// text changes, at most `max_writes` of them. A run that published wrote
+/// its writes already and leaves these to the next.
+fn hold_comments<C: Rest>(
+    client: &C,
+    config: &Config,
+    held: &[(String, u64, String)],
+    max_writes: usize,
+    lines: &mut Vec<String>,
+) -> Result<()> {
+    let mut writes = 0;
+    for (repo, number, head) in held {
+        let body = hold_body(head);
+        let comments = match pages(client, &format!("repos/{repo}/issues/{number}/comments")) {
+            Ok(comments) => comments,
+            Err(error) if pass::budget_spent(&error) => return Err(error),
+            Err(error) => {
+                lines.push(format!("hold comment {repo}#{number}: {error:#}"));
+                continue;
+            }
+        };
+        let existing = comments.iter().rev().find(|c| {
+            c["user"]["login"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
+                && c["body"].as_str().is_some_and(is_hold_body)
+        });
+        if existing.is_some_and(|c| c["body"] == body.as_str()) {
+            continue;
+        }
+        if writes >= max_writes {
+            lines.push(format!(
+                "hold comment {repo}#{number}: held by --max-writes"
+            ));
+            continue;
+        }
+        // One with no id cannot be edited; a second would not be one comment.
+        let id = existing.map(|c| c["id"].as_u64().filter(|id| *id > 0));
+        if id == Some(None) {
+            lines.push(format!(
+                "hold comment {repo}#{number}: its comment has no id"
+            ));
+            continue;
+        }
+        // Leave room for this comment, a fresh /promote command and the
+        // publication receipt. REST rejects an exactly full final page.
+        if id.is_none() && comments.len() + 3 >= PAGE_SIZE {
+            lines.push(format!(
+                "hold comment {repo}#{number}: no room in comment evidence window"
+            ));
+            continue;
+        }
+        writes += 1;
+        let (method, path, done) = match id.flatten() {
+            Some(id) => (
+                "PATCH",
+                format!("repos/{repo}/issues/comments/{id}"),
+                "updated",
+            ),
+            None => (
+                "POST",
+                format!("repos/{repo}/issues/{number}/comments"),
+                "posted",
+            ),
+        };
+        match send(client, method, &path, json!({"body": body})) {
+            Ok(_) => lines.push(format!("hold comment {repo}#{number}: {done}")),
+            Err(error) if pass::budget_spent(&error) => return Err(error),
+            Err(error) => lines.push(format!("hold comment {repo}#{number}: {error:#}")),
+        }
+    }
+    Ok(())
 }
 
 /// Everything read before the first write: revalidation, the receipt, and
@@ -882,7 +987,7 @@ fn validate(
         "promotion target changed"
     );
     let number = pull["number"].as_u64().context("invalid pull number")?;
-    let command = evaluate(
+    let (command, reviews) = publication_command(
         client,
         config,
         (repo, number),
@@ -890,19 +995,6 @@ fn validate(
         (in_network(&metadata, &target.upstream), &target.upstream),
         now,
     )?;
-    // An authenticated command alone must not ready a head the operator never
-    // approved. A later COMMENTED review does not cancel a deciding review.
-    let reviews = pages(client, &format!("repos/{repo}/pulls/{number}/reviews"))?;
-    let decision = reviews.iter().rev().find(|r| {
-        r["user"]["login"]
-            .as_str()
-            .is_some_and(|s| s.eq_ignore_ascii_case(&config.operator))
-            && r["state"] != "COMMENTED"
-    });
-    ensure!(
-        decision.is_some_and(|r| r["state"] == "APPROVED" && r["commit_id"] == command.head),
-        "operator has not approved the current head"
-    );
     let gate = gates_impl(
         client,
         config,
@@ -919,6 +1011,12 @@ fn validate(
         policy::Permitted::BotOk => {}
         policy::Permitted::HumanText => provenance::verify(client, config, repo, pull, &command)?,
     }
+    // Trigger selection can read a draft timeline after the reviews. Do not
+    // publish if approval or command cancellation evidence changed meanwhile.
+    ensure!(
+        pages(client, &format!("repos/{repo}/pulls/{number}/reviews"))? == reviews,
+        "review evidence changed before publication"
+    );
     Ok(command)
 }
 

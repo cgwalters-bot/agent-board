@@ -114,7 +114,7 @@ impl<'a> Awaiting<'a> {
         now: OffsetDateTime,
     ) -> Result<String> {
         self.reason_impl(client, repo, number, now).map_err(|e| {
-            if e.is::<Held>() || e.is::<NotSelected>() {
+            if e.is::<Held>() || e.is::<NotSelected>() || e.is::<Unpublished>() {
                 e
             } else {
                 read_failure(e)
@@ -159,7 +159,7 @@ impl<'a> Awaiting<'a> {
         let metadata = get(client, &format!("repos/{repo}"))?;
         let target = super::target(&metadata, repo, legacy)?
             .context("repository lacks midstream metadata")?;
-        let command = evaluate(
+        let (command, _) = publication_command(
             client,
             self.config,
             (repo, number),
@@ -182,17 +182,23 @@ impl<'a> Awaiting<'a> {
         permission.map_err(GateFailure::into_error)?;
         match gate {
             Gates::Promoted(line) => Ok(line),
+            // What publication does itself is a wait for it, not a hold.
             Gates::Ready {
                 signoffs, behind, ..
             } => {
-                hold!(behind == 0, "needs publication rebase (behind_by={behind})");
-                hold!(signoffs == 0, "DCO sign-off rewrite required");
-                hold!(
-                    !pull["head"]["repo"]["owner"]["login"]
-                        .as_str()
-                        .is_some_and(|o| o.eq_ignore_ascii_case(&self.config.bot)),
-                    "bot-fork staging unverified"
-                );
+                let unpublished = |why: String| Err(Unpublished(why).into());
+                if behind > 0 {
+                    return unpublished(format!("needs publication rebase (behind_by={behind})"));
+                }
+                if signoffs > 0 {
+                    return unpublished("DCO sign-off rewrite required".into());
+                }
+                if pull["head"]["repo"]["owner"]["login"]
+                    .as_str()
+                    .is_some_and(|o| o.eq_ignore_ascii_case(&self.config.bot))
+                {
+                    return unpublished("bot-fork staging unverified".into());
+                }
                 Ok("ready to publish".into())
             }
         }

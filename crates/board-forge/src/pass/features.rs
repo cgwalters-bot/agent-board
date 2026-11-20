@@ -89,6 +89,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
         "epics.inWorkRepositories",
         "sessions.apply",
         "promote.onApproval",
+        "promote.holdComments",
         "revisit.repairQuestions",
     ] {
         catalog.insert(name.to_owned(), Bool);

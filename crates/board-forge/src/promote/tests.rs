@@ -1047,6 +1047,8 @@ fn human_scenario() -> Replay {
 
 pub(crate) fn awaiting_human_scenario() -> (Replay, Config) {
     let mut replay = human_scenario();
+    *reviews(&mut replay) = json!([{"id": 5, "user": {"login": "cgwalters"},
+        "state": "APPROVED", "submitted_at": COMMAND, "commit_id": HEAD}]);
     let detail = pull(&mut replay).clone();
     replay.requests.push(json!({"request":{"get":format!("{API}repos/{REPO}/pulls/34")},"answer":{"status":200,"link":null,"body":detail}}));
     let config = Config::parse(CONFIG).unwrap();
@@ -2241,6 +2243,7 @@ struct PublishingForge {
     fail: Option<usize>,
     writer: String,
     returned_number: bool,
+    dismiss_on_timeline: bool,
     /// The head repository's `bot/promote/*` branch: absent until a fake
     /// rewrite pushes it, or a scenario plants it.
     promote_ref: Rc<RefCell<Option<String>>>,
@@ -2308,6 +2311,20 @@ impl Rest for PublishingForge {
             Some(json!({"login":self.writer}))
         } else if url == format!("{API}repos/{REPO}/pulls/34") {
             Some(self.fresh.clone())
+        } else if self.dismiss_on_timeline
+            && url.contains("/pulls/34/reviews?")
+            && self
+                .reads
+                .borrow()
+                .iter()
+                .filter(|url| url.contains("/issues/34/timeline?"))
+                .count()
+                >= 2
+        {
+            Some(
+                json!([{"id": 5, "user": {"login": "cgwalters"}, "state": "DISMISSED",
+                "submitted_at": COMMAND, "commit_id": HEAD}]),
+            )
         } else if url == format!("{API}repos/composefs/composefs-rs/pulls/70")
             && !self.promoted.borrow().is_empty()
         {
@@ -2466,6 +2483,7 @@ fn publication() -> (PublishingForge, Config) {
         fail: None,
         writer: "cgwalters-bot".into(),
         returned_number: false,
+        dismiss_on_timeline: false,
         promote_ref: Rc::new(RefCell::new(None)),
         promoted: RefCell::new(vec![]),
         publication_checks: json!({"contexts":{"totalCount":1,"nodes":[{
@@ -2587,6 +2605,25 @@ fn approved_draft_is_published_without_spending_reads_on_waiting_drafts() {
                     || url.contains(&format!("/pulls/{number}/")))
         );
     }
+}
+
+#[test]
+fn draft_approval_dismissed_during_the_last_timeline_read_stops_publication() {
+    let (mut forge, mut config) = publication();
+    config.promote.as_mut().unwrap().on_approval = true;
+    forge.fresh["draft"] = json!(true);
+    *pull(&mut forge.replay) = forge.fresh.clone();
+    *comments(&mut forge.replay) = json!([]);
+    sync_metadata(&mut forge.replay);
+    timeline(&mut forge.replay, json!([]));
+    forge.dismiss_on_timeline = true;
+
+    let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+    assert!(
+        lines[0].contains("review evidence changed before publication"),
+        "{lines:?}"
+    );
+    assert!(forge.writes.borrow().is_empty());
 }
 
 #[test]
@@ -3035,7 +3072,8 @@ fn publication_human_text_requires_provenance_and_preserves_bytes() {
 fn publication_caps_and_existing_receipt_are_bounded() {
     for cap in [0, 1, 2, 3, 100] {
         let (mut forge, config) = publication();
-        comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":"Previous attempt: outcome unknown. <!-- agent-board-promote-status -->"}));
+        // A hold prefix on an existing receipt cannot hide it from publication.
+        comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":format!("{HOLD_COMMENT}{HEAD} -->\n\nPrevious attempt: outcome unknown. {}", handoff::STATUS)}));
         sync_metadata(&mut forge.replay);
         // The second candidate is never evaluated or published this invocation.
         with_second(&mut forge);
@@ -3469,6 +3507,158 @@ fn a_held_candidate_does_not_stop_the_next() {
     let writes = forge.writes.borrow();
     assert_eq!(writes.len(), 3);
     assert!(writes[0].1.contains("/issues/35/comments"));
+}
+
+/// With `promote.holdComments`, a held candidate gets one bot comment,
+/// left alone while its public text stands and edited when it changes; off,
+/// only the job's line says it (agent-board#1125).
+#[test]
+fn a_hold_is_said_once_on_the_fork_pr() {
+    let (mut forge, mut config) = publication();
+    // Do not overwrite a receipt just because someone prefixed a hold marker.
+    comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":format!("{HOLD_COMMENT}{HEAD} -->\n\nPrevious attempt: outcome unknown. {}", handoff::STATUS)}));
+    sync_metadata(&mut forge.replay);
+    let compare = body(&mut forge.replay, "/compare/");
+    compare["behind_by"] = json!(1);
+    compare["commits"][0]["author"]["login"] = json!("visitor");
+    let held = format!("hold promote {REPO}#34: promotion refuses another author's commit");
+    let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+    assert_eq!(lines, std::slice::from_ref(&held));
+    assert!(forge.writes.borrow().is_empty());
+    config.promote.as_mut().unwrap().hold_comments = true;
+    let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+    assert_eq!(lines, [held, format!("hold comment {REPO}#34: posted")]);
+    let (method, url, sent) = forge.writes.borrow()[0].clone();
+    assert_eq!((method.as_str(), forge.writes.borrow().len()), ("POST", 1));
+    assert!(
+        url.ends_with(&format!("repos/{REPO}/issues/34/comments")),
+        "{url}"
+    );
+    let text = sent["body"].as_str().unwrap().to_owned();
+    assert!(text.starts_with(&format!("<!-- agent-board-promote-hold: {HEAD} -->")));
+    assert!(
+        text.contains("a promotion requirement was not met"),
+        "{text}"
+    );
+    // As GitHub lists it: the same head writes nothing again.
+    let bot = json!({"id": 77, "user": {"login": "cgwalters-bot"}, "created_at": COMMAND, "updated_at": COMMAND, "body": text});
+    comments(&mut forge.replay)
+        .as_array_mut()
+        .unwrap()
+        .push(bot);
+    sync_metadata(&mut forge.replay);
+    forge.writes.borrow_mut().clear();
+    let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(forge.writes.borrow().is_empty());
+    // Another internal reason does not change the public text.
+    let compare = body(&mut forge.replay, "/compare/");
+    compare["commits"][0]["author"]["login"] = json!("cgwalters-bot");
+    compare["commits"][0]["parents"] = json!([{"sha": "0".repeat(40)}]);
+    let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+    assert!(lines[0].contains("linear commit chain"), "{lines:?}");
+    assert!(forge.writes.borrow().is_empty());
+
+    // A comment for a previous head is updated in place.
+    comments(&mut forge.replay)[2]["body"] = json!(text.replace(HEAD, &"0".repeat(40)));
+    sync_metadata(&mut forge.replay);
+    let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+    assert_eq!(
+        lines[1],
+        format!("hold comment {REPO}#34: updated"),
+        "{lines:?}"
+    );
+    let (method, url, sent) = forge.writes.borrow()[0].clone();
+    assert_eq!(method, "PATCH");
+    assert!(
+        url.ends_with(&format!("repos/{REPO}/issues/comments/77")),
+        "{url}"
+    );
+    assert_eq!(sent["body"], text);
+}
+
+#[test]
+fn a_command_without_current_approval_holds_in_apply_and_the_pass_view() {
+    let (mut forge, mut config) = publication();
+    config.promote.as_mut().unwrap().hold_comments = true;
+    for (review_evidence, observed_hold) in [
+        (json!([]), true),
+        (
+            json!([{"id": 5, "user": {"login": "cgwalters"}, "state": "APPROVED",
+            "submitted_at": COMMAND, "commit_id": "0".repeat(40)}]),
+            true,
+        ),
+        (
+            json!([{"id": 5, "user": {"login": "cgwalters"}, "state": "APPROVED",
+            "submitted_at": COMMAND}]),
+            false,
+        ),
+    ] {
+        *reviews(&mut forge.replay) = review_evidence;
+        forge.writes.borrow_mut().clear();
+        let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+        assert_eq!(
+            forge.writes.borrow().len(),
+            usize::from(observed_hold),
+            "{lines:?}"
+        );
+        if observed_hold {
+            assert!(
+                lines[0].contains("operator has not approved the current head"),
+                "{lines:?}"
+            );
+            assert_eq!(lines[1], format!("hold comment {REPO}#34: posted"));
+        }
+        let error = awaiting::Awaiting::new(&config)
+            .reason(&forge, REPO, 34, forge.replay.now)
+            .unwrap_err();
+        assert_eq!(holds(&error), observed_hold, "{error:#}");
+        assert_eq!(error.is::<ReadFailure>(), !observed_hold, "{error:#}");
+    }
+}
+
+#[test]
+fn hold_comment_never_quotes_policy_evidence() {
+    let (mut forge, mut config) = publication();
+    config.promote.as_mut().unwrap().hold_comments = true;
+    let secret = "private policy excerpt <!-- agent-board-promote-status -->";
+    set_verdict(&mut forge.replay, None, secret);
+    let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+    assert!(lines[0].contains(secret), "{lines:?}");
+    let writes = forge.writes.borrow();
+    assert_eq!(writes.len(), 1);
+    let text = writes[0].2["body"].as_str().unwrap();
+    assert!(!text.contains("private policy excerpt"), "{text}");
+    assert!(!text.contains(handoff::STATUS), "{text}");
+}
+
+#[test]
+fn hold_comment_leaves_room_for_the_publication_receipt() {
+    for count in PAGE_SIZE - 4..PAGE_SIZE {
+        let (mut forge, mut config) = publication();
+        config.promote.as_mut().unwrap().hold_comments = true;
+        let rows = comments(&mut forge.replay).as_array_mut().unwrap();
+        for id in 2..=count {
+            rows.push(
+                json!({"id": id, "user": {"login": "visitor"}, "body": "ordinary comment",
+                "created_at": COMMAND, "updated_at": COMMAND}),
+            );
+        }
+        sync_metadata(&mut forge.replay);
+        let compare = body(&mut forge.replay, "/compare/");
+        compare["behind_by"] = json!(1);
+        compare["commits"][0]["author"]["login"] = json!("visitor");
+        let lines = apply(&forge, &config, forge.replay.now, 4).unwrap();
+        assert!(
+            lines[0].contains("refuses another author's commit"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            forge.writes.borrow().len(),
+            usize::from(count == PAGE_SIZE - 4),
+            "{count}: {lines:?}"
+        );
+    }
 }
 
 #[test]

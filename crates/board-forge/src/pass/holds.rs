@@ -450,6 +450,11 @@ pub struct PassSummary {
     /// not get that far, so that a pass without it publishes what it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revisited: Option<Option<usize>>,
+    /// Stage 4b's evaluated candidates whose promotion holds
+    /// (agent-board#1125); absent where promotion is off or its forks were
+    /// not listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promote_held: Option<usize>,
     /// When an applying pass last started a run, applied an epic plan or
     /// merged a pull request, as far as the published snapshots say: this
     /// snapshot's `at` where this pass did, or none before it said
@@ -3508,6 +3513,7 @@ mod tests {
             started: 1,
             live_epics: None,
             revisited: None,
+            promote_held: None,
             progress_at: String::new(),
         };
         (wip, pass)
@@ -3609,6 +3615,17 @@ mod tests {
             pass.revisited = revisited;
             let value = serde_json::to_value(snapshot(&[], String::new(), (wip, pass))).unwrap();
             assert_eq!(value["pass"].get("revisited"), expected.as_ref());
+        }
+    }
+
+    /// `promote_held` is absent where stage 4b did not count, else a count.
+    #[test]
+    fn promote_held_in_the_summary() {
+        for (held, expected) in [(None, None), (Some(2), Some(json!(2)))] {
+            let (wip, mut pass) = tally();
+            pass.promote_held = held;
+            let value = serde_json::to_value(snapshot(&[], String::new(), (wip, pass))).unwrap();
+            assert_eq!(value["pass"].get("promote_held"), expected.as_ref());
         }
     }
 

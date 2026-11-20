@@ -7,7 +7,7 @@ const TAG: &str = "<!-- agent-board-dependencies: ";
 const BLOCKED: &str = "blocked";
 const SUPERVISOR: &str = "needs-supervisor";
 pub(super) const DRAFT: &str = "mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { clientMutationId } }";
-const READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }";
+pub(super) const READY_MUTATION: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }";
 type PullStep = (String, bool, Option<Wait>, Option<Stepped>);
 
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -408,7 +408,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         "dependency stop needs supervisor release"
                     );
                     if current["isDraft"] == true {
-                        self.mutate(READY, json!({"id": current["id"]}))?;
+                        self.mutate(READY_MUTATION, json!({"id": current["id"]}))?;
                     }
                     if has_label(&current, BLOCKED) {
                         self.send(

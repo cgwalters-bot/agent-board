@@ -16,6 +16,9 @@ const API: &str = "https://api.github.com/";
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
 
+/// First line of a diagnostic comment, never a publication receipt.
+const HOLD_COMMENT: &str = "<!-- agent-board-promote-hold: ";
+
 /// An unreadable response, distinct from a well-read fact holding promotion.
 #[derive(Debug)]
 pub(crate) struct ReadFailure(String);
@@ -38,6 +41,25 @@ impl std::fmt::Display for Held {
 }
 
 impl std::error::Error for Held {}
+
+/// Whether `error` says the promotion holds on a well-read fact, rather than
+/// failing to read one or waiting for a publication that would go ahead.
+pub(crate) fn holds(error: &anyhow::Error) -> bool {
+    error.is::<Held>()
+}
+
+/// What only publication's --apply does yet, a rebase, a sign-off or
+/// unverified bot-fork staging: not a hold ([`holds`]).
+#[derive(Debug)]
+struct Unpublished(String);
+
+impl std::fmt::Display for Unpublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unpublished {}
 
 #[derive(Debug)]
 pub(crate) struct NotSelected(String);
@@ -468,7 +490,7 @@ pub fn preview<C: Rest + Transport>(
                     now,
                 );
                 match evidence {
-                    Ok(command) => {
+                    Ok((command, _)) => {
                         match assess(client, config, repo, &pull, target, &command, &mut policies) {
                             Ok((Gates::Promoted(result), _)) => {
                                 lines.push(format!("{result}; head={head} {command}; staging verification required for bot-fork head"));
@@ -1273,6 +1295,34 @@ fn at(value: &Value) -> Result<OffsetDateTime> {
         .context("invalid evidence time")
 }
 
+/// Publication and its hold view use the same complete review observation as
+/// command selection. An authenticated command is not itself an approval.
+/// The writer also checks that this evidence still stands after the gate reads.
+fn publication_command(
+    client: &(impl Rest + Transport),
+    config: &Config,
+    item: (&str, u64),
+    pull: &Value,
+    network: (bool, &str),
+    now: OffsetDateTime,
+) -> Result<(Command, Vec<Value>)> {
+    let (command, reviews) = evaluate(client, config, item, pull, network, now)?;
+    let approved_commit = latest_operator_review(&reviews, config)
+        .filter(|review| review["state"] == "APPROVED")
+        .map(|review| {
+            review["commit_id"]
+                .as_str()
+                .filter(|id| oid(id))
+                .context("invalid operator approval commit")
+        })
+        .transpose()?;
+    hold!(
+        approved_commit == Some(command.head.as_str()),
+        "operator has not approved the current head"
+    );
+    Ok((command, reviews))
+}
+
 fn evaluate(
     client: &(impl Rest + Transport),
     config: &Config,
@@ -1280,7 +1330,7 @@ fn evaluate(
     pull: &Value,
     (network, upstream): (bool, &str),
     now: OffsetDateTime,
-) -> Result<Command> {
+) -> Result<(Command, Vec<Value>)> {
     hold!(network, "fork-network mismatch");
     hold!(pull["state"] == "open", "pull is not open");
     repository(&pull["base"]["repo"], repo)?;
@@ -1503,7 +1553,16 @@ fn evaluate(
             .is_some_and(|s| s.eq_ignore_ascii_case("needs-human"))),
         "needs-human"
     );
-    Ok(selected)
+    Ok((selected, reviews))
+}
+
+fn latest_operator_review<'a>(reviews: &'a [Value], config: &Config) -> Option<&'a Value> {
+    reviews.iter().rev().find(|r| {
+        r["user"]["login"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(&config.operator))
+            && r["state"] != "COMMENTED"
+    })
 }
 
 /// With `promote.onApproval`, on a draft, the operator's latest deciding review,
@@ -1522,12 +1581,7 @@ fn approval(
     head: &str,
     pushed: OffsetDateTime,
 ) -> Result<Option<(String, OffsetDateTime, bool)>> {
-    let Some(review) = reviews.iter().rev().find(|r| {
-        r["user"]["login"]
-            .as_str()
-            .is_some_and(|s| s.eq_ignore_ascii_case(&config.operator))
-            && r["state"] != "COMMENTED"
-    }) else {
+    let Some(review) = latest_operator_review(reviews, config) else {
         return Ok(None);
     };
     if review["state"] != "APPROVED" || review["commit_id"] != head {

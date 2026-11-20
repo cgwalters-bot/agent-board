@@ -152,7 +152,7 @@ opt-ins, not every optional key. The GitHub catalog consists of:
   `reruns`, `reapOverdueRuns`, `cleanupHistory`, `topDown`, `usage.probe`,
   `holds.needsYou`, `holds.approvalEvidence`, `holds.actNow`, `holds.passView`,
   `holds.today`, `holds.epicFocus`, `epics.close`, `epics.inWorkRepositories`,
-  `sessions.apply`, `promote.onApproval`,
+  `sessions.apply`, `promote.onApproval`, `promote.holdComments`,
   `revisit.repairQuestions`, and the false-default boolean fields of the shared
   `PrOptions` metadata (including `pr.agentRecovery`). `pr.directionFirst` is
   excluded because it no longer changes a pass. Missing is unconfigured;
@@ -1683,7 +1683,11 @@ last made progress ([stall alarms](#stall-alarms)). `candidates` and
 `live_epics` are null where their stage did not get that far. With
 `revisit` set, `pass` also has `revisited`, the [revisits](#revisits) among
 `started` (null where stage 4 did not get that far); without it the key is
-absent, so a pass without it publishes what it did before. `wip` and
+absent, so a pass without it publishes what it did before. With promotion
+on, `pass` also has `promote_held`: how many of stage 4b's evaluated
+candidates hold (agent-board#1125), not counting a rebase, sign-off or
+staging that publication does itself; absent where promotion is off or its
+forks were not listed. `wip` and
 `pass` were added to v1 later, so a reader treats them as absent in an
 older comment, and a change in either publishes as a change of the holds
 does. With `leases` set, the snapshot also has `leases`, after `pass`: the
@@ -6331,6 +6335,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.operatorReviewFixes` | With `notifications`, route nonempty operator changes-requested reviews on the bot's PR to existing bounded fix rounds instead of intake triage; mixed batches and other intents stay in triage. See [operator intake](poll.md); `false` |
 | `pr.supervisorHolds` | Route recognized PR infrastructure stops to `needs-infra-fix`, not the operator; existing write/request caps apply. See [infrastructure stops](#infrastructure-stops); `false` |
 | `pr.foldRounds` | Minimize as outdated the bot's routine marker each new round, refund, check rerun or review start supersedes, at the end of the pass, so a pull request shows its current round with the earlier ones folded; stops are never folded; at most 20 a pass, one `--max-writes` step; see [the poll](poll.md); `false` |
+| `pr.readyApproved` | Mark the bot's draft with no checkpoint in our own space ready, one write, once its head is approved and its checks are green, so the merge step takes it on a later pass with its usual gates. Approval of an older head does not prevent a `needs-human` stop; see [the poll](poll.md); `false` |
 | `pr.quietWaits` | Decide a bot pull request unchanged in its listing (head, `updated_at`) since a whole read that left it waiting on the operator alone (a promotion or withheld-approval wait) from that listing, without reading it again, for at most four hours; GitHub only; see [quiet pull request waits](#quiet-pull-request-waits-github); `true` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |
@@ -6340,6 +6345,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `promote.forks` | Legacy map of fork repository to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, readable for one release for pinned callers. Every entry needs `origin=fork`, `bot-midstream` and GitHub fork status; upstream must equal GitHub's parent, base overrides its default branch. Without entries, `midstream` discovery supplies candidates from metadata. A non-fork attempt or conflicting parent is a hard error. Publication remains off by default through `promote.publish`. |
 | `promote.publish` | Default `false`: allow standalone `promote --apply --max-writes N` to publish one upstream draft or update one same-head PR after fresh gates and operator current-head approval; three writes reserved; no pushes, ready changes or fork closure; the pass always remains read-only for promotion |
 | `promote.onApproval` | Default `false`: standalone `promote` also evaluates draft fork PRs and, on a draft without a `/promote` command, takes the operator's latest deciding review approving the current head, submitted after its push, as the trigger (never `--human-text`); publication still needs `promote.publish` |
+| `promote.holdComments` | Default `false`: standalone `promote --apply` posts one bot comment (`<!-- agent-board-promote-hold: HEAD -->`) when a promotion requirement was not met; detailed reasons stay in the job log. New comments leave space for a fresh command and the publication receipt within the evidence limit. Comments are edited only when their public text changes and written only by a run that published nothing, at most `--max-writes` of them. |
 | `promote.signoff.name`, `promote.signoff.email` | Reserved operator sign-off identity; both non-empty; required with `promote.forks`, no default; no sign-off is performed in the preview |
 | `promote.policyRepository` | Repository whose default branch supplies upstream policy records, never written; required with `promote.forks`; read only after earlier candidate gates pass |
 | `promote.policyPath` | Directory of the records in it, one `OWNER/REPO.md` per upstream; absent, its top level |

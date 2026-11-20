@@ -291,6 +291,10 @@ const WITHHELD_WAIT: &str =
 /// Why the bot's clean, green draft on a `pr.noMerge` base waits: a draft
 /// is the finished state there, and only the operator promotes it.
 const PROMOTE_WAIT: &str = "a midstream draft, waiting for promotion";
+/// The step marking an approved, green draft ready ([`PollPolicy::ready_approved`]).
+const READY: &str = "ready";
+const READY_APPROVED: &str =
+    "a draft with no checkpoint, approved at its head with green checks, so marked ready";
 /// Why the bot's midstream draft whose own words say it is unfinished or
 /// untested ([`untested`]) waits with `continuation.untested` off: it is not
 /// ready to promote, and nothing continues it until the operator does.
@@ -391,6 +395,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
       files(first: 100) { nodes { path changeType } pageInfo { hasNextPage } }
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { id createdAt reason beforeCommit { oid } } } }
       baseChange: timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
+      draftChange: timelineItems(last: 1, itemTypes: [CONVERT_TO_DRAFT_EVENT]) { nodes { ... on ConvertToDraftEvent { createdAt actor { login } } } }
       reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
       series: commits(first: 100) { nodes { commit { oid messageHeadline } } pageInfo { hasNextPage } }
       commits(last: 1) { nodes { commit { oid committedDate message statusCheckRollup { state contexts(first: 100) { "#,
@@ -587,6 +592,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "actionFirst",
     "quietWaits",
     "foldRounds",
+    "readyApproved",
     "reviewPools",
     "reviewDispatchRepositories",
     "draftReviewRepositories",
@@ -857,6 +863,12 @@ pub struct PollPolicy {
     /// comment for each. A stop is never folded: it asks a person to act.
     /// Off by default.
     pub fold_rounds: bool,
+    /// The pass's `pr.readyApproved` (agent-board#1125): the bot's draft
+    /// with no checkpoint in our own space ([`Config::ours`]) whose head is
+    /// approved and green is marked ready, so that the merge step takes it
+    /// as any approved pull request, rather than stopped for a person to do
+    /// it. An approval of an older head does not clear that stop. Off by default.
+    pub ready_approved: bool,
     /// The pass's `pr.reviewPools`: the pass starts the review job for a
     /// head that has no run of it, paced on these pools, and the runs it
     /// started count as the job's ([`reviews_head`]). Empty (the default)
@@ -1189,6 +1201,8 @@ pub struct PrOptions {
     #[serde(default)]
     pub fold_rounds: bool,
     #[serde(default)]
+    pub ready_approved: bool,
+    #[serde(default)]
     pub review_pools: Vec<String>,
     #[serde(default)]
     pub review_dispatch_repositories: Vec<String>,
@@ -1364,6 +1378,7 @@ impl PrOptions {
             owner_branches,
             own_space_only,
             fold_rounds,
+            ready_approved,
             review_pools,
             review_dispatch_repositories,
             draft_review_repositories,
@@ -1391,6 +1406,7 @@ impl PrOptions {
         policy.owner_branches = owner_branches;
         policy.own_space_only = own_space_only;
         policy.fold_rounds = fold_rounds;
+        policy.ready_approved = ready_approved;
         policy.review_pools = review_pools;
         policy.review_dispatch_repositories = review_dispatch_repositories;
         policy.draft_review_repositories = draft_review_repositories;
@@ -1561,6 +1577,7 @@ impl PollPolicy {
             hold_dependencies: false,
             agent_recovery: false,
             fold_rounds: false,
+            ready_approved: false,
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
             draft_review_repositories: Vec::new(),
@@ -2729,6 +2746,32 @@ fn reviewed_on_base(pull: &Value, config: &Config, review_run: Option<&Value>) -
     })
 }
 
+/// Whether the head's approval came after its newest conversion to draft, if
+/// there was one ([`PollPolicy::ready_approved`]). Whoever returned it to
+/// draft took back what any approval before said. Where the bot did, as its
+/// dependency hold does, the approval that counts on the head must follow it
+/// (the review job's from a run started after it, as in [`reviewed_on_base`]);
+/// where anyone else did, or who is not known, only the operator's later
+/// approval outranks them. A conversion whose time cannot be read is taken to
+/// be newer than any review.
+fn approved_since_draft(pull: &Value, config: &Config, review_run: Option<&Value>) -> bool {
+    let Some(change) = nodes(pull, "/draftChange/nodes").last() else {
+        return true;
+    };
+    let Some(changed) = timestamp(change["createdAt"].as_str()) else {
+        return false;
+    };
+    let after = |at: Option<&str>| timestamp(at).is_some_and(|at| at > changed);
+    let (operator, _) = verdicts(pull, config);
+    if !text(change, "/actor/login").eq_ignore_ascii_case(&config.bot) {
+        return matches!(operator, Some((Review::Approved, r)) if after(r["submittedAt"].as_str()));
+    }
+    matches!(head_verdict(pull, config, review_run), Some((Review::Approved, r))
+        if after(r["submittedAt"].as_str())
+            && (operator.is_some()
+                || after(review_run.and_then(|run| run["run_started_at"].as_str()))))
+}
+
 /// The run of the review job a pass reads to decide `pull`: the one its marker
 /// on the job's newest verdict names, where that verdict could count.
 pub fn review_run_id(pull: &Value, config: &Config) -> Option<u64> {
@@ -2752,17 +2795,31 @@ type ReviewStep = (Decision, Option<(u64, Option<String>)>);
 /// may count, before its run is checked.
 fn verdicts<'a>(pull: &'a Value, config: &Config) -> (Verdict<'a>, Verdict<'a>) {
     let at_head = reviews_at_head(pull);
-    // An app's slug may be a user's login too: the type tells them apart.
-    let operator_review = |r: &Value| {
-        text(r, "/author/__typename") == "User" && text(r, "/author/login") == config.operator
-    };
-    let job_counts = config.review_workflow.is_some()
-        && from_fork(pull, &config.bot)
-        && pull["baseRepository"]["isPrivate"] == false;
     (
-        newest_verdict(&at_head, operator_review, false),
-        job_counts.then(|| job_verdict(pull)).flatten(),
+        newest_verdict(&at_head, |r| operator_review(r, config), false),
+        job_counts(pull, config)
+            .then(|| job_verdict(pull))
+            .flatten(),
     )
+}
+
+/// Whether `review` is the operator's. An app's slug may be a user's login
+/// too: the type tells them apart.
+fn operator_review(review: &Value, config: &Config) -> bool {
+    text(review, "/author/__typename") == "User" && text(review, "/author/login") == config.operator
+}
+
+/// Whether `review` is the review job's ([`ACTIONS_BOT_ID`]).
+fn job_review(review: &Value) -> bool {
+    text(review, "/author/__typename") == "Bot"
+        && review.pointer("/author/databaseId").and_then(Value::as_u64) == Some(ACTIONS_BOT_ID)
+}
+
+/// Where the review job's verdict may count ([`head_review`]).
+fn job_counts(pull: &Value, config: &Config) -> bool {
+    config.review_workflow.is_some()
+        && from_fork(pull, &config.bot)
+        && pull["baseRepository"]["isPrivate"] == false
 }
 
 /// The pull request's reviews of its head.
@@ -2777,10 +2834,6 @@ fn reviews_at_head(pull: &Value) -> Vec<&Value> {
 /// The review job's newest verdict on the head, whether or not it counts
 /// ([`verdicts`] says where it may).
 fn job_verdict(pull: &Value) -> Verdict<'_> {
-    let job_review = |r: &Value| {
-        text(r, "/author/__typename") == "Bot"
-            && r.pointer("/author/databaseId").and_then(Value::as_u64) == Some(ACTIONS_BOT_ID)
-    };
     newest_verdict(&reviews_at_head(pull), job_review, true)
 }
 
@@ -4875,8 +4928,31 @@ pub fn decide(
     // agentic-job marks complete work ready itself, so a draft of ours with
     // no checkpoint says nothing of how to go on: a person marks it ready or
     // continues it. Marking it ready on green checks, as before, would send
-    // unfinished work to review and the merge queue.
+    // unfinished work to review and the merge queue. With `readyApproved`, an
+    // approval of its head (and green checks: failing ones are rounds above)
+    // says the work is complete, in our own space; the merge step still
+    // gates it as any pull request. An old approval leaves the person stop:
+    // configured review pools do not guarantee this draft can get a review.
+    // Nor does an approval from before a retarget or a return to draft: the
+    // merge step would take the same approval again on the next pass.
     if draft {
+        if harness
+            && config.policy.ready_approved
+            && config.ours(text(pull, "/baseRepository/nameWithOwner"))
+            && review == Some(Review::Approved)
+            && reviewed_on_base(pull, config, review_run)
+            && approved_since_draft(pull, config, review_run)
+        {
+            return if checks.pending.is_empty() {
+                step(READY, READY_APPROVED)
+            } else {
+                step(
+                    "wait",
+                    format!("{CHECKS_PENDING}{}", checks.pending.join(", ")),
+                )
+                .followed(None)
+            };
+        }
         return if harness {
             step(
                 "needs-human",
@@ -6850,6 +6926,14 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 )?;
                 Ok(Some("retitled from its head commit".into()))
             }
+            // The bot's own draft, approved at the head read. GitHub's mutation
+            // cannot be pinned to that head; a push after the read leaves a
+            // ready pull request with no approval of its head, which the merge
+            // step waits on as on any other.
+            READY => {
+                self.mutate(dependencies::READY_MUTATION, json!({"id": id}))?;
+                Ok(Some("marked ready".into()))
+            }
             action @ ("fix" | "continue" | "rebase") => {
                 let round = decision.round.context("a run without a round")?;
                 if let Err(why) = self.admits() {
@@ -8705,6 +8789,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         Ok(pull)
     }
 
+    fn base_checks(&mut self, repo: &str, base: &str) -> Result<(Vec<Value>, bool)> {
+        let encoded: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
+        let rules = self.get(&format!("repos/{repo}/rules/branches/{encoded}"))?;
+        let branch = self.get(&format!("repos/{repo}/branches/{encoded}"))?;
+        Ok((required_checks(&rules, &branch)?, merge_queued(&rules)?))
+    }
+
     /// `pull`'s comments, as the REST list has them: those [`PULL_QUERY`]
     /// read where that is all of them, which saves a request for nearly every
     /// pull request; else the list, without the cache where a pass applies.
@@ -9204,23 +9295,21 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         };
         let base = text(&pull, "/baseRefName").to_owned();
         if !required.contains_key(&base) {
-            let encoded: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
-            let rules = self.get(&format!("repos/{repo}/rules/branches/{encoded}"))?;
-            let branch = self.get(&format!("repos/{repo}/branches/{encoded}"))?;
-            let queued = merge_queued(&rules)?;
-            required.insert(base.clone(), (required_checks(&rules, &branch)?, queued));
+            required.insert(base.clone(), self.base_checks(repo, &base)?);
         }
         let (base_required, queued) = &required[&base];
         // Without a merge queue the poll's own merge is the last gate, so
         // every check on the head holds it, required or not (#163).
         let promoted = publication_checks.is_some();
-        let mut checks = if let Some(checks) = publication_checks {
-            checks
-        } else if *queued {
-            classify_checks(&pull, base_required)
-        } else {
-            classify_all_checks(&pull, base_required)
+        let classify = |pull: &Value, required: &[Value], queued| {
+            if queued {
+                classify_checks(pull, required)
+            } else {
+                classify_all_checks(pull, required)
+            }
         };
+        let mut checks =
+            publication_checks.unwrap_or_else(|| classify(&pull, base_required, *queued));
         let head = text(&pull, "/headRefOid");
         // Removals are read only for the bot's own pull requests from its fork,
         // whose marker can count them; out of the queue and not handed to a
@@ -9670,7 +9759,53 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         // The hold is read again just before the step's first write: one put
         // on since the read above stops it too.
-        let hold = if writing {
+        let mut ready_pull = None;
+        let hold = if writing && decision.action == READY {
+            // Ready has no expected-head argument. Re-decide from the last
+            // read instead of maintaining a second list of eligibility gates.
+            (|| {
+                let (required, queued) = self.base_checks(repo, &base)?;
+                let mut fresh = self.read_pull(owner, name, number)?;
+                if is_held(&fresh) {
+                    return Ok(Some(format!("labelled {HOLD_LABEL}")));
+                }
+                let same_draft = fresh["state"] == "OPEN"
+                    && fresh["isDraft"] == true
+                    && fresh["headRefOid"] == head
+                    && fresh.pointer("/commits/nodes/0/commit/oid") == Some(&fresh["headRefOid"])
+                    && fresh["labels"]["nodes"].is_array()
+                    && [
+                        "/id",
+                        "/baseRefName",
+                        "/baseRefOid",
+                        "/baseChange",
+                        "/draftChange",
+                        "/reviews",
+                    ]
+                    .iter()
+                    .all(|at| fresh.pointer(at) == pull.pointer(at));
+                if same_draft {
+                    self.more_checks(owner, name, number, &mut fresh)?;
+                    let checks = classify(&fresh, &required, queued);
+                    if decide(
+                        self.config,
+                        &fresh,
+                        &checks,
+                        &marker,
+                        (fix_run.as_ref(), review_run.as_ref()),
+                        &outages,
+                        self.now,
+                    )
+                    .action
+                        == READY
+                    {
+                        ready_pull = Some(fresh);
+                        return Ok(None);
+                    }
+                }
+                Ok(Some("draft changed since its approval was read".into()))
+            })()
+        } else if writing {
             self.read_pull(owner, name, number).map(|p| {
                 if is_held(&p) {
                     Some(format!("labelled {HOLD_LABEL}"))
@@ -9772,7 +9907,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
             (Some(_), None, _) => self.take(
                 repo,
-                &pull,
+                ready_pull.as_ref().unwrap_or(&pull),
                 &checks,
                 (&marker, &comments),
                 &decision,
@@ -11453,6 +11588,8 @@ mod tests {
         let described = "docs: Explain the exemption\n\nThe review relies on it.";
         let continued = json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older"});
         let retitle = json!({"continuation": {"retitle": true}});
+        let ready = json!({"readyApproved": true});
+        let rereview = json!({"readyApproved": true, "reviewWorkflow": "review.yml", "reviewPools": ["claude"]});
         let diagnostic = json!({"diagnosticPool": "large"});
         let rebase = json!({"rebaseRounds": 2});
         // An outage issue as tracker's broker.cjs opens it, and the policy
@@ -11788,6 +11925,98 @@ mod tests {
                 "a green draft with no checkpoint is not marked ready either",
                 "pull-470",
                 json!({"isDraft": true}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            // With `readyApproved`, an approval of the head is what marks it
+            // ready (agent-board#1125); nothing short of one does.
+            (
+                "with readyApproved, an approved green draft is marked ready",
+                "pull-470",
+                json!({"isDraft": true, "policy": ready}),
+                json!({"rounds": 0}),
+                none.clone(),
+                READY,
+                None,
+            ),
+            (
+                "with readyApproved, an approved draft waits for its checks",
+                "pull-470",
+                json!({"isDraft": true, "policy": ready, "contexts": {"ci": {"status": "QUEUED", "conclusion": null}}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "review pools do not clear the person stop on an old job approval",
+                "pull-470",
+                json!({"isDraft": true, "policy": rereview, "reviews": {"nodes": [review("APPROVED", job(), "older", "VERDICT: APPROVE")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "with readyApproved but no reviewPools, nothing would start that review, so it stops",
+                "pull-470",
+                json!({"isDraft": true, "policy": ready, "reviews": {"nodes": [review("APPROVED", job(), "older", "VERDICT: APPROVE")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "review pools do not clear the person stop on an old operator approval",
+                "pull-470",
+                json!({"isDraft": true, "policy": rereview, "reviews": {"nodes": [review("APPROVED", user("cgwalters"), "older", "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "with readyApproved and reviewPools, a later change request of an earlier head is not an approval",
+                "pull-470",
+                json!({"isDraft": true, "policy": rereview, "reviews": {"nodes": [review("APPROVED", job(), "older", "VERDICT: APPROVE"), later(review("CHANGES_REQUESTED", job(), "older", "VERDICT: CHANGES"))]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "with readyApproved and reviewPools, the operator's change request outranks the job's later approval",
+                "pull-470",
+                json!({"isDraft": true, "policy": rereview, "reviews": {"nodes": [review("CHANGES_REQUESTED", user("cgwalters"), "older", ""), later(review("APPROVED", job(), "older", "VERDICT: APPROVE"))]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "with readyApproved, an unreviewed draft still stops",
+                "pull-470",
+                json!({"isDraft": true, "policy": ready, "contexts": {"review": null}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "with readyApproved and reviewPools, someone else's approval of an earlier head asks for nothing",
+                "pull-470",
+                json!({"isDraft": true, "policy": rereview, "reviews": {"nodes": [review("APPROVED", user("someone"), "older", "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "with readyApproved, an approved draft outside our own space still stops",
+                "pull-470",
+                json!({"isDraft": true, "policy": ready, "baseRepository": {"nameWithOwner": "upstream/project", "isPrivate": false, "defaultBranchRef": {"name": "main"}}}),
                 json!({"rounds": 0}),
                 none.clone(),
                 "needs-human",
@@ -13236,7 +13465,10 @@ mod tests {
                         );
                         assert_eq!(queued, suppressed, "{name}");
                     }
-                } else if listed && got.reason.starts_with("a draft with no checkpoint") {
+                } else if listed
+                    && (got.reason.starts_with("a draft with no checkpoint")
+                        || (p["isDraft"] == true && got.reason == NO_REVIEW))
+                {
                     // A draft is the finished state on a midstream fork: it
                     // waits for its checks, then for promotion, unlabelled.
                     let pending = classify_checks(&p, &required()).pending;
@@ -19997,6 +20229,10 @@ mod tests {
     fn apply_takes_the_step_the_preview_prints() {
         let changes = json!({"contexts": {"review": {"state": "FAILURE"}}});
         let comment = format!("POST repos/{REPO}/issues/470/comments");
+        let readied = format!("ready: {READY_APPROVED} -> marked ready");
+        let unready = format!(
+            "ready: {READY_APPROVED} -> not taken: draft changed since its approval was read"
+        );
         let label = [
             format!("POST repos/{REPO}/labels"),
             format!("POST repos/{REPO}/issues/470/labels"),
@@ -20066,6 +20302,183 @@ mod tests {
             (
                 "a draft with no checkpoint is labelled, never marked ready",
                 json!({"isDraft": true, "contexts": {"review": null}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "needs-human: a draft with no checkpoint; mark it ready if the work is complete -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                0,
+            ),
+            (
+                "with readyApproved, an approved green draft is marked ready, and nothing else",
+                json!({"isDraft": true, "readyApproved": true}),
+                none.clone(),
+                vec![],
+                vec![],
+                &readied,
+                vec!["markPullRequestReadyForReview".into()],
+                0,
+            ),
+            (
+                "with readyApproved, an approval before a return to draft does not ready it",
+                json!({"isDraft": true, "readyApproved": true,
+                    "draftChange": {"nodes": [{"createdAt": "2026-10-12T01:15:00Z", "actor": {"login": "cgwalters"}}]},
+                    "reviews": {"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "needs-human: a draft with no checkpoint; mark it ready if the work is complete -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                0,
+            ),
+            (
+                "nor, where a person returned it, does the review job's approval after it",
+                json!({"isDraft": true, "readyApproved": true,
+                    "draftChange": {"nodes": [{"createdAt": "2026-10-12T00:30:00Z", "actor": {"login": "cgwalters"}}]}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "needs-human: a draft with no checkpoint; mark it ready if the work is complete -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                0,
+            ),
+            (
+                "where the bot returned it, the review job's approval from a run after it readies it",
+                json!({"isDraft": true, "readyApproved": true,
+                    "draftChange": {"nodes": [{"createdAt": "2026-10-12T00:30:00Z", "actor": {"login": BOT}}]}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &readied,
+                vec!["markPullRequestReadyForReview".into()],
+                0,
+            ),
+            (
+                "but not from a run started before it",
+                json!({"isDraft": true, "readyApproved": true,
+                    "draftChange": {"nodes": [{"createdAt": "2026-10-12T00:55:00Z", "actor": {"login": BOT}}]}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "needs-human: a draft with no checkpoint; mark it ready if the work is complete -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                0,
+            ),
+            (
+                "nor the operator's, after a conversion whose time cannot be read",
+                json!({"isDraft": true, "readyApproved": true, "draftChange": {"nodes": [{}]},
+                    "reviews": {"nodes": [later(review("APPROVED", user("cgwalters"), HEAD, ""))]}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "needs-human: a draft with no checkpoint; mark it ready if the work is complete -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                0,
+            ),
+            (
+                "the operator's approval after the return to draft readies it",
+                json!({"isDraft": true, "readyApproved": true,
+                    "draftChange": {"nodes": [{"createdAt": "2026-10-12T01:15:00Z", "actor": {"login": "cgwalters"}}]},
+                    "reviews": {"nodes": [later(review("APPROVED", user("cgwalters"), HEAD, ""))]}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &readied,
+                vec!["markPullRequestReadyForReview".into()],
+                0,
+            ),
+            (
+                "a return to draft seen by the read before the write cancels it",
+                json!({"isDraft": true, "readyApproved": true,
+                    "late": {"draftChange": {"nodes": [{"createdAt": "2026-10-12T01:15:00Z"}]}}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &unready,
+                vec![],
+                0,
+            ),
+            (
+                "a checkpoint added to the body without a push cancels ready",
+                json!({"isDraft": true, "readyApproved": true,
+                    "late": {"body": "```checkpoint\n{\"reason\":\"incomplete\",\"done\":\"Started\",\"left\":\"Tests\",\"next\":\"Run tests\"}\n```"}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &unready,
+                vec![],
+                0,
+            ),
+            (
+                "unread labels at the last read cancel ready",
+                json!({"isDraft": true, "readyApproved": true,
+                    "late": {"labels": {"nodes": [], "pageInfo": {"hasNextPage": true}}}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &unready,
+                vec![],
+                0,
+            ),
+            (
+                "a late retarget cancels ready even if its timeline event is not visible yet",
+                json!({"isDraft": true, "readyApproved": true, "late": {"baseRefName": "other"}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &unready,
+                vec![],
+                0,
+            ),
+            (
+                "a dependency declared at the last read holds ready",
+                json!({"isDraft": true, "readyApproved": true, "holdDependencies": true, "body": "",
+                    "late": {"body": "Depends on other/repo#12"}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "ready: a draft with no checkpoint, approved at its head with green checks, so marked ready -> not taken: blocked by other/repo#12",
+                vec![],
+                0,
+            ),
+            (
+                "a newly failed check on the same head cancels ready",
+                json!({"isDraft": true, "readyApproved": true, "late": {
+                    "commits": pull("pull-470", json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}))["commits"]}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &unready,
+                vec![],
+                0,
+            ),
+            (
+                "and so does a dismissed approval",
+                json!({"isDraft": true, "readyApproved": true, "late": {"reviews": {"nodes": []}}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &unready,
+                vec![],
+                0,
+            ),
+            (
+                "an approval before a retarget does not ready it",
+                json!({"isDraft": true, "readyApproved": true,
+                    "baseChange": {"nodes": [{"createdAt": "2026-10-12T01:15:00Z"}]},
+                    "reviews": {"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "needs-human: a draft with no checkpoint; mark it ready if the work is complete -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                0,
+            ),
+            (
+                "a private draft with only old approval stops even with review pools",
+                json!({"isDraft": true, "readyApproved": true, "reviewPools": true,
+                    "baseRepository": {"nameWithOwner": REPO, "isPrivate": true, "defaultBranchRef": {"name": "main"}},
+                    "reviews": {"nodes": [review("APPROVED", user("cgwalters"), "older", "")]}}),
                 none.clone(),
                 vec![],
                 vec![],
@@ -20361,11 +20774,47 @@ mod tests {
                 .and_then(|c| c.remove("pushed"))
                 .map(|head| (470, head.as_str().unwrap().to_owned()));
             let bounds = change.as_object_mut().and_then(|c| c.remove("bounds"));
+            fake.late_pull_fields = change.as_object_mut().and_then(|c| c.remove("late"));
             let mut cfg = config();
             cfg.policy.owner_branches = change
                 .as_object_mut()
                 .and_then(|c| c.remove("ownerBranches"))
                 .is_some();
+            cfg.policy.ready_approved = change
+                .as_object_mut()
+                .and_then(|c| c.remove("readyApproved"))
+                .is_some();
+            if change
+                .as_object_mut()
+                .unwrap()
+                .remove("holdDependencies")
+                .is_some()
+            {
+                cfg.policy.hold_dependencies = true;
+                fake.page(
+                    &format!(
+                        "repos/{REPO}/issues/470/dependencies/blocked_by?per_page={}",
+                        crate::dependencies::LIMIT + 1
+                    ),
+                    None,
+                    None,
+                    json!([]),
+                );
+                fake.page(
+                    "repos/other/repo/issues/12",
+                    None,
+                    None,
+                    json!({"number":12,"state":"open"}),
+                );
+            }
+            if change
+                .as_object_mut()
+                .unwrap()
+                .remove("reviewPools")
+                .is_some()
+            {
+                cfg.policy.review_pools = vec!["claude".into()];
+            }
             let own = change.as_object_mut().and_then(|c| c.remove("own"));
             if own.is_some() {
                 cfg.policy.head_owners = vec!["cgwalters-forge".into()];

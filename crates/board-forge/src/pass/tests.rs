@@ -19849,6 +19849,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
             p.owner_branches,
             p.own_space_only,
             p.fold_rounds,
+            p.ready_approved,
             p.quiet_waits,
             p.review_pools,
             p.review_dispatch_repositories,
@@ -19863,7 +19864,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
     let repo = "cgwalters-forge/bootc";
     let every = json!({
         "checkReruns": true, "unstall": true, "directionFirst": true, "ownerBranches": true,
-        "ownSpaceOnly": true, "foldRounds": true, "reviewWorkflow": "review.yml",
+        "ownSpaceOnly": true, "foldRounds": true, "readyApproved": true, "reviewWorkflow": "review.yml",
         "reviewPools": ["claude"], "reviewDispatchRepositories": [repo],
         "draftReviewRepositories": [repo], "headOwners": ["cgwalters-forge"],
         "noMerge": [repo], "operatorPaths": [".github/pass.json", ".github/agentic-job/"],
@@ -23399,14 +23400,23 @@ fn promotion_view_is_read_only_and_budgeted() {
         "malformed detail",
         "canceled command",
         "stale permission",
+        "another author",
     ] {
         let (mut replay, cfg) = awaiting_scenario();
         let mut expected = "DCO sign-off rewrite required";
         let mut failures = 0;
+        // Only a hold counts; what publication does itself (a rebase or a
+        // sign-off) is a wait for it (agent-board#1125).
+        let held = matches!(case, "needs-human" | "policy missing" | "another author");
         match case {
             "behind" => {
                 answer(&mut replay, "/compare/")["body"]["behind_by"] = json!(31);
                 expected = "needs publication rebase (behind_by=31)";
+            }
+            "another author" => {
+                answer(&mut replay, "/compare/")["body"]["commits"][0]["author"]["login"] =
+                    json!("someone");
+                expected = "dco=required: missing sign-off on 1 of 1 commits: 866b6ce9050782c50eb0fec1c08b37cebec93dc6 is by neither bot nor operator";
             }
             "needs-human" => {
                 let e = replay
@@ -23494,7 +23504,11 @@ fn promotion_view_is_read_only_and_budgeted() {
             };
             assert_eq!(
                 promote::view(&budget, &cfg, replay.now),
-                (vec!["promote: discovery incomplete (budget)".into()], 0)
+                (
+                    vec!["promote: discovery incomplete (budget)".into()],
+                    0,
+                    None
+                )
             );
             continue;
         }
@@ -23502,8 +23516,9 @@ fn promotion_view_is_read_only_and_budgeted() {
             inner: &replay,
             bounds: &bounds,
         };
-        let (lines, errors) = promote::view(&budget, &cfg, replay.now);
+        let (lines, errors, holds) = promote::view(&budget, &cfg, replay.now);
         assert_eq!(errors, failures, "{case}: {lines:?}");
+        assert_eq!(holds, Some(usize::from(held)), "{case}: {lines:?}");
         assert_eq!(bounds.writes.get(), 0, "{case}");
         match case {
             "silent" => {
@@ -23627,7 +23642,7 @@ fn promotion_provenance_distinguishes_missing_authorship_from_unreadable_evidenc
             inner: &replay,
             bounds: &bounds,
         };
-        let (lines, failures) = promote::view(&budget, &cfg, replay.now);
+        let (lines, failures, _) = promote::view(&budget, &cfg, replay.now);
         let unreadable = matches!(case, "malformed" | "truncated");
         assert_eq!(failures, usize::from(unreadable), "{case}: {lines:?}");
         assert!(

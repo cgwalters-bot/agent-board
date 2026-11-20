@@ -19,6 +19,12 @@ pub struct Promote {
     #[serde(default)]
     pub on_approval: bool,
 
+    /// With --apply, mark a held fork PR with one bot comment; the detailed
+    /// reason stays in the job log (agent-board#1125). Written only by a run
+    /// that published nothing, within its --max-writes. Off by default.
+    #[serde(default)]
+    pub hold_comments: bool,
+
     /// Legacy scope/base hints, accepted for one release. GitHub fork parent,
     /// origin=fork and bot-midstream metadata are required before use.
     #[serde(default)]
@@ -168,7 +174,8 @@ impl<C: Rest + Transport> Transport for Reads<'_, '_, C> {
 
 impl<C: Rest + Transport> Scheduler<'_, C> {
     pub(super) fn promote(&mut self) {
-        let (lines, failures) = view(&self.client, self.config, self.now);
+        let (lines, failures, held) = view(&self.client, self.config, self.now);
+        self.report.tally.1.promote_held = held;
         debug_assert_eq!(
             failures,
             lines
@@ -186,15 +193,20 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     }
 }
 
+/// The view's lines, its read failures, and how many of the candidates it
+/// evaluated hold ([`crate::promote::holds`]), short of those its budget left
+/// unevaluated, which its lines name; none where it is off or its forks were
+/// not listed.
 pub(super) fn view<C: Rest + Transport>(
     client: &Budget<'_, C>,
     config: &Config,
     now: OffsetDateTime,
-) -> (Vec<String>, usize) {
+) -> (Vec<String>, usize, Option<usize>) {
     let mut lines = Vec::new();
     let mut failures = 0;
+    let mut held = 0;
     if !crate::promote::enabled(config) {
-        return (vec!["promote: off".into()], 0);
+        return (vec!["promote: off".into()], 0, None);
     }
     let reads = Reads {
         client,
@@ -204,9 +216,19 @@ pub(super) fn view<C: Rest + Transport>(
     let forks = match crate::promote::targets(&reads, config) {
         Ok(forks) => forks,
         Err(_) if reads.exhausted.get() => {
-            return (vec!["promote: discovery incomplete (budget)".into()], 0);
+            return (
+                vec!["promote: discovery incomplete (budget)".into()],
+                0,
+                None,
+            );
         }
-        Err(error) => return (vec![format!("promote error: discovery: {error:#}")], 1),
+        Err(error) => {
+            return (
+                vec![format!("promote error: discovery: {error:#}")],
+                1,
+                None,
+            );
+        }
     };
     let mut candidates = Vec::new();
     {
@@ -256,9 +278,10 @@ pub(super) fn view<C: Rest + Transport>(
             failures += 1;
             lines.push(format!("promote error: {repo}#{number}: {error}"));
         } else {
+            held += usize::from(result.as_ref().is_err_and(crate::promote::holds));
             let reason = result.unwrap_or_else(|e| format!("{e:#}"));
             lines.push(format!("promote awaiting {repo}#{number}: {reason}"));
         }
     }
-    (lines, failures)
+    (lines, failures, Some(held))
 }
