@@ -36,6 +36,9 @@ const SECURE_HOST_IMAGE: &str = "ghcr.io/cgwalters-forge/secure-host";
 // Repeated reference strings could otherwise multiply full YAML parses during
 // scalar selection. Refuse excessive edit work, never a partial pin bump.
 const MAX_WORKFLOW_REFERENCES: usize = 128;
+/// A caller reference at this branch of the wrappers follows them on purpose:
+/// it is never edited, and discovery checks once what the branch serves.
+const FOLLOWED_BRANCH: &str = "main";
 
 fn image_pin(version: &str, digest: &str) -> Result<String> {
     if !digest.strip_prefix("sha256:").is_some_and(|s| {
@@ -150,6 +153,7 @@ fn pin_boundary(rest: &str) -> bool {
 
 /// Only exact configured workflow paths, never other actions/workflows in the
 /// same repository. Fixtures opt into string scanning; workflows read jobs.uses.
+/// A pin is a full commit SHA or `FOLLOWED_BRANCH`, which the caller resolves.
 fn caller_pins(
     text: &str,
     wrappers: &Target,
@@ -167,8 +171,8 @@ fn caller_pins(
             return Ok(None);
         }
         ensure!(
-            full_sha(pin),
-            "{}:{path} requires a full commit SHA, got {pin:?}",
+            full_sha(pin) || pin == FOLLOWED_BRANCH,
+            "{}:{path} requires a full commit SHA or {FOLLOWED_BRANCH}, got {pin:?}",
             wrappers.repository
         );
         Ok(Some((path.into(), pin.into())))
@@ -191,6 +195,12 @@ fn caller_pins(
                     .find(|c: char| c.is_whitespace() || "\"'`;,)]}".contains(c))
                     .unwrap_or(text.len() - start);
                 let pin = &text[start..start + len];
+                // `@main,old` in a string is not `@main`.
+                ensure!(
+                    pin != FOLLOWED_BRANCH || pin_boundary(&text[start + len..]),
+                    "{}:{path} has an incomplete reference at {pin:?}",
+                    wrappers.repository
+                );
                 reference(&format!("{needle}{pin}"))?;
                 found.push((start, len, (*path).clone()));
             }
@@ -260,7 +270,8 @@ fn set_caller_pins(value: &mut serde_yaml_ng::Value, wrappers: &Target, to: &str
         for job in jobs.values_mut() {
             if let Some(uses) = job.get_mut("uses")
                 && let Some(reference) = uses.as_str()
-                && let Some((target, _)) = reference.split_once('@')
+                && let Some((target, pin)) = reference.split_once('@')
+                && pin != FOLLOWED_BRANCH
                 && wrappers
                     .files
                     .iter()
@@ -299,6 +310,9 @@ fn repin_caller(
         };
         let mut moved = text.clone();
         for (start, len, _) in pins.into_iter().rev() {
+            if moved[start..start + len] == *FOLLOWED_BRANCH {
+                continue;
+            }
             let mut candidate = moved.clone();
             candidate.replace_range(start..start + len, &to.pin);
             if let Some(expected) = &expected {
@@ -734,6 +748,9 @@ pub struct Facts {
     pub secure_host: Option<Pull>,
     /// Each caller's repository and PR.
     pub callers: Vec<(String, Option<Pull>)>,
+    /// Why callers following the wrappers' `FOLLOWED_BRANCH` may not run
+    /// the merged wrappers bump, if they may not.
+    pub followers: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -851,6 +868,10 @@ pub fn next(f: &Facts) -> Step {
         .iter()
         .all(|(_, pr)| pr.as_ref().is_some_and(Pull::merged))
     {
+        // Pinned callers never wait on followers, but done claims them too.
+        if let Some(why) = &f.followers {
+            return Step::Stall(why.clone());
+        }
         return Step::Done;
     }
     Step::Wait("the review.yml pin bumps".into())
@@ -1287,6 +1308,9 @@ struct Pass<'a> {
     used_reads: BTreeSet<String>,
     read_bytes: usize,
     callers: Vec<Target>,
+    /// Once checked, why callers at `FOLLOWED_BRANCH` may not run the merged
+    /// wrappers bump, if they may not.
+    followed: Option<Option<String>>,
 }
 
 /// One pass: prints its decisions to `out`, a line each, and with `apply`
@@ -1330,6 +1354,7 @@ pub fn pass_with_cache(
         used_reads: BTreeSet::new(),
         read_bytes: 0,
         callers: vec![],
+        followed: None,
     }
     .run();
     crate::pass::cache::bound(&mut cache.0);
@@ -1401,7 +1426,7 @@ impl Pass<'_> {
         Ok(all.into_values().collect())
     }
 
-    fn discover_callers(&mut self) -> Result<Vec<Target>> {
+    fn discover_callers(&mut self, merge: &str) -> Result<Vec<Target>> {
         let c = self.config;
         // Identity and inventories are always live. A cache never grants write
         // authority or visibility, even when its trees describe a real commit.
@@ -1490,9 +1515,51 @@ impl Pass<'_> {
                 }
             }
         }
+        // A repository whose references all follow the wrappers needs no
+        // edit, and so no fork.
+        let mut pinned = BTreeMap::new();
+        for (repo, paths) in files {
+            if paths.is_empty() {
+                continue;
+            }
+            let sha = match heads.get(&repo) {
+                Some(sha) => sha.clone(),
+                None => {
+                    let base = self.default_branch(&repo)?;
+                    string(
+                        &self.get(&format!("/repos/{repo}/commits/{}", encode(&base)))?,
+                        "/sha",
+                    )?
+                }
+            };
+            let mut edits = false;
+            for path in &paths {
+                let content = self.discovery_contents(&repo, &sha, path)?;
+                let pins = caller_pins(&content, &c.wrappers, !workflow_file(path))?;
+                ensure!(
+                    !pins.is_empty(),
+                    "configured extra {repo}:{path} has no configured wrapper pin"
+                );
+                let records: BTreeSet<_> = pins
+                    .into_iter()
+                    .map(|(at, len, wrapper)| (wrapper, content[at..at + len].to_owned()))
+                    .collect();
+                for (wrapper, pin) in records {
+                    if pin == FOLLOWED_BRANCH {
+                        self.follow(merge)?;
+                    } else {
+                        edits = true;
+                    }
+                    self.log(&format!("caller {repo} {path} {wrapper} {pin}"))?;
+                }
+            }
+            if edits {
+                pinned.insert(repo, paths);
+            }
+        }
         // Include private and renamed bot forks; the short name conveys no
         // parent identity. Never create a missing fork on the operator's behalf.
-        let forks = if files.is_empty() {
+        let forks = if pinned.is_empty() {
             vec![]
         } else {
             self.inventory(
@@ -1500,7 +1567,7 @@ impl Pass<'_> {
             )?
         };
         let mut by_parent: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        if !files.is_empty() {
+        if !pinned.is_empty() {
             complete_inventory(&self.get("/user")?, &forks, &c.bot)?;
         }
         for fork in forks {
@@ -1519,35 +1586,7 @@ impl Pass<'_> {
             }
         }
         let mut callers = vec![];
-        for (repo, paths) in files {
-            if paths.is_empty() {
-                continue;
-            }
-            let sha = match heads.get(&repo) {
-                Some(sha) => sha.clone(),
-                None => {
-                    let base = self.default_branch(&repo)?;
-                    string(
-                        &self.get(&format!("/repos/{repo}/commits/{}", encode(&base)))?,
-                        "/sha",
-                    )?
-                }
-            };
-            for path in &paths {
-                let content = self.discovery_contents(&repo, &sha, path)?;
-                let pins = caller_pins(&content, &c.wrappers, !workflow_file(path))?;
-                ensure!(
-                    !pins.is_empty(),
-                    "configured extra {repo}:{path} has no configured wrapper pin"
-                );
-                let records: BTreeSet<_> = pins
-                    .into_iter()
-                    .map(|(at, len, wrapper)| (wrapper, content[at..at + len].to_owned()))
-                    .collect();
-                for (wrapper, pin) in records {
-                    self.log(&format!("caller {repo} {path} {wrapper} {pin}"))?;
-                }
-            }
+        for (repo, paths) in pinned {
             let fork = if let Some(fork) = overrides.get(&repo) {
                 ensure!(
                     self::owner(fork).eq_ignore_ascii_case(&c.bot),
@@ -1576,6 +1615,57 @@ impl Pass<'_> {
             });
         }
         Ok(callers)
+    }
+
+    /// Checks, once a pass, what callers at the wrappers' `FOLLOWED_BRANCH`
+    /// run. It must be the wrappers' default branch, whose review gate the
+    /// bump `merge` passed, with no tag of that name, which GitHub would run
+    /// in its place; otherwise the train stalls, as no caller edit can fix
+    /// it. Ancestry would not show a later revert, so the branch head's
+    /// workflows, all a caller or nested reusable workflow can run from
+    /// it, must be the bump's; otherwise the train cannot close.
+    fn follow(&mut self, merge: &str) -> Result<()> {
+        if self.followed.is_some() {
+            return Ok(());
+        }
+        let repo = self.config.wrappers.repository.clone();
+        let base = self.default_branch(&repo)?;
+        if base != FOLLOWED_BRANCH {
+            return stall(format!(
+                "callers follow {repo}@{FOLLOWED_BRANCH}, but its default branch is {base}"
+            ));
+        }
+        let tags = self.get(&format!(
+            "/repos/{repo}/git/matching-refs/tags/{FOLLOWED_BRANCH}"
+        ))?;
+        let tag = format!("refs/tags/{FOLLOWED_BRANCH}");
+        if list(&tags)?.iter().any(|t| t["ref"] == *tag) {
+            return stall(format!(
+                "callers follow {repo}@{FOLLOWED_BRANCH}, but GitHub runs its tag {FOLLOWED_BRANCH} in place of the branch; delete the tag"
+            ));
+        }
+        let head = string(
+            &self.get(&format!("/repos/{repo}/git/ref/heads/{FOLLOWED_BRANCH}"))?,
+            "/object/sha",
+        )?;
+        ensure!(full_sha(&head), "invalid {FOLLOWED_BRANCH} head for {repo}");
+        self.log(&format!("wrappers {repo}@{FOLLOWED_BRANCH} {head}"))?;
+        let changed =
+            head != merge && self.workflows(&repo, &head)? != self.workflows(&repo, merge)?;
+        self.followed = Some(changed.then(|| format!(
+            "callers follow {repo}@{FOLLOWED_BRANCH}, whose workflows at {head} differ from the wrappers' pin bump {merge}; if they still run this release, close this issue instead"
+        )));
+        Ok(())
+    }
+
+    /// The tree of `repo`'s `.github/workflows` at commit `at`.
+    fn workflows(&mut self, repo: &str, at: &str) -> Result<String> {
+        let listing = self.get(&format!("/repos/{repo}/contents/.github?ref={at}"))?;
+        let dir = list(&listing)?
+            .iter()
+            .find(|e| e["name"] == "workflows" && e["type"] == "dir")
+            .with_context(|| format!("{repo} has no .github/workflows at {at}"))?;
+        string(dir, "/sha")
     }
 
     fn discovery_contents(&mut self, repo: &str, sha: &str, path: &str) -> Result<String> {
@@ -2185,7 +2275,7 @@ impl Pass<'_> {
                     .context("the wrappers' pin bump has no merge commit")?;
                 ensure!(full_sha(merge), "wrappers merge is not a full commit SHA");
                 self.on_default(&c.wrappers.repository, merge, "the wrappers' pin bump")?;
-                self.callers = self.discover_callers()?;
+                self.callers = self.discover_callers(merge)?;
                 for caller in self.callers.clone() {
                     let mut pr = self.pull(&caller, &branch, since)?;
                     let base = self.default_branch(&caller.repository)?;
@@ -2206,9 +2296,12 @@ impl Pass<'_> {
                             "{}:{path} no longer pins a configured wrapper",
                             caller.repository
                         );
-                        current &= pins
-                            .iter()
-                            .all(|(at, len, _)| &content[*at..at + len] == merge);
+                        for (at, len, _) in pins {
+                            match &content[at..at + len] {
+                                FOLLOWED_BRANCH => self.follow(merge)?,
+                                pin => current &= pin == merge,
+                            }
+                        }
                     }
                     if current && pr.is_none() {
                         pr = Some(Pull {
@@ -2224,6 +2317,7 @@ impl Pass<'_> {
                     }
                     facts.callers.push((caller.repository, pr));
                 }
+                facts.followers = self.followed.clone().flatten();
             }
             Ok(())
         })();
@@ -2528,7 +2622,7 @@ impl Pass<'_> {
                 self.comment(
                     issue,
                     &format!(
-                        "Done: v{version} is released and pinned by the wrappers and every caller."
+                        "Done: v{version} is released and pinned by the wrappers and every caller that pins them."
                     ),
                 )
             }

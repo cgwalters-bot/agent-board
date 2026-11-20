@@ -79,9 +79,17 @@ complete pagination, resolves their current default-branch heads, reads their
 complete recursive trees, and inspects `.github/workflows/*.yml` and `*.yaml`.
 Only actual workflow `jobs.<job>.uses` values naming an exact workflow path in
 `wrappers.files` count. Each must use a full 40-character lowercase hexadecimal
-commit SHA; other paths and repositories do not count. The output is sorted by
-repository, file, wrapper path and current pin. Multiple files and different
-pins in one repository produce one PR. Already-current files need no edit or PR.
+commit SHA or `main`; other paths and repositories do not count. A caller at
+`main` follows the wrappers on purpose and is never edited, and a repository
+with only such callers needs no fork. The train stalls unless `main` is the
+wrappers' default branch and has no same-named tag, which GitHub would run in
+its place. Pinned callers still get their PRs, but the train stalls instead of
+closing while the wrappers' `.github/workflows` at `main` differ from the
+merged wrappers bump's, as a later commit may have reverted it; any workflow
+change there counts, so check what they run and close the issue by hand. The output
+is sorted by repository, file, wrapper path and current pin. Multiple files
+and different pins in one repository produce one PR. Already-current files
+need no edit or PR.
 
 `callers` entries add extra files, including test fixture strings, and select
 fork-name overrides; they never restrict discovery. Files are deduplicated.

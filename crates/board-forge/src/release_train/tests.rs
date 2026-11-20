@@ -1030,9 +1030,109 @@ fn discovery_finds_the_unlisted_site_and_adds_fixture_exceptions() {
 }
 
 #[test]
+fn callers_following_the_wrappers_main_hold_done_until_it_serves_the_bump() {
+    let wrappers = "/repos/cgwalters-forge/actions";
+    let followed = "cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@main";
+    let ahead = "4".repeat(40);
+    let (bumped, reverted) = ("5".repeat(40), "6".repeat(40));
+    let differ = "whose workflows at";
+    for (main, workflows, tag, base, current, expected) in [
+        (WRAPPER_MERGE, &reverted, None, "main", true, "v0.6.4: done"),
+        (&ahead, &bumped, None, "main", true, "v0.6.4: done"),
+        // Ahead of the bump, but a later commit reverted it.
+        (&ahead, &reverted, None, "main", true, differ),
+        // Pinned callers still get their PRs meanwhile.
+        (&ahead, &reverted, None, "main", false, "v0.6.4: callers"),
+        (
+            WRAPPER_MERGE,
+            &bumped,
+            None,
+            "main",
+            false,
+            "v0.6.4: callers",
+        ),
+        (
+            WRAPPER_MERGE,
+            &bumped,
+            Some("refs/tags/main"),
+            "main",
+            true,
+            "runs its tag main",
+        ),
+        (
+            WRAPPER_MERGE,
+            &bumped,
+            Some("refs/tags/main-old"),
+            "main",
+            true,
+            "v0.6.4: done",
+        ),
+        (
+            WRAPPER_MERGE,
+            &bumped,
+            None,
+            "trunk",
+            true,
+            "its default branch is trunk",
+        ),
+    ] {
+        for apply in [false, true] {
+            let mut f = discovery_fixture(current);
+            // Following callers need no fork: tracker's would not resolve.
+            f["config"]["callers"][0]["fork"] = json!("cgwalters-bot/missing");
+            let r = &mut f["responses"];
+            // Both tracker's workflow and its configured fixture follow main.
+            let at = "/repos/cgwalters-forge/tracker/contents";
+            r[format!("{at}/{CALLER_WORKFLOW}?ref={CALLER_HEAD}")] = json!({"encoding": "base64",
+                "content": base64(&format!("jobs:\n  review:\n    uses: {followed}\n"))});
+            r[format!("{at}/.github/poll/poll.test.cjs?ref={CALLER_HEAD}")] = json!({"encoding": "base64",
+                "content": base64(&format!("assert pin == '{followed}'\n"))});
+            r[wrappers]["default_branch"] = json!(base);
+            if base != "main" {
+                // The bump is on the default branch either way.
+                r[format!("{wrappers}/compare/{base}...{WRAPPER_MERGE}")] =
+                    json!({"status": "behind"});
+            }
+            r[format!("{wrappers}/git/matching-refs/tags/main")] =
+                json!(tag.iter().map(|t| json!({"ref": t})).collect::<Vec<_>>());
+            r[format!("{wrappers}/git/ref/heads/main")] = json!({"object": {"sha": main}});
+            for (at, tree) in [(WRAPPER_MERGE, &bumped), (&ahead, workflows)] {
+                r[format!("{wrappers}/contents/.github?ref={at}")] = json!([
+                    {"name": "dependabot.yml", "type": "file", "sha": "7".repeat(40)},
+                    {"name": "workflows", "type": "dir", "sha": tree}
+                ]);
+            }
+            let out = replay(&f, apply).unwrap();
+            assert!(out.contains(expected), "{out}");
+            if tag == Some("refs/tags/main") || base != "main" {
+                assert!(!out.contains("v0.6.4: "), "{out}");
+                continue;
+            }
+            assert!(
+                out.contains(&format!("wrappers cgwalters-forge/actions@main {main}")),
+                "{out}"
+            );
+            assert!(
+                out.contains(&format!(
+                    "caller cgwalters-forge/tracker {CALLER_WORKFLOW} .github/workflows/cgwalters-review.yml main"
+                )),
+                "{out}"
+            );
+            assert!(!out.contains("PR on cgwalters-forge/tracker "), "{out}");
+            assert_eq!(
+                out.contains("PR on cgwalters-forge/agent-board "),
+                !current,
+                "{out}"
+            );
+        }
+    }
+}
+
+#[test]
 fn workflow_references_are_exact_and_commit_pinned() {
     let wrappers = config().wrappers;
     let reference = format!("example/actions/.github/workflows/review.yml@{CALLER_HEAD}");
+    let followed = reference.replace(CALLER_HEAD, FOLLOWED_BRANCH);
     for (text, count, valid) in [
         (
             format!("jobs: {{review: {{uses: '{reference}'}}}}"),
@@ -1073,6 +1173,15 @@ fn workflow_references_are_exact_and_commit_pinned() {
             0,
             false,
         ),
+        (format!("jobs: {{review: {{uses: '{followed}'}}}}"), 1, true),
+        (
+            format!(
+                "jobs: {{review: {{uses: '{}'}}}}",
+                reference.replace(CALLER_HEAD, "stable")
+            ),
+            0,
+            false,
+        ),
         (
             format!(
                 "jobs: {{review: {{uses: '{}'}}}}",
@@ -1100,6 +1209,42 @@ fn workflow_references_are_exact_and_commit_pinned() {
         if valid {
             assert_eq!(result.unwrap().len(), count, "{text}");
         }
+    }
+    // A fixture string follows main only as a complete reference.
+    for (text, valid) in [
+        (format!("'{followed}'"), true),
+        (format!("'{followed},old'"), false),
+        (format!("'{followed};old'"), false),
+    ] {
+        let result = caller_pins(&text, &wrappers, true);
+        assert_eq!(result.is_ok(), valid, "{text}: {result:?}");
+    }
+    // Only the pinned reference moves; one following main is never edited.
+    let to = Pin {
+        pin: WRAPPER_MERGE.into(),
+        version: "0.6.4".into(),
+    };
+    for (path, head, line) in [
+        (CALLER_WORKFLOW, "jobs:\n", "  {job}:\n    uses: {ref}\n"),
+        ("tests/pin.txt", "", "'{ref}'\n"),
+    ] {
+        let line = |job: &str, at: &str| line.replace("{job}", job).replace("{ref}", at);
+        let files = [(path.into(), format!("{head}{}", line("a", &followed)))];
+        assert!(
+            repin_caller(&files, &wrappers, "tool", &to)
+                .unwrap()
+                .is_empty()
+        );
+        let both = format!("{head}{}{}", line("a", &followed), line("b", &reference));
+        let files = [(path.into(), both)];
+        let moved = repin_caller(&files, &wrappers, "tool", &to).unwrap();
+        assert_eq!(moved.len(), 1, "{path}");
+        let moved = &moved[0].1;
+        assert!(moved.contains(&followed), "{moved}");
+        assert!(
+            moved.contains(&reference.replace(CALLER_HEAD, WRAPPER_MERGE)),
+            "{moved}"
+        );
     }
     let files = vec![
         (
@@ -1280,6 +1425,7 @@ fn inventories_paginate_and_never_accept_partial_coverage() {
         used_reads: BTreeSet::new(),
         read_bytes: 0,
         callers: vec![],
+        followed: None,
     };
     assert!(
         pass.inventory("/orgs/example/repos?type=all")
