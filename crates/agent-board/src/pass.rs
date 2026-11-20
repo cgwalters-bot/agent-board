@@ -212,7 +212,26 @@ fn own_run() -> Result<PassRun> {
     let repository = var("GITHUB_REPOSITORY")?;
     board_forge::poll::validate_repository(&repository).context("GITHUB_REPOSITORY")?;
     let id = var("GITHUB_RUN_ID")?.parse().context("GITHUB_RUN_ID")?;
-    Ok(PassRun { repository, id })
+    let attempt = run_attempt(
+        "GITHUB_RUN_ATTEMPT",
+        std::env::var("GITHUB_RUN_ATTEMPT").ok(),
+    )?;
+    Ok(PassRun {
+        repository,
+        id,
+        attempt,
+    })
+}
+
+/// The run attempt the variable `name` gives as `value`, 1 where it is
+/// unset: one that is set is a positive number.
+fn run_attempt(name: &str, value: Option<String>) -> Result<u64> {
+    let Some(attempt) = value else {
+        return Ok(1);
+    };
+    let attempt: u64 = attempt.parse().with_context(|| name.to_owned())?;
+    ensure!(attempt > 0, "{name} is 0; attempts start at 1");
+    Ok(attempt)
 }
 
 /// Forgejo exports its own Actions variables and GitHub-compatible aliases.
@@ -238,7 +257,12 @@ fn forgejo_apply_mode(
             .parse()
             .context("Forgejo RUN_ID")?;
         ensure!(id > 0, "invalid Forgejo RUN_ID");
-        return Ok(Some(PassRun { repository, id }));
+        let attempt = run_attempt("RUN_ATTEMPT", var("RUN_ATTEMPT").ok())?;
+        return Ok(Some(PassRun {
+            repository,
+            id,
+            attempt,
+        }));
     }
     ensure!(
         limits.dispatch.is_some() && limits.writes.is_some(),

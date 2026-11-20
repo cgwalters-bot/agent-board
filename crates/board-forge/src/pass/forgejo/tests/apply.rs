@@ -987,6 +987,7 @@ fn forgejo_actions_uses_the_pass_workflows_own_runs() {
         let own = PassRun {
             repository: "example/control".into(),
             id: 50,
+            attempt: 1,
         };
         let report = run(
             &fake,

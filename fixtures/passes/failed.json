@@ -1,0 +1,152 @@
+{
+  "schema": "agent-board/passes/v1",
+  "published_at": "2026-11-05T12:00:00Z",
+  "retention": 10,
+  "omitted": 1,
+  "passes": [
+    {
+      "run": {
+        "repository": "o/runner",
+        "id": 42,
+        "attempt": 2
+      },
+      "started_at": "2026-11-05T12:00:00Z",
+      "finished_at": "2026-11-05T12:00:00Z",
+      "mode": "actions",
+      "result": "failure",
+      "sections": [
+        {
+          "name": "setup",
+          "outcome": "failed",
+          "error": "Stage failed; see the run log."
+        },
+        {
+          "name": "changes",
+          "outcome": "skipped",
+          "error": null
+        },
+        {
+          "name": "usage",
+          "outcome": "skipped",
+          "error": null
+        },
+        {
+          "name": "maintain",
+          "outcome": "skipped",
+          "error": null
+        },
+        {
+          "name": "pull-requests",
+          "outcome": "skipped",
+          "error": null
+        },
+        {
+          "name": "epics",
+          "outcome": "skipped",
+          "error": null
+        },
+        {
+          "name": "schedule",
+          "outcome": "skipped",
+          "error": null
+        },
+        {
+          "name": "status",
+          "outcome": "skipped",
+          "error": null
+        },
+        {
+          "name": "holds",
+          "outcome": "skipped",
+          "error": null
+        },
+        {
+          "name": "cost",
+          "outcome": "skipped",
+          "error": null
+        }
+      ],
+      "starts": [],
+      "no_start": [],
+      "candidates": null,
+      "omitted": {
+        "sections": 0,
+        "starts": 0,
+        "no_start": 0
+      }
+    },
+    {
+      "run": {
+        "repository": "o/runner",
+        "id": 41,
+        "attempt": 1
+      },
+      "started_at": "2026-11-05T11:30:00Z",
+      "finished_at": "2026-11-05T11:30:00Z",
+      "mode": "actions",
+      "result": "success",
+      "sections": [],
+      "starts": [],
+      "no_start": [],
+      "candidates": null,
+      "omitted": {
+        "sections": 0,
+        "starts": 0,
+        "no_start": 0
+      }
+    }
+  ],
+  "pools": {
+    "observed_at": "2026-11-05T11:58:00Z",
+    "complete": true,
+    "omitted": 1,
+    "items": [
+      {
+        "pool": "claude",
+        "observed_at": "2026-11-05T11:57:30Z",
+        "used_percent": 45.4,
+        "allowed_percent": 50.0,
+        "resets_at": "2026-11-05T13:00:00Z",
+        "held": false,
+        "ready": null
+      },
+      {
+        "pool": "openai",
+        "observed_at": null,
+        "used_percent": null,
+        "allowed_percent": null,
+        "resets_at": null,
+        "held": true,
+        "ready": null
+      }
+    ]
+  },
+  "in_flight": {
+    "observed_at": "2026-11-05T12:00:00Z",
+    "complete": true,
+    "omitted": 0,
+    "runs": [
+      {
+        "item": "o/work#1",
+        "kind": "fix",
+        "pool": "unknown",
+        "run": {
+          "repository": "o/runner",
+          "id": 101
+        },
+        "since": "2026-11-05T11:00:00Z"
+      },
+      {
+        "item": "o/work#2",
+        "kind": "fix",
+        "pool": "unknown",
+        "run": {
+          "repository": "o/runner",
+          "id": 102
+        },
+        "since": "2026-11-05T11:00:00Z"
+      }
+    ],
+    "prs": []
+  }
+}

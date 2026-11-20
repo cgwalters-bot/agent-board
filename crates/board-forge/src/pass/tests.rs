@@ -5769,6 +5769,7 @@ fn own() -> PassRun {
     PassRun {
         repository: "cgwalters-forge/tracker".into(),
         id: 4242,
+        attempt: 1,
     }
 }
 
@@ -5927,6 +5928,17 @@ impl Forge {
             .filter(|b| b.starts_with(holds::PART_MARKER))
             .collect();
         holds::assemble(first, &parts)
+    }
+
+    /// The pass history the last write of its comment published
+    /// ([`history::published`]).
+    pub(super) fn published_passes(&self) -> Option<Value> {
+        let writes = self.writes.borrow();
+        let bodies = writes.iter().filter(|(method, ..)| method != "GET");
+        let body = bodies
+            .map(|(.., body)| text(body, "/body"))
+            .rfind(|b| b.starts_with(history::MARKER))?;
+        history::published(body)
     }
 
     /// The actual emitted holds comment, not a reconstruction from the report.
@@ -7003,8 +7015,12 @@ fn apply_publishes_the_holds() {
     let url = "https://github.com/cgwalters-forge/tracker/actions/runs/4243";
     let mut forge = Forge::new(None, false);
     forge.passes = vec![json!({"id": 4243, "html_url": url})];
-    let report = apply(&forge, &config(json!({"holds": at})));
+    let mut settings = json!({"holds": at});
+    settings["holds"]["passes"] = true.into();
+    let report = apply(&forge, &config(settings));
     let line = format!("holds: not published; another pass is in progress, {url}");
+    assert!(report.lines.contains(&line), "{:#?}", report.lines);
+    let line = format!("passes: not published; another pass is in progress, {url}");
     assert!(report.lines.contains(&line), "{:#?}", report.lines);
     assert!(forge.writes.borrow().is_empty());
     // A preview says what it would write. Stage 3's epics are held too:
@@ -7119,6 +7135,350 @@ fn apply_publishes_the_pass_view() {
             ),
         }
     }
+}
+
+/// With `holds.passes`, an applying pass publishes the pass history as the
+/// bot's own comment on the holds issue, one the reader takes, with this
+/// pass's run, its confirmed starts and every stage's outcome, even where
+/// the hold snapshot's write was refused, which its holds section then says.
+/// Off, there is none.
+#[test]
+fn passes_are_published_apart_from_the_holds() {
+    for (passes, refuse_holds) in [(true, false), (true, true), (false, false)] {
+        let mut forge = Forge::new(None, false);
+        let at = forge.holds_destination(true);
+        let mut settings = json!({"wip": 8, "holds": at});
+        settings["holds"]["passes"] = passes.into();
+        if refuse_holds {
+            // The holds issue has no hold snapshot yet, so its write is the
+            // first comment posted there; the history's comes after it.
+            let holds = format!("POST {API_ROOT}repos/cgwalters-forge/bot-ops/issues/1/comments");
+            *forge.refuse.borrow_mut() = Some(holds);
+        }
+        let config = config(settings);
+        let report = apply(&forge, &config);
+        let case = format!("passes {passes}, holds refused {refuse_holds}");
+        assert_eq!(forge.published_holds().is_some(), !refuse_holds, "{case}");
+        let Some(published) = forge.published_passes() else {
+            assert!(!passes, "{case}: {:#?}", report.lines);
+            assert!(report.passes.is_none(), "{case}");
+            assert!(
+                !report.lines.iter().any(|l| l.starts_with("passes")),
+                "{case}"
+            );
+            continue;
+        };
+        assert!(
+            history::tests::accepted(&published),
+            "{case}: {published:#}"
+        );
+        assert_eq!(report.passes.as_ref(), Some(&published), "{case}");
+        let said = report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("passes: published https://"));
+        assert!(said, "{case}: {:#?}", report.lines);
+        assert_eq!(published["omitted"], 0, "{case}");
+        let pass = &published["passes"][0];
+        assert_eq!(
+            pass["run"],
+            json!({"repository": "cgwalters-forge/tracker", "id": 4242, "attempt": 1})
+        );
+        assert_eq!(pass["mode"], "actions");
+        let starts = pass["starts"].as_array().unwrap();
+        assert_eq!(starts.len(), report.tally.1.started, "{case}: {pass}");
+        assert!(!starts.is_empty(), "{case}");
+        assert!(
+            starts
+                .iter()
+                .all(|s| s["state"] == "confirmed" && s["run"]["id"].as_u64() > Some(0)),
+            "{case}: {pass}"
+        );
+        let sections: BTreeMap<&str, &Value> = (pass["sections"].as_array().unwrap().iter())
+            .map(|s| (s["name"].as_str().unwrap(), &s["outcome"]))
+            .collect();
+        assert_eq!(sections.len(), Stage::ALL.len(), "{case}");
+        assert_eq!(sections["schedule"], "ok", "{case}: {pass}");
+        match refuse_holds {
+            true => {
+                assert_eq!(
+                    (&pass["result"], sections["holds"]),
+                    (&json!("partial"), &json!("failed"))
+                );
+                assert_eq!(pass["sections"][8]["error"], history::FAILURE_SUMMARY);
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("connection refused during POST"))
+                );
+            }
+            false => {
+                assert_eq!(
+                    (&pass["result"], sections["holds"]),
+                    (&json!("success"), &json!("ok"))
+                );
+            }
+        }
+        assert_eq!(
+            pass["candidates"]["read"],
+            report.tally.1.candidates.unwrap()
+        );
+        assert_eq!(published["pools"]["complete"], true, "{case}");
+        assert_eq!(published["in_flight"]["complete"], true, "{case}");
+        // Nothing from a hold's reason, and no address.
+        let text = published.to_string();
+        assert!(!text.contains('$') && !text.contains("://"), "{text}");
+    }
+}
+
+/// A scan its request reserve stopped before any candidate, with room left
+/// to publish, is cut short, its candidates unread and none taken for no
+/// ready work; one whose start `--max-dispatch` held found ready work.
+#[test]
+fn passes_say_a_stopped_or_capped_scan_was_not_idle() {
+    let dispatch_cap = Limits {
+        dispatch: Some(0),
+        ..Limits::default()
+    };
+    for (stopped, schedule, result) in [(true, "cut-short", "partial"), (false, "ok", "success")] {
+        let mut forge = Forge::new(None, false);
+        let at = forge.holds_destination(true);
+        let mut settings = json!({"wip": 8, "holds": at});
+        settings["holds"]["passes"] = true.into();
+        let config = config(settings);
+        let report = match stopped {
+            true => apply_within(&forge, &config, 80),
+            false => apply_limited(&forge, &config, dispatch_cap),
+        };
+        let stop = (report.lines.iter())
+            .any(|l| l.starts_with("budget: ") && l.contains("more candidate(s) wait"));
+        assert_eq!(stop, stopped, "{:#?}", report.lines);
+        let published = forge
+            .published_passes()
+            .unwrap_or_else(|| panic!("{:#?}", report.lines));
+        assert!(history::tests::accepted(&published), "{published:#}");
+        let pass = &published["passes"][0];
+        let sections = pass["sections"].as_array().unwrap();
+        let outcome = |name: &str| &sections.iter().find(|s| s["name"] == name).unwrap()["outcome"];
+        assert_eq!(
+            (outcome("schedule"), &pass["result"]),
+            (&json!(schedule), &json!(result)),
+            "{pass}"
+        );
+        let idle =
+            (pass["no_start"].as_array().unwrap().iter()).any(|r| r["reason"] == "no-ready-work");
+        assert!(!idle, "{pass}");
+        let all = report.tally.1.candidates.unwrap();
+        let (read, unread, ready) = match stopped {
+            true => (0, all, 0),
+            false => (
+                all,
+                0,
+                pass["candidates"]["ready"].as_u64().unwrap() as usize,
+            ),
+        };
+        assert!(stopped || ready > 0, "{pass}");
+        assert_eq!(
+            pass["candidates"],
+            json!({"read": read, "unread": unread, "ready": ready})
+        );
+    }
+}
+
+#[test]
+fn passes_carry_only_history_with_verified_edit_attribution() {
+    for (editor, different_body, carry) in [
+        (None, false, Some(true)),
+        (Some("cgwalters-bot"), false, Some(true)),
+        (Some("someone-else"), false, Some(false)),
+        (None, true, None),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let mut settings = json!({"holds": forge.holds_destination(true)});
+        settings["holds"]["passes"] = true.into();
+        let stamp = forge.replay.now.format(&Rfc3339).unwrap();
+        let previous = json!({"schema": history::SCHEMA, "published_at": stamp, "passes": [{
+            "run": {"repository": "o/runner", "id": 77, "attempt": 1},
+            "started_at": stamp, "finished_at": stamp, "mode": "actions", "result": "success",
+            "sections": [{"name": "setup", "outcome": "ok", "error": null, "detail": "x"}],
+            "starts": [], "no_start": [], "candidates": null,
+            "omitted": {"sections": 0, "starts": 0, "no_start": 0}, "diagnostic": "x"
+        }]});
+        let body = history::body(&previous);
+        forge.previous_holds(body.clone());
+        let checked = if different_body {
+            "changed".into()
+        } else {
+            body
+        };
+        let at = editor.map(|_| stamp);
+        forge.replay.requests.push(json!({
+            "request": graphql_key(history::HISTORY_EDITS_QUERY, &json!({"id": "IC_7"})),
+            "answer": {"data": {"node": {"body": checked, "author": {"login": "cgwalters-bot"},
+                "lastEditedAt": at, "editor": editor.map(|login| json!({"login": login}))}}}
+        }));
+        let cfg = config(settings);
+        if editor.is_none() && !different_body {
+            let local = block(run(
+                &forge,
+                &forge,
+                &cfg,
+                State::default(),
+                (Mode::Local, Limits::default()),
+                forge.replay.now,
+            ))
+            .unwrap();
+            assert!(
+                local
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("no Actions run for the overlap check"))
+            );
+            assert!(forge.published_passes().is_none());
+
+            forge.on_get = Some(Box::new(|url, body| {
+                if url == format!("{API_ROOT}user") {
+                    body["login"] = "cgwalters".into();
+                }
+            }));
+            let operator = apply(&forge, &cfg);
+            assert!(
+                operator
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("passes error:") && l.contains("the token is"))
+            );
+            assert!(forge.published_passes().is_none());
+            forge.on_get = None;
+        }
+        let report = apply(&forge, &cfg);
+        match carry {
+            Some(carry) => {
+                let doc = forge
+                    .published_passes()
+                    .unwrap_or_else(|| panic!("{:#?}", report.lines));
+                assert!(history::tests::accepted(&doc));
+                assert_eq!(
+                    doc["passes"].as_array().unwrap().len(),
+                    1 + usize::from(carry)
+                );
+                if carry {
+                    assert_eq!(doc["passes"][1]["run"]["id"], 77);
+                    // Only the schema's fields are carried.
+                    let carried = doc["passes"][1].to_string();
+                    assert!(!carried.contains("\"x\""), "{carried}");
+                    assert_eq!(
+                        doc["passes"][1]["sections"],
+                        json!([{"name": "setup", "outcome": "ok", "error": null}])
+                    );
+                }
+            }
+            None => {
+                assert!(forge.published_passes().is_none());
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("history body changed"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn passes_do_not_create_a_comment_past_the_first_page() {
+    let mut forge = Forge::new(None, false);
+    let mut settings = json!({"holds": forge.holds_destination(true)});
+    settings["holds"]["passes"] = true.into();
+    let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+    *comments = json!(vec![
+        json!({"body": "ordinary comment"});
+        COMMENTS_PER_PAGE - 1
+    ]);
+    // Model the holds append occupying the last slot on the next REST read.
+    forge.rival = Some(json!({"body": holds::HOLDS_MARKER}));
+    let report = apply(&forge, &config(settings));
+    assert!(forge.published_holds().is_some());
+    assert!(forge.published_passes().is_none());
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.contains("a new comment would fall past the first page"))
+    );
+}
+
+/// A pass whose setup failed publishes a `failure` record with every later
+/// section skipped; a preview writes nothing, says what it would, and its
+/// starts are previews.
+#[test]
+fn passes_record_a_failed_setup_and_a_preview() {
+    let mut forge = Forge::new(None, false);
+    let at = forge.holds_destination(true);
+    let mut settings = json!({"wip": 8, "holds": at});
+    settings["holds"]["passes"] = true.into();
+    let mut cfg = config(settings);
+    cfg.dispatch_ref = None;
+    forge.on_get = Some(Box::new(|url, body| {
+        if url.ends_with("/repos/cgwalters-forge/tracker") {
+            body["default_branch"] = Value::Null;
+        }
+    }));
+    let report = apply(&forge, &cfg);
+    let published = forge
+        .published_passes()
+        .unwrap_or_else(|| panic!("{:#?}", report.lines));
+    assert!(history::tests::accepted(&published), "{published:#}");
+    let pass = &published["passes"][0];
+    assert_eq!(pass["result"], "failure", "{pass}");
+    assert_eq!(pass["sections"][0]["outcome"], "failed");
+    assert_eq!(pass["sections"][0]["error"], history::FAILURE_SUMMARY);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("dispatch ref error: "))
+    );
+    assert!(
+        pass["sections"].as_array().unwrap()[1..]
+            .iter()
+            .all(|s| s["outcome"] == "skipped"),
+        "{pass}"
+    );
+    assert_eq!(
+        (&pass["starts"], &pass["candidates"]),
+        (&json!([]), &Value::Null)
+    );
+    let mut forge = Forge::new(None, false);
+    let at = forge.holds_destination(true);
+    let mut settings = json!({"wip": 8, "holds": at});
+    settings["holds"]["passes"] = true.into();
+    let report = preview(&config(settings), &forge.replay);
+    let said = "passes: publish to cgwalters-forge/bot-ops#1; a preview does not write it";
+    assert!(
+        report.lines.iter().any(|l| l == said),
+        "{:#?}",
+        report.lines
+    );
+    let document = report.passes.as_ref().unwrap();
+    assert!(history::tests::accepted(document), "{document:#}");
+    let pass = &document["passes"][0];
+    assert_eq!(
+        (&pass["run"], &pass["mode"]),
+        (&Value::Null, &json!("preview"))
+    );
+    let starts = pass["starts"].as_array().unwrap();
+    assert!(!starts.is_empty(), "{pass}");
+    assert!(
+        starts
+            .iter()
+            .all(|s| s["state"] == "preview" && s["run"].is_null()),
+        "{pass}"
+    );
+    let planned: u64 = report.planned_starts.values().sum();
+    assert_eq!(starts.len() as u64, planned, "{pass}");
 }
 
 #[test]

@@ -742,14 +742,14 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         Ok(url)
     }
 
-    /// Fails unless the token is the bot's: only the bot's comment is found
-    /// again, and under another login each pass would add one more.
-    fn bot_account(&self) -> Result<()> {
+    /// Fails unless the token is the bot's: only bot publications are found
+    /// again, and history also requires the bot to be the last editor.
+    pub(in crate::pass) fn bot_account(&self) -> Result<()> {
         let account = self.client.get(&format!("{API_ROOT}user"), None)?;
         let login = text(&account.body, "/login");
         ensure!(
             login.eq_ignore_ascii_case(&self.config.bot),
-            "the token is {login:?}'s, not {}'s; not adding a comment it would not find again",
+            "the token is {login:?}'s, not {}'s; not writing as another account",
             self.config.bot
         );
         Ok(())

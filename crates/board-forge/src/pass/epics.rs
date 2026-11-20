@@ -2740,12 +2740,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.report.failed_operations.push(line.clone());
             self.not_started += 1;
         }
-        if !self.apply && matches!(step, Step::Started(..)) {
+        if !self.apply
+            && let Step::Started(line, _) = &step
+        {
             *self
                 .report
                 .planned_starts
                 .entry("planning".into())
                 .or_default() += 1;
+            let pool = line_pool(line);
+            self.client
+                .bounds
+                .preview_start(&facts.issue, "planning", pool);
         }
         match step {
             Step::Hold(hold) => self.epic_held(facts, hold),
