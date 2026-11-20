@@ -110,6 +110,41 @@ Regression replays use the apply annotations from tracker runs `43244188959` and
 live dispatch test. Deployment requires tracker `.github/pass.json` key
 `pr.holdMissingData` set to `true`; no caller configuration is changed here.
 
+### Blocked fix rounds (#1119)
+
+The concrete failure prevented is spending fix rounds that cannot help, and
+stopping without saying why (tracker#1781). `pr.blockedRounds: true` in the pass
+(`blockedRounds: true` in standalone poll) enables it; it is off by default.
+
+- A stop after a round that pushed no new head quotes the run's checked `noop`
+  or `missing_data` reason as a bounded, unverified excerpt, as
+  [infrastructure stops](pass.md#infrastructure-stops) do. It is read the same
+  way: one artifact of the first attempt of a public caller's run.
+- Before a further round, rerun or fresh continuation on the head such a run
+  left, that reason is read. One saying the fix belongs in another repository or
+  under a protected path stops the pull request with the operator instead, and
+  takes an empty round's stop from the supervisor, whose release would start
+  fresh rounds that get the same answer. The clause must tie the phrase to
+  the fix ("the fix belongs in another repository", not "another repository
+  consumes the API"); one with a negation ("no protected paths need changes")
+  or "protected by" does not count. The wording
+  only stops rounds: a forged reason can ask a person, never start or release
+  anything. A `pr.holdMissingData` stop quotes the reason too.
+- A fix round on a head whose only failed checks are jobs of the review job's
+  own run, which left no verdict, re-runs that run once instead, as
+  [`reruns`](pass.md#reruns) does for a missing review. While that run or a newer
+  one of the head runs, or for a day after it passed while its check still reads
+  failed, the head waits. One that failed again or cannot be re-run is the
+  operator's, even with `pr.agentRecovery`. Neither `pr.agentRecovery` nor
+  `pr.checkReruns` takes the place of that wait or rerun. The operator's
+  approval does not count as the job's verdict here; their change request
+  still starts a fix round.
+
+Whatever the setting, a claim's rewrite into its marker is sent once more when
+GitHub answers it with a 5xx: it is the same edit of the pass's own comment. A
+claim that was still never recorded remains a person's: a pass that took it up
+could not contend with a stop posted meanwhile.
+
 ### Declared PR dependencies (first slice of #936)
 
 The concrete failure prevented is spending review and recovery rounds on a head

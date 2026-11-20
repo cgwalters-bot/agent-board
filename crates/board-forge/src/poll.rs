@@ -597,6 +597,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "holdDependencies",
     "agentRecovery",
     "holdMissingData",
+    "blockedRounds",
     "fixRounds",
 ];
 
@@ -830,6 +831,13 @@ pub struct PollPolicy {
     /// Stop repeated recovery spending after an exact-run missing-data handback.
     /// Off by default; only the trusted apply job's annotation is evidence.
     pub hold_missing_data: bool,
+    /// The pass's `pr.blockedRounds` (agent-board#1119): stop spending rounds
+    /// that cannot help. A stop after an empty round quotes the run's checked
+    /// reason; a round that would follow one whose reason puts the fix out of
+    /// the pull request's reach stops instead; and a failure of the review
+    /// job alone, with no verdict, re-runs it rather than start a fix round.
+    /// Off by default.
+    pub blocked_rounds: bool,
     /// The caller's dispatch workflow, including during previews.
     pub fix_caller_workflow: Option<String>,
     /// The pass's `pr.directionFirst` (agent-board#840): the operator's
@@ -1166,6 +1174,8 @@ pub struct PrOptions {
     #[serde(default)]
     pub hold_missing_data: bool,
     #[serde(default)]
+    pub blocked_rounds: bool,
+    #[serde(default)]
     pub hold_dependencies: bool,
     #[serde(default)]
     pub supervisor_holds: bool,
@@ -1353,6 +1363,7 @@ impl PrOptions {
             agent_recovery,
             queue_only_repository,
             hold_missing_data,
+            blocked_rounds,
             hold_dependencies,
             supervisor_holds,
             action_first,
@@ -1381,6 +1392,7 @@ impl PrOptions {
         policy.agent_recovery = agent_recovery;
         policy.hold_dependencies = hold_dependencies;
         policy.hold_missing_data = hold_missing_data;
+        policy.blocked_rounds = blocked_rounds;
         policy.action_first = action_first;
         policy.quiet_waits = quiet_waits.unwrap_or(true);
         policy.supervisor_holds = supervisor_holds;
@@ -1551,6 +1563,7 @@ impl PollPolicy {
             check_reruns: false,
             unstall: false,
             hold_missing_data: false,
+            blocked_rounds: false,
             fix_caller_workflow: None,
             direction_first: false,
             owner_branches: false,
@@ -4376,6 +4389,57 @@ fn append_fix_reason(reason: &mut String, message: &str) {
     }
 }
 
+/// What a run's reason says when its fix belongs in another repository or
+/// under a protected path, which no further round on the head can make
+/// (tracker#1781). Matched only to stop rounds: a forged one asks a person.
+const OUT_OF_REACH: &[&str] = &[
+    "another repository",
+    "other repository",
+    "different repository",
+    "protected path",
+    "protected file",
+    "is protected",
+    "are protected",
+];
+
+/// Words that turn a clause's [`OUT_OF_REACH`] phrase into one that says
+/// the fix is not out of reach, as in "no protected paths need changes".
+const NEGATIONS: &[&str] = &["no", "not", "none", "never", "nothing", "without"];
+
+/// Word stems that tie a clause's [`OUT_OF_REACH`] phrase to the change the
+/// fix needs, as in "the fix belongs in another repository", unlike "another
+/// repository consumes the API".
+const FIX_TIES: &[&str] = &[
+    "belong", "chang", "edit", "fix", "modif", "need", "requir", "touch", "updat",
+];
+
+/// Whether one clause of `message` states an [`OUT_OF_REACH`] phrase with
+/// no negation, tied to the fix by a [`FIX_TIES`] word, and not as
+/// "protected by" (a test, say), which is no path.
+fn out_of_reach(message: &str) -> bool {
+    let message = message.to_lowercase();
+    message.split(['.', '!', '?', ';', ',']).any(|clause| {
+        let words: Vec<_> = clause
+            .split_whitespace()
+            .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\''))
+            .collect();
+        let negated = words
+            .iter()
+            .any(|word| NEGATIONS.contains(word) || word.ends_with("n't"));
+        let tied = words
+            .iter()
+            .any(|word| FIX_TIES.iter().any(|tie| word.starts_with(tie)));
+        let clause = words.join(" ");
+        !negated
+            && tied
+            && OUT_OF_REACH.iter().any(|phrase| {
+                clause
+                    .match_indices(phrase)
+                    .any(|(at, _)| !clause[at + phrase.len()..].starts_with(" by"))
+            })
+    })
+}
+
 /// The step for a head the marker's run was started for, fix or continuation:
 /// wait for it, or hand a run that is over and left the head as it was to a
 /// human. Only one that succeeded gets the grace for its push to show.
@@ -5654,17 +5718,35 @@ pub(crate) fn before_own_steps(step: &str) -> bool {
 /// (`https://github.com/OWNER/REPO/actions/runs/RUN/job/JOB`); none for a
 /// status or another repository's job, which the pass does not read.
 fn job_id(repo: &str, url: &str) -> Option<u64> {
+    job_ids(repo, url).map(|(_, job)| job)
+}
+
+/// The job of a check's Actions job URL in `repo`, and its run where that
+/// is a plain id.
+fn job_ids(repo: &str, url: &str) -> Option<(Option<u64>, u64)> {
     let rest = url.strip_prefix("https://github.com/")?;
     let (at, rest) = rest.split_at_checked(repo.len())?;
-    let job = rest
-        .strip_prefix("/actions/runs/")?
-        .split_once("/job/")?
-        .1
-        .split(['?', '#'])
-        .next()?;
-    (at.eq_ignore_ascii_case(repo) && job.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| job.parse().ok())
+    let (run, job) = rest.strip_prefix("/actions/runs/")?.split_once("/job/")?;
+    let job = job.split(['?', '#']).next()?;
+    let id = |s: &str| -> Option<u64> {
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse().ok())?
+    };
+    at.eq_ignore_ascii_case(repo)
+        .then(|| Some((id(run), id(job)?)))
         .flatten()
+}
+
+/// The one Actions run of `repo` that every failed check is a job of.
+fn failed_run(repo: &str, checks: &Checks) -> Option<u64> {
+    let mut runs = checks.failed.iter().map(|(_, url)| {
+        url.as_deref()
+            .and_then(|url| job_ids(repo, url))
+            .and_then(|(run, _)| run)
+    });
+    let first = runs.next()??;
+    runs.all(|run| run == Some(first)).then_some(first)
 }
 
 /// The check run of an Actions job: the one its `check_run_url` names, in
@@ -5977,7 +6059,18 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         superseded: (&Marker, &[Value]),
     ) -> Result<()> {
         marker.id = Some(claim);
-        self.record_run(repo, marker, text)?;
+        // Sent once more on a server error (tracker#1747's 502): the same
+        // edit of this pass's own comment, so a write that did land is
+        // only repeated. Without it the round waits out its timeout.
+        if let Err(error) = self.record_run(repo, marker, text) {
+            if error
+                .downcast_ref::<Refused>()
+                .is_none_or(|refused| refused.status < 500)
+            {
+                return Err(error);
+            }
+            self.record_run(repo, marker, text)?;
+        }
         self.supersede(repo, superseded);
         Ok(())
     }
@@ -6157,16 +6250,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 "It is labelled `{LABEL}`; remove the label to have the poll start again on it, with fresh fix rounds."
             )
         };
-        let mut text = format!("The poll stopped following this pull request: {reason}. {release}");
-        if let Some(cause) = cause {
-            let mut reason = reason.to_owned();
-            if cause == crate::stop::Cause::EmptyFix
-                && let Some(message) = self.empty_fix_message.take()
-            {
-                append_fix_reason(&mut reason, &message);
-            }
-            text = supervisor_text(cause, &reason);
+        // Set only for the stop of an empty round, or of the round that would
+        // have followed one ([`Pass::empty_fix_reason`]).
+        let mut reason = reason.to_owned();
+        if let Some(message) = self.empty_fix_message.take() {
+            append_fix_reason(&mut reason, &message);
         }
+        let mut text = match cause {
+            Some(cause) => supervisor_text(cause, &reason),
+            None => format!("The poll stopped following this pull request: {reason}. {release}"),
+        };
         // CI output, fenced so that nothing in it renders, mentions or links;
         // without its backticks, it cannot close the fence either, and
         // without `<!--`, it cannot carry a marker or claim of the bot's.
@@ -7178,6 +7271,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// the repository has no such workflow, whose runs answer 404: there is
     /// no review job's verdict, only the operator's (agent-board#1088).
     fn review_rerun(&mut self, repo: &str, pull: &Value) -> Result<Option<(Decision, u64)>> {
+        let Some((runs, whole)) = self.review_head_runs(repo, pull)? else {
+            return Ok(None);
+        };
+        self.review_rerun_of(repo, pull, &runs, whole)
+    }
+
+    /// The review job's runs on `pull_request_target` for `pull`'s head,
+    /// newest first, and whether they are all of them; none where there is
+    /// no review job ([`Pass::review_rerun`]).
+    fn review_head_runs(&mut self, repo: &str, pull: &Value) -> Result<Option<(Vec<Value>, bool)>> {
         let Some(workflow) = &self.config.review_workflow else {
             return Ok(None);
         };
@@ -7196,10 +7299,82 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
             Err(error) => return Err(error),
         };
-        let runs = nodes(&list, "/workflow_runs");
+        let runs = nodes(&list, "/workflow_runs").to_vec();
         // A full read may leave out an older run that was re-run.
         let whole = (runs.len() as u64) < REVIEW_RUN_READS;
-        self.review_rerun_of(repo, pull, runs, whole)
+        Ok(Some((runs, whole)))
+    }
+
+    /// With [`PollPolicy::blocked_rounds`], the step for `pull` whose only
+    /// failed checks are jobs of `failed`, where that is one of the review
+    /// job's runs for its head, in place of a fix round: the review job's
+    /// failure is not the change's to mend. While it, or a newer run of the
+    /// head, runs again, or its check still reads failed after it passed, the
+    /// head waits. One that failed is re-run once ([`Pass::review_rerun_of`]);
+    /// one that cannot be is a person's. None where `failed` is not such a
+    /// run, so the round goes ahead.
+    fn review_failure(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+        failed: u64,
+    ) -> Result<Option<(Decision, Option<u64>)>> {
+        let Some((runs, whole)) = self.review_head_runs(repo, pull)? else {
+            return Ok(None);
+        };
+        let Some(at) = runs
+            .iter()
+            .position(|r| r["id"].as_u64() == Some(failed) && reviews_head(pull, r, self.config))
+        else {
+            return Ok(None);
+        };
+        let head = text(pull, "/headRefOid");
+        let run = &runs[at];
+        let url = format!("https://github.com/{repo}/actions/runs/{failed}");
+        if let Some(active) = runs[..=at].iter().find(|r| r["status"] != "completed") {
+            let why = format!(
+                "the review job's run {url} failed, and its run https://github.com/{repo}/actions/runs/{} for {} has not finished",
+                active["id"],
+                short(head)
+            );
+            return Ok(Some((
+                step("wait", why).followed(run_wait_since(active)),
+                None,
+            )));
+        }
+        let passed = text(run, "/conclusion") == "success";
+        // The rollup may still show the attempt before, for a while.
+        if at == 0
+            && passed
+            && !older_than(self.now, run["updated_at"].as_str(), RERUN_WINDOW_SECONDS)
+        {
+            let why = format!(
+                "the review job's run {url} ended ({}) after its check failed; the check is waited on",
+                text(run, "/conclusion")
+            );
+            return Ok(Some((
+                step("wait", why).followed(timestamp(run["updated_at"].as_str())),
+                None,
+            )));
+        }
+        let retry = if at == 0 && !passed {
+            self.review_rerun_of(repo, pull, &runs, whole)?
+                .map(|(step, run)| (step, Some(run)))
+        } else {
+            None
+        };
+        Ok(Some(retry.unwrap_or_else(|| {
+            (
+                step(
+                    "needs-human",
+                    format!(
+                        "the review job's run {url} failed with no review of {}, and cannot be re-run; re-run or review it",
+                        short(head)
+                    ),
+                ),
+                None,
+            )
+        })))
     }
 
     /// [`Pass::review_rerun`] of the head's runs `runs`, newest first, all
@@ -8301,7 +8476,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         })
     }
 
-    /// Best effort evidence for a stop already classified as EmptyFix. An
+    /// Best effort evidence for a stop already classified as EmptyFix, or a
+    /// further round after one ([`PollPolicy::blocked_rounds`]): the reason
+    /// of the report's one `noop` or `missing_data`. An
     /// attempt-scoped artifact is not available from this API, so do not
     /// attribute a run-scoped report to a rerun. Never read patches or logs.
     /// Only a public caller's report is quoted: its artifacts are already
@@ -8362,11 +8539,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let Some([item]) = report["items"].as_array().map(Vec::as_slice) else {
             return Ok(None);
         };
-        Ok((report["ok"] == true
-            && report.get("patch") == Some(&Value::Null)
-            && item["type"] == "noop")
-            .then(|| item["message"].as_str().map(str::to_owned))
-            .flatten())
+        if report["ok"] != true || report.get("patch") != Some(&Value::Null) {
+            return Ok(None);
+        }
+        Ok(match item["type"].as_str() {
+            Some("noop") => item["message"].as_str(),
+            Some("missing_data") if self.config.policy.blocked_rounds => item["reason"].as_str(),
+            _ => None,
+        }
+        .map(str::to_owned))
     }
 
     /// Two bounded fresh reads, only for an unchanged head's recorded failed
@@ -9457,9 +9638,88 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 ..step
             };
         }
+        // With `blockedRounds`, a head whose only failure is the review job's
+        // own run, which left no verdict (an infrastructure failure), is not
+        // a fix round's to mend: that run is re-run once and waited on, or it
+        // is a person's ([`Pass::review_failure`]), not agent triage's or a
+        // generic check rerun's. The job's verdict is read apart from the
+        // operator's: their approval leaves the failed check to fix, while
+        // their change request is a fix round of its own.
+        let (operator_verdict, job_review) = verdicts(&pull, self.config);
+        let mut review_only = false;
+        if self.config.policy.blocked_rounds
+            && self.config.policy.review_pools.is_empty()
+            && review_rerun.is_none()
+            && !ordinary_reviews(self.config, repo)
+            && !merge_only
+            && retarget.is_none()
+            && stale.is_none()
+            && answer.is_empty()
+            && decision.action == "fix"
+            && from_fork(&pull, &self.config.bot)
+            && operator_verdict.is_none_or(|(verdict, _)| verdict != Review::ChangesRequested)
+            && job_review
+                .filter(|(_, r)| review_run_matches(&pull, r, review_run.as_ref(), self.config))
+                .is_none()
+            && pull["mergeable"] != CONFLICTING
+            && !placeholder_commits(&pull)
+            && checks.queue_log.is_none()
+            && let Some(failed) = failed_run(repo, &checks)
+            && let Some((step, run)) = self.review_failure(repo, &pull, failed)?
+        {
+            review_rerun = run.map(|run| (run, None));
+            review_only = true;
+            decision = Decision {
+                queue: decision.queue.take(),
+                ..step
+            };
+        }
+        let recover = self.config.policy.agent_recovery
+            && !missing_data
+            && !queue_stop
+            && is_harness(&pull, self.config)
+            && !labelled(&pull)
+            && !is_held(&pull)
+            && review_hold(self.config, &pull).is_none();
+        // The `holdMissingData` stop is one too: its reason is quoted alike.
+        let missing_data_stop = missing_data && answer.is_empty();
+        let empty_round = |d: &Decision| {
+            d.action == "needs-human"
+                && (missing_data_stop || d.infrastructure == Some(crate::stop::Cause::EmptyFix))
+        };
+        let check_reason = |d: &Decision| {
+            empty_round(d) || matches!(d.action, "fix" | "continue" | "rebase" | RUN_RERUN)
+        };
+        let reason_run = (self.config.policy.blocked_rounds
+            && answer.is_empty()
+            && retarget.is_none()
+            && self.config.held_in(repo).is_none()
+            && !marker.stopped
+            && marker.sha.as_deref() == Some(head))
+        .then(|| {
+            marker
+                .run
+                .zip(fix_run.as_ref().filter(|r| r["status"] == "completed"))
+        })
+        .flatten();
+        // Recovery can replace an empty fix with triage or consume a grant
+        // that clears the fix's receipt. Check that receipt before either can
+        // happen; reuse the result if we reach the usual stop handling below.
+        let checked_reason = if recover && check_reason(&decision) {
+            reason_run.map(|(id, run)| self.empty_fix_reason(id, run))
+        } else {
+            None
+        };
+        let recovery_blocked = checked_reason
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(Option::as_deref)
+            .is_some_and(out_of_reach);
         // Retry CI before charging a fix round or stopping, but never replace
         // a stack operation, an operator answer, or an in-flight round.
         let retry_scope = (self.config.policy.reruns || self.config.policy.check_reruns)
+            && !recovery_blocked
+            && !review_only
             && !promoted
             && !missing_data
             && !recovery::pending(&marker)
@@ -9510,14 +9770,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 )
             };
         }
-        if self.config.policy.agent_recovery
-            && !missing_data
-            && !queue_stop
-            && is_harness(&pull, self.config)
-            && !labelled(&pull)
-            && !is_held(&pull)
-            && review_hold(self.config, &pull).is_none()
-        {
+        if recover && !recovery_blocked && !review_only {
             decision = self.recovery_step(repo, &pull, &marker, &comments, decision)?;
         }
         // A ready head merges past older overlapping work, which then rebases
@@ -9610,6 +9863,48 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
             None => {}
         }
+        // With `blockedRounds`, the stop of an empty round, or a further round
+        // or rerun on the head it left, reads that run's checked reason first.
+        // One that puts the fix out of the pull request's reach stops it with
+        // the operator: another round, or the supervisor's release, would get
+        // the same answer. The text can only stop rounds, never start one.
+        self.empty_fix_message = None;
+        let mut evidence_error = None;
+        let mut reason_read = false;
+        let is_empty_round = empty_round(&decision);
+        if check_reason(&decision)
+            && let Some((id, run)) = reason_run
+        {
+            reason_read = true;
+            match checked_reason.unwrap_or_else(|| self.empty_fix_reason(id, run)) {
+                Ok(message) => self.empty_fix_message = message,
+                Err(error) => evidence_error = Some(error),
+            }
+            let reach = self.empty_fix_message.as_deref().is_some_and(out_of_reach);
+            if reach && is_empty_round {
+                decision.infrastructure = None;
+            } else if reach {
+                let url = format!(
+                    "https://github.com/{}/actions/runs/{id}",
+                    self.config.dispatch_repo
+                );
+                decision = Decision {
+                    queue: decision.queue.take(),
+                    ..step(
+                        "needs-human",
+                        format!(
+                            "{}'s run {url} pushed no new head for {} and reported the fix out of this pull request's reach, so no further round starts",
+                            marker.round_name(),
+                            short(head)
+                        ),
+                    )
+                };
+            } else if !is_empty_round {
+                // It explains only a stop.
+                self.empty_fix_message = None;
+                evidence_error = None;
+            }
+        }
         // Read only for a diagnostic round that starts, or the stop after
         // one, and only where the step is taken. A read that fails is said
         // in its place, so that it cannot hold the round or the stop.
@@ -9656,9 +9951,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // Best effort, before the hold read and the stop's one post: an
         // evidence read that fails cannot keep the stop from being made, and
         // the poll never rewrites a stop the supervisor may have linked.
-        self.empty_fix_message = None;
-        let mut evidence_error = None;
         if writing
+            && !reason_read
             && supervisor_empty_fix
             && marker.sha.as_deref() == Some(head)
             && let (Some(id), Some(run)) = (marker.run, &fix_run)
@@ -9668,13 +9962,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 Err(error) => evidence_error = Some(error),
             }
         }
-        // The hold is read again just before the step's first write: one put
-        // on since the read above stops it too.
+        // The hold is read again just before the step's first write. Checked
+        // reports are head-specific, even when they turn a supervisor hold
+        // or another round into a plain stop.
+        let revalidate_stop = supervisor_empty_fix
+            || (decision.action == "needs-human" && self.empty_fix_message.is_some());
         let hold = if writing {
             self.read_pull(owner, name, number).map(|p| {
                 if is_held(&p) {
                     Some(format!("labelled {HOLD_LABEL}"))
-                } else if supervisor_empty_fix
+                } else if revalidate_stop
                     && (p["state"] != "OPEN"
                         || p["headRefOid"] != head
                         || labelled(&p)
@@ -19571,6 +19868,30 @@ mod tests {
             .replace(&REVIEW_RUN.to_string(), "77");
         let commented = json!({"nodes": [{"state": "COMMENTED", "body": cited, "submittedAt": "2026-10-12T01:10:00Z",
             "author": job(), "commit": {"oid": head}}]});
+        // With `blockedRounds`, the head's only failed check, a job of `run`.
+        let blocked = |run: u64| {
+            json!({"blocked": true, "contexts": {"ci": {"conclusion": "FAILURE",
+                "detailsUrl": format!("https://github.com/{REPO}/actions/runs/{run}/job/5")}}})
+        };
+        let again3 = again.clone();
+        let recovering = |mut change: Value| {
+            change["recovery"] = json!(true);
+            change
+        };
+        let rechecking = |mut change: Value| {
+            change["checkReruns"] = json!(true);
+            change
+        };
+        // The operator's approval is not the job's verdict: the failed run
+        // is still the review job's to re-run, not a fix round's.
+        let mut approved = blocked(77);
+        approved["reviews"] = json!({"nodes": [review("APPROVED", user("cgwalters"), &head, "")]});
+        let mut rebased = blocked(77);
+        rebased["baseChange"] = json!({"nodes": [{"createdAt": "2026-10-12T01:30:00Z"}]});
+        let fix_writes = vec![
+            format!("POST repos/{REPO}/issues/470/comments"),
+            format!("PATCH repos/{REPO}/issues/comments/99"),
+        ];
         #[rustfmt::skip]
         // Name, `reruns`, the head's runs listed, newest first, each as its
         // fields changed (one object: one run; null: none), the pull
@@ -19609,12 +19930,44 @@ mod tests {
             ("unstall re-runs a failed review run", false, json!({}), json!({"unstall": true}), ended("failure", RE_RUN), vec![rerun.clone()]),
             ("unstall: one that failed again goes to a person", false, json!({"run_attempt": 2}), json!({"unstall": true}), again2, labelled.clone()),
             ("unstall: one that failed over a day ago goes to a person", false, json!({"created_at": "2026-10-11T01:00:00Z", "updated_at": "2026-10-11T01:30:00Z"}),
-                json!({"unstall": true}), stale, labelled),
+                json!({"unstall": true}), stale, labelled.clone()),
+            // `blockedRounds` (#1119): a fix round cannot mend the review
+            // job's own failure with no verdict, so it is re-run instead.
+            ("blockedRounds re-runs a review run that is the only failure", false, json!({}), blocked(77), ended("failure", RE_RUN), vec![rerun.clone()]),
+            ("blockedRounds: one that failed again goes to a person", false, json!({"run_attempt": 2}), blocked(77), again3.clone(), labelled.clone()),
+            // Not to agent triage, which could spend rounds on it.
+            ("blockedRounds: with agentRecovery too", false, json!({"run_attempt": 2}), recovering(blocked(77)), again3, labelled.clone()),
+            // Nor does triage take the place of its rerun, nor a generic
+            // check rerun, which would run it from a base it no longer has.
+            ("blockedRounds: with agentRecovery, it is re-run", false, json!({}), recovering(blocked(77)), ended("failure", RE_RUN), vec![rerun.clone()]),
+            ("blockedRounds: with checkReruns, it is re-run", false, json!({}), rechecking(blocked(77)), ended("failure", RE_RUN), vec![rerun.clone()]),
+            ("blockedRounds: with checkReruns, one from before the base changed goes to a person", false, json!({}), rechecking(rebased),
+                format!("{REPO}#470 {} needs-human: the review job's run https://github.com/{REPO}/actions/runs/77 failed with no review of {}, and cannot be re-run; re-run or review it -> labelled {LABEL}", short(&head), short(&head)), labelled.clone()),
+            ("blockedRounds: with the operator's approval, it is re-run", false, json!({}), approved, ended("failure", RE_RUN), vec![rerun.clone()]),
+            // The passes after its rerun, while the rollup still shows the
+            // first attempt's failure, spend no round on it.
+            ("blockedRounds: its rerun is waited on", false, json!({"run_attempt": 2, "status": "queued", "conclusion": null}), blocked(77),
+                format!("{REPO}#470 {} wait: the review job's run https://github.com/{REPO}/actions/runs/77 failed, and its run https://github.com/{REPO}/actions/runs/77 for {} has not finished", short(&head), short(&head)), vec![]),
+            ("blockedRounds: so is a newer run of the head", false, json!([{"id": 78, "status": "in_progress", "conclusion": null}, {}]), blocked(77),
+                format!("{REPO}#470 {} wait: the review job's run https://github.com/{REPO}/actions/runs/77 failed, and its run https://github.com/{REPO}/actions/runs/78 for {} has not finished", short(&head), short(&head)), vec![]),
+            ("blockedRounds: so is the check of a rerun that passed", false, json!({"run_attempt": 2, "conclusion": "success"}), blocked(77),
+                format!("{REPO}#470 {} wait: the review job's run https://github.com/{REPO}/actions/runs/77 ended (success) after its check failed; the check is waited on", short(&head)), vec![]),
+            ("blockedRounds: one too old to re-run goes to a person", false, json!({"created_at": "2026-10-11T01:00:00Z", "updated_at": "2026-10-11T01:30:00Z"}), blocked(77),
+                format!("{REPO}#470 {} needs-human: the review job's run https://github.com/{REPO}/actions/runs/77 failed with no review of {}, and cannot be re-run; re-run or review it -> labelled {LABEL}", short(&head), short(&head)), labelled),
+            ("blockedRounds: another run's failure is not the review job's", false, json!({}), blocked(78),
+                format!("{REPO}#470 {} fix: check ci failed -> run started", short(&head)), fix_writes),
         ];
         for (name, reruns, run, change, line, writes) in cases {
             let mut fake = github();
             let mut change = change;
             let unstall = change.as_object_mut().unwrap().remove("unstall").is_some();
+            let blocked = change.as_object_mut().unwrap().remove("blocked").is_some();
+            let recovery = change.as_object_mut().unwrap().remove("recovery").is_some();
+            let recheck = change
+                .as_object_mut()
+                .unwrap()
+                .remove("checkReruns")
+                .is_some();
             if change.get("reviews").is_none() {
                 change["reviews"] = json!({"nodes": []});
             }
@@ -19651,7 +20004,10 @@ mod tests {
             let mut cfg = config();
             cfg.policy.reruns = reruns;
             cfg.policy.unstall = unstall;
-            cfg.policy.check_reruns = true;
+            cfg.policy.blocked_rounds = blocked;
+            cfg.policy.agent_recovery = recovery;
+            // Which would retry the failed `ci` job of a stop or fix round.
+            cfg.policy.check_reruns = !blocked || recheck;
             let dispatcher = Fake::default();
             let follow = [REPO.to_owned()];
             let outcome = run_capped(
@@ -19667,13 +20023,17 @@ mod tests {
             .unwrap();
             assert_eq!(outcome.lines.last().unwrap(), &line, "{name}");
             assert_eq!(written(&fake.writes), writes, "{name}");
-            assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+            assert_eq!(
+                dispatcher.writes.borrow().is_empty(),
+                !line.ends_with("run started"),
+                "{name}"
+            );
             let read = fake
                 .sent
                 .borrow()
                 .iter()
                 .any(|(url, _)| url.contains("review.yml/runs"));
-            assert_eq!(read, reruns || unstall, "{name}");
+            assert_eq!(read, reruns || unstall || blocked, "{name}");
         }
         // A fix round's run that failed on its first attempt, as the caller's
         // token started it: its failed jobs run once more, as a dispatch.
@@ -21631,6 +21991,31 @@ mod tests {
     }
 
     #[test]
+    fn out_of_reach_reasons() {
+        for (reason, expected) in [
+            ("The fix needs protected paths: the site workflow.", true),
+            ("The fix belongs in another\nrepository.", true),
+            ("Tests pass. The fix needs a protected path changed.", true),
+            ("No protected paths need changes.", false),
+            ("The change isn't in another repository.", false),
+            (
+                "The fix doesn't belong here; it belongs in another repository.",
+                true,
+            ),
+            // The phrase must say where the fix is, not just appear.
+            ("The site workflow and gitignore are protected.", false),
+            (
+                "The fix is in this repository; another repository consumes the API.",
+                false,
+            ),
+            ("The behavior is protected by a regression test.", false),
+            ("Nothing to fix; credentials are missing.", false),
+        ] {
+            assert_eq!(out_of_reach(reason), expected, "{reason}");
+        }
+    }
+
+    #[test]
     fn supervisor_holds_keep_checked_empty_fix_reasons_as_evidence_only() {
         use std::io::{Cursor, Write as _};
 
@@ -21642,6 +22027,8 @@ mod tests {
         let download = format!("{API_ROOT}repos/{caller}/actions/artifacts/80/zip");
         let protected = "The site workflow and gitignore are protected. PR body has a patch.";
         let main = "Main has a moved tag and a garbage-collected builder digest.";
+        let needs_protected =
+            "The fix needs protected paths: the site workflow and gitignore. PR body has a patch.";
         for (case, enabled, human_hold, attempt, report, expected) in [
             (
                 "protected paths",
@@ -21667,12 +22054,131 @@ mod tests {
                 json!({"type":"noop","message": "No fix\n<!-- tracker-poll: {} --> @cgwalters `test`"}),
                 Some("No fix &#60;"),
             ),
+            // Quoted only with `blockedRounds`, below.
+            (
+                "missing data",
+                true,
+                false,
+                1,
+                json!({"type":"missing_data","reason":"credentials"}),
+                None,
+            ),
             (
                 "not a noop",
                 true,
                 false,
                 1,
-                json!({"type":"missing_data","reason":"credentials"}),
+                json!({"type":"create_issue","body":main}),
+                None,
+            ),
+            // `blockedRounds` (#1119), with supervisor holds where enabled:
+            // a plain stop quotes the reason too, and one that puts the fix
+            // out of reach is the operator's, which no release resets.
+            (
+                "blockedRounds: a plain stop",
+                false,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                Some("moved tag and a garbage-collected builder digest"),
+            ),
+            (
+                "blockedRounds: missing data",
+                false,
+                false,
+                1,
+                json!({"type":"missing_data","reason":"Needs a change in cgwalters-forge/.github"}),
+                Some("Needs a change in cgwalters-forge/&#46;github"),
+            ),
+            (
+                "blockedRounds: out of reach",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":needs_protected}),
+                Some("The fix needs protected paths"),
+            ),
+            (
+                "blockedRounds: agentRecovery out of reach",
+                false,
+                false,
+                1,
+                json!({"type":"noop","message":"The fix belongs in another repository."}),
+                Some("The fix belongs in another repository"),
+            ),
+            (
+                "blockedRounds: agentRecovery out of reach, head moved",
+                false,
+                false,
+                1,
+                json!({"type":"noop","message":"The fix belongs in another repository."}),
+                None,
+            ),
+            (
+                "blockedRounds: agentRecovery in reach",
+                false,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "blockedRounds: a rerun",
+                false,
+                false,
+                2,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            // A failed run's rerun is another round on the head: not spent
+            // where the reason puts the fix out of reach.
+            (
+                "blockedRounds: a failed run out of reach",
+                true,
+                false,
+                1,
+                json!({"type":"missing_data","reason":"The fix belongs in another\nrepository."}),
+                Some("The fix belongs in another repository"),
+            ),
+            // `holdMissingData` stops it without an empty round's cause.
+            (
+                "blockedRounds: a failed run held by holdMissingData",
+                false,
+                false,
+                1,
+                json!({"type":"missing_data","reason":"Needs a change in cgwalters-forge/.github"}),
+                Some("Needs a change in cgwalters-forge/&#46;github"),
+            ),
+            (
+                "blockedRounds: a failed run in reach",
+                false,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
+                None,
+            ),
+            (
+                "blockedRounds: out of reach, head moved",
+                true,
+                false,
+                1,
+                json!({"type":"noop","message":needs_protected}),
+                None,
+            ),
+            (
+                "blockedRounds: a failed run out of reach, unread labels",
+                false,
+                false,
+                1,
+                json!({"type":"missing_data","reason":"The fix belongs in another repository."}),
+                None,
+            ),
+            (
+                "blockedRounds: a plain stop, head moved",
+                false,
+                false,
+                1,
+                json!({"type":"noop","message":main}),
                 None,
             ),
             ("no artifact", true, false, 1, Value::Null, None),
@@ -21758,11 +22264,13 @@ mod tests {
             ),
         ] {
             let mut fake = github();
-            if case == "head moved" {
+            let head_moved = case.ends_with("head moved");
+            let unread_labels = case.ends_with("unread labels");
+            if head_moved {
                 fake.late_pull_fields = Some(json!({"headRefOid":"newer"}));
             }
             // An operator's hold may be past the first page of the final read.
-            if case == "unread labels" {
+            if unread_labels {
                 fake.late_pull_fields =
                     Some(json!({"labels":{"nodes":[],"pageInfo":{"hasNextPage":true}}}));
             }
@@ -21773,12 +22281,36 @@ mod tests {
             } else {
                 DISPATCH_REF
             };
-            fake.page(&format!("repos/{caller}/actions/runs/{run}"), None, None, json!({
-                "id":run,"repository":{"full_name":caller,"private":case == "private caller"},
-                "event":DISPATCH_EVENT,"head_branch":branch,
-                "path":".github/workflows/dispatch.yml","status":"completed","conclusion":"success",
-                "updated_at":"2026-10-01T01:00:00Z","run_attempt":attempt,
-            }));
+            let failed = case.starts_with("blockedRounds: a failed run");
+            if case.contains("holdMissingData") {
+                let check = 81;
+                fake.page(
+                    &format!("repos/{caller}/actions/runs/{run}/attempts/{attempt}/jobs?per_page={MISSING_DATA_PAGE_LIMIT}"),
+                    None,
+                    None,
+                    json!({"total_count": 1, "jobs": [{"name": "run / apply / apply", "run_id": run, "run_attempt": attempt, "conclusion": "failure",
+                        "check_run_url": format!("{API_ROOT}repos/{caller}/check-runs/{check}")}]}),
+                );
+                fake.page(
+                    &format!("repos/{caller}/check-runs/{check}/annotations?per_page={MISSING_DATA_PAGE_LIMIT}"),
+                    None,
+                    None,
+                    json!([{"annotation_level": "failure", "message": MISSING_DATA_ANNOTATION}]),
+                );
+            }
+            fake.page(
+                &format!("repos/{caller}/actions/runs/{run}"),
+                None,
+                None,
+                json!({
+                    "id":run,"repository":{"full_name":caller,"private":case == "private caller"},
+                    "event":DISPATCH_EVENT,"head_branch":branch,
+                    "path":".github/workflows/dispatch.yml","status":"completed",
+                    "conclusion":if failed {"failure"} else {"success"},
+                    "created_at":"2026-10-12T01:00:00Z",
+                    "updated_at":"2026-10-01T01:00:00Z","run_attempt":attempt,
+                }),
+            );
             if report.is_null() {
                 fake.page(
                     &listing,
@@ -21809,10 +22341,19 @@ mod tests {
             } else {
                 json!([])
             };
+            let blocked = case.starts_with("blockedRounds");
+            // Only a reason read can send the stop to the operator instead.
+            let reason = report["message"].as_str().or(report["reason"].as_str());
+            let supervisor =
+                enabled && !(blocked && attempt == 1 && reason.is_some_and(out_of_reach));
             let (outcome, fake, dispatcher) = applied_policy_on(
                 fake,
                 PollPolicy {
                     supervisor_holds: enabled,
+                    blocked_rounds: blocked,
+                    agent_recovery: case.contains("agentRecovery"),
+                    hold_missing_data: case.contains("holdMissingData"),
+                    reruns: failed,
                     assign_holds: true,
                     ..PollPolicy::default()
                 },
@@ -21822,7 +22363,23 @@ mod tests {
                 git_ref,
             );
             assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
-            assert!(dispatcher.writes.borrow().is_empty(), "{case}");
+            let triage = case == "blockedRounds: agentRecovery in reach";
+            let rerun = case == "blockedRounds: a failed run in reach";
+            assert_eq!(
+                written(&dispatcher.writes),
+                if triage {
+                    vec![format!(
+                        "POST repos/{caller}/actions/workflows/dispatch.yml/dispatches"
+                    )]
+                } else if rerun {
+                    vec![format!(
+                        "POST repos/{caller}/actions/runs/{run}/rerun-failed-jobs"
+                    )]
+                } else {
+                    vec![]
+                },
+                "{case}"
+            );
             let read = fake
                 .sent
                 .borrow()
@@ -21831,14 +22388,18 @@ mod tests {
             // Only of a public caller's run on the ref it was dispatched from.
             assert_eq!(
                 read,
-                enabled
+                (enabled || blocked)
                     && !human_hold
                     && attempt == 1
                     && !matches!(case, "private caller" | "run off the dispatch ref"),
                 "{case}"
             );
             let writes = fake.writes.borrow();
-            if human_hold || matches!(case, "head moved" | "unread labels") {
+            if triage {
+                assert!(outcome.lines.iter().any(|line| line.contains("triage:")));
+                continue;
+            }
+            if human_hold || rerun || head_moved || unread_labels {
                 assert!(writes.is_empty(), "{case}: {writes:?}");
                 continue;
             }
@@ -21846,7 +22407,7 @@ mod tests {
             // a stop the supervisor may have linked meanwhile.
             assert_eq!(
                 writes.len(),
-                if enabled { 3 } else { 2 },
+                if supervisor { 3 } else { 2 },
                 "{case}: {writes:?}"
             );
             assert!(
@@ -21871,14 +22432,14 @@ mod tests {
                 writes
                     .iter()
                     .any(|(url, _)| url.ends_with("/requested_reviewers")),
-                !enabled,
+                !supervisor,
                 "{case}"
             );
             assert_eq!(
                 writes
                     .iter()
                     .any(|(_, body)| body["labels"] == json!([crate::stop::SUPERVISOR_LABEL])),
-                enabled,
+                supervisor,
                 "{case}"
             );
             let body = writes
@@ -21894,6 +22455,11 @@ mod tests {
             if let Some(expected) = expected {
                 assert!(body.contains(expected), "{case}: {body}");
             }
+            assert_eq!(
+                body.contains("out of this pull request's reach, so no further round starts"),
+                failed && reason.is_some_and(out_of_reach),
+                "{case}: {body}"
+            );
             assert!(
                 !body.contains("Forged patch") && !body.contains("@cgwalters"),
                 "{case}: {body}"
@@ -24015,11 +24581,52 @@ mod tests {
                 vec![comment.clone(), patch.clone()],
                 1,
             ),
+            // tracker#1747: the claim's rewrite into the marker got a 502.
+            (
+                "a marker write answered 5xx is sent once more",
+                vec![],
+                vec![],
+                started,
+                vec![comment.clone(), patch.clone(), patch.clone()],
+                1,
+            ),
+            // `blockedRounds` takes no lost claim up: a stop posted meanwhile
+            // could not contend with it, so the round stays a person's.
+            (
+                "blockedRounds: a claim never recorded still goes to a human",
+                vec![claim(BOT, &body, "2026-10-11T00:00:00Z")],
+                vec![],
+                "-> labelled needs-human",
+                vec![
+                    format!("POST repos/{REPO}/labels"),
+                    format!("POST repos/{REPO}/issues/470/labels"),
+                    comment.clone(),
+                ],
+                0,
+            ),
         ];
         for (name, claims, late, line, writes, dispatches) in cases {
             let second = contender(claims, late, 100);
+            let mut cfg = config();
+            cfg.policy.blocked_rounds = name.starts_with("blockedRounds");
+            if name.contains("5xx") {
+                second.answers.borrow_mut().insert(
+                    format!("{API_ROOT}repos/{REPO}/issues/comments/100"),
+                    vec![(502, json!({"message": "Bad Gateway"}))],
+                );
+            }
             let dispatcher = Fake::default();
-            let outcome = applied(&second, &dispatcher);
+            let outcome = run(
+                &second,
+                &second,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.to_owned()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
             let got = outcome.lines.last().unwrap();
             assert!(got.contains(line), "{name}: {got}");
             assert_eq!(written(&second.writes), writes, "{name}");
