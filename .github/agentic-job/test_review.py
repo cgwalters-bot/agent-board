@@ -55,7 +55,7 @@ class ReviewContracts(unittest.TestCase):
             caller,
             r"uses: cgwalters-forge/actions/\.github/workflows/cgwalters-review\.yml@[0-9a-f]{40} # ",
         )
-        self.assertIn("@a5f914db4eb19e8711fc31ae939d5f2dc87cdace # agentic-job v0.6.15 (runs agentic-job 427ce229", caller)
+        self.assertIn("@b590d3260a18cc59ceb3eb850e62fb62ff967d37 # agentic-job v0.6.16", caller)
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", caller)
         self.assertIn("issue_comment:\n    types: [created]", caller)
         self.assertIn("github.event.issue.pull_request && startsWith", caller)
@@ -111,11 +111,16 @@ class ReviewContracts(unittest.TestCase):
                 self.assertEqual(bounds["hosts"], ["github.com"])
                 self.assertEqual(bounds["repos"], ["cgwalters-forge/agent-board"])
                 self.assertEqual(bounds["bases"], ["main"])
-                self.assertEqual(bounds["max_outputs"], 1)
+                # The verdict and up to ten inline findings (cgwalters-review.yml).
+                self.assertEqual(bounds["max_outputs"], 11)
                 self.assertNotIn("outputs", bounds)
                 self.assertNotIn("trigger", bounds)
                 github = bounds["github"]
-                self.assertEqual(github["outputs"], {"add_comment": {"max": 1}, "noop": {"max": 1}})
+                self.assertEqual(github["outputs"], {
+                    "add_comment": {"max": 1},
+                    "noop": {"max": 1},
+                    "create_pull_request_review_comment": {"max": 10},
+                })
                 self.assertEqual(github["trigger"]["events"], events)
                 self.assertEqual(github["trigger"]["roles"], roles)
                 self.assertEqual(github["trigger"]["bots"], bots)
