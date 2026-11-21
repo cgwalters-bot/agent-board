@@ -575,6 +575,7 @@ fn setup_credential_free_rehearsal() {
         if line.starts_with("agent-board pass ") {
             let text = String::from_utf8(output.stdout).unwrap();
             assert!(text.starts_with("pass: preview\n"), "{text}");
+            assert!(!text.contains("REST root reads:"), "{text}");
             assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 1);
             assert!(text.contains("held by --max-dispatch: start "), "{text}");
             assert!(text.ends_with(&format!("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":1}}\n")), "{text}");
@@ -609,6 +610,39 @@ fn setup_credential_free_rehearsal() {
     assert!(config.follow.is_empty());
     assert!(config.epics.is_none());
     assert!(config.triage.is_none());
+}
+
+#[test]
+fn rest_root_attribution_is_opt_in_and_replay_only() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let args = [
+        "pass",
+        "--attribute-rest-root",
+        "--config",
+        "fixtures/pass/config.json",
+    ];
+    command().args(args).current_dir(root).assert().code(1);
+    let replay = ["--replay", "fixtures/pass/board-2026-10-23.json"];
+    command()
+        .args(args)
+        .args(replay)
+        .args(["--record", "unused.json"])
+        .current_dir(root)
+        .assert()
+        .code(1);
+    let run = command()
+        .args(args)
+        .args(replay)
+        .current_dir(root)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("DISPATCH_TOKEN")
+        .assert()
+        .success();
+    let text = String::from_utf8_lossy(&run.get_output().stdout);
+    assert!(text.contains(
+        "REST root reads: charged paths {}, refunded 304s 0, successful decision metadata reads 0, repeated 0\n",
+    ));
 }
 
 #[test]

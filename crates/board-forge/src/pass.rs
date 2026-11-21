@@ -3003,6 +3003,7 @@ struct Bounds {
     /// Requests by endpoint class and by cause ([`Spent`]).
     by_class: RefCell<BTreeMap<String, usize>>,
     by_cause: RefCell<BTreeMap<String, usize>>,
+    root_reads: RefCell<Option<RootReads>>,
 }
 
 impl Bounds {
@@ -3047,6 +3048,7 @@ impl Bounds {
             cause: RefCell::new(None),
             by_class: RefCell::default(),
             by_cause: RefCell::default(),
+            root_reads: RefCell::default(),
         }
     }
 
@@ -3350,6 +3352,79 @@ pub(crate) fn path_class(path: &str) -> String {
     }
 }
 
+/// Attribution of the existing charged `root` bucket, enabled only in replay.
+#[derive(Default)]
+struct RootReads {
+    paths: BTreeMap<String, usize>,
+    refunded: usize,
+    metadata_ok: usize,
+    repeated: usize,
+    seen: BTreeSet<[u8; 32]>,
+}
+
+impl RootReads {
+    fn record(&mut self, url: &str, refunded: bool, decision_ok: bool) {
+        if refunded {
+            self.refunded += 1;
+            return;
+        }
+        // Emit only fixed route shapes: even path segments can carry secrets.
+        let path = url.strip_prefix(API_ROOT).unwrap_or_default();
+        let clean = path.split(['?', '#']).next().unwrap_or_default();
+        let mut segments = clean.splitn(4, '/');
+        let route = match (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) {
+            (Some(""), None, None, None) => "/",
+            (Some("repos"), Some(owner), Some(repo), None)
+                if !owner.is_empty() && !repo.is_empty() =>
+            {
+                "/repos/{owner}/{repo}"
+            }
+            (Some("repos"), Some(_), Some(_), Some(_)) => "/repos/{owner}/{repo}/…",
+            (Some("orgs"), Some(org), None, None) if !org.is_empty() => "/orgs/{org}",
+            (Some("orgs"), Some(_), Some(_), _) => "/orgs/{org}/…",
+            (Some("users"), Some(user), None, None) if !user.is_empty() => "/users/{user}",
+            (Some("users"), Some(_), Some(_), _) => "/users/{user}/…",
+            _ => "other",
+        };
+        *self.paths.entry(route.into()).or_default() += 1;
+        if decision_ok
+            && route == "/repos/{owner}/{repo}"
+            && clean == path
+            && validate_repository(clean.strip_prefix("repos/").unwrap_or_default()).is_ok()
+        {
+            self.metadata_ok += 1;
+            // There is only one replay transport. Keep fixed-size identities,
+            // never raw URLs; cap memory even when requestShare raises the limit.
+            let key = Sha256::digest(url).into();
+            if self.seen.contains(&key) {
+                self.repeated += 1;
+            } else if self.seen.len() < PASS_REQUEST_LIMIT {
+                self.seen.insert(key);
+            }
+        }
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "REST root reads: charged paths {}, refunded 304s {}, successful decision metadata reads {}, repeated {}{}",
+            ranked(&self.paths, usize::MAX),
+            self.refunded,
+            self.metadata_ok,
+            self.repeated,
+            if self.metadata_ok - self.repeated > self.seen.len() {
+                " (lower bound: identity limit reached)"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
 /// The class of a GraphQL `query`, for [`Spent::by_class`]: `graphql`, or
 /// `mutation`, and its first [`GRAPHQL_FIELDS`] nested fields, arguments
 /// left out, as `graphql repository.issue`.
@@ -3509,6 +3584,14 @@ pub(crate) fn promotion_reads<C: Rest + Transport>(
 }
 
 impl<C> Budget<'_, C> {
+    fn root_read(&self, class: &str, url: &str, refunded: bool, decision_ok: bool) {
+        if class == "root"
+            && let Some(root) = self.bounds.root_reads.borrow_mut().as_mut()
+        {
+            root.record(url, refunded, decision_ok);
+        }
+    }
+
     fn publication_read(&self, key: &str) -> Option<KeptRead> {
         (self.bounds.stage.get() == Stage::Holds)
             .then(|| self.bounds.publication_reads.borrow().get(key).cloned())
@@ -3667,7 +3750,9 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 
     fn get_fresh(&self, url: &str) -> Result<RestResponse> {
-        self.spend(false, &endpoint_class(url))?;
+        let class = endpoint_class(url);
+        self.spend(false, &class)?;
+        self.root_read(&class, url, false, false);
         let response = self.observe(self.inner.get_fresh(url))?;
         if response.status == 200 {
             self.keep_publication_read(url.to_owned(), KeptRead::Rest(response.clone()));
@@ -3745,11 +3830,24 @@ impl<C: Rest> Rest for Budget<'_, C> {
                         .map(|v| ("If-Modified-Since", v))
                 })
         });
-        let mut response = self.observe(self.inner.get(url, condition.or(validator)))?;
-        if condition.or(validator).is_some() && response.status == 304 {
+        let validator = condition.or(validator);
+        let result = self.observe(self.inner.get(url, validator));
+        let before = self.bounds.revalidated.get();
+        if validator.is_some() && result.as_ref().is_ok_and(|r| r.status == 304) {
             self.bounds.refund(&class);
             self.bounds.shared_responses.borrow_mut().modified += 1;
         }
+        self.root_read(
+            &class,
+            url,
+            self.bounds.revalidated.get() != before,
+            validator.is_none()
+                && !self.bounds.starting.get()
+                && !self.bounds.finishing.get()
+                && self.bounds.stage.get() != Stage::Holds
+                && result.as_ref().is_ok_and(|r| r.status == 200),
+        );
+        let mut response = result?;
         if response.status == 304
             && condition.is_some()
             && let Some(cached) = &cached
@@ -3793,7 +3891,9 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 
     fn get_live(&self, url: &str) -> Result<RestResponse> {
-        self.spend(false, &endpoint_class(url))?;
+        let class = endpoint_class(url);
+        self.spend(false, &class)?;
+        self.root_read(&class, url, false, false);
         self.observe(self.inner.get_live(url))
     }
 
@@ -3812,7 +3912,11 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
-        self.spend(method != "GET", &endpoint_class(url))?;
+        let class = endpoint_class(url);
+        self.spend(method != "GET", &class)?;
+        if method == "GET" {
+            self.root_read(&class, url, false, false);
+        }
         // An ambiguous failed write may have committed.
         if method != "GET" {
             self.bounds.shared_responses.borrow_mut().entries.clear();
@@ -4340,12 +4444,56 @@ pub async fn run<C: Rest + Transport + crate::github::GraphQl + Broker>(
     (mode, limits): (Mode<'_>, Limits),
     now: OffsetDateTime,
 ) -> Result<Report> {
+    run_pass(
+        client,
+        dispatcher,
+        config,
+        state,
+        (mode, limits),
+        now,
+        false,
+    )
+    .await
+}
+
+/// Preview a GitHub recording from empty pass state, optionally attributing
+/// its charged REST root reads. This diagnostic has no live or apply mode.
+pub async fn run_replay(
+    replay: &Replay,
+    config: &Config,
+    limits: Limits,
+    attribute_root: bool,
+) -> Result<Report> {
+    run_pass(
+        replay,
+        replay,
+        config,
+        State::default(),
+        (Mode::Preview, limits),
+        replay.now,
+        attribute_root,
+    )
+    .await
+}
+
+async fn run_pass<C: Rest + Transport + crate::github::GraphQl + Broker>(
+    client: &C,
+    dispatcher: &C,
+    config: &Config,
+    state: State,
+    (mode, limits): (Mode<'_>, Limits),
+    now: OffsetDateTime,
+    attribute_root: bool,
+) -> Result<Report> {
     ensure!(
         config.forgejo_board().is_none(),
         "use pass::forgejo::run for a Forgejo board"
     );
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, admit_by);
+    if attribute_root {
+        *bounds.root_reads.borrow_mut() = Some(RootReads::default());
+    }
     if config.pool_headroom {
         *bounds.routing.borrow_mut() = Some(routing::Routing::default());
     }
@@ -4473,6 +4621,9 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds.collapse(&mut report);
     report.summary = caps.summary();
     report.spent = bounds.spent();
+    if let Some(root) = bounds.root_reads.borrow().as_ref() {
+        report.lines.push(root.line());
+    }
     report.effects = bounds.effects.borrow().clone();
     if let Some(store) = bounds.living.borrow().as_ref() {
         report

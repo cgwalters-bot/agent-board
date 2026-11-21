@@ -2816,6 +2816,70 @@ fn spent_names_each_stage_that_spent() {
     }
 }
 
+#[test]
+fn rest_root_attribution_counts_reads_without_reusing_them() {
+    let repo = format!("{API_ROOT}repos/private-owner/private-repo");
+    let other = format!("{API_ROOT}repos/private-owner/other-repo");
+    let absent = format!("{API_ROOT}repos/private-owner/absent-repo");
+    let user = format!("{API_ROOT}users/private-user?value=private-query");
+    let suffix = format!("{API_ROOT}repos/private-owner/private-repo/private.file");
+    let mut replay = replay();
+    for url in [&repo, &other, &user, &suffix] {
+        replay.requests.push(json!({"request": {"get": url},
+            "answer": {"status": 200, "body": {"private-body": true}}}));
+    }
+    replay
+        .requests
+        .push(json!({"request": {"get": absent}, "answer": {ABSENT: true}}));
+    let forge = ConditionalRecording {
+        replay,
+        reads: RefCell::default(),
+        traffic: RefCell::default(),
+    };
+    let bounds = Bounds::new(50, Instant::now() + Duration::from_secs(60));
+    *bounds.root_reads.borrow_mut() = Some(RootReads::default());
+    let client = Budget {
+        inner: &forge,
+        bounds: &bounds,
+    };
+    let first = client.get(&repo, None).unwrap();
+    for url in [&repo, &other, &user, &suffix] {
+        assert_eq!(client.get(url, None).unwrap().status, 200);
+    }
+    for _ in 0..2 {
+        assert!(
+            client
+                .get(&absent, None)
+                .is_err_and(|e| e.is::<crate::github::NotFound>())
+        );
+    }
+    let etag = first.etag.as_deref().unwrap();
+    assert_eq!(
+        client
+            .get(&repo, Some(("If-None-Match", etag)))
+            .unwrap()
+            .status,
+        304
+    );
+    assert_eq!(client.get_fresh(&repo).unwrap().status, 200);
+    assert_eq!(client.get_live(&repo).unwrap().status, 200);
+    bounds.starting.set(true);
+    assert_eq!(client.get(&repo, None).unwrap().status, 200);
+    bounds.starting.set(false);
+    assert!(client.send("GET", &repo, &Value::Null).is_err());
+    assert!(client.send("POST", &repo, &Value::Null).is_err());
+
+    let spent = bounds.spent();
+    assert_eq!(forge.network_requests(), Some(13));
+    assert_eq!(forge.reads.borrow()[&format!("REST {absent}")], 2);
+    assert_eq!(spent.by_class["root"], 12); // Includes the write, not the 304.
+    assert_eq!(spent.revalidated, 1);
+    assert_eq!(
+        bounds.root_reads.borrow().as_ref().unwrap().line(),
+        r#"REST root reads: charged paths {"/repos/{owner}/{repo}":9,"/repos/{owner}/{repo}/…":1,"/users/{user}":1}, refunded 304s 1, successful decision metadata reads 3, repeated 1"#
+    );
+}
+
 /// A request's endpoint class: the path after the repository, owner or
 /// user, without numbers or the query; a GraphQL query's first nested
 /// fields, without arguments.
