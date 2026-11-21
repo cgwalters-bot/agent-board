@@ -408,21 +408,23 @@ work, without weakening the current-head authorization boundary.
 * **The source line** (agent-board#1002). A midstream PR names its source
   issue on one line of its own, canonically
   `Part of https://github.com/FORK/issues/N` (`Fixes` for a slice that
-  completes it), which upstream readers could not follow. Publication removes
-  exactly that line: the whole line, less surrounding whitespace, is `Part of`
+   completes it), which upstream readers could not follow. Publication removes
+   the source line only when the whole line, less surrounding whitespace, is `Part of`
   or `Fixes`, one space and the fork issue's full URL, at most with a
   sentence's period, and it names the issue the source tie above found. One
-  blank line is left where its paragraph was and the result is trimmed;
-  nothing else changes. Two such lines, or one naming another issue, hold;
+   blank line is left where its paragraph was and the result is trimmed.
+   Two such lines, or one naming another issue, hold;
   otherwise punctuated, quoted or listed, it is prose, and a body naming the
   source issue's URL without a source line holds as "source line not
   recognised" (composefs-rs#66). The fork PR keeps the line, so stacking,
   the `Upstream: #N` derivation, the handoff and retries still read the same
-  source. The removal is the one permitted deterministic edit, like the
-  derived closing line: it is not a rewrite of prose, grants no approval and
-  leaves every gate, provenance proof and write bound as above. A source
-  staged outside the fork (an issues-off fork's tracker item) has no fork
-  issue to name and holds for a person.
+   source. Publication also removes tracker dispatch's terminal footer when
+   the apply receipt, visible run link and gh-aw comments match the current
+   wrapper's format for the same run. Older formats still need manual cleanup.
+   Neither removal rewrites prose or grants approval; all gates, provenance
+   proofs and write bounds still apply, and midstream links in author text
+   hold. A source staged outside the fork (an issues-off fork's tracker item)
+   has no fork issue to name and holds for a person.
 * **Writing it.** The pass appends the same instruction to the brief of an
   implement or fix plan whose work repository is a midstream fork stage 2
   read by topic, and to the poll's fix, rebase, continuation and
