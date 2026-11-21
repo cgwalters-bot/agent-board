@@ -2170,6 +2170,18 @@ fn status_cli_refusals() {
             1,
             "--json pools needs the config's pace",
         ),
+        (
+            vec![
+                "--owner",
+                "example",
+                "--config",
+                config,
+                "--json",
+                "needs_you",
+            ],
+            1,
+            "--json needs_you needs holds.needsYou",
+        ),
         // Every check above precedes the token; without one nothing is read.
         (
             vec![
@@ -2191,6 +2203,160 @@ fn status_cli_refusals() {
         assert!(output.stdout.is_empty(), "{args:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn status_loads_every_pass_key() {
+    // Start with the deployment-shaped pass fixture, then exercise the other
+    // top-level GitHub pass keys. Forgejo's live report is a separate capability.
+    let mut config: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config-v1.json")).unwrap();
+    let extra: Value = serde_json::from_str(r#"{
+        "dispatchRef": "main",
+        "midstream": {"owner": "example", "topic": "bot-midstream"},
+        "notifications": false, "issueIntake": false, "authored": 1, "openPrCap": 1,
+        "reserveScheduling": false, "poolHeadroom": false, "triagePools": ["claude"],
+        "triageReplans": 0, "operatorAsk": {"text": "Ask about architecture", "domains": ["architecture"]},
+        "guidance": {}, "skipActiveWork": false, "idleReplan": false, "existingChildPlans": false,
+        "researchPlans": false, "fixPlans": false, "sessionPlans": false, "triageClose": false,
+        "replanInvalid": false, "operatorQuestionsOnly": false, "reserveOperator": false,
+        "assignHolds": false, "readFreeHolds": false, "leanReads": false, "replanAfterDays": 0,
+        "bodyPlans": false, "revisit": {"perPass": 1, "afterDays": 7},
+        "sweep": {"weekday": "Monday", "hourUtc": 0},
+        "sessions": {"repositories": ["example/project"]},
+        "maintain": {"repos": {"sinceDays": 30, "min": 1, "max": 2}, "share": 0.2,
+            "digest": {"repository": "example/ops", "issue": 2}, "hourUtc": 0},
+        "mix": {}, "pace": {"speed": 1.5, "marginPercent": 1, "overrides": []},
+        "holds": {"repository": "example/ops", "issue": 1, "needsYou": true},
+        "decisions": {"repository": "example/ops", "issue": 3}, "leases": false,
+        "reapOverdueRuns": false, "direction": {"repository": "example/ops", "issue": 4},
+        "prices": {}, "cost": {"hourUtc": 0}, "state": "state.json", "store": "state.sqlite",
+        "changeSweepHours": 0, "livingStatus": "living.json", "cleanupHistory": false,
+        "topDown": false, "requestShare": 10, "requestWindow": {"passMinutes": 45, "floor": 100},
+        "promote": {}, "fixBounds": [], "maxDispatch": 1, "maxWrites": 2, "maxStatusChanges": 3
+    }"#).unwrap();
+    config
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let pass = board_forge::pass::Config::parse(&config.to_string()).unwrap();
+    let settings = board_forge::org_status::Settings::from_pass("example", &pass, None).unwrap();
+    let pace = settings.pace.unwrap();
+    assert_eq!(
+        (pace.repository.as_str(), pace.issue, pace.bot.as_str()),
+        ("example/ops", 1, "worker")
+    );
+    assert_eq!((pace.speed, pace.margin_percent), (1.5, 1.0));
+    assert_eq!(settings.follow, ["example/project"]);
+    assert!(settings.holds.is_some());
+
+    let dir = std::env::temp_dir().join(format!("agent-board-status-pass-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pass.json");
+    std::fs::write(&path, config.to_string()).unwrap();
+    // Both formats load the same config through the CLI, without a live read.
+    for args in [vec![], vec!["--verbose", "--json", "pools,needs_you"]] {
+        let result = command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(["status", "--owner", "example", "--config"])
+            .arg(&path)
+            .args(args)
+            .assert()
+            .code(4);
+        assert!(result.get_output().stdout.is_empty());
+    }
+
+    for (text, error) in [
+        (
+            config.to_string().replacen("\"follow\":", "\"folow\":", 1),
+            "folow",
+        ),
+        (
+            format!("{{\"follow\":[],{}", &config.to_string()[1..]),
+            "duplicate configuration field follow",
+        ),
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let result = command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(["status", "--owner", "example", "--config"])
+            .arg(&path)
+            .assert()
+            .code(1);
+        assert!(String::from_utf8_lossy(&result.get_output().stderr).contains(error));
+    }
+
+    config["workRepositories"] = serde_json::json!([
+        {"org": "example", "forks": false, "visibility": "public"}
+    ]);
+    config.as_object_mut().unwrap().remove("holds");
+    std::fs::write(&path, config.to_string()).unwrap();
+    for (args, code, error) in [
+        (vec![], 4, ""),
+        (
+            vec!["--json", "needs_you"],
+            1,
+            "--json needs_you needs holds.needsYou",
+        ),
+        (vec!["--json", "bad"], 1, "unknown JSON field"),
+        (vec!["--job-limit", "0"], 1, "--job-limit is not"),
+    ] {
+        let result = command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(["status", "--owner", "example", "--config"])
+            .arg(&path)
+            .args(args)
+            .assert()
+            .code(code);
+        assert!(String::from_utf8_lossy(&result.get_output().stderr).contains(error));
+    }
+
+    let contract: Value =
+        serde_json::from_str(include_str!("../../../fixtures/forgejo/pass-contract.json")).unwrap();
+    let mut forgejo = serde_json::json!({
+        "operator": "owner", "bot": "worker", "dispatchRepo": "example/control",
+        "dispatchWorkflow": "dispatch.yml", "forgejoIntake": {"state": "cursor.json"},
+        "board": contract["instance"]["board"],
+    });
+    forgejo["board"]["intake"] =
+        serde_json::json!({"repositories": ["example/work"], "operatorId": 1234});
+    board_forge::pass::Config::parse(&forgejo.to_string()).unwrap();
+    std::fs::write(&path, forgejo.to_string()).unwrap();
+    let result = command()
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .args(["status", "--owner", "example", "--config"])
+        .arg(&path)
+        .assert()
+        .code(1);
+    assert!(String::from_utf8_lossy(&result.get_output().stderr).contains("status is GitHub-only"));
+
+    // An otherwise valid standalone poll file with a foreign tag must not
+    // start repository discovery on GitHub.
+    let mut legacy = serde_json::json!({
+        "operator": "owner", "bot": "worker", "dispatchRepo": "example/control",
+        "dispatchWorkflow": "dispatch.yml", "board": {"forge": "gitlab"},
+        "follow": [{"org": "example", "forks": false, "visibility": "public"}],
+        "queueOnlyRepository": "example/project",
+        "pace": {"repository": "example/ops", "issue": 1, "bot": "worker"}
+    });
+    for (code, error) in [(1, "status is GitHub-only"), (4, "")] {
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        let result = command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(["status", "--owner", "example", "--config"])
+            .arg(&path)
+            .assert()
+            .code(code);
+        assert!(String::from_utf8_lossy(&result.get_output().stderr).contains(error));
+        // With no foreign tag the repository checks must wait for discovery.
+        legacy.as_object_mut().unwrap().remove("board");
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

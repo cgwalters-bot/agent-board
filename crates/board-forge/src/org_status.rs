@@ -2,15 +2,16 @@
 //! pass (agent-board#262). Runner load across the organization's
 //! repositories, agent runs of the configured dispatch workflow, the pools
 //! of the usage snapshot the poll paces by, the followed repositories'
-//! merge queues, and the board.
+//! merge queues, the published needs-you count, and the board.
 //!
 //! Every read goes through the supervisor's [`Bounded`](crate::supervise::Bounded)
 //! API, which refuses writes and stops at a request budget and a deadline:
 //! a large organization or a stalled API ends the pass instead of exhausting
 //! the token's rate limit. A section that cannot be read whole says so
 //! rather than showing a short count as the load.
+use crate::pass::{self, holds};
 use crate::poll::{PollPolicy, option, pace, validate_repository, validate_workflow};
-use crate::supervise::health::{USAGE_MARKER, usage_snapshot};
+use crate::supervise::health::{USAGE_MARKER, issue_comments, own_comments, usage_snapshot};
 use crate::supervise::{Api, encode, iso, millis, run_title};
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{Priority, Snapshot, Status};
@@ -27,7 +28,7 @@ pub const TIMEOUT_SECONDS: u64 = 120;
 /// The longest `--job-limit`: no GitHub plan runs more concurrent jobs.
 pub const JOB_LIMIT_MAX: u64 = 10_000;
 /// The report's sections, for `--json`.
-pub const FIELDS: &[&str] = &["runners", "agents", "pools", "queues", "board"];
+pub const FIELDS: &[&str] = &["runners", "agents", "pools", "queues", "needs_you", "board"];
 const PAGE: usize = 100;
 /// Pages of the organization's repositories: at most 500 repositories.
 const REPOSITORY_PAGES: usize = 5;
@@ -40,6 +41,8 @@ const OUTCOME_SECONDS: i64 = 3600;
 const OUTCOME_CREATED_SECONDS: i64 = 6 * 3600;
 /// Pages of the usage issue's comments searched for the snapshot.
 const USAGE_PAGES: usize = 3;
+/// Pages of the holds issue's comments searched for the snapshot and its parts.
+const HOLDS_PAGES: usize = 3;
 /// Merge-queue entries and open pull requests read per followed repository.
 const QUEUE_READS: usize = 100;
 const ACTIVE: &[&str] = &["queued", "in_progress"];
@@ -55,14 +58,78 @@ pub struct Settings {
     /// Whose merge queues and approved pull requests are shown.
     pub follow: Vec<String>,
     pub pace: Option<pace::Pace>,
+    pub holds: Option<Publication>,
     /// The plan's concurrent hosted-job limit, if given.
     pub job_limit: Option<u64>,
 }
 
+#[derive(Debug)]
+pub struct Publication {
+    repository: String,
+    issue: u64,
+    bot: String,
+}
+
 impl Settings {
-    pub fn from_json(owner: &str, config: &Value, job_limit: Option<u64>) -> Result<Self> {
+    pub fn check_args(owner: &str, job_limit: Option<u64>) -> Result<()> {
         ensure!(crate::is_github_login(owner), "invalid --owner {owner:?}");
-        let policy = PollPolicy::from_json(config)?;
+        if let Some(limit) = job_limit {
+            ensure!(
+                (1..=JOB_LIMIT_MAX).contains(&limit),
+                "--job-limit is not 1 to {JOB_LIMIT_MAX}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Project the read-only status settings from a resolved pass config.
+    pub fn from_pass(owner: &str, config: &pass::Config, job_limit: Option<u64>) -> Result<Self> {
+        Self::check_args(owner, job_limit)?;
+        // Forgejo repositories must not be mistaken for GitHub lookalikes.
+        ensure!(
+            config.forgejo_board().is_none(),
+            "unsupported_capability: status is GitHub-only"
+        );
+        ensure!(
+            !config.has_repository_sources(),
+            "status needs a resolved pass configuration"
+        );
+        Ok(Self {
+            owner: owner.into(),
+            dispatch_repo: config.dispatch_repo.clone(),
+            dispatch_workflow: config.dispatch_workflow.clone(),
+            follow: config.follow.clone(),
+            pace: config.poll_pace(None),
+            holds: config
+                .holds
+                .as_ref()
+                .filter(|at| at.needs_you)
+                .map(|at| Publication {
+                    repository: at.repository.clone(),
+                    issue: at.issue,
+                    bot: config.bot.clone(),
+                }),
+            job_limit,
+        })
+    }
+
+    /// Legacy standalone poll configuration, with resolved repository lists.
+    pub fn from_json(owner: &str, config: &Value, job_limit: Option<u64>) -> Result<Self> {
+        let settings = Self::from_poll_sources(owner, config, job_limit)?;
+        PollPolicy::from_json(config)?;
+        Ok(settings)
+    }
+
+    /// Validate the local status settings before discovering the rest of `follow`.
+    /// The caller still needs `from_json` to validate the resolved poll policy.
+    pub fn from_poll_sources(owner: &str, config: &Value, job_limit: Option<u64>) -> Result<Self> {
+        Self::check_args(owner, job_limit)?;
+        ensure!(
+            config["board"]
+                .get("forge")
+                .is_none_or(|forge| forge == "github"),
+            "unsupported_capability: status is GitHub-only"
+        );
         let dispatch_repo = config["dispatchRepo"]
             .as_str()
             .context("agent-board config: dispatchRepo is required")?;
@@ -71,23 +138,19 @@ impl Settings {
             .and_then(Value::as_str)
             .context("agent-board config: status needs dispatchWorkflow")?;
         validate_workflow(dispatch_workflow)?;
-        let follow: Vec<String> = serde_json::from_value(config["follow"].clone())
-            .context("agent-board config: follow is not a list of repositories")?;
+        let follow: Vec<String> =
+            serde_json::from_value(config.get("follow").cloned().unwrap_or_else(|| json!([])))
+                .context("agent-board config: follow is not a list of repositories")?;
         for repo in &follow {
             validate_repository(repo).context("follow")?;
-        }
-        if let Some(limit) = job_limit {
-            ensure!(
-                (1..=JOB_LIMIT_MAX).contains(&limit),
-                "--job-limit is not 1 to {JOB_LIMIT_MAX}"
-            );
         }
         Ok(Self {
             owner: owner.into(),
             dispatch_repo: dispatch_repo.into(),
             dispatch_workflow: dispatch_workflow.into(),
             follow,
-            pace: policy.pace,
+            pace: pace::Pace::from_json(config.get("pace"))?,
+            holds: None,
             job_limit,
         })
     }
@@ -110,6 +173,9 @@ pub fn collect(
     // Pools are paced only where the config names a usage snapshot.
     if s.pace.is_some() {
         report["pools"] = section(pools(api, s, now));
+    }
+    if let Some(holds) = &s.holds {
+        report["needs_you"] = section(needs_you(api, holds, now_ms));
     }
     report["queues"] = section(queues(api, s));
     report["agents"] = section(agents(api, s, now_ms));
@@ -370,7 +436,7 @@ fn pools(api: &dyn Api, s: &Settings, now: OffsetDateTime) -> Result<Value> {
         // comment on the issue.
         found = comments
             .iter()
-            .filter(|c| c["user"]["login"] == pace.bot.as_str())
+            .filter(|c| login_is(&c["user"], &pace.bot))
             .filter_map(|c| c["body"].as_str())
             .find(|b| b.starts_with(USAGE_MARKER))
             .map(usage_snapshot);
@@ -418,6 +484,60 @@ fn pools(api: &dyn Api, s: &Settings, now: OffsetDateTime) -> Result<Value> {
         // The poll's own line, so that both say the same of each pool.
         "line": pace::line_with_speed(&paces, &BTreeSet::new(), &pace.overrides, now, pace.speed),
     }))
+}
+
+fn login_is(actor: &Value, bot: &str) -> bool {
+    actor["login"]
+        .as_str()
+        .is_some_and(|login| login.eq_ignore_ascii_case(bot))
+}
+
+fn needs_you(api: &dyn Api, at: &Publication, now_ms: i64) -> Result<Value> {
+    let comments = issue_comments(api, &at.repository, at.issue, HOLDS_PAGES)?;
+    let first = comments
+        .iter()
+        .filter(|c| login_is(&c["author"], &at.bot))
+        .filter(|c| {
+            c["body"]
+                .as_str()
+                .is_some_and(|body| body.starts_with(holds::HOLDS_MARKER))
+        })
+        .max_by_key(|c| millis(&c["updatedAt"]))
+        .context("no holds snapshot")?;
+    // Anyone with write access can edit a bot comment. Verify the header and
+    // all parts used, rather than trusting authorship or falling back to an older header.
+    let own = own_comments(&comments, &at.bot);
+    let verified = |c: &Value| c.get("lastEditedAt").is_some() && c.get("editor").is_some();
+    ensure!(
+        verified(first) && own.iter().any(|c| std::ptr::eq(*c, first)),
+        "holds snapshot edit provenance is not verified"
+    );
+    let bodies: Vec<_> = own
+        .into_iter()
+        .filter(|c| verified(c))
+        .filter_map(|c| c["body"].as_str())
+        .collect();
+    let first = first["body"]
+        .as_str()
+        .context("missing holds snapshot body")?;
+    let snapshot =
+        holds::published_among(first, &bodies).context("holds snapshot is unreadable")?;
+    let published_at = millis(&snapshot["at"]).context("holds snapshot has no timestamp")?;
+    // A stopped pass must not look like a current, empty inbox.
+    let day_ms = time::Duration::days(1).whole_milliseconds() as i64;
+    ensure!(
+        (now_ms - day_ms..=now_ms).contains(&published_at),
+        "holds snapshot is stale or future-dated"
+    );
+    let list = &snapshot["needs_you"];
+    ensure!(
+        list["schema"] == holds::NEEDS_YOU_SCHEMA,
+        "needs-you not published or unknown schema"
+    );
+    let count = list["count"]
+        .as_u64()
+        .context("needs-you count is missing")?;
+    Ok(json!({"count": count, "complete": list["complete"] == true}))
 }
 
 const QUEUES_QUERY: &str = r#"query($owner: String!, $name: String!, $reads: Int!) {
@@ -566,8 +686,8 @@ fn counts(states: &Value) -> String {
     format!("{} running, {} queued", n("in_progress"), n("queued"))
 }
 
-/// The report for a terminal, one line or so per fact.
-pub fn text(report: &Value) -> String {
+/// The report for a terminal, one line per section unless verbose.
+pub fn text(report: &Value, verbose: bool) -> String {
     let mut out = String::new();
     let mut line = |s: String| {
         out.push_str(&s);
@@ -586,26 +706,42 @@ pub fn text(report: &Value) -> String {
             "runners: {} repositories, hosted jobs running {}{limit}",
             r["repositories"], r["hosted_in_progress"]
         ));
-        for (label, classes) in r["labels"].as_object().into_iter().flatten() {
-            line(format!(
-                "  {}: agent {}; other {}",
-                clean(&label.as_str().into()),
-                counts(&classes["agent"]),
-                counts(&classes["other"])
-            ));
-        }
-        for (class, job) in r["oldest_queued"].as_object().into_iter().flatten() {
-            line(format!(
-                "  oldest queued {class} job: {} {}",
-                duration(job["wait_seconds"].as_i64().unwrap_or(0)),
-                clean(&job["html_url"])
-            ));
+        if verbose {
+            for (label, classes) in r["labels"].as_object().into_iter().flatten() {
+                line(format!(
+                    "  {}: agent {}; other {}",
+                    clean(&label.as_str().into()),
+                    counts(&classes["agent"]),
+                    counts(&classes["other"])
+                ));
+            }
+            for (class, job) in r["oldest_queued"].as_object().into_iter().flatten() {
+                line(format!(
+                    "  oldest queued {class} job: {} {}",
+                    duration(job["wait_seconds"].as_i64().unwrap_or(0)),
+                    clean(&job["html_url"])
+                ));
+            }
         }
     }
 
     let a = &report["agents"];
     if let Some(why) = unavailable(a) {
         line(format!("agents: unavailable: {why}"));
+    } else if !verbose {
+        let runs = a["runs"].as_array().into_iter().flatten();
+        let count = |status: &str| runs.clone().filter(|r| r["status"] == status).count();
+        let overdue = runs.clone().filter(|r| r["overdue"] == true).count();
+        let overdue = if overdue > 0 {
+            format!(", {overdue} overdue")
+        } else {
+            String::new()
+        };
+        line(format!(
+            "agents: {} running, {} queued{overdue}",
+            count("in_progress"),
+            count("queued")
+        ));
     } else {
         line("agents:".into());
         for (key, name) in [("by_kind", "kind"), ("by_pool", "pool")] {
@@ -665,6 +801,27 @@ pub fn text(report: &Value) -> String {
     let q = &report["queues"];
     if let Some(why) = unavailable(q) {
         line(format!("queues: unavailable: {why}"));
+    } else if !verbose {
+        let queues = q.as_object().into_iter().flat_map(|q| q.values());
+        let queued: u128 = queues
+            .clone()
+            .filter_map(|q| q["queued"].as_u64())
+            .map(u128::from)
+            .sum();
+        let approved: usize = queues
+            .clone()
+            .filter_map(|q| q["approved_not_queued"].as_array())
+            .map(Vec::len)
+            .sum();
+        let repositories = queues.clone().count();
+        let partial = if queues.clone().any(|q| q["complete"] != true) {
+            " (partial)"
+        } else {
+            ""
+        };
+        line(format!(
+            "queues{partial}: {queued} queued, {approved} approved not queued across {repositories} repositories"
+        ));
     } else {
         line("queues:".into());
         for (repo, queue) in q.as_object().into_iter().flatten() {
@@ -691,6 +848,20 @@ pub fn text(report: &Value) -> String {
         }
     }
 
+    let needs = &report["needs_you"];
+    if let Some(why) = unavailable(needs) {
+        line(format!("needs-you: unavailable: {why}"));
+    } else if needs.is_object() {
+        let partial = if needs["complete"] == true {
+            ""
+        } else {
+            " (partial)"
+        };
+        line(format!("needs-you{partial}: {}", needs["count"]));
+    } else {
+        line("needs-you: not configured".into());
+    }
+
     let b = &report["board"];
     if let Some(why) = unavailable(b) {
         line(format!("board: unavailable: {why}"));
@@ -713,7 +884,7 @@ pub fn text(report: &Value) -> String {
             .flatten()
             .map(clean)
             .collect();
-        if !unstarted.is_empty() {
+        if verbose && !unstarted.is_empty() {
             line(format!("  P0 without run or PR: {}", unstarted.join(", ")));
         }
     }
@@ -766,11 +937,14 @@ mod tests {
         }
 
         fn graphql(&self, _: &str, variables: Value) -> Result<Value> {
-            let key = format!(
+            let mut key = format!(
                 "graphql {}/{}",
                 variables["owner"].as_str().unwrap(),
                 variables["name"].as_str().unwrap()
             );
+            if let Some(number) = variables["number"].as_u64() {
+                key.push_str(&format!("#{number}"));
+            }
             self.paths.borrow_mut().push(key.clone());
             self.responses
                 .get(&key)
@@ -903,7 +1077,18 @@ mod tests {
             json!(["example/intake#10", "example/intake#14"])
         );
         assert_eq!(
-            text(&report),
+            text(&report, false),
+            "\
+runners: 2 repositories, hosted jobs running 2/60
+agents: 1 running, 2 queued
+pools: claude normal 26% used of 30% allowed, openai held until 2026-10-23T00:00Z
+queues: 2 queued, 3 approved not queued across 1 repositories
+needs-you: not configured
+board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
+"
+        );
+        assert_eq!(
+            text(&report, true),
             "\
 runners: 2 repositories, hosted jobs running 2/60
   self-hosted: agent 0 running, 0 queued; other 1 running, 0 queued
@@ -923,10 +1108,75 @@ agents:
 pools: claude normal 26% used of 30% allowed, openai held until 2026-10-23T00:00Z
 queues:
   example/code: 2 queued; approved, not queued: #42 conflicting, #43 failing, #44 behind
+needs-you: not configured
 board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
   P0 without run or PR: example/intake#10, example/intake#14
 "
         );
+    }
+
+    #[test]
+    fn needs_you_counts_the_bot_publication_not_the_displayed_cards() {
+        let body = |at: &str, count: u64| {
+            let snapshot = json!({"schema": holds::HOLDS_SCHEMA, "at": at,
+                "needs_you": {"schema": holds::NEEDS_YOU_SCHEMA, "count": count,
+                    "complete": false, "items": []}});
+            format!("{}\n```json\n{snapshot}\n```", holds::HOLDS_MARKER)
+        };
+        let comment = |user: &str, body: &str| json!({"author":{"login":user}, "updatedAt":NOW, "lastEditedAt": null, "editor": null, "body":body});
+        let parts = holds::split(&body(NOW, 12), NOW, 120).unwrap();
+        assert!(parts.len() > 1);
+        let settings = Settings {
+            holds: Some(Publication {
+                repository: "example/ops".into(),
+                issue: 8,
+                bot: "worker".into(),
+            }),
+            ..settings()
+        };
+        let mut comments = vec![comment("someone-else", &body(NOW, 99))];
+        comments.extend(parts.iter().map(|p| comment("Worker", p)));
+        let clock = || crate::supervise::now_millis(now());
+        let path = "graphql example/ops#8";
+        for (comments, expected) in [
+            (comments.clone(), "needs-you (partial): 12"),
+            (
+                {
+                    let mut edited = comments.clone();
+                    edited.last_mut().unwrap()["editor"] = json!({"login":"someone-else"});
+                    edited
+                },
+                "needs-you: unavailable: holds snapshot is unreadable",
+            ),
+            (
+                {
+                    comments[1]["lastEditedAt"] = json!(NOW);
+                    comments
+                },
+                "needs-you: unavailable: holds snapshot edit provenance is not verified",
+            ),
+            (
+                vec![comment("worker", &body("2026-10-20T12:00:00Z", 0))],
+                "needs-you: unavailable: holds snapshot is stale or future-dated",
+            ),
+        ] {
+            let mut fake = Fake::new();
+            fake.responses.insert(
+                path.into(),
+                json!({"repository":{"issue":{"comments":{
+                    "nodes":comments, "pageInfo":{"hasNextPage":false}
+                }}}}),
+            );
+            let report = collect(
+                &bounded(&fake, REQUEST_LIMIT, &clock),
+                &settings,
+                now(),
+                None,
+            );
+            assert_eq!(complete(&report), !expected.contains("unavailable"));
+            let output = text(&report, false);
+            assert!(output.lines().any(|line| line == expected), "{output}");
+        }
     }
 
     #[test]
@@ -978,7 +1228,7 @@ board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
                     "{other}: {report:#}"
                 );
             }
-            assert!(text(&report).contains(&format!("{section}: unavailable: ")));
+            assert!(text(&report, false).contains(&format!("{section}: unavailable: ")));
         }
         // A board that could not be read is a section too.
         let fake = Fake::new();
@@ -1010,7 +1260,7 @@ board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
             .with("/repos/example/ops/issues/7/comments?per_page=100&page=1", |v| {
                 v.as_array_mut().unwrap().insert(
                     0,
-                    json!({"user": {"login": "usage-bot"}, "body": "<!-- bot-usage v1 -->\nbroken"}),
+                    json!({"user": {"login": "Usage-Bot"}, "body": "<!-- bot-usage v1 -->\nbroken"}),
                 )
             });
         let report = collect(
@@ -1045,7 +1295,7 @@ board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
             None,
         );
         assert!(complete(&report) && report.get("pools").is_none());
-        assert!(!text(&report).contains("pools"));
+        assert!(!text(&report, false).contains("pools"));
     }
 
     #[test]
@@ -1105,9 +1355,12 @@ board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
             ),
             (
                 "example",
-                with("unknownKey", json!(1)),
+                with(
+                    "pace",
+                    json!({"repository": "example/ops", "issue": 7, "bot": "worker", "marginPercent": -1}),
+                ),
                 None,
-                "unknown agent-board config key",
+                "pace marginPercent",
             ),
             ("example", config(), Some(0), "--job-limit"),
             ("example", config(), Some(JOB_LIMIT_MAX + 1), "--job-limit"),
@@ -1198,7 +1451,7 @@ board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
                 "  implement o/r#9[2J running, 1m old, pool a",
             ),
         ] {
-            let out = text(&json!({"agents": {"runs": [run]}}));
+            let out = text(&json!({"agents": {"runs": [run]}}), true);
             assert!(out.lines().any(|l| l == expected), "{out}");
         }
     }
@@ -1206,7 +1459,7 @@ board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
     #[test]
     fn remote_text_cannot_drive_the_terminal() {
         let report = json!({"agents": {"failed": [{"title": "fix o/r#1\u{1b}[2J\u{7}", "html_url": "u\nforged"}]}});
-        let out = text(&report);
+        let out = text(&report, true);
         assert!(out.contains("failed: fix o/r#1[2J uforged"), "{out}");
         assert!(!out.contains('\u{1b}'));
     }

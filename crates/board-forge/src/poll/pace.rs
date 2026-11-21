@@ -192,7 +192,7 @@ pub fn check_overrides(
 }
 
 impl Pace {
-    pub(super) fn from_json(value: Option<&Value>) -> Result<Option<Self>> {
+    pub(crate) fn from_json(value: Option<&Value>) -> Result<Option<Self>> {
         let Some(value) = value else {
             return Ok(None);
         };

@@ -43,7 +43,7 @@ Commands:
 - [`prune`](#agent-board-prune): Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
 - [`promote`](#agent-board-promote): Preview operator /promote command evidence on configured forks, or with promote.onApproval the operator's current-head approval of a draft; standalone, not a pass stage. Policy and human-text provenance must pass. With promote.publish=true, --apply and --max-writes, revalidate all gates and the operator's current-head approval, rebase cleanly and add operator sign-offs where needed, then create an upstream draft or update an existing same-head PR with approved fork title/body, less the body's one standalone full-URL source line (Part of or Fixes https://github.com/FORK/issues/N), appending a closing reference for the source issue's optional Upstream: #N link. At most one candidate and four writes; one fork status comment and a create-only publication branch, no approved-ref updates, readiness changes or fork closure. Conflicting rebases hold. Bot-fork acceptance still needs recorded staging verification (docs/architecture.md#promote)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
-- [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
+- [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues, needs-you and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
 - [`digest`](#agent-board-digest): Gather weekly public material and file or reuse its issue; preview unless --apply (docs/digest.md)
 - [`broker`](#agent-board-broker): Probe the inference broker and keep one outage issue open while it is unreachable
@@ -1198,7 +1198,7 @@ Options:
 
 ## agent-board status
 
-How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
+How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues, needs-you and, with --project, the board (read-only; GH_TOKEN reads)
 
 ```text
 agent-board status [OPTIONS] --config <FILE>
@@ -1206,8 +1206,9 @@ agent-board status [OPTIONS] --config <FILE>
 
 Options:
 
-- `--config <FILE>`: Repository-owned agent-board.json from a trusted default-branch checkout: the dispatch repository and workflow whose runs are agent runs, the followed repositories whose queues are shown, and `pace`, where the usage snapshot is
+- `--config <FILE>`: The GitHub pass configuration (or standalone poll configuration) from a trusted default-branch checkout
 - `--job-limit <N>`: Concurrent hosted-job limit to compare running jobs against
+- `--verbose`: Show repository resolution and individual jobs, runs, and queue details
 
 ## agent-board release-train
 

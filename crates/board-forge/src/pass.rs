@@ -2177,6 +2177,18 @@ impl Config {
     /// The pull request poll's settings: today's defaults but for the `pr`
     /// keys, paced where `usage` is set by `snapshot`, this pass's reading,
     /// or without one by the published snapshot.
+    pub(crate) fn poll_pace(&self, snapshot: Option<&Value>) -> Option<poll::pace::Pace> {
+        self.usage.as_ref().map(|usage| poll::pace::Pace {
+            repository: usage.repository.clone(),
+            issue: usage.issue,
+            bot: self.bot.clone(),
+            margin_percent: self.pace.margin,
+            speed: self.pace.speed,
+            overrides: self.pace.overrides.clone(),
+            snapshot: snapshot.cloned(),
+        })
+    }
+
     pub fn poll(&self, snapshot: Option<&Value>) -> poll::Config {
         let mut policy = PollPolicy {
             open_pr_cap: self.open_pr_cap,
@@ -2193,15 +2205,7 @@ impl Config {
                 .map(|q| q.fixed_flakes.clone())
                 .unwrap_or_default(),
             rebase_rounds: self.pr.rebase_rounds,
-            pace: self.usage.as_ref().map(|usage| poll::pace::Pace {
-                repository: usage.repository.clone(),
-                issue: usage.issue,
-                bot: self.bot.clone(),
-                margin_percent: self.pace.margin,
-                speed: self.pace.speed,
-                overrides: self.pace.overrides.clone(),
-                snapshot: snapshot.cloned(),
-            }),
+            pace: self.poll_pace(snapshot),
             fix_bounds: self.fix_bounds.clone(),
             preview_fix_pools: self.pool_headroom.then(|| self.pr.fix_pools.clone()),
             pass_triage_pools: self.pool_headroom.then(|| self.triage_pools().to_vec()),

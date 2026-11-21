@@ -187,7 +187,7 @@ enum Command {
     Promote(promote::Promote),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),
-    /// How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads).
+    /// How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues, needs-you and, with --project, the board (read-only; GH_TOKEN reads).
     Status(org_status::Status),
     /// One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply).
     ReleaseTrain(release_train::ReleaseTrain),
@@ -1426,7 +1426,6 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 "unsupported GitHub host"
             );
             let owner = cli.owner.as_deref().context("status requires --owner")?;
-            let settings = org_status::settings(args, owner)?;
             for field in cli.json.iter().flat_map(|f| f.split(',')) {
                 ensure!(
                     board_forge::org_status::FIELDS.contains(&field),
@@ -1437,11 +1436,8 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                     field != "board" || cli.project.is_some(),
                     "--json board needs --project"
                 );
-                ensure!(
-                    field != "pools" || settings.pace.is_some(),
-                    "--json pools needs the config's pace"
-                );
             }
+            let settings = org_status::settings(args, owner, cli.json.as_deref())?;
             // Refused before any read, as every other section needs the token too.
             let client = board_forge::github::Client::from_env()?;
             let board = cli.project.map(|_| load(&cli, runtime));
@@ -1452,7 +1448,7 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
             } else {
                 io::stdout()
                     .lock()
-                    .write_all(board_forge::org_status::text(&report).as_bytes())?;
+                    .write_all(board_forge::org_status::text(&report, args.verbose).as_bytes())?;
             }
             // The report is printed whole; a section that could not be read fails the command.
             ensure!(complete, "status: not every section could be read");
