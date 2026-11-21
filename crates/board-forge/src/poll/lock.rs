@@ -485,6 +485,7 @@ mod tests {
             now: OffsetDateTime::UNIX_EPOCH,
             previous: BTreeMap::new(),
             used: BTreeMap::new(),
+            evicted: 0,
             remaining: 1 + ITEM_REQUESTS,
             cut: None,
             apply: None,

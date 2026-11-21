@@ -15,6 +15,9 @@ pub(super) struct Responses {
     pub hits: usize,
     pub misses: usize,
     pub modified: usize,
+    /// Keys this pass evicted and has not kept again, and the misses on them.
+    pub evicted: BTreeSet<String>,
+    pub evicted_misses: usize,
 }
 
 pub(crate) fn seal(mut entry: Value) -> Value {
@@ -33,50 +36,102 @@ pub(crate) fn intact(entry: &Value) -> bool {
             .is_none_or(|digest| seal(entry.clone())["digest"] == *digest)
 }
 
+/// What [`bound`] evicted and what it kept.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Bounded {
+    pub evicted: BTreeSet<String>,
+    pub entries: usize,
+    pub bytes: usize,
+}
+
+impl Bounded {
+    /// The one line for callers that bound once in a while; the pass sums
+    /// its evictions into its summary instead.
+    pub fn warn(&self) {
+        if !self.evicted.is_empty() {
+            eprintln!(
+                "cache: evicted {} oversized or excess disposable responses; cold reads",
+                self.evicted.len()
+            );
+        }
+    }
+}
+
 /// Eviction affects responses only, never pending asks, receipts or accounting.
-pub(crate) fn bound(entries: &mut BTreeMap<String, Value>) {
-    let before = entries.len();
-    let mut bytes = 0;
-    let mut count = 0;
+/// It keeps entries in URL order.
+pub(crate) fn bound(entries: &mut BTreeMap<String, Value>) -> Bounded {
+    let mut bounded = Bounded::default();
     entries.retain(|url, entry| {
         let size = url.len() + entry.to_string().len();
-        let keep = size <= MAX_ENTRY_BYTES && count < MAX_ENTRIES && bytes + size <= MAX_BYTES;
+        let keep = size <= MAX_ENTRY_BYTES
+            && bounded.entries < MAX_ENTRIES
+            && bounded.bytes + size <= MAX_BYTES;
         if keep {
-            bytes += size;
-            count += 1;
+            bounded.bytes += size;
+            bounded.entries += 1;
+        } else {
+            bounded.evicted.insert(url.clone());
         }
         keep
     });
-    if before != entries.len() {
-        eprintln!(
-            "cache: evicted {} oversized or excess disposable responses; cold reads",
-            before - entries.len()
-        );
-    }
+    bounded
 }
 
 impl Responses {
     pub fn get(&mut self, url: &str) -> Option<Value> {
-        let entry = self.entries.get(&format!("{url}{REPRESENTATION}")).cloned();
+        let key = format!("{url}{REPRESENTATION}");
+        let entry = self.entries.get(&key).cloned();
         if entry.is_some() {
             self.hits += 1;
         } else {
             self.misses += 1;
+            self.evicted_misses += usize::from(self.evicted.contains(&key));
         }
         entry
+    }
+
+    /// After a write: what follows misses as not cached, not as evicted.
+    pub fn invalidate(&mut self) {
+        self.entries.clear();
+        self.evicted.clear();
     }
 
     pub fn keep(&mut self, url: &str, response: &RestResponse) {
         if response.status != 200 || response.etag.is_none() {
             return;
         }
+        let key = format!("{url}{REPRESENTATION}");
+        self.evicted.remove(&key);
         self.entries.insert(
-            format!("{url}{REPRESENTATION}"),
+            key,
             seal(json!({
                 "etag": response.etag, "link": response.link, "body": response.body
             })),
         );
-        bound(&mut self.entries);
+        self.evicted.append(&mut bound(&mut self.entries).evicted);
+    }
+
+    /// The pass's one eviction line, with `last` the bound of the state it
+    /// keeps; never a URL, only counts against the caps.
+    pub fn evictions(&self, last: &Bounded) -> String {
+        format!(
+            "cache: evicted {} disposable responses this pass, {} more on save; kept {}/{MAX_ENTRIES} entries, {}/{MAX_BYTES} bytes",
+            self.evicted.len(),
+            last.evicted.difference(&self.evicted).count(),
+            last.entries,
+            last.bytes,
+        )
+    }
+
+    /// The misses: those on responses this pass evicted, and the rest, which
+    /// the cache did not hold (never kept, inherited away or invalidated).
+    pub fn misses(&self) -> String {
+        format!(
+            "misses {} ({} evicted this pass, {} not cached)",
+            self.misses,
+            self.evicted_misses,
+            self.misses - self.evicted_misses
+        )
     }
 }
 
@@ -283,10 +338,78 @@ mod tests {
         let mut entries = (0..MAX_ENTRIES + 1)
             .map(|n| (format!("{url}/{n}"), json!({"body": []})))
             .collect();
-        bound(&mut entries);
+        let bounded = bound(&mut entries);
         assert_eq!(entries.len(), MAX_ENTRIES);
+        assert_eq!((bounded.evicted.len(), bounded.entries), (1, MAX_ENTRIES));
         entries.insert("large".into(), json!({"body": "x".repeat(MAX_ENTRY_BYTES)}));
-        bound(&mut entries);
+        let bounded = bound(&mut entries);
         assert!(!entries.contains_key("large"));
+        assert_eq!(bounded.evicted, BTreeSet::from(["large".to_owned()]));
+    }
+
+    #[test]
+    fn rebinding_says_whether_the_scope_was_absent_and_never_its_digest() {
+        let mut state = State {
+            interval_seconds: poll::MIN_INTERVAL_SECONDS,
+            ..State::default()
+        };
+        state
+            .responses
+            .insert(format!("{API_ROOT}a"), json!({"body": []}));
+        assert_eq!(
+            state.rebind_line("scope-one").unwrap(),
+            "cache: response scope absent; cold reads, dropping 1 responses and 0 pass responses"
+        );
+        state.bind_responses("scope-one");
+        assert_eq!(state.rebind_line("scope-one"), None);
+        let line = state.rebind_line("scope-two").unwrap();
+        assert_eq!(
+            line,
+            "cache: response scope changed; cold reads, dropping 0 responses and 0 pass responses"
+        );
+        assert!(!line.contains("scope-one") && !line.contains("scope-two"));
+    }
+
+    #[test]
+    fn misses_split_into_evicted_this_pass_and_not_cached() {
+        let mut responses = Responses::default();
+        let ok = |etag: &str| RestResponse {
+            status: 200,
+            etag: Some(etag.into()),
+            last_modified: None,
+            link: None,
+            body: json!([]),
+        };
+        // URL order: the cap evicts the last URL, so keep "b..." beyond the cap.
+        for n in 0..MAX_ENTRIES {
+            responses.keep(&format!("{API_ROOT}a/{n:04}"), &ok("1"));
+        }
+        let evicted = format!("{API_ROOT}b");
+        responses.keep(&evicted, &ok("1"));
+        assert!(responses.get(&evicted).is_none());
+        assert!(responses.get(&format!("{API_ROOT}c")).is_none());
+        assert!(responses.get(&format!("{API_ROOT}a/0000")).is_some());
+        assert_eq!(
+            responses.misses(),
+            "misses 2 (1 evicted this pass, 1 not cached)"
+        );
+        let mut state = responses.entries.clone();
+        state.insert(format!("{API_ROOT}0"), json!({"body": []}));
+        let last = bound(&mut state);
+        let line = responses.evictions(&last);
+        assert_eq!(
+            line,
+            format!(
+                "cache: evicted 1 disposable responses this pass, 1 more on save; kept {MAX_ENTRIES}/{MAX_ENTRIES} entries, {}/{MAX_BYTES} bytes",
+                last.bytes
+            )
+        );
+        assert!(!line.contains(API_ROOT));
+        responses.invalidate(); // After a write, nothing misses as evicted.
+        assert!(responses.get(&evicted).is_none());
+        assert_eq!(
+            responses.misses(),
+            "misses 3 (1 evicted this pass, 2 not cached)"
+        );
     }
 }

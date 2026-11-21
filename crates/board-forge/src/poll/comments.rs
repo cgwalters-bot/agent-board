@@ -4440,6 +4440,7 @@ pub(super) mod tests {
                 now: now(),
                 previous: BTreeMap::new(),
                 used: BTreeMap::new(),
+                evicted: 0,
                 remaining,
                 cut: None,
                 apply: Some(apply),

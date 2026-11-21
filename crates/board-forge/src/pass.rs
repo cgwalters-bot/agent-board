@@ -3707,7 +3707,7 @@ impl<C> Budget<'_, C> {
     fn graphql_spent(&self, mutation: bool, result: Result<Value>) -> Result<Value> {
         let bounds = self.bounds;
         if mutation {
-            bounds.shared_responses.borrow_mut().entries.clear();
+            bounds.shared_responses.borrow_mut().invalidate();
         }
         let cost = result
             .as_ref()
@@ -3919,7 +3919,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
         }
         // An ambiguous failed write may have committed.
         if method != "GET" {
-            self.bounds.shared_responses.borrow_mut().entries.clear();
+            self.bounds.shared_responses.borrow_mut().invalidate();
         }
         let prepared = self
             .bounds
@@ -4609,11 +4609,12 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
                 .responses
                 .retain(|key, _| bounds.writes.get() == 0 && !key.ends_with(cache::REPRESENTATION));
             state.responses.extend(responses.entries.clone());
-            cache::bound(&mut state.responses);
+            let last = cache::bound(&mut state.responses);
+            report.lines.push(responses.evictions(&last));
         }
         report.lines.push(format!(
-            "cache: hits {}, misses {}, 304s {}, network sends {} (including retries), charged requests {}, GraphQL points {}",
-            responses.hits, responses.misses, responses.modified,
+            "cache: hits {}, {}, 304s {}, network sends {} (including retries), charged requests {}, GraphQL points {}",
+            responses.hits, responses.misses(), responses.modified,
             network().zip(network_before).map(|(after, before)| after.saturating_sub(before).to_string()).unwrap_or_else(|| "unavailable".into()),
             bounds.limit.get().saturating_sub(bounds.left.get()), bounds.points.get()
         ));

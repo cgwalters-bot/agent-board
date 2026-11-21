@@ -177,7 +177,10 @@ The index holds at most 1,024 responses, 8 MiB of serialized response data,
 and 256 KiB per entry. Deterministic eviction drops responses only. Newly
 written entries include a SHA-256 corruption checksum; this is **not** writer
 authentication. Invalid responses are discarded with diagnostics. An incompatible
-response scope also starts cold. Legacy poll states still decode. A malformed
+response scope also starts cold; the log says whether the scope was absent or
+changed, never the scope digest. Each pass logs one
+eviction summary against these caps and splits its misses into responses it
+evicted itself and ones not cached. Legacy poll states still decode. A malformed
 whole state or incompatible *poll-state* schema remains an error, rather than
 silently losing waiting asks: do not delete that state to repair its disposable
 responses. The file is parsed before the response bounds are applied; these are
@@ -196,7 +199,7 @@ wrote does not carry old slim responses into its next state. All pagination,
 coverage errors, per-pass time/request reserves and the existing 304-refund cap
 remain in force. No action ledger or budget counter is stored in this cache.
 
-The `cache:` line separates validator hits/misses, observed 304s, transport
+The `cache:` line separates validator hits/misses (misses split as above), observed 304s, transport
 network sends (including retries), charged requests and GraphQL points. Network
 sends count API transport calls and explicit download redirects, not broker
 traffic, TCP attempts or redirects internal to an HTTP library. A transport
