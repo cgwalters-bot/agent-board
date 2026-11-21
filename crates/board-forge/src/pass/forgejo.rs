@@ -338,6 +338,7 @@ fn run_within(
     }
     bounds.enter(Stage::Status);
     schedule.status();
+    bounds.publication_share.set(config.holds_share());
     bounds.enter(Stage::Holds);
     schedule.publish_holds();
     report
