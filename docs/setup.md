@@ -196,6 +196,17 @@ in CI and checks the pass's decisions and summary. Nothing here proves live
 token access, dispatch, inference, review, container isolation or a scheduled
 loop. Every flag is in the [CLI reference](cli.md).
 
+To inspect the `root` endpoint bucket, append `--attribute-rest-root` to a
+GitHub replay. Share only the `REST root reads:` line: it contains fixed route
+shapes and counts, not request URLs, repository names, response bodies or
+credentials. It counts reads actually charged during replay, including failed
+reads, not entries in the recording (which keeps only the first answer per
+request). The repeat count covers exact, queryless repository metadata GETs
+that returned 200 in the replay, excluding conditional reads, fresh checks,
+starts in progress and holds publication. It is evidence about that replay,
+not proof that the live pass repeats successful reads or that reuse is safe.
+Replay starts with empty state and does not reproduce live HTTP revalidation.
+
 ### Compare two revisions
 
 A change to the pass can pass its fixtures and review and still do nothing on

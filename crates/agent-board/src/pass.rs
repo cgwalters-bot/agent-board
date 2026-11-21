@@ -38,6 +38,9 @@ pub struct Pass {
     /// Preview a recorded pass (a replay fixture) at its clock instead of reading the forge; needs no token. A Forgejo fixture replays only on the instance it was recorded on. On GitHub, with --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage.
     #[arg(long, value_name = "FILE", conflicts_with = "apply")]
     pub replay: Option<PathBuf>,
+    /// During GitHub replay, count charged REST root reads by normalized path and repeated successful decision metadata reads.
+    #[arg(long, requires = "replay", conflicts_with = "record")]
+    pub attribute_rest_root: bool,
     /// Preview live, and save every read and its answer to FILE as a replay fixture.
     #[arg(long, value_name = "FILE", conflicts_with = "apply")]
     pub record: Option<PathBuf>,
@@ -296,6 +299,11 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                 "--record with --replay",
                 "a seeded recording is GitHub-only",
             ),
+            (
+                args.attribute_rest_root,
+                "--attribute-rest-root",
+                "REST root attribution is GitHub-only",
+            ),
         ] {
             ensure!(!supplied, "unsupported_capability: {option}: {reason}");
         }
@@ -395,13 +403,12 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         None => None,
     };
     let report = match (&replay, &args.record) {
-        (Some(replay), None) => {
-            let state = State::default();
-            let preview = (Mode::Preview, limits);
-            runtime.block_on(pass::run(
-                replay, replay, &config, state, preview, replay.now,
-            ))?
-        }
+        (Some(replay), None) => runtime.block_on(pass::run_replay(
+            replay,
+            &config,
+            limits,
+            args.attribute_rest_root,
+        ))?,
         (seed, record) => {
             let now = time::OffsetDateTime::now_utc();
             // No wait under a rate limit outlasts the pass's time bound,
