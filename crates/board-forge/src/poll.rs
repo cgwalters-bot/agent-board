@@ -1996,8 +1996,8 @@ impl State {
     /// Discard only responses on a host/credential/representation/config change.
     /// In particular, pending intake and fairness cursors must survive cache loss.
     pub fn bind_responses(&mut self, scope: &str) {
-        if self.response_scope.as_deref() != Some(scope) {
-            eprintln!("cache: absent or incompatible response scope; cold reads");
+        if let Some(line) = self.rebind_line(scope) {
+            eprintln!("{line}");
             self.responses.clear();
             self.pass_responses.clear();
             // Decided under another configuration or identity.
@@ -2005,6 +2005,23 @@ impl State {
             self.carried_holds.clear();
             self.response_scope = Some(scope.to_owned());
         }
+    }
+
+    /// Why [`Self::bind_responses`] drops the responses, or none if it keeps
+    /// them: counts only, never the scope digest. Telling which scope input
+    /// changed would need new state fields, which the previous binary's
+    /// strict decoding rejects on rollback.
+    pub(crate) fn rebind_line(&self, scope: &str) -> Option<String> {
+        let why = match self.response_scope.as_deref() {
+            Some(kept) if kept == scope => return None,
+            None => "absent",
+            Some(_) => "changed",
+        };
+        Some(format!(
+            "cache: response scope {why}; cold reads, dropping {} responses and {} pass responses",
+            self.responses.len(),
+            self.pass_responses.len()
+        ))
     }
 
     pub fn from_json(value: &Value) -> Result<Self> {
@@ -2074,9 +2091,8 @@ impl State {
                 Some((url.clone(), entry.clone()))
             })
             .collect::<BTreeMap<_, _>>();
-        let before = responses.len();
-        crate::pass::cache::bound(&mut responses);
-        if before != responses.len() || !object.get("responses").is_some_and(Value::is_object) {
+        let evicted = !crate::pass::cache::bound(&mut responses).evicted.is_empty();
+        if evicted || !object.get("responses").is_some_and(Value::is_object) {
             eprintln!("cache: missing, oversized or evicted disposable responses; cold reads");
         }
         let pass_responses: BTreeMap<String, Value> = object
@@ -5533,6 +5549,8 @@ struct Pass<'a, R, G> {
     previous: BTreeMap<String, Value>,
     /// Only what this pass used is kept, which bounds the state file.
     used: BTreeMap<String, Value>,
+    /// How many responses the bound on `used` evicted, logged once.
+    evicted: usize,
     remaining: usize,
     /// Where the pass's share stopped the walk ([`Rest::share_left`]), as
     /// [`State::share_cursor`] names it; nothing more is walked after it.
@@ -5720,6 +5738,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             now,
             previous: BTreeMap::new(),
             used: BTreeMap::new(),
+            evicted: 0,
             remaining: POLL_REQUEST_LIMIT,
             cut: None,
             apply: None,
@@ -7842,7 +7861,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         };
         let entry = crate::pass::cache::seal(entry);
         self.used.insert(url.to_owned(), entry.clone());
-        crate::pass::cache::bound(&mut self.used);
+        self.evicted += crate::pass::cache::bound(&mut self.used).evicted.len();
         Ok((
             entry["body"].clone(),
             entry["next"].as_str().map(str::to_owned),
@@ -10734,6 +10753,12 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     };
     // Any claim's step is over: nothing is under way past the poll.
     pass.rest.under_way(false);
+    if pass.evicted > 0 {
+        eprintln!(
+            "cache: evicted {} oversized or excess slim responses this poll; cold reads",
+            pass.evicted
+        );
+    }
     outcome.dispatched = pass.dispatched;
     outcome.merged = pass.merged;
     outcome.reviewing = pass.reviewing;
@@ -26221,6 +26246,7 @@ mod tests {
             now: now(),
             previous: BTreeMap::new(),
             used: BTreeMap::new(),
+            evicted: 0,
             remaining: POLL_REQUEST_LIMIT,
             cut: None,
             apply: None,

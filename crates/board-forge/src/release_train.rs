@@ -1342,7 +1342,7 @@ pub fn pass_with_cache(
     out: &mut dyn Write,
     cache: &mut crate::prune::Cache,
 ) -> Result<()> {
-    crate::pass::cache::bound(&mut cache.0);
+    crate::pass::cache::bound(&mut cache.0).warn();
     let result = Pass {
         api,
         config,
@@ -1357,7 +1357,7 @@ pub fn pass_with_cache(
         followed: None,
     }
     .run();
-    crate::pass::cache::bound(&mut cache.0);
+    crate::pass::cache::bound(&mut cache.0).warn();
     result
 }
 
