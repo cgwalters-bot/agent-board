@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 /// Normalizing JSON must not turn duplicate scope fields (for example two
 /// dispatchRepo keys) into a silently selected last value. Validate the source
 /// document before its map representation can discard duplicates.
-pub(crate) fn check_source_fields(text: &str) -> Result<()> {
+pub fn check_source_fields(text: &str) -> Result<()> {
     struct Unique;
 
     impl<'de> Deserialize<'de> for Unique {

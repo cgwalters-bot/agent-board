@@ -1517,21 +1517,28 @@ inferred.
 
 ## Organization status
 
-`agent-board status --owner ORG --config agent-board.json [--job-limit N]`
-reports how loaded the organization is (agent-board#262), read-only through the
-supervisor's bounded API (at most `REQUEST_LIMIT` requests and
-`TIMEOUT_SECONDS`, no write). Runner load is the queued and running jobs of
-every unarchived repository's queued and in-progress runs, by runner label
-(self-hosted as one), with the configured `dispatchRepo`'s `dispatchWorkflow`
-runs counted as agent runs apart from other CI, against `--job-limit`.
-Agent runs are counted by the kind and pool their titles name, and each in
-flight is listed with its kind, item, status, age and pool, with the last
-hour's outcomes; pools, where the config has `pace`, are the poll's pace line
-from the same usage snapshot (such as `claude normal 26% used of 30% allowed`,
-the allowed share including any burst); queues are each `follow` repository's merge queue
-and its approved pull requests not in it, among the newest hundred (marked
-partial past that); `--project` adds the board's Status counts and open P0
-items with no Run, Result or linked pull request, read by the board's own
-bounded snapshot. A section that cannot be read is shown as unavailable and the
-command exits 1. The requests grow with the load (one per active run), and are
-made one at a time.
+`agent-board status --owner ORG --config .github/pass.json [--job-limit N]`
+summarizes GitHub organization load: hosted jobs, queued and running agent
+runs, pools against pace, merge queues, and the published needs-you count.
+It reads the trusted [pass config](pass.md#one-configuration-file) without
+applying its scheduling or write policy. It also accepts the standalone poll
+config's `pace` location; with a pass config it reads the bot's snapshot from
+`usage.repository` and `usage.issue` and uses the pass's `pace` settings.
+
+Queue totals cover the resolved `follow` list. The count of approved PRs
+not in a queue is partial if more than 100 open PRs need inspection in a
+repository. The needs-you count comes from the bot's existing holds publication
+when `holds.needsYou` is set. The header and its parts must be written by the
+bot and, if edited, last edited by the bot. An incomplete count is marked
+partial; a missing, unverifiable, or stale snapshot is not counted as zero.
+
+Use `--verbose` for repository resolution, per-label jobs, individual agent
+runs with their age and pool, last-hour outcomes, and per-repository queue
+details. `--project` adds board Status counts; with `--verbose` it also lists
+open P0 items with no Run, Result or linked pull request. `--json` still returns
+the detailed fields independently of `--verbose`. A section that cannot be
+read is shown as unavailable and the command exits 1. Source discovery and
+report collection each admit up to 600 reads over 120 seconds. Retries within
+a read are not counted separately, and an in-flight read may finish later. A project
+snapshot, if requested, has its own existing limits. Runner census requests grow with load
+(one job listing per active run, with pagination), and run one at a time.

@@ -583,7 +583,7 @@ const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: 
 /// The comments that are `who`'s, by agent-board's rule for plans: written
 /// by them and, if edited at all, last edited by them, as GitHub lets anyone
 /// with write access edit a comment. `comments` are GraphQL nodes.
-fn own_comments<'a>(comments: &'a [Value], who: &str) -> Vec<&'a Value> {
+pub(crate) fn own_comments<'a>(comments: &'a [Value], who: &str) -> Vec<&'a Value> {
     let is = |actor: &Value| {
         actor["login"]
             .as_str()
@@ -596,6 +596,44 @@ fn own_comments<'a>(comments: &'a [Value], who: &str) -> Vec<&'a Value> {
                 && !((truthy(&c["lastEditedAt"]) || truthy(&c["editor"])) && !is(&c["editor"]))
         })
         .collect()
+}
+
+pub(crate) fn issue_comments(
+    api: &dyn Api,
+    repo: &str,
+    number: u64,
+    pages: usize,
+) -> Result<Vec<Value>> {
+    let (owner, name) = repo.split_once('/').context("repository")?;
+    let mut all = vec![];
+    let mut cursor = Value::Null;
+    for _ in 0..pages {
+        let data = api.graphql(
+            COMMENTS_QUERY,
+            json!({"owner": owner, "name": name, "number": number, "cursor": cursor}),
+        )?;
+        let comments = &data["repository"]["issue"]["comments"];
+        all.extend(
+            comments["nodes"]
+                .as_array()
+                .context("comments not readable")?
+                .iter()
+                .cloned(),
+        );
+        match comments["pageInfo"]["hasNextPage"].as_bool() {
+            Some(false) => return Ok(all),
+            Some(true) => {
+                let next = &comments["pageInfo"]["endCursor"];
+                ensure!(
+                    next.as_str().is_some() && next != &cursor,
+                    "invalid comment cursor"
+                );
+                cursor = next.clone();
+            }
+            None => bail!("comment pagination not readable"),
+        }
+    }
+    bail!("more than {} comments", pages * 100)
 }
 
 /// The JSON of the usage snapshot comment, if it holds one of its schema.
@@ -885,28 +923,7 @@ impl Collector<'_> {
     }
 
     fn comments(&self, repo: &str, number: u64) -> Result<Vec<Value>> {
-        let (owner, name) = repo.split_once('/').context("repository")?;
-        let mut all = vec![];
-        let mut cursor = Value::Null;
-        for _ in 0..COMMENT_PAGES {
-            let data = self.query(
-                COMMENTS_QUERY,
-                json!({"owner": owner, "name": name, "number": number, "cursor": cursor}),
-            )?;
-            let comments = &data["repository"]["issue"]["comments"];
-            all.extend(
-                comments["nodes"]
-                    .as_array()
-                    .context("comments not readable")?
-                    .iter()
-                    .cloned(),
-            );
-            if comments["pageInfo"]["hasNextPage"] != true {
-                return Ok(all);
-            }
-            cursor = comments["pageInfo"]["endCursor"].clone();
-        }
-        bail!("more than {} comments", COMMENT_PAGES * 100)
+        issue_comments(self.api, repo, number, COMMENT_PAGES)
     }
 
     /// The bot's open pull requests in the followed repositories, one
