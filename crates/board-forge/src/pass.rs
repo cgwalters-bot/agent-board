@@ -183,8 +183,12 @@ type HoldComments = (Option<Value>, Vec<Value>, usize);
 /// repository and the account.
 const HOLDS_READS: usize = HOLDS_PAGES + 2;
 /// Reporting must not consume the pass it describes. No new reads are
-/// reserved from scheduling; publication gets at most this share of leftovers.
+/// reserved from scheduling; publication gets at most this share of leftovers
+/// unless `holds.requestShare` sets another.
 const HOLDS_SHARE: usize = 15;
+/// The most `holds.requestShare` may be, so that a typo cannot hand reporting
+/// most of the pass.
+const HOLDS_SHARE_LIMIT: usize = 50;
 pub(super) const HOLDS_PENDING_LIMIT: usize = 1000;
 /// The start of a line that holds every new run on the WIP limit.
 const WIP_HOLD: &str = "hold wip: ";
@@ -1287,6 +1291,10 @@ pub struct HoldsAt {
     /// ([`focus::SCHEMA`]) to the snapshot; needs `epics` and a GitHub board.
     #[serde(default, rename = "epicFocus")]
     pub epic_focus: bool,
+    /// The percentage of the pass's request limit publication may spend,
+    /// [`HOLDS_SHARE`] unless set, at most [`HOLDS_SHARE_LIMIT`].
+    #[serde(rename = "requestShare")]
+    pub request_share: Option<usize>,
 }
 
 /// The issue whose body is the operator's direction: in a private
@@ -1840,6 +1848,12 @@ impl Config {
                 .validate_repository(&holds.repository)
                 .context("holds repository")?;
             ensure!(holds.issue > 0, "holds issue is not a positive number");
+            if let Some(share) = holds.request_share {
+                ensure!(
+                    (1..=HOLDS_SHARE_LIMIT).contains(&share),
+                    "holds requestShare {share} is not a percentage from 1 to {HOLDS_SHARE_LIMIT}"
+                );
+            }
             if let Some(repository) = &holds.drafts {
                 ensure!(holds.needs_you, "holds drafts needs holds needsYou");
                 ensure!(
@@ -2089,6 +2103,15 @@ impl Config {
     /// Whether the hold snapshot has the epic focus (`holds.epicFocus`).
     fn epic_focus(&self) -> bool {
         self.holds.as_ref().is_some_and(|h| h.epic_focus)
+    }
+
+    /// The percentage of the pass's request limit holds publication may
+    /// spend (`holds.requestShare`).
+    fn holds_share(&self) -> usize {
+        self.holds
+            .as_ref()
+            .and_then(|h| h.request_share)
+            .unwrap_or(HOLDS_SHARE)
     }
 
     /// Whether `repository` is in `midstream`'s organization, so may be one.
@@ -2949,6 +2972,8 @@ struct Bounds {
     publication_summary_cursor: RefCell<Option<String>>,
     /// Physical requests, including conditional reads refunded elsewhere.
     publication_requests: Cell<usize>,
+    /// The percentage of [`Self::limit`] they may be ([`Config::holds_share`]).
+    publication_share: Cell<usize>,
     cache_enabled: Cell<bool>,
     responses: RefCell<BTreeMap<String, Value>>,
     next_responses: RefCell<BTreeMap<String, Value>>,
@@ -3017,6 +3042,7 @@ impl Bounds {
             publication_pending: RefCell::default(),
             publication_summary_cursor: RefCell::default(),
             publication_requests: Cell::new(0),
+            publication_share: Cell::new(HOLDS_SHARE),
             cache_enabled: Cell::new(false),
             responses: RefCell::default(),
             next_responses: RefCell::default(),
@@ -3153,7 +3179,7 @@ impl Bounds {
     }
 
     fn publication_left(&self) -> usize {
-        self.share(HOLDS_SHARE)
+        self.share(self.publication_share.get())
             .saturating_sub(self.publication_requests.get())
     }
 
@@ -3650,7 +3676,8 @@ impl<C> Budget<'_, C> {
             let reserve = if write { 0 } else { WRITE_RESERVE };
             ensure!(
                 bounds.publication_left() > reserve,
-                "holds publication's {HOLDS_SHARE}% request share is spent"
+                "holds publication's {}% request share is spent",
+                bounds.publication_share.get()
             );
         }
         if !write && bounds.share_spent() {
@@ -4852,6 +4879,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // partial.
     scheduler.reconcile_living();
     scheduler.cleanup_history();
+    bounds.publication_share.set(config.holds_share());
     bounds.enter(Stage::Holds);
     if scheduler.holds_whole {
         scheduler.publish_holds();

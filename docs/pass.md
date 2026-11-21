@@ -1927,11 +1927,15 @@ other, and the line says `without the epic focus, over the comments' size`.
 
 The concrete failure bounded here is optional report enrichment spending hundreds
 of requests on old holds and dispatch records. GitHub holds publication, including
-all its optional sections, gets at most 15% of the pass's request limit (97 of
-650 requests), or what remains after work, whichever is smaller. Conditional
+all its optional sections, gets by default at most 15% of the pass's request
+limit (97 of 650 requests), or what remains after work, whichever is smaller. Conditional
 reads count even when a 304 refunds the main budget. Its final writes fit inside
 that share; no requests are reserved from starts or merges for reporting.
-This adds no option: publication remains off without `holds`.
+Publication remains off without `holds`. A pass that ends with requests left
+can raise the share with `holds.requestShare` (1–50%) so that the needs-you
+list is read whole rather than cut short. The cap of half the limit keeps a
+typo from handing reporting most of the pass, and the refusal still says
+`holds publication's N% request share is spent`.
 
 Publication reuses successful REST and identical GraphQL reads made earlier in
 this pass, within a bounded in-memory cache. These observations are for reporting
@@ -6296,6 +6300,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `holds.passView` | Add the [pass view](#pass-view) (`agent-board/pass-view/v1`): the last passes, pool pace and runs in flight; needs `holds`, GitHub only; `false` |
 | `holds.today` | Add [today's activity](#today) (`agent-board/today/v1`): UTC-day changes and starts, yesterday's private cost; needs `holds`, GitHub only; `false` |
 | `holds.epicFocus` | Add the [epic focus](#epic-focus) (`agent-board/epic-focus/v1`): each open P0 epic's progress, runs and blockers; needs `holds` and `epics`, a GitHub board only; `false` |
+| `holds.requestShare` | The percentage, 1–50, of the pass's request limit that [holds publication](#what-is-built) may spend, still within what work left; `15` |
 | `decisions.repository`, `decisions.issue` | Existing decisions document read only with `holds.needsYou`; GitHub only; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |

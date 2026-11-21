@@ -7149,29 +7149,44 @@ fn publication_reuses_observations_but_never_decision_rechecks() {
 
 #[test]
 fn publication_share_bounds_reads_writes_and_refunds() {
-    let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
-    let client = Budget {
-        inner: &Revalidating,
-        bounds: &bounds,
-    };
-    bounds.enter(Stage::Holds);
-    // Neither a start's bypass nor a 304 refund can enlarge publication.
-    bounds.starting.set(true);
-    bounds.finishing.set(true);
-    let share = PASS_REQUEST_LIMIT * HOLDS_SHARE / 100;
-    for _ in 0..share - WRITE_RESERVE {
-        client.spend(false, "conditional").unwrap();
-        bounds.refund("conditional");
+    // The default, and holds.requestShare's larger share (agent-board#1133).
+    for (holds, percent) in [
+        (json!({"repository": "o/ops", "issue": 1}), HOLDS_SHARE),
+        (
+            json!({"repository": "o/ops", "issue": 1, "requestShare": 40}),
+            40,
+        ),
+    ] {
+        let cfg = config(json!({"holds": holds}));
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        let client = Budget {
+            inner: &Revalidating,
+            bounds: &bounds,
+        };
+        bounds.publication_share.set(cfg.holds_share());
+        bounds.enter(Stage::Holds);
+        // Neither a start's bypass nor a 304 refund can enlarge publication.
+        bounds.starting.set(true);
+        bounds.finishing.set(true);
+        let share = PASS_REQUEST_LIMIT * percent / 100;
+        for _ in 0..share - WRITE_RESERVE {
+            client.spend(false, "conditional").unwrap();
+            bounds.refund("conditional");
+        }
+        let refused = client.spend(false, "conditional").unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!("holds publication's {percent}% request share is spent")
+        );
+        for _ in 0..WRITE_RESERVE {
+            client.spend(true, "write").unwrap();
+        }
+        assert!(client.spend(true, "write").is_err());
+        assert_eq!(bounds.publication_requests.get(), share);
+        // Unspent pass capacity remains available to work, not earmarked for reports.
+        bounds.enter(Stage::Schedule);
+        assert!(client.spend(false, "work").is_ok());
     }
-    assert!(client.spend(false, "conditional").is_err());
-    for _ in 0..WRITE_RESERVE {
-        client.spend(true, "write").unwrap();
-    }
-    assert!(client.spend(true, "write").is_err());
-    assert_eq!(bounds.publication_requests.get(), share);
-    // Unspent pass capacity remains available to work, not earmarked for reports.
-    bounds.enter(Stage::Schedule);
-    assert!(client.spend(false, "work").is_ok());
 }
 
 #[test]
@@ -20618,6 +20633,18 @@ fn config_table() {
         ),
         (
             json!({"holds": {"repository": "o/ops", "issue": 1, "epicFocus": "yes"}}),
+            "invalid type",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "requestShare": 0}}),
+            "holds requestShare 0 is not a percentage from 1 to 50",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "requestShare": 51}}),
+            "holds requestShare 51 is not a percentage from 1 to 50",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "requestShare": "all"}}),
             "invalid type",
         ),
         (
