@@ -3706,9 +3706,6 @@ impl<C> Budget<'_, C> {
     /// `rateLimit { cost }` where it reads one, or else an estimate.
     fn graphql_spent(&self, mutation: bool, result: Result<Value>) -> Result<Value> {
         let bounds = self.bounds;
-        if mutation {
-            bounds.shared_responses.borrow_mut().invalidate();
-        }
         let cost = result
             .as_ref()
             .ok()
@@ -3917,10 +3914,9 @@ impl<C: Rest> Rest for Budget<'_, C> {
         if method == "GET" {
             self.root_read(&class, url, false, false);
         }
-        // An ambiguous failed write may have committed.
-        if method != "GET" {
-            self.bounds.shared_responses.borrow_mut().invalidate();
-        }
+        // A write keeps the shared responses: each serves only as the
+        // validator of a conditional read, so a resource this write changed,
+        // even one an ambiguous failure may have committed, reads fresh.
         let prepared = self
             .bounds
             .living

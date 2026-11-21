@@ -193,9 +193,11 @@ shortcut for comments, timelines, reviews, checks or relationships. Existing
 GraphQL reads remain fresh. The existing `Kept` hold-only read deduplication is
 retained; it does not authorize starts. Explicit live poll reads bypass the
 shared cache, as do shared reads during start/recovery admission. Writes,
-including ambiguous failures and GraphQL mutations, discard the disposable
-shared index. Poll writes also discard their local response index; a pass that
-wrote does not carry old slim responses into its next state. All pagination,
+including ambiguous failures and GraphQL mutations, keep the disposable shared
+index: a cached body is served only after a conditional read, so a resource a
+write changed answers 200 with its new body. Poll writes still discard their
+local response index; a pass that wrote does not carry old slim responses into
+its next state. All pagination,
 coverage errors, per-pass time/request reserves and the existing 304-refund cap
 remain in force. No action ledger or budget counter is stored in this cache.
 
@@ -220,9 +222,10 @@ Applying replay coverage now compares the exact emitted writes for serialized
 cold, warm and lost-response state, preserves pending intake/refusal records,
 and proves a rerun after response loss does not repeat a dispatch. It also
 injects a new hold label or occupied capacity after the first start, verifies
-the final capacity read bypasses validators, and loses a dispatch reply to
-exercise invalidation and forge-receipt recovery. Applying merge and stop-label
-replays cover cold, warm and lost responses too: a hold added between discovery
+the final capacity read bypasses validators, checks that the writes keep the
+warm representations while a REST resource changed after the start reads
+fresh, and loses a dispatch reply to exercise forge-receipt recovery from a cold
+rerun. Applying merge and stop-label replays cover cold, warm and lost responses too: a hold added between discovery
 and the final live GraphQL recheck prevents both writes. Unheld controls actually
 merge the pinned head or post the stop label, and stop-comment evidence bypasses
 validators. This covers concurrent holds, not every possible concurrent change
