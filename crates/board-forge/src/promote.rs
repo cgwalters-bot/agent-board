@@ -1100,7 +1100,7 @@ fn source_issue(repo: &str, pull: &Value) -> Result<board_core::ItemRef> {
 }
 
 /// The approved title and body as upstream would read them: the body less its
-/// standalone source line ([`text::strip`]), and both held unless publishable.
+/// standalone source line and generated footer ([`text::strip`]), and both held unless publishable.
 fn publication_text(repo: &str, upstream: &str, pull: &Value) -> Result<String> {
     let source = source_issue(repo, pull)?;
     let body = pull["body"].as_str().context("missing pull body")?;
@@ -1179,7 +1179,7 @@ fn source_text(repo: &str, pull: &Value) -> Result<String> {
 }
 
 /// Only this mechanically derived closing line supplements the approved text,
-/// and the source line is the only one removed from it. A qualified body link
+/// and only the source line and generated footer are removed. A qualified body link
 /// cannot redirect publication or close another repo's issue.
 fn promotion_body(client: &impl Rest, repo: &str, pull: &Value, upstream: &str) -> Result<String> {
     let source = source_issue(repo, pull)?;

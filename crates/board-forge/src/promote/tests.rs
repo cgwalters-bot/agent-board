@@ -6,6 +6,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const FIXTURE: &str = include_str!("../../../../fixtures/promote/public-2026-11-04.json");
+// https://github.com/cgwalters-forge/ostree/pull/10, after its source-line fix.
+const OSTREE_BODY: &str = include_str!("../../../../fixtures/promote/ostree-10.md");
 const CONFIG: &str = include_str!("../../../../fixtures/promote/config.json");
 const REPO: &str = "cgwalters-forge/composefs-rs";
 const HEAD: &str = "866b6ce9050782c50eb0fec1c08b37cebec93dc6";
@@ -612,6 +614,70 @@ fn source_body_shapes_and_published_text() {
 }
 
 #[test]
+fn publication_drops_dispatch_footer_from_ostree_10() {
+    const FORK: &str = "cgwalters-forge/ostree";
+    const UPSTREAM: &str = "ostreedev/ostree";
+    const TITLE: &str = "prepare-root: Fix build with Amazon Linux 2023 headers";
+    let body = OSTREE_BODY;
+    const RECEIPT: &str = "<!-- agentic-job-applied: 43755780244/0/0d41ee15c4bb76d5 -->";
+    let (author, footer) = body.split_once("\n\n<!-- agentic-job-applied: ").unwrap();
+    let footer = format!("<!-- agentic-job-applied: {footer}");
+    let expected = author.replace(
+        "\n\nPart of https://github.com/cgwalters-forge/ostree/issues/8",
+        "",
+    );
+    let publish = |title: &str, body: &str| {
+        publication_text(FORK, UPSTREAM, &json!({"title": title, "body": body}))
+    };
+    assert_eq!(publish(TITLE, body).unwrap(), expected);
+    assert_eq!(
+        publish(TITLE, &body.replace('\n', "\r\n")).unwrap(),
+        expected.replace('\n', "\r\n")
+    );
+
+    for (title, body) in [
+        ("See cgwalters-forge/tracker#12", body.to_owned()),
+        (TITLE, format!("See cgwalters-forge/tracker#12.\n\n{body}")),
+        (
+            TITLE,
+            format!("{author}\n\n<!-- See cgwalters-forge/tracker#12 -->\n\n{footer}"),
+        ),
+        (TITLE, format!("{body}\nMore author text")),
+        (TITLE, body.replace(" · [◷]", " and see [◷]")),
+        (TITLE, body.replace(&format!("{RECEIPT}\n\n"), "")),
+        (
+            TITLE,
+            body.replace("applied: 43755780244/", "applied: 43755780245/"),
+        ),
+        (TITLE, body.replace("0d41ee15c4bb76d5", "0d41ee15c4bb76dx")),
+        (
+            TITLE,
+            body.replace("\"repo_id\":\"1389152030\"", "\"repo_id\":\"1\""),
+        ),
+        (
+            TITLE,
+            body.replace(
+                "\"version\":1",
+                "\"note\":\"cgwalters-forge/tracker#12\",\"version\":1",
+            ),
+        ),
+        (TITLE, format!("{author}\n\n```md\n\n{footer}")),
+        (TITLE, format!("{author}\n\n```md\n```\u{a0}\n\n{footer}")),
+    ] {
+        let err = publish(title, &body).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("text references cgwalters-forge/tracker"),
+            "{err:#}: {body}"
+        );
+    }
+    // Even a full wrapper-shaped suffix in a fence opened after a bare CR
+    // must stay intact. Without a source line there is no other edit to hold.
+    let example = format!("{expected}\n\n<!-->\r```md\r-->\n\n{footer}");
+    assert_eq!(text::strip(FORK, &example, 8).unwrap(), example);
+}
+
+#[test]
 fn publication_holds_source_metadata_in_code_or_html() {
     for example in [
         format!("```text\nPart of {REPO}#31\n```"),
@@ -684,6 +750,24 @@ fn publication_holds_source_metadata_in_code_or_html() {
 }
 
 #[test]
+fn publication_holds_source_metadata_after_bare_cr() {
+    let body = format!("<!-->\r```md\r-->\n\nPart of https://github.com/{REPO}/issues/31");
+    let pull = json!({"title": "Example", "body": body});
+    let error = publication_text(REPO, "composefs/composefs-rs", &pull).unwrap_err();
+    assert!(error.is::<Held>(), "{error:#}");
+    assert!(
+        error
+            .to_string()
+            .contains("source metadata in code or HTML"),
+        "{error:#}"
+    );
+    assert!(matches!(
+        text::repair(REPO, "composefs/composefs-rs", "Example", &body),
+        text::Repair::Skip(_)
+    ));
+}
+
+#[test]
 fn publication_and_repair_hold_new_closing_adjacency_without_writes() {
     for keyword in ["Fixes", "closes:", "(RESOLVED", "- Closes"] {
         for target in [
@@ -734,6 +818,7 @@ fn legacy_draft_repair_is_explicit_scoped_and_revalidated() {
         "wrong writer",
         "oversized cap",
         "already repaired",
+        "fence after bare CR",
         "numeric code",
         "numeric fragment",
         "fenced example",
@@ -772,6 +857,7 @@ fn legacy_draft_repair_is_explicit_scoped_and_revalidated() {
                 p["body"] = json!("Read https://example.com/page#123\n\nFixes #31")
             }
             "fenced example" => p["body"] = json!("```text\nFixes #31\n```\n\nFixes #31"),
+            "fence after bare CR" => p["body"] = json!("<!-->\r```md\r-->\n\nFixes #31"),
             "HTML example" => {
                 p["body"] = json!("Summary.\n\n<pre>\nFixes #31\n</pre>\n\nPart of #31")
             }
@@ -878,6 +964,7 @@ fn legacy_draft_repair_is_explicit_scoped_and_revalidated() {
                 "numeric code"
                     | "numeric fragment"
                     | "fenced example"
+                    | "fence after bare CR"
                     | "HTML example"
                     | "multiline code"
                     | "HTML code"
@@ -2951,8 +3038,27 @@ pub(crate) fn handoff_scenario() -> (Replay, Config) {
 
 #[test]
 fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
-    for (existing, linked) in [(false, false), (true, false), (false, true), (true, true)] {
+    let (_, footer) = OSTREE_BODY
+        .split_once("\n\n<!-- agentic-job-applied: ")
+        .unwrap();
+    let footer = footer.replace("%2Fostree+", "%2Fcomposefs-rs+");
+    for (existing, linked, author_reference) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
         let (mut forge, config) = publication();
+        let prefix = if author_reference {
+            "See cgwalters-forge/tracker#12.\n\n"
+        } else {
+            ""
+        };
+        let approved = format!("{prefix}{SOURCED}\n\n<!-- agentic-job-applied: {footer}");
+        forge.fresh["body"] = json!(approved);
+        *pull(&mut forge.replay) = forge.fresh.clone();
         if linked {
             body(&mut forge.replay, "/issues/31")["body"] = json!("Upstream: #9");
             source_evidence(&mut forge.replay, "cgwalters-bot", PUSH);
@@ -2965,6 +3071,16 @@ fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
             sync_metadata(&mut forge.replay);
         }
         let lines = apply(&forge, &config, forge.replay.now, 3).unwrap();
+        if author_reference {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("text references cgwalters-forge/tracker")),
+                "{lines:?}"
+            );
+            assert!(forge.writes.borrow().is_empty());
+            continue;
+        }
         assert_eq!(
             lines,
             [format!(
@@ -2983,9 +3099,8 @@ fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
             )
         );
         assert_eq!(publication.2["title"], forge.fresh["title"]);
-        // The fork's source line is the one thing removed; the approved fork
-        // text itself is unchanged.
-        assert_eq!(forge.fresh["body"], SOURCED);
+        // The fork keeps the body that the operator approved.
+        assert_eq!(forge.fresh["body"], approved);
         let expected_body = if linked {
             format!("{PUBLISHED}\n\nFixes composefs/composefs-rs#9")
         } else {
