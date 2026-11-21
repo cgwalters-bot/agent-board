@@ -1538,18 +1538,6 @@ fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
                 .any(|(_, conditional)| *conditional),
             cache == "warm"
         );
-        let mut read_since_write = BTreeSet::new();
-        for (request, conditional) in &traffic[first_write..] {
-            if let Some(url) = request.strip_prefix("GET ") {
-                assert!(
-                    !conditional || read_since_write.contains(url),
-                    "{cache}: stale validator after write: {request}"
-                );
-                read_since_write.insert(url.to_owned());
-            } else if !request.starts_with("LIVE ") {
-                read_since_write.clear();
-            }
-        }
         drop(traffic);
         let writes = forge.replay.writes.borrow().clone();
         if let Some(expected) = &expected {
@@ -1595,6 +1583,10 @@ fn response_cache_applying_rechecks_concurrent_start_holds() {
         let seed = cached_pass(&forge, &config, State::default(), false);
         let state = State::from_json(&seed.state.unwrap().to_json()).unwrap();
         assert!(!state.responses.is_empty());
+        let warm: Vec<_> = (state.responses.keys())
+            .filter(|k| k.ends_with(cache::REPRESENTATION))
+            .cloned()
+            .collect();
         forge.replay.late = Some(Box::new(move |request, answer| {
             if changed == "label" && request.contains(r#""number":459"#) {
                 let labels = &mut answer["repository"]["issue"]["labels"];
@@ -1603,6 +1595,12 @@ fn response_cache_applying_rechecks_concurrent_start_holds() {
                     .unwrap()
                     .push(json!({"name": "needs-human"}));
                 labels["totalCount"] = (labels["totalCount"].as_u64().unwrap() + 1).into();
+            } else if changed == "label" && request.contains("/issues/459/comments?") {
+                // A concurrent change to a REST resource the warm pass kept.
+                answer.as_array_mut().unwrap().push(json!({
+                    "id": 99, "user": {"login": "visitor"},
+                    "created_at": "2026-10-23T00:00:00Z", "body": "unrelated"
+                }));
             } else if changed == "capacity" && request.contains("status=queued") {
                 answer["total_count"] = 1.into();
                 answer["workflow_runs"] = runs(1).into();
@@ -1655,6 +1653,36 @@ fn response_cache_applying_rechecks_concurrent_start_holds() {
             !reads.last().unwrap().1,
             "start authorization must read directly"
         );
+        // The writes keep the warm representations, and one a write changed
+        // read fresh through its validator rather than its kept body.
+        let first_write = traffic.iter().position(|(r, _)| r.starts_with("POST "));
+        let comments = format!(
+            "{API_ROOT}repos/cgwalters-forge/tracker/issues/459/comments?per_page=100&page=1"
+        );
+        let state = report.state.unwrap();
+        assert!(!forge.replay.writes.borrow().is_empty());
+        let missing: Vec<_> = (warm.iter())
+            .filter(|k| !state.responses.contains_key(*k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{changed}: the writes dropped {missing:?}"
+        );
+        if changed == "label" {
+            assert!(
+                traffic[first_write.unwrap()..].contains(&(format!("GET {comments}"), true)),
+                "{changed}: exercise a conditional read after a write"
+            );
+            let kept = &state.responses[&format!("{comments}{}", cache::REPRESENTATION)];
+            assert!(
+                kept["body"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["id"] == 99),
+                "{changed}: {kept}"
+            );
+        }
     }
 }
 
@@ -1691,8 +1719,9 @@ fn response_cache_applying_ambiguous_dispatch_is_not_replayed() {
             "{:#?}", report.lines
         );
         let mut state = State::from_json(&report.state.unwrap().to_json()).unwrap();
-        // The final mutation lost its reply. No pre-mutation validator survives.
-        assert!(state.responses.is_empty(), "{:?}", state.responses.keys());
+        // The final mutation lost its reply. Its validators survive: each
+        // serves only a conditional read, which a committed write answers fresh.
+        assert!(!state.responses.is_empty());
         state.responses.clear();
         let writes = forge.replay.writes.borrow().clone();
         let again = cached_pass(&forge, &config, state, true);

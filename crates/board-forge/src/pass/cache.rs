@@ -90,12 +90,6 @@ impl Responses {
         entry
     }
 
-    /// After a write: what follows misses as not cached, not as evicted.
-    pub fn invalidate(&mut self) {
-        self.entries.clear();
-        self.evicted.clear();
-    }
-
     pub fn keep(&mut self, url: &str, response: &RestResponse) {
         if response.status != 200 || response.etag.is_none() {
             return;
@@ -124,7 +118,7 @@ impl Responses {
     }
 
     /// The misses: those on responses this pass evicted, and the rest, which
-    /// the cache did not hold (never kept, inherited away or invalidated).
+    /// the cache did not hold (never kept or inherited away).
     pub fn misses(&self) -> String {
         format!(
             "misses {} ({} evicted this pass, {} not cached)",
@@ -269,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn prewrite_reads_bypass_and_ambiguous_mutations_invalidate() {
+    fn prewrite_reads_bypass_and_ambiguous_mutations_keep_validators() {
         let forge = Forge::default();
         let bounds = bounds();
         let client = Budget {
@@ -287,12 +281,17 @@ mod tests {
         client.get(&url, None).unwrap();
         bounds.finishing.set(false);
         assert_eq!(forge.conditional.get(), 0);
+        // The write may have committed: its resource reads fresh, through the
+        // validator it kept.
         assert!(client.send("PATCH", &url, &json!({})).is_err());
-        assert!(bounds.shared_responses.borrow().entries.is_empty());
+        assert_eq!(bounds.shared_responses.borrow().entries.len(), 1);
         assert_eq!(client.get(&url, None).unwrap().body, json!([2]));
-        assert_eq!(forge.conditional.get(), 0);
+        assert_eq!(forge.conditional.get(), 1);
+        forge.version.set(3);
         let _ = client.graphql_spent(true, Err(anyhow::anyhow!("ambiguous mutation")));
-        assert!(bounds.shared_responses.borrow().entries.is_empty());
+        assert_eq!(bounds.shared_responses.borrow().entries.len(), 1);
+        assert_eq!(client.get(&url, None).unwrap().body, json!([3]));
+        assert_eq!(forge.conditional.get(), 2);
     }
 
     #[test]
@@ -405,11 +404,5 @@ mod tests {
             )
         );
         assert!(!line.contains(API_ROOT));
-        responses.invalidate(); // After a write, nothing misses as evicted.
-        assert!(responses.get(&evicted).is_none());
-        assert_eq!(
-            responses.misses(),
-            "misses 3 (1 evicted this pass, 2 not cached)"
-        );
     }
 }
