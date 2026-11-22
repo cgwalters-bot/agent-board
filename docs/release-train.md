@@ -84,9 +84,23 @@ commit SHA or `main`; other paths and repositories do not count. A caller at
 with only such callers needs no fork. The train stalls unless `main` is the
 wrappers' default branch and has no same-named tag, which GitHub would run in
 its place. Pinned callers still get their PRs, but the train stalls instead of
-closing while the wrappers' `.github/workflows` at `main` differ from the
-merged wrappers bump's, as a later commit may have reverted it; any workflow
-change there counts, so check what they run and close the issue by hand. The output
+closing while a followed wrapper at the wrappers' `main` pins other release
+revisions than at the merged wrappers bump, as a later commit may have
+reverted it. Its release pins are the job and step `uses:` values naming the
+release repository or secure-host, with their `if:`, in the wrapper and in the wrappers workflows
+it calls, locally, at `main` or at a commit, transitively. Any other change,
+such as a new input, step or job, does not hold the train. This check catches a
+plain revert of a release pin; it is a liveness signal, not a security gate.
+Edits that already passed the wrappers' review, such as to the guards of the
+jobs enclosing a pinned step or calling a wrappers workflow, release pins
+outside `uses:`, such as a
+literal checkout `ref:`, and calls into other repositories are not compared;
+the wrappers take the source commit from the release's pinned policy
+workflow. A reached workflow that is missing or does not decode, or a call to
+a wrappers workflow at a tag or another branch, which may run any release,
+stalls the train. These reads happen only once the train would otherwise
+close, so they never hold pinned callers' PRs; a failed one fails that pass,
+and the next pass tries again. The output
 is sorted by repository, file, wrapper path and current pin. Multiple files
 and different pins in one repository produce one PR. Already-current files
 need no edit or PR.

@@ -13,7 +13,7 @@
 //! it only reads and prints each write as `would: ...`, line for line as
 //! train.cjs printed it but for the release and wrappers steps it checks
 //! more, so the two can be diffed on the same state.
-use crate::github::{API_ROOT, Client, is_github_login};
+use crate::github::{API_ROOT, Client, NotFound, is_github_login};
 use crate::poll::{Rest, check_keys, validate_repository, validate_workflow};
 use crate::supervise::encode;
 use crate::supervise::health::base64_decode;
@@ -37,6 +37,10 @@ pub const CACHE_SCHEMA: &str = "agent-board.release-train-cache.v1";
 const NOTES_LIMIT: usize = 30_000;
 const SECURE_HOST_PIN: &str = "secure-host/Containerfile.pin";
 const SECURE_HOST_IMAGE: &str = "ghcr.io/cgwalters-forge/secure-host";
+/// The local forwarder current wrappers run secure-host through.
+const SECURE_HOST_LOCAL: &str = "./.agentic-job-source/secure-host";
+/// The repositories a wrapper may run the secure-host action from.
+const SECURE_HOST_REPOS: [&str; 2] = ["cgwalters-forge/agentic-job", "cgwalters-forge/actions"];
 // Repeated reference strings could otherwise multiply full YAML parses during
 // scalar selection. Refuse excessive edit work, never a partial pin bump.
 const MAX_WORKFLOW_REFERENCES: usize = 128;
@@ -116,12 +120,11 @@ fn repin_host_line(text: &mut String, merge: &str) -> Result<usize> {
     // Current wrappers check out policy's source for prepare and run.
     // Only this local forwarder is replaced; keep the checkout and all
     // inputs on the step untouched.
-    let local = "./.agentic-job-source/secure-host";
     let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
     let mut from = 0;
-    while let Some(at) = text[from..].find(local) {
+    while let Some(at) = text[from..].find(SECURE_HOST_LOCAL) {
         let start = from + at;
-        let end = start + local.len();
+        let end = start + SECURE_HOST_LOCAL.len();
         if !pin_boundary(&text[end..]) {
             // A configuration path under secure-host/ is not an action.
             from = end;
@@ -131,7 +134,7 @@ fn repin_host_line(text: &mut String, merge: &str) -> Result<usize> {
         from = start + replacement.len();
         found += 1;
     }
-    for repo in ["cgwalters-forge/agentic-job", "cgwalters-forge/actions"] {
+    for repo in SECURE_HOST_REPOS {
         let needle = format!("{repo}/secure-host@");
         let mut from = 0;
         while let Some(at) = text[from..].find(&needle) {
@@ -264,6 +267,83 @@ fn caller_workflow(text: &str) -> Result<serde_yaml_ng::Value> {
         .apply_merge()
         .context("expand caller workflow YAML merges")?;
     Ok(value)
+}
+
+/// Sorted release pins and the (commit, path) of wrappers workflows called.
+type ReleaseUses = (Vec<String>, BTreeSet<(String, String)>);
+
+/// What a wrappers workflow read at commit `at` runs of the release: its job
+/// and step `uses:` values naming the `release` repository or secure-host,
+/// with their `if:`, and the wrappers workflows it calls. A local call is read at `at`, one at
+/// `FOLLOWED_BRANCH` at `side`, the followed branch commit being compared,
+/// and one at a commit there. A wrappers call at another ref, such as a tag,
+/// may run another release with no change here, so it is a stall reason.
+/// Other calls and steps do not run the release, so their changes never hold
+/// the train. The error is a stall reason, without fetched paths, refs or YAML.
+fn release_uses(
+    text: &str,
+    release: &str,
+    wrappers: &str,
+    at: &str,
+    side: &str,
+) -> std::result::Result<ReleaseUses, &'static str> {
+    let workflow = caller_workflow(text).map_err(|_| "has unreadable workflow YAML")?;
+    // Owner and repository names are case-insensitive, paths are not.
+    fn named<'a>(uses: &'a str, repo: &str) -> Option<&'a str> {
+        let (start, rest) = uses.split_at_checked(repo.len())?;
+        (start.eq_ignore_ascii_case(repo) && rest.starts_with(['/', '@'])).then_some(rest)
+    }
+    let pinned = |uses: &str| {
+        named(uses, release).is_some()
+            || SECURE_HOST_REPOS
+                .iter()
+                .any(|repo| named(uses, repo).is_some_and(|a| a.starts_with("/secure-host@")))
+            || uses
+                .strip_prefix(SECURE_HOST_LOCAL)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    let (mut pins, mut calls) = (vec![], BTreeSet::new());
+    let jobs = workflow
+        .get("jobs")
+        .and_then(serde_yaml_ng::Value::as_mapping);
+    for job in jobs.into_iter().flat_map(|jobs| jobs.values()) {
+        let steps = job
+            .get("steps")
+            .and_then(serde_yaml_ng::Value::as_sequence)
+            .into_iter()
+            .flatten();
+        for item in std::iter::once(job).chain(steps) {
+            let Some(uses) = item.get("uses").and_then(serde_yaml_ng::Value::as_str) else {
+                continue;
+            };
+            if pinned(uses) {
+                // Its guard too: swapping guards between pins swaps releases.
+                let guard = item.get("if").map(serde_yaml_ng::to_string);
+                let guard = guard.transpose().map_err(|_| "has an unreadable if")?;
+                pins.push(format!("{uses} if {}", guard.unwrap_or_default().trim()));
+            }
+        }
+        let Some(call) = job.get("uses").and_then(serde_yaml_ng::Value::as_str) else {
+            continue;
+        };
+        if let Some(path) = call.strip_prefix("./") {
+            calls.insert((at.to_owned(), path.to_owned()));
+        } else if let Some((path, commit)) = named(call, wrappers)
+            .and_then(|c| c.strip_prefix('/'))
+            .and_then(|c| c.split_once('@'))
+        {
+            if commit == FOLLOWED_BRANCH {
+                calls.insert((side.to_owned(), path.to_owned()));
+            } else if full_sha(commit) {
+                calls.insert((commit.to_owned(), path.to_owned()));
+            } else {
+                return Err("calls a wrappers workflow at a ref the train cannot follow");
+            }
+        }
+    }
+    calls.retain(|(_, path)| workflow_file(path));
+    pins.sort();
+    Ok((pins, calls))
 }
 
 fn set_caller_pins(value: &mut serde_yaml_ng::Value, wrappers: &Target, to: &str) {
@@ -1328,9 +1408,10 @@ struct Pass<'a> {
     used_reads: BTreeSet<String>,
     read_bytes: usize,
     callers: Vec<Target>,
-    /// Once checked, why callers at `FOLLOWED_BRANCH` may not run the merged
-    /// wrappers bump, if they may not.
-    followed: Option<Option<String>>,
+    /// Once checked, the wrappers' `FOLLOWED_BRANCH` head.
+    followed_head: Option<String>,
+    /// The wrapper paths callers follow at `FOLLOWED_BRANCH`.
+    followed: BTreeSet<String>,
     /// While discovering callers, the step it is at, for a budget error.
     discovering: Option<String>,
 }
@@ -1376,7 +1457,8 @@ pub fn pass_with_cache(
         used_reads: BTreeSet::new(),
         read_bytes: 0,
         callers: vec![],
-        followed: None,
+        followed_head: None,
+        followed: BTreeSet::new(),
         discovering: None,
     }
     .run();
@@ -1445,7 +1527,7 @@ impl Pass<'_> {
         Ok(all.into_values().collect())
     }
 
-    fn discover_callers(&mut self, merge: &str) -> Result<Vec<Target>> {
+    fn discover_callers(&mut self) -> Result<Vec<Target>> {
         let c = self.config;
         // Identity and inventories are always live. A cache never grants write
         // authority or visibility, even when its trees describe a real commit.
@@ -1567,7 +1649,7 @@ impl Pass<'_> {
                     .collect();
                 for (wrapper, pin) in records {
                     if pin == FOLLOWED_BRANCH {
-                        self.follow(merge)?;
+                        self.follow(&wrapper)?;
                     } else {
                         edits = true;
                     }
@@ -1639,17 +1721,84 @@ impl Pass<'_> {
         Ok(callers)
     }
 
-    /// Checks, once a pass, what callers at the wrappers' `FOLLOWED_BRANCH`
-    /// run. It must be the wrappers' default branch, whose review gate the
-    /// bump `merge` passed, with no tag of that name, which GitHub would run
-    /// in its place; otherwise the train stalls, as no caller edit can fix
-    /// it. Ancestry would not show a later revert, so the branch head's
-    /// workflows, all a caller or nested reusable workflow can run from
-    /// it, must be the bump's; otherwise the train cannot close.
-    fn follow(&mut self, merge: &str) -> Result<()> {
-        if self.followed.is_some() {
-            return Ok(());
+    /// Records that callers follow `wrapper` at the wrappers'
+    /// `FOLLOWED_BRANCH`, checking once a pass that the branch is what
+    /// GitHub runs for them.
+    fn follow(&mut self, wrapper: &str) -> Result<()> {
+        if self.followed_head.is_none() {
+            self.followed_head()?;
         }
+        self.followed.insert(wrapper.to_owned());
+        Ok(())
+    }
+
+    /// Why callers at the wrappers' `FOLLOWED_BRANCH` may not run the bump
+    /// `merge`, if they may not. Ancestry would not show a later revert, so
+    /// the release pins each followed wrapper reaches at that branch must be
+    /// those it reached at the bump (see [`release_uses`]). Read only once
+    /// the train would otherwise close, so these reads never take pinned
+    /// callers' request budget, and a failed read fails the pass for the
+    /// next to retry.
+    fn followers(&mut self, merge: &str) -> Result<Option<String>> {
+        let Some(head) = self.followed_head.clone() else {
+            return Ok(None);
+        };
+        if head == merge {
+            return Ok(None);
+        }
+        for wrapper in self.followed.clone() {
+            let why = match self.release_pins(&wrapper, &head)? {
+                Err(why) => format!("a reachable workflow {why}"),
+                Ok(served) if self.release_pins(&wrapper, merge)?.as_ref() == Ok(&served) => {
+                    continue;
+                }
+                Ok(_) => format!(
+                    "a reachable workflow at {head} pins other release or secure-host revisions than the wrappers' pin bump {merge}; if they still run this release, close this issue instead"
+                ),
+            };
+            let repo = &self.config.wrappers.repository;
+            return Ok(Some(format!(
+                "callers follow {repo}@{FOLLOWED_BRANCH}, {why}"
+            )));
+        }
+        Ok(None)
+    }
+
+    /// The release pins of `wrapper` and the wrappers workflows it reaches,
+    /// with `side` as the followed branch's commit, or a stall reason.
+    fn release_pins(
+        &mut self,
+        wrapper: &str,
+        side: &str,
+    ) -> Result<std::result::Result<Vec<String>, &'static str>> {
+        let repo = self.config.wrappers.repository.clone();
+        let release = self.config.release.repository.clone();
+        let mut pending = vec![(side.to_owned(), wrapper.to_owned())];
+        let (mut seen, mut pins) = (BTreeSet::new(), vec![]);
+        while let Some((at, path)) = pending.pop() {
+            if !seen.insert((at.clone(), path.clone())) {
+                continue;
+            }
+            let Some(text) = self.workflow_contents(&repo, &at, &path)? else {
+                return Ok(Err("is missing or inaccessible"));
+            };
+            match release_uses(&text, &release, &repo, &at, side) {
+                Ok((found, calls)) => {
+                    pins.extend(found);
+                    pending.extend(calls);
+                }
+                Err(why) => return Ok(Err(why)),
+            }
+        }
+        pins.sort();
+        Ok(Ok(pins))
+    }
+
+    /// The wrappers' `FOLLOWED_BRANCH` head. It must be their default
+    /// branch, whose review gate the bump passed, with no tag of that name,
+    /// which GitHub would run in its place; otherwise the train stalls, as
+    /// no caller edit can fix it.
+    fn followed_head(&mut self) -> Result<String> {
         let repo = self.config.wrappers.repository.clone();
         let base = self.default_branch(&repo)?;
         if base != FOLLOWED_BRANCH {
@@ -1672,22 +1821,17 @@ impl Pass<'_> {
         )?;
         ensure!(full_sha(&head), "invalid {FOLLOWED_BRANCH} head for {repo}");
         self.log(&format!("wrappers {repo}@{FOLLOWED_BRANCH} {head}"))?;
-        let changed =
-            head != merge && self.workflows(&repo, &head)? != self.workflows(&repo, merge)?;
-        self.followed = Some(changed.then(|| format!(
-            "callers follow {repo}@{FOLLOWED_BRANCH}, whose workflows at {head} differ from the wrappers' pin bump {merge}; if they still run this release, close this issue instead"
-        )));
-        Ok(())
+        self.followed_head = Some(head.clone());
+        Ok(head)
     }
 
-    /// The tree of `repo`'s `.github/workflows` at commit `at`.
-    fn workflows(&mut self, repo: &str, at: &str) -> Result<String> {
-        let listing = self.get(&format!("/repos/{repo}/contents/.github?ref={at}"))?;
-        let dir = list(&listing)?
-            .iter()
-            .find(|e| e["name"] == "workflows" && e["type"] == "dir")
-            .with_context(|| format!("{repo} has no .github/workflows at {at}"))?;
-        string(dir, "/sha")
+    /// The reusable workflow at this commit, or None if missing or hidden.
+    fn workflow_contents(&mut self, repo: &str, at: &str, path: &str) -> Result<Option<String>> {
+        match self.discovery_contents(repo, at, path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.is::<NotFound>() || status(&e) == Some(404) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn discovery_contents(&mut self, repo: &str, sha: &str, path: &str) -> Result<String> {
@@ -2314,7 +2458,7 @@ impl Pass<'_> {
                 self.on_default(&c.wrappers.repository, merge, "the wrappers' pin bump")?;
                 let start = self.requests;
                 self.discovering = Some("the repository inventory".into());
-                let callers = self.discover_callers(merge);
+                let callers = self.discover_callers();
                 self.discovering = None;
                 self.callers = callers?;
                 self.log(&format!(
@@ -2342,9 +2486,9 @@ impl Pass<'_> {
                             "{}:{path} no longer pins a configured wrapper",
                             caller.repository
                         );
-                        for (at, len, _) in pins {
+                        for (at, len, wrapper) in pins {
                             match &content[at..at + len] {
-                                FOLLOWED_BRANCH => self.follow(merge)?,
+                                FOLLOWED_BRANCH => self.follow(&wrapper)?,
                                 pin => current &= pin == merge,
                             }
                         }
@@ -2363,7 +2507,9 @@ impl Pass<'_> {
                     }
                     facts.callers.push((caller.repository, pr));
                 }
-                facts.followers = self.followed.clone().flatten();
+                if next(&facts) == Step::Done {
+                    facts.followers = self.followers(merge)?;
+                }
             }
             Ok(())
         })();
