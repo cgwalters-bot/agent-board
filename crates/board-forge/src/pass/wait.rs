@@ -327,7 +327,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             return under_way(facts, busy, &writers)
                 .map(|held| self.active_hold("pull-request", held));
         }
-        hold(facts, busy, &writers).map(Step::Hold)
+        // One `stackHeld` may stack past needs its plan read.
+        hold(facts, busy, &writers)
+            .filter(|held| self.stackable(facts, held, &slots.busy).is_none())
+            .map(Step::Hold)
     }
 
     /// Whether `facts` waits on the operator: labelled [`NEEDS_HUMAN`], which

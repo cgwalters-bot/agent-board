@@ -6144,6 +6144,13 @@ impl Transport for Forge {
         if query.starts_with(FRESH_QUERY) {
             let mut data = self.fresh(&variables)?;
             self.late(&variables.to_string(), &mut data);
+            if let Some(racing) = self
+                .racing
+                .as_ref()
+                .filter(|_| self.dispatches().is_empty())
+            {
+                racing(query, &mut data);
+            }
             return Ok(data);
         }
         if query.starts_with("query InboxInventory(") {
@@ -13780,6 +13787,26 @@ fn apply_reruns_a_failed_run_once() {
         )
     };
     let stacked: Edit = |r| replan_468(r, r#""item":468,"#, r#""item":468,"stacks_on":467,"#);
+    // Its record says its run was stacked, as `stackHeld` stacks a plan
+    // that names no `stacks_on`; nothing else would hold its rerun.
+    fn recorded_stacked(r: &mut Replay) {
+        independent(r);
+        let record = comments_468(r)
+            .iter_mut()
+            .find(|c| text(c, "/url").ends_with("#issuecomment-6332216967"))
+            .unwrap();
+        let body = format!(
+            "{}\n<!-- {}: 900 -->",
+            text(record, "/body"),
+            plan::STACKED_MARKER
+        );
+        record["body"] = body.into();
+    }
+    // As `starts` would re-run it: it failed before its agent started.
+    let never_started_stacked: Edit = |r| {
+        recorded_stacked(r);
+        failed_at(r, 39718949900, agent_failed(), NOT_STARTED);
+    };
     let profile: Edit = |r| replan_468(r, "\"hosted\"", "\"devspace-rhel10-64\"");
     // #468's plan names tracker#17, a pull request, whose issue read fails
     // as GitHub's does, `answer` its error; only a NOT_FOUND asks what it is.
@@ -13811,14 +13838,14 @@ fn apply_reruns_a_failed_run_once() {
     let triage: Edit = |r| replan_468(r, r#""kind":"implement","#, r#""kind":"triage","#);
     // The recording's open tracker#889 changes paths its plan names: the
     // rerun waits for it, as a start would. Without it, it is re-run.
-    let independent: Edit = |r| {
+    fn independent(r: &mut Replay) {
         let pulls = (r.requests.iter_mut())
             .filter_map(|e| e["answer"].pointer_mut("/data/repository/pullRequests/nodes"))
             .filter_map(Value::as_array_mut);
         for nodes in pulls {
             nodes.retain(|n| n["number"] != 889);
         }
-    };
+    }
     type Edit = fn(&mut Replay);
     let none: Edit = |_| {};
     // Name, settings, the failed runs listed, an edit of the recording, the
@@ -13960,6 +13987,22 @@ fn apply_reruns_a_failed_run_once() {
             vec![run(1)],
             stacked,
             "hold cgwalters-forge/tracker#468: its implement run",
+            0,
+        ),
+        (
+            "so is one its record says was stacked",
+            json!({"reruns": true}),
+            vec![run(1)],
+            recorded_stacked,
+            "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z's stacked run failed; it is re-run by hand",
+            0,
+        ),
+        (
+            "even where it failed before its agent started",
+            json!({"starts": {}}),
+            vec![run(1)],
+            never_started_stacked,
+            "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z's stacked run failed; it is re-run by hand",
             0,
         ),
     ];
@@ -18360,6 +18403,265 @@ fn stacked_plan_waits_for_the_lower_issues_next_run() {
             assert!(forge.dispatches().is_empty());
             assert!(forge.writes.borrow().is_empty());
         }
+    }
+}
+
+/// `stackHeld` (agent-board#1144): a start held only by the issue's own open
+/// pull request of the bot from a `dispatch/` branch of the repository
+/// itself stacks on it; a fork's or the operator's pull request, two of
+/// them, a run in flight on the issue or the base, another overlap, or the
+/// option off keep a hold, as do an overlap and an open blocker issue,
+/// whose bounded reads cannot show the base is all that holds the work.
+#[test]
+fn stack_held_stacks_on_one_in_repo_bot_pull_request() {
+    const BOT: &str = "cgwalters-bot";
+    const OPERATOR: &str = "cgwalters";
+    let pull = |number: u64, author: &str, closes: u64| {
+        json!({"number": number, "author": {"login": author}, "isCrossRepository": false,
+            "headRefName": format!("dispatch/implement/agent-run-{number}"),
+            "body": format!("Work.\n\nCloses #{closes}")})
+    };
+    let edit = |mut pull: Value, field: &str, value: Value| {
+        pull[field] = value;
+        pull
+    };
+    let fork = |p| edit(p, "isCrossRepository", json!(true));
+    let closing = |number: u64, author: &str| {
+        json!({"number": number, "state": "OPEN", "author": {"login": author},
+            "repository": {"nameWithOwner": "cgwalters-forge/tracker"}})
+    };
+    let (none, own) = (Vec::new(), vec![closing(999, BOT)]);
+    let (quiet, readme) = ("No paths named.", "Changes README.md.");
+    // A path no open pull request of the recording changes.
+    let elsewhere = "Changes docs/elsewhere.md.";
+    // The hold (`pr-open/` and a change: `pages`, the overlap read has a
+    // next page; `files`, an open pull request as many files as are read;
+    // `promote`, its repository a promotion fork), whether stackHeld is on, the closing pull requests on the
+    // board of an issue's own (`pr-open`), the lower issue's open pull
+    // requests, #446's text, the item of a run in flight, and the pull
+    // request stacked on.
+    type Case<'a> = (
+        &'a str,
+        bool,
+        Vec<Value>,
+        Vec<Value>,
+        &'a str,
+        Option<&'a str>,
+        Option<u64>,
+    );
+    #[rustfmt::skip]
+    let cases: Vec<Case> = vec![
+        ("pr-open", false, own.clone(), vec![pull(999, BOT, 446)], quiet, None, None),
+        ("pr-open", true, own.clone(), vec![pull(999, BOT, 446)], quiet, None, Some(999)),
+        ("pr-open", true, own.clone(), vec![fork(pull(999, BOT, 446))], quiet, None, None),
+        ("pr-open", true, own.clone(), vec![edit(pull(999, BOT, 446), "headRefName", json!("main"))], quiet, None, None),
+        ("pr-open", true, vec![closing(999, OPERATOR)], vec![pull(999, OPERATOR, 446)], quiet, None, None),
+        ("pr-open", true, vec![closing(999, BOT), closing(998, BOT)], vec![pull(999, BOT, 446)], quiet, None, None),
+        // The issue's only pull request on the board is not the base resolve finds.
+        ("pr-open", true, own.clone(), vec![pull(998, BOT, 446)], quiet, None, None),
+        ("pr-open", true, own.clone(), vec![pull(999, BOT, 446)], quiet, Some("implement cgwalters-forge/tracker#446"), None),
+        ("pr-open", true, own.clone(), vec![pull(999, BOT, 446)], quiet, Some("fix cgwalters-forge/tracker#999"), None),
+        // Its base #999 shares its files by design; #832 does not.
+        ("pr-open", true, own.clone(), vec![pull(999, BOT, 446)], readme, None, None),
+        // A complete read shows nothing overlaps; one its bounds cut short
+        // does not.
+        ("pr-open", true, own.clone(), vec![pull(999, BOT, 446)], elsewhere, None, Some(999)),
+        ("pr-open/pages", true, own.clone(), vec![pull(999, BOT, 446)], elsewhere, None, None),
+        ("pr-open/files", true, own.clone(), vec![pull(999, BOT, 446)], elsewhere, None, None),
+        // Promotion would publish it by a plan that stacks on nothing.
+        ("pr-open/promote", true, own.clone(), vec![pull(999, BOT, 446)], quiet, None, None),
+        // Its pull request no longer closes it when the start reads it again:
+        // the preview stacks it, the start holds.
+        ("pr-open/raced", true, own.clone(), vec![pull(999, BOT, 446)], quiet, None, Some(999)),
+        // Its comments cannot be read: it keeps the hold, saying why.
+        ("pr-open/comments", true, own.clone(), vec![pull(999, BOT, 446)], quiet, None, None),
+        // Neither an overlap nor an open blocker is stacked past.
+        ("overlap", true, none.clone(), vec![pull(832, BOT, 800)], quiet, None, None),
+        ("blocked", true, none.clone(), vec![pull(700, BOT, 445)], quiet, None, None),
+    ];
+    for (case_hold, enabled, own, pulls, text, busy, stacked) in cases {
+        let case = format!("{case_hold}/{enabled}/{own:?}/{pulls:?}/{text}/{busy:?}");
+        let (hold, change) = case_hold.split_once('/').unwrap_or((case_hold, ""));
+        let mut forge = Forge::new(None, false);
+        let replay = &mut forge.replay;
+        let (issue, lower) = match hold {
+            "overlap" => (527, 800),
+            "pr-open" => (446, 446),
+            _ => (446, 445),
+        };
+        let name = format!("cgwalters-forge/tracker#{issue}");
+        only(replay, &[name.as_str()]);
+        if issue == 446 {
+            implement_plan(replay);
+        }
+        for entry in &mut replay.requests {
+            let nodes = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+            for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+                if node["content"]["number"] != issue {
+                    continue;
+                }
+                if !own.is_empty() {
+                    node["content"]["closedByPullRequestsReferences"] =
+                        json!({"nodes": own.clone(), "totalCount": own.len()});
+                }
+                if hold == "blocked" {
+                    node["content"]["issueDependenciesSummary"] = json!({"blockedBy": 1});
+                }
+            }
+        }
+        let variables = json!({"owner": "cgwalters-forge", "name": "tracker",
+            "number": lower, "pulls": crate::stack::STACK_PULL_READS});
+        replay.requests.push(json!({
+            "request": graphql_key(crate::stack::LOWER_QUERY, &variables),
+            "answer": {"data": {"repository": {"issue": {"state": "OPEN"},
+                "pullRequests": {"nodes": pulls}, "defaultBranchRef": {"name": "main"},
+                "merged": {"nodes": []}}}},
+        }));
+        let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
+        replay.requests.push(json!({
+            "request": graphql_key(overlap::TEXT_QUERY, &variables),
+            "answer": {"data": {"repository": {"issue": {"title": "Design", "body": text}}}},
+        }));
+        if let Some(item) = busy {
+            let run = json!({"id": STUCK_RUN, "status": "queued",
+                "display_title": format!("{item} (claude)"),
+                "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/7",
+                "run_started_at": "2026-10-23T13:00:00Z"});
+            let body = &mut answer(replay, "status=queued")["body"];
+            body["total_count"] = 1.into();
+            body["workflow_runs"] = json!([run]);
+        }
+        // The overlap check's page of open pull requests, with their files.
+        let overlap_pulls = (replay.requests.iter_mut())
+            .filter_map(|e| e["answer"].pointer_mut("/data/repository/pullRequests"))
+            .filter(|p| p.pointer("/nodes/0/files").is_some());
+        for connection in overlap_pulls {
+            match change {
+                "pages" => {
+                    connection["pageInfo"] = json!({"hasNextPage": true, "endCursor": "next"});
+                }
+                "files" => {
+                    let files: Vec<Value> = (0..overlap::FILE_READS)
+                        .map(|n| json!({"path": format!("src/file{n}.rs")}))
+                        .collect();
+                    let nodes = connection["nodes"].as_array_mut().unwrap();
+                    nodes.push(json!({"author": {"login": BOT}, "number": 950,
+                        "files": {"nodes": files}}));
+                }
+                _ => {}
+            }
+        }
+        let mut settings = json!({"wip": 8, "stackHeld": enabled});
+        if change == "promote" {
+            settings["promote"] = json!({"forks": {"cgwalters-forge/tracker":
+                    {"upstream": "other-org/project", "base": "main"}},
+                "signoff": {"name": "Operator", "email": "operator@example.invalid"},
+                "policyRepository": "cgwalters-forge/tracker"});
+        }
+        let config = config(settings);
+        if change == "promote" {
+            upstream_fork(replay, &config);
+            // Every issue on the board has its handoff read, whatever query read it.
+            let numbers: BTreeSet<u64> = (replay.requests.iter())
+                .filter_map(|e| e["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes"))
+                .flat_map(|nodes| nodes.as_array().into_iter().flatten())
+                .filter_map(|node| node["content"]["number"].as_u64())
+                .collect();
+            for number in numbers {
+                let path = format!("repos/cgwalters-forge/tracker/issues/{number}");
+                let issue = json!({"number": number, "body": "No link",
+                    "repository_url": format!("{API_ROOT}repos/cgwalters-forge/tracker")});
+                for (path, body) in [
+                    (format!("{path}/timeline?per_page=100&page=1"), json!([])),
+                    (path, issue),
+                ] {
+                    replay
+                        .requests
+                        .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+                        "answer": {"status": 200, "link": null, "body": body}}));
+                }
+            }
+        }
+        let report = preview(&config, replay);
+        assert_eq!(report.failures, 0, "{case}: {:#?}", report.lines);
+        let held = match hold {
+            _ if hold == "overlap" || text == readme => format!(
+                "hold {name}: Waiting: open pull request cgwalters-forge/tracker#832 changes `README.md`."
+            ),
+            _ if change == "pages" || change == "files" => format!(
+                "hold {name}: Waiting: the overlap check reads only {} paths of each issue's text, the newest {} open pull requests, {} files of each and {} runs, and there were more.",
+                overlap::PATH_LIMIT,
+                overlap::PULL_READS,
+                overlap::FILE_READS,
+                overlap::RUN_READS
+            ),
+            "pr-open" => format!("hold {name}: pull request cgwalters-forge/tracker#999 is open"),
+            _ => format!("hold {name}: 1 open dependencies"),
+        };
+        match change {
+            "comments" => {
+                *forge.fail.borrow_mut() = Some(plan::COMMENTS_QUERY.into());
+                let report = apply(&forge, &config);
+                let prefix = format!("{held}; stackHeld could not read its comments: ");
+                assert!(
+                    report.lines.iter().any(|l| l.starts_with(&prefix)),
+                    "{case}: {:#?}",
+                    report.lines
+                );
+                assert!(forge.dispatches().is_empty(), "{case}");
+                continue;
+            }
+            "raced" => {
+                forge.racing = Some(Box::new(|query, data| {
+                    let issue = &mut data["repository"]["issue"];
+                    if query.starts_with(FRESH_QUERY) && issue["number"] == 446 {
+                        issue["closedByPullRequestsReferences"] =
+                            json!({"nodes": [], "totalCount": 0});
+                    }
+                }));
+            }
+            _ => {}
+        }
+        let Some(base) = stacked else {
+            assert!(report.lines.contains(&held), "{case}: {:#?}", report.lines);
+            continue;
+        };
+        let start = format!("start implement {name} plan=");
+        let suffix = format!(" stacked=cgwalters-forge/tracker#{base}");
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&start) && l.ends_with(&suffix)),
+            "{case}: {:#?}",
+            report.lines
+        );
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{case}: {:#?}", report.lines);
+        if change == "raced" {
+            assert!(report.lines.contains(&held), "{case}: {:#?}", report.lines);
+            assert!(forge.dispatches().is_empty(), "{case}");
+            continue;
+        }
+        let writes = forge.writes.borrow();
+        let (_, _, sent) = writes
+            .iter()
+            .find(|(_, url, _)| url.ends_with("/dispatches"))
+            .unwrap_or_else(|| panic!("{case}: {:#?}", report.lines));
+        let branch = format!("dispatch/implement/agent-run-{base}");
+        assert_eq!(sent["inputs"]["base"], branch.as_str(), "{case}");
+        assert_eq!(sent["inputs"]["item"], issue.to_string(), "{case}");
+        let record = forge.comments_on("cgwalters-forge/tracker", issue);
+        let url = format!("https://github.com/cgwalters-forge/tracker/pull/{base}");
+        // Its recovery reads that it was stacked from its record alone.
+        let marker = format!("\n<!-- {}: {base} -->\n", plan::STACKED_MARKER);
+        assert!(
+            record
+                .iter()
+                .any(|c| c.contains(&marker)
+                    && c.contains(&format!("Stacked on {url} (`{branch}`)."))),
+            "{case}: {record:#?}"
+        );
     }
 }
 

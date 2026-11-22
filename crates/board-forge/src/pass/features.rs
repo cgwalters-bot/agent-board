@@ -65,6 +65,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
         "researchPlans",
         "fixPlans",
         "sessionPlans",
+        "stackHeld",
         "triageClose",
         "replanInvalid",
         "operatorQuestionsOnly",

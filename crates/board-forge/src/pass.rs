@@ -76,7 +76,8 @@ pub(super) const CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 /// and write after it: the triage plan's post, or a body plan's second read
 /// of the body and the comments and its post, the plan protocol's two reads
 /// of the comments (10 pages each), its account read, the overlap check (at
-/// most 14, and [`overlap::DRAFT_READS`] more), the record, the dispatch (two
+/// most 14, and [`overlap::DRAFT_READS`] more, or for a stacked run 17 and
+/// no draft reads), the record, the dispatch (two
 /// tries) and its note, with room for a stack's reads. A start never runs out
 /// of budget between claim and run.
 const START_REQUESTS: usize = 64 + overlap::DRAFT_READS;
@@ -216,8 +217,8 @@ const HOLD_LABELS: &[(&str, HoldKind)] = &[
 const EXCLUDED_LABELS: &[&str] = &[EPIC_LABEL, "question"];
 /// The board Status that holds an item.
 const BLOCKED_STATUS: &str = "Blocked";
-/// The run statuses that hold a slot, as the Actions API names them.
-const ACTIVE_RUNS: &[&str] = &["queued", "in_progress", "waiting", "requested", "pending"];
+/// The run statuses that hold a slot, as a stacked run's overlap check reads them.
+const ACTIVE_RUNS: &[&str] = overlap::ACTIVE_RUNS;
 /// Dispatch runs past this bound are overdue, matching the poll's fix-run timeout.
 pub const RUN_TIMEOUT_SECONDS: i64 = 7 * 60 * 60;
 /// Cleanup must leave request and write headroom for ordinary follow-up.
@@ -701,6 +702,11 @@ pub struct Config {
     /// planner's: without this, every session plan waits on the operator.
     #[serde(default)]
     pub session_plans: bool,
+    /// Off unless set: an implement start held only by the issue's own open
+    /// pull request, the bot's, stacks on that pull request instead, where
+    /// [`crate::stack::resolve`] accepts it as a base (agent-board#1144).
+    #[serde(default)]
+    pub stack_held: bool,
     /// Off unless set: a triage verdict of [`CLOSE_VERDICTS`] closes the
     /// issue rather than asking the operator; needs `triageFollowUpDays`.
     #[serde(default)]
@@ -8315,6 +8321,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(self.active_hold("pull-request", held));
         }
         let no_runs = BTreeMap::new();
+        // A hold `stackHeld` may stack past, if its plan stacks.
+        let mut under = None;
         if let Some(held) = hold(
             &facts,
             if config.skip_active_work {
@@ -8324,14 +8332,34 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             },
             &writers,
         ) {
-            return Ok(Step::Hold(held));
+            match self.stackable(&facts, &held, busy) {
+                Some(stackable) => under = Some(stackable),
+                None => return Ok(Step::Hold(held)),
+            }
         }
         // The board's facts held it, or now its comments may.
         if let Some(step) = self.lean_carried(&facts, board) {
             return Ok(step);
         }
         let issue = &facts.issue;
-        let comments = plan::issue_comments(&self.client, issue)?;
+        let comments = match (plan::issue_comments(&self.client, issue), &under) {
+            (Ok(comments), _) => comments,
+            // Only `stackHeld` asked: it keeps the hold it would have had.
+            (Err(error), Some(under)) => {
+                let mut held = under.hold.clone();
+                held.reason = format!(
+                    "{}; stackHeld could not read its comments: {error:#}",
+                    held.reason
+                );
+                return Ok(Step::Hold(held));
+            }
+            (Err(error), None) => return Err(error),
+        };
+        if let Some(under) = &under
+            && !self.stackable_plan(issue, &comments, &writers)
+        {
+            return Ok(Step::Hold(under.hold.clone()));
+        }
         if config.skip_active_work {
             match self.active_work(&facts, &comments, target) {
                 Ok(Some((rule, held))) => return Ok(self.active_hold(rule, held)),
@@ -8343,7 +8371,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     )));
                 }
             }
-            if let Some(held) = hold(&facts, busy, &writers) {
+            if let Some(held) = hold(&facts, busy, &writers)
+                && !under.as_ref().is_some_and(|u| u.is(&held))
+            {
                 return Ok(Step::Hold(held));
             }
             if plan::newest_plan(&comments, &writers)
@@ -8455,6 +8485,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     // An extra's run is its batch's, whose other issues are not read.
                     if record.body.contains(batch::BATCH_MARKER) {
                         let why = format!("plan {id}'s batched run failed; it is re-run by hand");
+                        return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+                    }
+                    // Its run's inputs name a base that may since have moved,
+                    // whether its plan or `stackHeld` stacked it.
+                    if plan::recorded_stack(&record.body).is_some() {
+                        let why = format!("plan {id}'s stacked run failed; it is re-run by hand");
                         return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
                     }
                     // Its rerun failed on infrastructure too: the plan was
@@ -8682,33 +8718,56 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // recheck and the plan protocol's reads, nor stopped by the budget
         // a start needs. The overlap's reads are kept until the next write;
         // the dispatch decides both again on what it reads then.
-        let lower = plan.stacks_on;
+        let mut lower = plan.stacks_on;
         if let Some(held) = stack_hold(&dest, lower, busy) {
             return Ok(Step::Hold(held));
         }
-        let bot = Some(config.bot.as_str());
-        let (plan, base, _) = match plan::stack(&self.client, &dest, plan, bot)? {
-            Ok(stacked) => stacked,
-            // The slice it stacks on is neither open nor closed yet.
-            Err(wait) => {
-                return Ok(Step::Hold(Hold::new(HoldKind::WaitingOn, wait.sentence())));
+        // What `stackHeld` stacked it on, for the dispatch to check again.
+        let mut stacked = None;
+        let (plan, base) = match &under {
+            Some(under) => match self.stack_on((&dest, &plan), under.pull, busy) {
+                Some(((plan, base, _), on)) => {
+                    stacked = Some(on);
+                    (plan, base)
+                }
+                None => return Ok(Step::Hold(under.hold.clone())),
+            },
+            None => {
+                let bot = Some(config.bot.as_str());
+                match plan::stack(&self.client, &dest, plan, bot)? {
+                    Ok((plan, base, _)) => (plan, base),
+                    // The slice it stacks on is neither open nor closed yet.
+                    Err(wait) => {
+                        return Ok(Step::Hold(Hold::new(HoldKind::WaitingOn, wait.sentence())));
+                    }
+                }
             }
         };
         // A triage run changes no files, so it neither waits on overlap nor
-        // stacks (a triage plan has no `stacks_on`).
-        if implement && base.is_none() {
-            let decision = overlap::decide_strict(
-                &self.kept(),
-                (issue, &dest),
-                &plan.brief,
-                &config.bot,
-                target,
-                (&self.ended_runs(), &waiver),
-            );
+        // stacks (a triage plan has no `stacks_on`). One `stackHeld` stacked
+        // past its own hold still waits on any overlap but its base's, unwaived,
+        // on any active run, and on a read too short to show there is none.
+        if implement && (base.is_none() || stacked.is_some()) {
+            let (kept, ended) = (self.kept(), self.ended_runs());
+            let (items, bot) = ((issue, &dest), config.bot.as_str());
+            let decision = match stacked {
+                Some((_, pull)) => {
+                    overlap::decide_stacked(&kept, items, &plan.brief, bot, target, &ended, pull)
+                }
+                None => {
+                    let checks = (&ended, &waiver);
+                    overlap::decide_strict(&kept, items, &plan.brief, bot, target, checks)
+                }
+            };
             if let Some(step) = self.overlap_hold((issue, &dest), decision) {
                 return Ok(step);
             }
         }
+        let line = match stacked {
+            Some((_, pull)) => format!("{line} stacked={}#{pull}", dest.repository),
+            None => line,
+        };
+        lower = lower.or(stacked.map(|(on, _)| on));
         // A start the cap holds is judged as a preview judges it, so that it
         // is held by the cap only where it would have started.
         if !self.apply || self.caps.full(Kind::Dispatch) {
@@ -8721,11 +8780,28 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // What the dispatch's own check waives is what the pass reports.
         self.ignored.borrow_mut().clear();
         let rule = |facts: &Facts, busy: &BTreeMap<String, String>, writers: &[&str]| {
-            hold(facts, busy, writers)
-                .or_else(|| stack_hold(&dest, lower, busy))
-                .or_else(|| self.assignment_hold(facts))
-                .or_else(|| fix.then(|| fix_in_flight(&dest, busy)).flatten())
-                .or_else(|| control.as_ref().and_then(|at| fix_in_flight(at, busy)))
+            let held = hold(facts, busy, writers);
+            match &under {
+                // Only while it is still the one hold it stacks past, on the
+                // same pull request: without it, nothing says it is the base.
+                Some(u) => match held {
+                    Some(held)
+                        if u.is(&held)
+                            && (self.stackable(facts, &held, busy))
+                                .is_some_and(|now| now.pull == u.pull) =>
+                    {
+                        None
+                    }
+                    Some(held) => Some(held),
+                    None => Some(u.hold.clone()),
+                },
+                None => held,
+            }
+            .or_else(|| stack_hold(&dest, lower, busy))
+            .or_else(|| stacked.and_then(|(_, pull)| stacking::base_in_flight(&dest, pull, busy)))
+            .or_else(|| self.assignment_hold(facts))
+            .or_else(|| fix.then(|| fix_in_flight(&dest, busy)).flatten())
+            .or_else(|| control.as_ref().and_then(|at| fix_in_flight(at, busy)))
         };
         // A fix plan's pull request has no issue facts to read again.
         let again = if fix { issue } else { &source };
@@ -8775,6 +8851,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             // A plan written by hand carries no direction.
             direction: None,
             midstreams: self.midstreams.as_deref(),
+            stack: stacked,
         };
         // Without the bot, dispatch checks no overlap; it batches implement
         // plans only, and the pass asks for no batch either way.
@@ -10436,6 +10513,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             waiver: Default::default(),
             direction: self.direction_hash(),
             midstreams: None,
+            stack: None,
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);
@@ -11011,6 +11089,7 @@ mod resets;
 pub mod revisit;
 mod routing;
 pub mod sessions;
+mod stacking;
 pub mod starts;
 mod status;
 pub(crate) use living::MARKER as LIVING_STATUS_MARKER;

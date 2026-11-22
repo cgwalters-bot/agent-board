@@ -408,3 +408,43 @@ whose base is not the repository's default branch, and when the bot's newest
 pull request from that base has merged it retargets the upper one to the
 branch that one merged into. An approval from before the base changed does
 not merge it (see [pull request follow-up](poll.md#configuration)).
+
+### Stacking held work
+
+With the pass's `stackHeld` (GitHub only, off by default,
+[#1144](https://github.com/cgwalters-forge/agent-board/issues/1144)), an
+accepted, undispatched implement plan for the issue it is on, with no
+`stacks_on` or `target_repo`, is stacked by the pass instead of held, as if
+it said `stacks_on: N` for its own issue N, when the issue's own open pull
+request holds it (`pr-open`): the only one of the operator's or the bot's
+among the issue's complete closing pull requests, and the bot's.
+
+That pull request must then be the base the stacking rules above accept (the
+bot's, from a `dispatch/` branch of the repository itself). Otherwise it
+keeps holding as before: a run in flight on the issue or on that pull request
+(such as a fix round), two or more pull requests, a pull request from a fork
+or by the operator, a read that fails, a plan of another kind, or an issue in
+a promotion or midstream fork (or any, while the midstream forks are unread),
+since promotion reads the stored plan, which names no `stacks_on`, and would
+publish the run's pull request without waiting for its base to merge. An overlap or an open
+blocker issue is never stacked past. Unlike a plan's own `stacks_on`, the run
+is still checked for overlap: any overlap but its base's (by number) holds it,
+whatever the pass's `overlap` waivers would release, as does a run waiting,
+requested or pending, and a read its bounds cut short (more than one page of
+open pull requests, a pull request with as many files as are read or one
+whose name is not a plain path, more runs
+than are read, or a brief or issue text, its own or a run's, naming more paths
+than are read). When the start reads the issue again, its own pull request
+must still be all that holds it. The start line ends ` stacked=OWNER/REPO#P`; the dispatch checks the
+base and the overlap again, and waits if the base is a different pull request
+or none. That check compares the pull request number, not its head: a push
+to P since the pass read it is not caught, and the run starts from P's
+branch as it is then. Each `pr-open` candidate
+the option could stack costs a read of its comments before it holds, as most
+such issues have already dispatched their plan. With `skipActiveWork`, its
+active-work holds (an open pull request included) are not stacked past.
+
+The record of any stacked run, whether its plan or the pass stacked it,
+carries a hidden `<!-- agent-board-stacked: P -->` line, and the pass's
+`reruns` and `starts` recovery leave such a run, once it failed, to a person:
+its inputs name a base that may since have moved.

@@ -10,7 +10,10 @@
 //! Waiting, not stacking: a guess from named paths does not choose a base.
 //! Only a plan that names the slice it stacks on starts from another pull
 //! request's head ([`crate::stack`]), and that run is not checked here: it
-//! shares the files of the stack below it by design.
+//! shares the files of the stack below it by design. The pass's `stackHeld`
+//! stacks an issue on its own open pull request, never on one an overlap
+//! found, and that run is still checked here ([`decide_stacked`]) against
+//! every other, with no waiver and every active run.
 //!
 //! Off unless the caller's configuration names the bot (`dispatch --bot`).
 //! The overlap is a coarse guess: the paths an issue's text names, against
@@ -44,6 +47,13 @@ pub const PULL_READS: u64 = 50;
 pub const FILE_READS: u64 = 100;
 /// Running issues whose text is read, at most.
 pub const RUN_READS: usize = 10;
+/// Runs listed of each status, at most; a full page may have more.
+const RUN_PAGE: usize = 100;
+/// The run statuses the dispatch check waits on.
+pub const IN_FLIGHT: &[&str] = &["in_progress", "queued"];
+/// The run statuses that hold a slot, as the Actions API names them: a run
+/// waiting, requested or pending may yet run beside the one checked.
+pub const ACTIVE_RUNS: &[&str] = &["queued", "in_progress", "waiting", "requested", "pending"];
 /// Requests spent on [`Waiver::stale_draft`], at most, so
 /// that the check's requests stay within what a start reserves; one past it
 /// holds.
@@ -315,11 +325,14 @@ pub(crate) fn shown(paths: &[String]) -> String {
 /// directory). URLs, repository names (`OWNER/REPO`), `host.name/...` and
 /// abbreviations (`e.g`) are left out, since they name no file.
 pub fn paths(text: &str) -> BTreeSet<String> {
+    bounded_paths(text).0
+}
+
+/// [`paths`], and whether the text names more than the first [`PATH_LIMIT`]
+/// of them, which were left out.
+fn bounded_paths(text: &str) -> (BTreeSet<String>, bool) {
     let mut found = BTreeSet::new();
     for token in text.split(|c: char| !pathlike(c)) {
-        if found.len() == PATH_LIMIT {
-            break;
-        }
         // Only a literal `./` prefix: `.github/` and dotfiles keep their dot.
         let mut token = token;
         while let Some(rest) = token.strip_prefix("./") {
@@ -355,11 +368,15 @@ pub fn paths(text: &str) -> BTreeSet<String> {
             && !token.starts_with(['/', '-'])
             && !token.contains("..")
             && !token.contains("//")
+            && !found.contains(token)
         {
+            if found.len() == PATH_LIMIT {
+                return (found, true);
+            }
             found.insert(token.to_owned());
         }
     }
-    found
+    (found, false)
 }
 
 fn pathlike(c: char) -> bool {
@@ -403,6 +420,7 @@ pub fn decide<C: Transport + Rest>(
         bot,
         target,
         (&BTreeSet::new(), &waiver),
+        None,
     ) {
         Ok(decision) => decision,
         // Without the check every run is independent; failing to read leaves that.
@@ -423,9 +441,50 @@ pub fn decide_strict<C: Transport + Rest>(
     brief: &str,
     bot: &str,
     target: &Target,
-    (ended, waiver): (&BTreeSet<u64>, &Waiver),
+    checks: (&BTreeSet<u64>, &Waiver),
 ) -> Decision {
-    check(client, (source, dest), brief, bot, target, (ended, waiver)).unwrap_or_else(|error| {
+    strict(client, (source, dest), brief, (bot, target), checks, None)
+}
+
+/// [`decide_strict`] for a run the pass stacks on open pull request `base`
+/// past that one's hold (`stackHeld`): only `base`, by number, shares its
+/// files by design. No waiver releases any other pull request, a run
+/// waiting, requested or pending holds as one in flight does, and it waits
+/// where the bounded read cannot show every overlap (an open pull request
+/// past the first page of [`PULL_READS`], a file past the first
+/// [`FILE_READS`] of one, more runs than are read, or a text naming more
+/// than [`PATH_LIMIT`] paths), as only a complete read shows that the base
+/// is all that overlaps.
+pub fn decide_stacked<C: Transport + Rest>(
+    client: &C,
+    (source, dest): (&ItemRef, &ItemRef),
+    brief: &str,
+    bot: &str,
+    target: &Target,
+    ended: &BTreeSet<u64>,
+    base: u64,
+) -> Decision {
+    let waiver = Waiver::default();
+    let checks = (ended, &waiver);
+    strict(
+        client,
+        (source, dest),
+        brief,
+        (bot, target),
+        checks,
+        Some(base),
+    )
+}
+
+fn strict<C: Transport + Rest>(
+    client: &C,
+    items: (&ItemRef, &ItemRef),
+    brief: &str,
+    (bot, target): (&str, &Target),
+    checks: (&BTreeSet<u64>, &Waiver),
+    base: Option<u64>,
+) -> Decision {
+    check(client, items, brief, bot, target, checks, base).unwrap_or_else(|error| {
         Decision::Wait(
             format!("the overlap check could not read ({error:#})"),
             Vec::new(),
@@ -433,6 +492,9 @@ pub fn decide_strict<C: Transport + Rest>(
     })
 }
 
+/// `base`: the pull request a stacked run starts from, which does not hold
+/// it; then every run of [`ACTIVE_RUNS`] counts, and a read that was not
+/// [`Overlap::whole`] waits.
 fn check<C: Transport + Rest>(
     client: &C,
     (source, dest): (&ItemRef, &ItemRef),
@@ -440,9 +502,12 @@ fn check<C: Transport + Rest>(
     bot: &str,
     target: &Target,
     (ended, waiver): (&BTreeSet<u64>, &Waiver),
+    base: Option<u64>,
 ) -> Result<Decision> {
-    let mut named = paths(brief);
-    named.extend(paths(&text(client, source)?));
+    let (mut named, mut cut) = bounded_paths(brief);
+    let (more, more_cut) = bounded_paths(&text(client, source)?);
+    named.extend(more);
+    cut |= more_cut;
     if named.is_empty() {
         return Ok(Decision::Independent("the issue names no path".into()));
     }
@@ -450,6 +515,11 @@ fn check<C: Transport + Rest>(
         author: Some(bot),
         pages: 1,
         first_run: true,
+        statuses: if base.is_some() {
+            ACTIVE_RUNS
+        } else {
+            IN_FLIGHT
+        },
     };
     let found = intersecting(client, &named, (dest, target), ended, scope)?;
     // A run in flight has not pushed, and a batch cannot join a run that
@@ -464,6 +534,14 @@ fn check<C: Transport + Rest>(
             Vec::new(),
         ));
     }
+    if base.is_some() && (cut || !found.whole()) {
+        let why = format!(
+            "the overlap check reads only {PATH_LIMIT} paths of each issue's text, the newest \
+             {PULL_READS} open pull requests, {FILE_READS} files of each and {RUN_READS} runs, \
+             and there were more"
+        );
+        return Ok(Decision::Wait(why, Vec::new()));
+    }
     let (mut overlapping, mut ignored) = (Vec::new(), Vec::new());
     let mut reads = DRAFT_READS;
     for found in &found.pulls {
@@ -472,6 +550,15 @@ fn check<C: Transport + Rest>(
             ..dest.clone()
         };
         let changes = format!("{} changes {}", pull.display(), shown(&found.shared));
+        // Its base aside, nothing a stacked run overlaps is waived.
+        match base {
+            Some(base) if base == found.number => continue,
+            Some(_) => {
+                overlapping.push((found.number, changes));
+                continue;
+            }
+            None => {}
+        }
         match waiver.waives(client, (dest, found.number), &found.shared, &mut reads)? {
             Some(why) => ignored.push(format!("{changes}, but {why}")),
             None => overlapping.push((found.number, changes)),
@@ -546,6 +633,19 @@ pub struct Overlap {
     /// Whether every open pull request was read, rather than only the
     /// pages asked for.
     pub complete: bool,
+    /// Whether a pull request read may change more files than the first
+    /// [`FILE_READS`] compared or changes one whose name is not a plain
+    /// path, more runs were in flight than the first
+    /// [`RUN_READS`] compared, or a run's issue names more than the first
+    /// [`PATH_LIMIT`] paths compared.
+    pub truncated: bool,
+}
+
+impl Overlap {
+    /// Whether nothing the bounded read left out could overlap.
+    pub fn whole(&self) -> bool {
+        self.complete && !self.truncated
+    }
 }
 
 /// What [`intersecting`] reads.
@@ -560,6 +660,8 @@ pub struct Scope<'a> {
     /// the dispatch check waits on it whatever else intersects, so a later
     /// read cannot change that.
     pub first_run: bool,
+    /// The statuses of the runs read, [`IN_FLIGHT`] or [`ACTIVE_RUNS`].
+    pub statuses: &'a [&'a str],
 }
 
 impl Scope<'_> {
@@ -568,12 +670,14 @@ impl Scope<'_> {
         author: None,
         pages: PULL_PAGES,
         first_run: false,
+        statuses: IN_FLIGHT,
     };
 }
 
 /// Every open pull request of `dest`'s repository whose files intersect
 /// `named`, and every implement run in flight on `target` for another issue
-/// of it (the first [`RUN_READS`]; those by id in `ended` left out) whose
+/// of it (the first [`RUN_READS`] of `scope`'s statuses; those by id in
+/// `ended` left out) whose
 /// issue names a path that does, as the dispatch check reads both, within
 /// `scope`.
 pub fn intersecting<C: Transport + Rest>(
@@ -584,16 +688,17 @@ pub fn intersecting<C: Transport + Rest>(
     scope: Scope,
 ) -> Result<Overlap> {
     let mut found = Overlap::default();
-    for mut run in in_flight(client, dest, target, ended)?
-        .into_iter()
-        .take(RUN_READS)
-    {
+    let (runs, full) = in_flight(client, dest, target, ended, scope.statuses)?;
+    found.truncated = full || runs.len() > RUN_READS;
+    for mut run in runs.into_iter().take(RUN_READS) {
         // Text against text, the same bare `.name` in both is as often an
         // extension as a file: agentic-job#636 waited on #882 only because
         // both said `.patch`. Against a path with a directory, or a pull
         // request's files, it still overlaps.
         let bare = |path: &str| path.starts_with('.') && !path.contains('/');
-        run.shared = paths(&text(client, &run.item)?)
+        let (named_by_run, cut) = bounded_paths(&text(client, &run.item)?);
+        found.truncated |= cut;
+        run.shared = named_by_run
             .into_iter()
             .filter(|o| named.iter().any(|n| overlaps(n, o) && !(n == o && bare(n))))
             .collect();
@@ -604,8 +709,9 @@ pub fn intersecting<C: Transport + Rest>(
             }
         }
     }
-    let (pulls, complete) = open_pulls(client, dest, scope)?;
+    let (pulls, complete, truncated) = open_pulls(client, dest, scope)?;
     found.complete = complete;
+    found.truncated |= truncated;
     for (mut pull, files) in pulls {
         pull.shared = shared(named, &files);
         if !pull.shared.is_empty() {
@@ -619,11 +725,17 @@ pub fn intersecting<C: Transport + Rest>(
 type Pulls = Vec<(PullOverlap, BTreeSet<String>)>;
 
 /// Open pull requests on `dest`'s repository by `scope`'s author, newest
-/// first, and the files each changes, from at most `scope`'s pages; and
-/// whether that was all.
-fn open_pulls<T: Transport>(client: &T, dest: &ItemRef, scope: Scope) -> Result<(Pulls, bool)> {
+/// first, and the files each changes, from at most `scope`'s pages; whether
+/// that was all; and whether one of them may change more files than were
+/// read ([`FILE_READS`] of them came back) or were kept.
+fn open_pulls<T: Transport>(
+    client: &T,
+    dest: &ItemRef,
+    scope: Scope,
+) -> Result<(Pulls, bool, bool)> {
     let (owner, name) = owner_name(dest)?;
     let mut out = Vec::new();
+    let mut truncated = false;
     let mut variables =
         json!({"owner": owner, "name": name, "pulls": PULL_READS, "files": FILE_READS});
     for _ in 0..scope.pages {
@@ -649,14 +761,18 @@ fn open_pulls<T: Transport>(client: &T, dest: &ItemRef, scope: Scope) -> Result<
             let files = pull
                 .pointer("/files/nodes")
                 .and_then(Value::as_array)
-                .context("pull request has no files")?
+                .context("pull request has no files")?;
+            // A path is quoted into the next run's task and into the record, and
+            // git allows backticks and newlines in one: keep only plain paths,
+            // and count one left out as a cut read.
+            let plain: BTreeSet<String> = files
                 .iter()
-                // A path is quoted into the next run's task and into the record, and
-                // git allows backticks and newlines in one: keep only plain paths.
                 .filter_map(|f| f["path"].as_str())
                 .filter(|p| p.chars().all(pathlike))
                 .map(str::to_owned)
                 .collect();
+            truncated |= files.len() as u64 >= FILE_READS || plain.len() < files.len();
+            let files = plain;
             let found = PullOverlap {
                 number,
                 author: author.map(str::to_owned),
@@ -668,17 +784,20 @@ fn open_pulls<T: Transport>(client: &T, dest: &ItemRef, scope: Scope) -> Result<
             out.push((found, files));
         }
         let page = &connection["pageInfo"];
-        match page["endCursor"].as_str() {
+        match (page["hasNextPage"] == true, page["endCursor"].as_str()) {
+            (false, _) => return Ok((out, true, truncated)),
             // The first page is asked without a cursor, as a recorded pass replays it.
-            Some(cursor) if page["hasNextPage"] == true => variables["after"] = cursor.into(),
-            _ => return Ok((out, true)),
+            (true, Some(cursor)) => variables["after"] = cursor.into(),
+            // More, but nowhere to read them from.
+            (true, None) => break,
         }
     }
-    Ok((out, false))
+    Ok((out, false, truncated))
 }
 
 /// The other issues of `dest`'s repository with an implement run of the
-/// caller's workflow queued or in progress. The caller names each run
+/// caller's workflow in one of `statuses`, and whether a status's page was
+/// full, so that more may be listed. The caller names each run
 /// `KIND OWNER/REPO#N` with an optional ` (POOL)` (its `run-name`), from the
 /// plan's `repo` and `item`. The runs in `ended` are left out.
 fn in_flight<C: Rest>(
@@ -686,12 +805,14 @@ fn in_flight<C: Rest>(
     dest: &ItemRef,
     target: &Target,
     ended: &BTreeSet<u64>,
-) -> Result<Vec<RunOverlap>> {
+    statuses: &[&str],
+) -> Result<(Vec<RunOverlap>, bool)> {
     target.validate()?;
     let mut out: Vec<RunOverlap> = Vec::new();
-    for status in ["in_progress", "queued"] {
+    let mut full = false;
+    for status in statuses {
         let url = format!(
-            "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page=100",
+            "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page={RUN_PAGE}",
             target.caller, target.workflow
         );
         let response = client.get(&url, None)?;
@@ -703,6 +824,7 @@ fn in_flight<C: Rest>(
         let runs = response.body["workflow_runs"]
             .as_array()
             .context("run list has no workflow_runs")?;
+        full |= runs.len() >= RUN_PAGE;
         for run in runs {
             if run["id"].as_u64().is_some_and(|id| ended.contains(&id)) {
                 continue;
@@ -737,7 +859,7 @@ fn in_flight<C: Rest>(
         }
     }
     out.sort_by_key(|o| o.item.number);
-    Ok(out)
+    Ok((out, full))
 }
 
 /// The most files GitHub lists of a comparison; one that reaches it may
@@ -857,6 +979,11 @@ mod tests {
         assert!(paths("E.g. i.e. a.k.a. P.S. U.S.").is_empty());
         let many: String = (0..2 * PATH_LIMIT).map(|n| format!("f{n}.rs ")).collect();
         assert_eq!(paths(&many).len(), PATH_LIMIT);
+        let (_, cut) = bounded_paths(&many);
+        assert!(cut);
+        // A path named again past the limit leaves nothing out.
+        let repeated: String = (0..PATH_LIMIT).map(|n| format!("f{n}.rs f0.rs ")).collect();
+        assert!(!bounded_paths(&repeated).1);
     }
 
     #[test]
@@ -888,6 +1015,7 @@ mod tests {
 
     /// The caller's run list, the bot's and others' pull requests on
     /// example/work and on example/tracker, and issue texts by OWNER/REPO#N.
+    #[derive(Clone)]
     struct Forge {
         runs: Vec<&'static str>,
         pulls: Value,
@@ -948,15 +1076,18 @@ mod tests {
                     body: pull["activity"].clone(),
                 });
             }
-            let runs: Vec<Value> = if url.contains("status=in_progress") {
-                (1..)
-                    .zip(&self.runs)
-                    .map(|(id, t)| json!({"id": id, "display_title": t}))
-                    .collect()
-            } else {
-                assert!(url.contains("status=queued"), "{url}");
-                vec![]
-            };
+            // A run is `STATUS|TITLE`, or in progress.
+            let status = ACTIVE_RUNS
+                .iter()
+                .find(|s| url.contains(&format!("status={s}&")))
+                .unwrap_or_else(|| panic!("{url}"));
+            let runs: Vec<Value> = (1..)
+                .zip(&self.runs)
+                .filter_map(|(id, run)| {
+                    let (of, title) = run.split_once('|').unwrap_or(("in_progress", run));
+                    (of == *status).then(|| json!({"id": id, "display_title": title}))
+                })
+                .collect();
             assert!(url.starts_with(
                 "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?"
             ));
@@ -1244,6 +1375,91 @@ mod tests {
         let running = wait("the run for example/work#11 in flight names `a.rs`", &[]);
         assert_eq!(strict(&BTreeSet::new()), running);
         assert_eq!(strict(&BTreeSet::from([1])), independent(none));
+        // A run waiting, requested or pending holds a run stacked past its
+        // own pull request, as the pass counts it active; not an ordinary one.
+        for (run, holds_strict) in [
+            ("queued|implement example/work#11", true),
+            ("waiting|implement example/work#11", false),
+            ("requested|implement example/work#11", false),
+            ("pending|implement example/work#11", false),
+        ] {
+            let forge = Forge {
+                runs: vec![run],
+                ..forge.clone()
+            };
+            let checks = (&BTreeSet::new(), &Waiver::default());
+            let items = (&issue, &issue);
+            let strict = decide_strict(&forge, items, "Do it.", bot, &target, checks);
+            let expected = if holds_strict {
+                &running
+            } else {
+                &independent(none)
+            };
+            assert_eq!(&strict, expected, "{run}");
+            let stacked = decide_stacked(&forge, items, "Do it.", bot, &target, checks.0, 5);
+            assert_eq!(stacked, running, "{run}");
+        }
+        // Nor may it start where a status lists a full page of runs.
+        let full = Forge {
+            runs: vec!["waiting|implement example/work#12"; RUN_PAGE],
+            texts: [
+                ("example/work#10", "Fix src/a.rs."),
+                ("example/work#12", "-"),
+            ]
+            .into(),
+            ..forge.clone()
+        };
+        let items = (&issue, &issue);
+        let stacked = decide_stacked(&full, items, "Do it.", bot, &target, &BTreeSet::new(), 5);
+        assert!(
+            matches!(&stacked, Decision::Wait(why, pulls) if why.contains("and there were more") && pulls.is_empty()),
+            "{stacked:?}"
+        );
+        // Nor where a text names more paths than are read, and the one left
+        // out is the only overlap: with the brief's or a run's first
+        // PATH_LIMIT alone, it would start.
+        // The fake forge's texts are 'static.
+        let listing = (0..PATH_LIMIT)
+            .map(|n| format!("p{n}.rs "))
+            .collect::<String>()
+            .leak();
+        let cut = format!("{listing}src/shared.rs").leak();
+        let other = json!([pull(6, bot, &["src/shared.rs"]), pull(5, bot, &["x.rs"])]);
+        let base_only = json!([pull(5, bot, &["x.rs"])]);
+        // A file whose name is not a plain path is not compared either.
+        let odd = json!([pull(6, bot, &["docs/My File.md"]), pull(5, bot, &["x.rs"])]);
+        for (name, brief, run_text, pulls, cut_off) in [
+            ("brief at the limit", &*listing, "-", &other, false),
+            ("brief past the limit", &*cut, "-", &other, true),
+            ("a file name left out", "docs/", "-", &odd, true),
+            (
+                "run's text at the limit",
+                "src/shared.rs",
+                &*listing,
+                &base_only,
+                false,
+            ),
+            (
+                "run's text past the limit",
+                "src/shared.rs",
+                &*cut,
+                &base_only,
+                true,
+            ),
+        ] {
+            let forge = Forge {
+                runs: vec!["implement example/work#12"],
+                pulls: pulls.clone(),
+                texts: [("example/work#10", "-"), ("example/work#12", run_text)].into(),
+                ..forge.clone()
+            };
+            let items = (&issue, &issue);
+            let none = &BTreeSet::new();
+            let stacked = decide_stacked(&forge, items, brief, bot, &target, none, 5);
+            let waits = matches!(&stacked, Decision::Wait(why, pulls)
+                if why.contains("and there were more") && pulls.is_empty());
+            assert_eq!(waits, cut_off, "{name}: {stacked:?}");
+        }
         let many = format!(
             "open pull request example/work#5 changes {}",
             shown(&["a/1.rs", "a/2.rs", "a/3.rs", "a/4.rs"].map(String::from))
@@ -1518,6 +1734,22 @@ mod tests {
                 checks,
             );
             assert_eq!(decision, expected, "{name}");
+            // A run stacked past its own pull request's hold exempts that
+            // base by number and waives no other.
+            let stacked = |base| {
+                let items = (&issue, &issue);
+                decide_stacked(&forge, items, "-", "agentic-bot", &target, checks.0, base)
+            };
+            match (&expected, stacked(999)) {
+                (Decision::Independent(_), got) => assert_eq!(got, expected, "{name}"),
+                (_, Decision::Wait(_, pulls)) if !pulls.is_empty() => {
+                    if let [base] = pulls[..] {
+                        let got = stacked(base);
+                        assert!(matches!(got, Decision::Independent(_)), "{name}: {got:?}");
+                    }
+                }
+                (_, got) => panic!("{name}: {got:?}"),
+            }
             // Neither waiver may release an overlap with a run still in flight.
             let forge = Forge {
                 runs: vec!["implement example/work#11"],
@@ -1780,6 +2012,7 @@ mod tests {
             author: Some(bot),
             pages: 1,
             first_run: true,
+            statuses: IN_FLIGHT,
         };
         let malformed = json!([{"number": 6, "author": {"login": "visitor"}, "files": null},
             pull(5, bot, &["src/a.rs"], false, 2)]);

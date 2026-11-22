@@ -147,7 +147,7 @@ opt-ins, not every optional key. The GitHub catalog consists of:
 
 - Boolean switches: `notifications`, `issueIntake`, `reserveScheduling`,
   `poolHeadroom`, `skipActiveWork`, `idleReplan`, `existingChildPlans`,
-  `researchPlans`, `fixPlans`, `sessionPlans`, `triageClose`, `replanInvalid`, `operatorQuestionsOnly`,
+  `researchPlans`, `fixPlans`, `sessionPlans`, `stackHeld`, `triageClose`, `replanInvalid`, `operatorQuestionsOnly`,
   `reserveOperator`, `assignHolds`, `readFreeHolds`, `leanReads`, `bodyPlans`, `leases`,
   `reruns`, `reapOverdueRuns`, `cleanupHistory`, `topDown`, `usage.probe`,
   `holds.needsYou`, `holds.approvalEvidence`, `holds.actNow`, `holds.passView`,
@@ -6266,6 +6266,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
 | `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling). Stage 2 then takes no step outside our own space but the bot's own rounds on a pull request it authored there with no same-head midstream pull request, see [the poll](poll.md); `false` |
 | `sessionPlans` | GitHub only: start the operator's own accepted [session](sessions.md) plans on their own issue under existing pacing and caps, as `researchPlans` starts research plans; the planner's session plans wait on the operator; `false` |
+| `stackHeld` | GitHub only: stack an implement start held only by the issue's own open pull request, the bot's, on that pull request where it is a `dispatch/` branch of the repository itself, see [stacking held work](job-plans.md#stacking-held-work); `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |

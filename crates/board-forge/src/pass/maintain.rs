@@ -990,6 +990,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             routing: None,
             direction: self.direction_hash(),
             midstreams: None,
+            stack: None,
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);

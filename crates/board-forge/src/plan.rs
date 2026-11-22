@@ -35,6 +35,13 @@ pub(crate) fn plan_epic_marker() -> String {
 /// The tag of the hidden line after it in the record of a plan the pass
 /// wrote with the operator's direction: `<!-- agent-board-direction: HASH -->`.
 pub const DIRECTION_MARKER: &str = "agent-board-direction";
+
+/// The tag of the hidden line in the record of a run started from another
+/// pull request's head: `<!-- agent-board-stacked: N -->`, N that pull
+/// request. Its run's inputs name that base, so the pass never re-runs it
+/// on its own; a plan the pass stacked (`stackHeld`) says so nowhere else.
+pub const STACKED_MARKER: &str = "agent-board-stacked";
+
 /// The info string of the fence a triage run's answer puts its verdict in:
 /// ```` ```schedule-triage ```` around `{"verdict": "done"}`, as tracker's
 /// scheduler asked for it and the supervisor reads it.
@@ -866,6 +873,14 @@ pub(crate) fn recorded_direction(record: &str) -> Option<&str> {
         .find_map(|l| l.strip_prefix(prefix.as_str())?.strip_suffix(" -->"))
 }
 
+/// The pull request a dispatch record's run was stacked on ([`STACKED_MARKER`]).
+pub(crate) fn recorded_stack(record: &str) -> Option<&str> {
+    let prefix = format!("<!-- {STACKED_MARKER}: ");
+    record
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str())?.strip_suffix(" -->"))
+}
+
 /// The comments by `logins` that record dispatching `plan`, oldest first.
 /// Only the writers' count, so a visitor cannot block a plan with a copied
 /// marker, while an operator's dispatch with their own token still holds off
@@ -1075,6 +1090,10 @@ pub struct Scheduled<'a> {
     /// The topic-admitted midstream forks stage 2 read: an implement or fix
     /// plan that works in one gets [`crate::promote::midstream_brief`].
     pub midstreams: Option<&'a [String]>,
+    /// The pass's `stackHeld`: the lower issue a plan that stacks on nothing
+    /// stacks on instead of waiting, and the pull request its base must be;
+    /// another base, none, or an overlap with anything else waits.
+    pub stack: Option<(u64, u64)>,
 }
 
 /// A dispatcher's refusal before it sent anything, as a lease admission
@@ -1124,6 +1143,9 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
                     .is_some_and(|a| writers.iter().any(|w| w.eq_ignore_ascii_case(a)))),
         "this issue uses a living status ledger; dispatch through its configured pass"
     );
+    if let Some((lower, _)) = scheduled.stack.filter(|_| plan.stacks_on.is_none()) {
+        plan.stacks_on = Some(lower);
+    }
     let legacy = target;
     let routing = scheduled
         .routing
@@ -1180,7 +1202,15 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
         number: plan.item,
         ..issue.clone()
     };
-    let (plan, base, stacked) = match stack(client, &dest, plan, bot)? {
+    let chosen = scheduled.stack.map(|(_, pull)| pull);
+    let stacked = stack(client, &dest, plan, bot)?.and_then(|stack| match (chosen, &stack.1) {
+        (Some(pull), base) if base.as_ref().is_none_or(|b| b.pull != pull) => {
+            let why = format!("its base is no longer pull request {pull}");
+            Err(Decision::Wait(why, Vec::new()))
+        }
+        _ => Ok(stack),
+    });
+    let (plan, base, stacked) = match stacked {
         Ok(stack) => stack,
         Err(wait) => {
             return Ok(Dispatched {
@@ -1193,15 +1223,32 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
         }
     };
     // A stacked run shares the files of the stack below it by design: its
-    // plan, not a guess from paths, decided how it runs.
+    // plan, not a guess from paths, decided how it runs. One the pass
+    // stacked still waits on any other overlap, unwaived, on any active run,
+    // or on a read too short to show there is none.
     let none = std::collections::BTreeSet::new();
     let ended = scheduled.ended.unwrap_or(&none);
     let strict = (ended, &scheduled.waiver);
-    let check = |bot| match scheduled.strict {
-        true => overlap::decide_strict(client, (issue, &dest), &plan.brief, bot, target, strict),
-        false => overlap::decide(client, issue, &dest, &plan.brief, bot, target),
+    let check = |bot| match (chosen, scheduled.strict) {
+        (Some(pull), _) => overlap::decide_stacked(
+            client,
+            (issue, &dest),
+            &plan.brief,
+            bot,
+            target,
+            ended,
+            pull,
+        ),
+        (None, true) => {
+            overlap::decide_strict(client, (issue, &dest), &plan.brief, bot, target, strict)
+        }
+        (None, false) => overlap::decide(client, issue, &dest, &plan.brief, bot, target),
     };
-    let overlap = bot.filter(|_| base.is_none()).map(check);
+    // Its record, as any stacked run's, carries no overlap unless it waits.
+    let overlap = match chosen {
+        Some(_) => bot.map(check).filter(|d| matches!(d, Decision::Wait(..))),
+        None => bot.filter(|_| base.is_none()).map(check),
+    };
     if let Some(Decision::Wait(..)) = overlap {
         // Unrecorded, so the next pass decides again on fresh state.
         return Ok(Dispatched {
@@ -1249,6 +1296,10 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
         };
         check_inputs(client, issue, &source, &chosen.extras, rule)?;
     }
+    let on_base = base
+        .as_ref()
+        .map(|b| format!("\n<!-- {STACKED_MARKER}: {} -->", b.pull))
+        .unwrap_or_default();
     let base = base.as_ref().map(|b| b.branch.as_str());
     let request = |extras: &[&crate::batch::Extra]| {
         let job = JobPlan {
@@ -1318,7 +1369,7 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     let header = match scheduled.direction {
         Some(hash) => format!("{}\n<!-- {DIRECTION_MARKER}: {hash} -->", marker_line(&id)),
         None => marker_line(&id),
-    };
+    } + &on_base;
     let mut records = vec![post(
         issue,
         &id,
