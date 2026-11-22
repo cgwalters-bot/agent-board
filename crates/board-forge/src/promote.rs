@@ -1320,14 +1320,49 @@ fn dco_gate(
     signoff_gate(config, commits).context("dco=required")
 }
 
+/// Commits the promotion may rewrite. A former Git author email alone is
+/// self-asserted: require explicit unmapped author evidence and the expected
+/// committer attribution, without treating either field as proof of approval.
+fn bot_or_operator_author(
+    config: &Config,
+    promote: &pass::promote::Promote,
+    commit: &Value,
+) -> bool {
+    if let Some(login) = commit.pointer("/author/login").and_then(Value::as_str) {
+        return login.eq_ignore_ascii_case(&config.bot)
+            || login.eq_ignore_ascii_case(&config.operator);
+    }
+    (commit.get("author").is_some_and(Value::is_null)
+        || commit.pointer("/author/login").is_some_and(Value::is_null))
+        && commit
+            .pointer("/committer/login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| {
+                login.eq_ignore_ascii_case(&config.bot)
+                    || login.eq_ignore_ascii_case("github-actions[bot]")
+            })
+        && commit
+            .pointer("/commit/author/email")
+            .and_then(Value::as_str)
+            .is_some_and(|email| {
+                promote
+                    .bot_author_emails
+                    .iter()
+                    .any(|allowed| allowed == email)
+            })
+}
+
 fn signoff_gate(config: &Config, own: &rewrite::Commits) -> Result<(String, String, usize)> {
     (|| {
         let commits = own.rows();
         let mut known = BTreeSet::from([own.parent()]);
-        let signoff = config
+        let promote = config
             .promote
             .as_ref()
-            .and_then(|p| p.signoff.as_ref())
+            .context("missing sign-off identity")?;
+        let signoff = promote
+            .signoff
+            .as_ref()
             .context("missing sign-off identity")?;
         let trailer = format!("Signed-off-by: {} <{}>", signoff.name, signoff.email);
         let mut missing = 0;
@@ -1356,9 +1391,7 @@ fn signoff_gate(config: &Config, own: &rewrite::Commits) -> Result<(String, Stri
                 if parents.len() != 1 {
                     problems.push(format!("{sha} is a merge commit"));
                 }
-                if !c["author"]["login"].as_str().is_some_and(|s| {
-                    s.eq_ignore_ascii_case(&config.bot) || s.eq_ignore_ascii_case(&config.operator)
-                }) {
+                if !bot_or_operator_author(config, promote, c) {
                     problems.push(format!("{sha} is by neither bot nor operator"));
                 }
             }

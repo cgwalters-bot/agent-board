@@ -188,29 +188,6 @@ impl Commits {
     }
 }
 
-fn former_bot_author(config: &Config, promote: &pass::promote::Promote, commit: &Value) -> bool {
-    // An author email alone is self-asserted. Require the expected committer
-    // attribution too, without treating either field as proof of approval.
-    (commit.get("author").is_some_and(Value::is_null)
-        || commit.pointer("/author/login").is_some_and(Value::is_null))
-        && commit
-            .pointer("/committer/login")
-            .and_then(Value::as_str)
-            .is_some_and(|login| {
-                login.eq_ignore_ascii_case(&config.bot)
-                    || login.eq_ignore_ascii_case("github-actions[bot]")
-            })
-        && commit
-            .pointer("/commit/author/email")
-            .and_then(Value::as_str)
-            .is_some_and(|email| {
-                promote
-                    .bot_author_emails
-                    .iter()
-                    .any(|allowed| allowed == email)
-            })
-}
-
 /// What a replay needs before any Git run: a linear chain from the merge base
 /// of commits by the bot or operator. A preview reads this; only a conflict is
 /// left to the replay itself.
@@ -233,11 +210,7 @@ pub(super) fn replayable(config: &Config, commits: &Commits) -> Result<()> {
             "promotion requires a linear commit chain"
         );
         hold!(
-            c["author"]["login"]
-                .as_str()
-                .is_some_and(|a| a.eq_ignore_ascii_case(&config.bot)
-                    || a.eq_ignore_ascii_case(&config.operator))
-                || former_bot_author(config, promote, c),
+            bot_or_operator_author(config, promote, c),
             "promotion refuses another author's commit"
         );
         parent = sha;
