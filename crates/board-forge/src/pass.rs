@@ -1559,11 +1559,7 @@ impl Config {
             );
         }
         if let Some(cap) = self.open_pr_cap {
-            ensure!(
-                (1..=pressure::CAP_LIMIT).contains(&cap),
-                "openPrCap must be 1 to {}",
-                pressure::CAP_LIMIT
-            );
+            pressure::check_cap(cap)?;
             ensure!(
                 self.forgejo_board().is_none(),
                 "openPrCap supports GitHub only"

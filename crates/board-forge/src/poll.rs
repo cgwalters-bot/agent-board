@@ -576,6 +576,9 @@ pub const POLL_OPTIONS: &[&str] = &[
     "dispatchWorkflow",
     "generatedBy",
     "maintainerReport",
+    // The pass's top-level keys of the same name, for PR follow-up only.
+    "assignHolds",
+    "openPrCap",
     // The pass's `pr` keys of [`PrOptions`].
     "maintainers",
     "queueOnlyRepository",
@@ -665,7 +668,8 @@ pub struct PollPolicy {
     pub maintainers: BTreeSet<String>,
     /// CLI-only selection, never authority to bypass the followed envelope.
     pub pull: Option<PullSelector>,
-    /// Pass-only opt-in repository backpressure; no new fix authority.
+    /// `openPrCap`: opt-in repository backpressure on PR follow-up, the
+    /// pass's setting or the standalone poll's; no new fix authority.
     pub open_pr_cap: Option<usize>,
     /// Avoid parking mechanical queue failures and exhausted work on the operator.
     /// Off by default; two triages and one bounded round grant per PR.
@@ -767,7 +771,7 @@ pub struct PollPolicy {
     /// the bot's PR to its bounded fix rounds, not intake triage. Off by default.
     pub operator_review_fixes: bool,
     /// The pass's existing `assignHolds`: request the operator's review instead
-    /// of labelling a stop. Off by default; no standalone poll setting.
+    /// of labelling a stop, or the standalone poll's `assignHolds`. Off by default.
     pub assign_holds: bool,
     /// `rebaseRounds`: the rebase rounds of a pull request whose
     /// only failure is a conflict with its base,
@@ -1470,7 +1474,16 @@ impl PollPolicy {
             pull: None,
             publication_forks: BTreeMap::new(),
             unavailable_publication_forks: vec![],
-            open_pr_cap: None,
+            open_pr_cap: get("openPrCap")?
+                .map(|cap| {
+                    let cap = cap
+                        .as_u64()
+                        .and_then(|cap| usize::try_from(cap).ok())
+                        .context("openPrCap is not a positive integer")?;
+                    crate::pass::pressure::check_cap(cap)?;
+                    anyhow::Ok(cap)
+                })
+                .transpose()?,
             queue_only_repository: None,
             maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
             merge_queue,
@@ -1564,8 +1577,11 @@ impl PollPolicy {
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
             draft_review_repositories: Vec::new(),
+            assign_holds: get("assignHolds")?
+                .map(|a| a.as_bool().context("assignHolds is not a boolean"))
+                .transpose()?
+                .unwrap_or(false),
             // The pass's only.
-            assign_holds: false,
             reruns: false,
             review_caller_workflow: None,
             wip: None,
@@ -22075,10 +22091,19 @@ mod tests {
 
     #[test]
     fn assign_holds_requests_review_and_waits_until_it_is_released() {
-        let policy = PollPolicy {
-            assign_holds: true,
-            ..PollPolicy::default()
-        };
+        // The pass's policy and a standalone poll's `assignHolds` hold alike.
+        for policy in [
+            PollPolicy {
+                assign_holds: true,
+                ..PollPolicy::default()
+            },
+            PollPolicy::from_json(&json!({"assignHolds": true})).unwrap(),
+        ] {
+            assign_holds_request_and_release(policy);
+        }
+    }
+
+    fn assign_holds_request_and_release(policy: PollPolicy) {
         let state = json!({"rounds": FIX_ROUNDS, "sha": "older"});
         let failed = json!({"contexts": {"ci": {"conclusion": "FAILURE"}}});
         let (outcome, fake, dispatcher) =

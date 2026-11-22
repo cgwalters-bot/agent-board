@@ -6,7 +6,8 @@ fn recovery_policy() -> PollPolicy {
 
 #[test]
 fn open_pr_cap_keeps_landing_work_and_serializes_oldest_paths() {
-    for cap in [None, Some(1), Some(2), Some(3)] {
+    // The pass's policy and a standalone poll's `openPrCap` decide alike.
+    for (cap, standalone) in [None, Some(1), Some(2), Some(3)].into_iter().flat_map(|cap| [(cap, false), (cap, true)]) {
         for shared in [false, true] {
             for (change, action) in [(json!({}), "merge"), (json!({"contexts":{"ci":{"conclusion":"FAILURE"}}}), "fix"), (json!({"mergeable":CONFLICTING}), "rebase")] {
                 let mut fake = github();
@@ -19,7 +20,13 @@ fn open_pr_cap_keeps_landing_work_and_serializes_oldest_paths() {
                 later["files"] = files(if shared { "src/a.rs" } else { "src/b.rs" });
                 fake.pulls.insert(471, later);
                 fake.page(&format!("repos/{REPO}/issues/471/comments?per_page=100"), None, None, json!([]));
-                let policy = PollPolicy { open_pr_cap:cap, rebase_rounds:2, ..PollPolicy::default() };
+                let policy = if standalone {
+                    let mut value = json!({"rebaseRounds": 2});
+                    if let Some(cap) = cap { value["openPrCap"] = cap.into(); }
+                    PollPolicy::from_json(&value).unwrap()
+                } else {
+                    PollPolicy { open_pr_cap:cap, rebase_rounds:2, ..PollPolicy::default() }
+                };
                 let mut first = change;
                 first["files"] = files("src/a.rs");
                 let (out, _, _) = applied_policy(fake, policy, first, json!({"rounds":0}));
