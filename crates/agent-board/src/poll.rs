@@ -414,6 +414,16 @@ mod tests {
         assert!(policy.toil_fix_pool.is_empty());
         assert!(policy.kind_pools.is_empty());
         assert!(policy.operator_comments.is_empty());
+        assert!(!policy.assign_holds && policy.open_pr_cap.is_none());
+        // A malformed PR follow-up setting fails here, before any client is built.
+        for (key, setting) in [("openPrCap", json!(0)), ("assignHolds", json!("yes"))] {
+            let mut bad = base.clone();
+            bad[key] = setting;
+            let err = configured(&args, Some(&bad), None, now)
+                .err()
+                .map(|e| format!("{e:#}"));
+            assert!(err.as_ref().is_some_and(|e| e.contains(key)), "{err:?}");
+        }
         let mut full = base;
         full["fixPools"] = json!(["configured"]);
         full["reviewWorkflow"] = json!("review.yml");

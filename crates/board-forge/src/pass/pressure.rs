@@ -9,6 +9,16 @@ pub(crate) const OPEN_LIMIT: usize = PAGES * 100;
 pub(crate) const OLDER_LIMIT: usize = 100;
 pub(crate) const FILE_LIMIT: usize = 3000;
 
+/// Refuses an `openPrCap` outside 1 to [`CAP_LIMIT`], in the pass's and the
+/// standalone poll's config alike.
+pub(crate) fn check_cap(cap: usize) -> Result<()> {
+    ensure!(
+        (1..=CAP_LIMIT).contains(&cap),
+        "openPrCap must be 1 to {CAP_LIMIT}"
+    );
+    Ok(())
+}
+
 fn count(client: &impl Rest, repo: &str, bot: &str) -> Result<usize> {
     let prefix = format!("{API_ROOT}repos/{repo}/pulls?");
     let mut next = Some(format!("{prefix}state=open&per_page=100"));

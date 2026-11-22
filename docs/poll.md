@@ -401,8 +401,9 @@ requested, no poll work runs on the PR; a missing or truncated reviewer list
 also holds it. Submitting a review or removing the request releases the stop
 and permits fresh rounds. Comments alone do not release a review-request hold;
 `operatorAnswers` and `staleDays` still apply only to labelled stops. Existing
-labels remain holds and are not automatically migrated. This uses the pass's
-existing top-level setting, not a new standalone poll option.
+labels remain holds and are not automatically migrated. A standalone poll
+takes the same top-level `assignHolds` in its `agent-board.json`, so a pass and
+a standalone poll of the same PR hold it alike.
 
 The hold diagnostic says `operator review pending; requester unknown`: the
 requested reviewer is not evidence of who asked. Bot-created requests still
@@ -626,7 +627,7 @@ failure; it does not start fresh CI or weaken the egress policy.
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `maintainerReport`, `mergeAuthors`, `queueOnlyRepository`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`, and the pass's `pr` keys below. File settings override the
+optional `maintainerReport`, `mergeAuthors`, `queueOnlyRepository`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`, the pass's top-level `assignHolds` and `openPrCap`, and the pass's `pr` keys below. File settings override the
 corresponding flags. Every reader of the file (poll, supervisor, `ask`,
 `--board-config`, `reconcile plan --config`) refuses a top-level key that is none
 of these and none of the other commands' sections (`board`, `statusReconcile`,
@@ -667,6 +668,18 @@ leaves a work repository unfollowed, so no work repository's pull requests go
 unseen. A standalone poll has no work repositories, so it checks nothing of the
 kind: `unstall` acts on the pull requests of its `follow` list only, and those of
 a repository left out of it are still never seen.
+
+The pass's top-level `assignHolds` (a boolean) and `openPrCap` (1 to 100) are
+read the same way, with the same types, bounds and PR follow-up decisions;
+omitted, both stay off as before. `assignHolds` holds a stopped ready PR on
+the operator's review request ([above](#one-pass)). In a standalone poll
+`openPrCap` covers PR follow-up only: the oldest-first wait behind older
+overlapping PRs described in
+[repository PR backpressure](pass.md#repository-pr-backpressure), and a merge
+waiting behind a queued one. Its open PR read is bounded, so a repository with
+more than 1000 open PRs, or a malformed list, is an error rather than a walk. It does
+not schedule issues or hold implements, which only the pass starts, and no
+summary prints the counts.
 
 `maintainers` is a top-level list in `agent-board.json` (`pr.maintainers` in
 `pass.json`). It prevents the central poll from competing with a repository's

@@ -20124,6 +20124,48 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
     assert!(poll(&json!({"stalledDays": 3})).is_err());
 }
 
+/// The pass's top-level `assignHolds` and `openPrCap` give a standalone poll
+/// the same PR follow-up policy, refused alike, and default off when omitted.
+#[test]
+fn assign_holds_and_open_pr_cap_are_one_policy_for_pass_and_poll() {
+    let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
+    let pass = |edit: &Value| {
+        let mut value = minimal.clone();
+        let keys = value.as_object_mut().unwrap();
+        keys.extend(edit.as_object().unwrap().clone());
+        Config::parse(&value.to_string()).map(|c| c.poll(None).policy)
+    };
+    let shared = |p: &PollPolicy| (p.assign_holds, p.open_pr_cap);
+    for (edit, want) in [
+        (json!({}), Some((false, None))),
+        (json!({"assignHolds": false}), Some((false, None))),
+        (json!({"assignHolds": true}), Some((true, None))),
+        (json!({"openPrCap": 1}), Some((false, Some(1)))),
+        (
+            json!({"openPrCap": 100, "assignHolds": true}),
+            Some((true, Some(100))),
+        ),
+        (json!({"openPrCap": 0}), None),
+        (json!({"openPrCap": 101}), None),
+        (json!({"openPrCap": -1}), None),
+        (json!({"openPrCap": 1.5}), None),
+        (json!({"openPrCap": "6"}), None),
+        (json!({"openPrCap": null}), None),
+        (json!({"assignHolds": "true"}), None),
+        (json!({"assignHolds": 1}), None),
+        (json!({"assignHolds": null}), None),
+    ] {
+        match (pass(&edit), PollPolicy::from_json(&edit), want) {
+            (Ok(pass), Ok(poll), Some(want)) => {
+                assert_eq!(shared(&pass), want, "{edit}");
+                assert_eq!(shared(&poll), want, "{edit}");
+            }
+            (Err(_), Err(_), None) => {}
+            (pass, poll, _) => panic!("{edit}: pass {:?}, poll {:?}", pass.err(), poll.err()),
+        }
+    }
+}
+
 #[test]
 fn v1_representative_config() {
     // Synthetic deployment shape: public placeholders, no live endpoint or credentials.
