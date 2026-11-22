@@ -20141,6 +20141,33 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
     assert!(poll(&json!({"stalledDays": 3})).is_err());
 }
 
+/// `trackingRepo` is where the poll files and finds tracking issues, and
+/// `dispatchRepo` unless set; the runs' repository is `dispatchRepo` either
+/// way (agent-board#1157).
+#[test]
+fn tracking_repo_defaults_to_dispatch_repo() {
+    let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
+    for (edit, tracking) in [
+        (json!({}), "o/caller"),
+        (json!({"trackingRepo": "o/tracker"}), "o/tracker"),
+        (json!({"trackingRepo": "o/caller"}), "o/caller"),
+    ] {
+        let mut value = minimal.clone();
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        let config = Config::parse(&value.to_string()).unwrap();
+        assert_eq!(config.tracking_repo(), tracking, "{edit}");
+        let poll = config.poll(None);
+        assert_eq!(
+            (poll.dispatch_repo.as_str(), poll.tracking_repo.as_str()),
+            ("o/caller", tracking),
+            "{edit}"
+        );
+    }
+}
+
 /// The pass's top-level `assignHolds` and `openPrCap` give a standalone poll
 /// the same PR follow-up policy, refused alike, and default off when omitted.
 #[test]
@@ -20635,6 +20662,20 @@ fn config_table() {
             json!({"direction": {"repository": "O/Caller", "issue": 3}}),
             "direction repository O/Caller is one the pass starts runs on",
         ),
+        // Runs on tracking issues are in the tracker (agent-board#1157).
+        (
+            json!({"trackingRepo": "o/tracker", "direction": {"repository": "O/Tracker", "issue": 3}}),
+            "direction repository O/Tracker is one the pass starts runs on",
+        ),
+        (
+            json!({"trackingRepo": "not a repo"}),
+            "trackingRepo: invalid repository",
+        ),
+        (
+            json!({"trackingRepo": "elsewhere/tracker"}),
+            "trackingRepo elsewhere/tracker is outside our own space, o/caller's owner and bot",
+        ),
+        (json!({"trackingRepo": null}), "config.trackingRepo is null"),
         (
             json!({"planPools": ["a"]}),
             "planPools names a, which is not in pools",
@@ -24385,6 +24426,58 @@ fn notifications_run_without_followed_repositories_and_report_denied_reads() {
     }
 }
 
+/// A midstream fork with issues disabled stages its upstream's direction in
+/// the tracker: `trackingRepo` where set, else `dispatchRepo`
+/// (agent-board#1157); the pass says so, and the poll's intake routes name
+/// the same repository.
+#[test]
+fn stage_direction_uses_fork_issue_availability_not_destination() {
+    const FORK: &str = "cgwalters-forge/fork";
+    for (setting, tracker, has_issues) in [
+        (json!({}), "cgwalters-forge/tracker", false),
+        (
+            json!({"trackingRepo": "cgwalters-forge/issues"}),
+            "cgwalters-forge/issues",
+            false,
+        ),
+        (json!({"trackingRepo": FORK}), FORK, true),
+    ] {
+        let mut recorded = replay();
+        let since = (recorded.now - time::Duration::days(2) - time::Duration::minutes(10))
+            .replace_nanosecond(0)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        for query in intake_queries(&since) {
+            recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page=1")},
+                "answer": {"status": 200, "link": null, "body": {"items": [], "total_count": 0, "incomplete_results": false}}}));
+        }
+        recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}orgs/cgwalters-forge/repos?per_page=100")},
+            "answer": {"status": 200, "link": null, "body": [{"full_name": FORK, "topics": ["bot-midstream"]}]}}));
+        recorded.requests.push(
+            json!({"request": {"get": format!("{API_ROOT}repos/{FORK}")},
+            "answer": {"status": 200, "link": null, "body": {"full_name": FORK, "fork": true,
+                "has_issues": has_issues, "parent": {"full_name": "upstream/project"}}}}),
+        );
+        followed(&mut recorded, (FORK, 1), json!({}), json!([]));
+        let mut settings = json!({"wip": 0, "notifications": true, "pr": {"fixPools": ["claude"]},
+            "midstream": {"owner": "cgwalters-forge", "topic": "bot-midstream"}});
+        (settings.as_object_mut().unwrap()).extend(setting.as_object().unwrap().clone());
+        let config = config(settings);
+        let report = preview(&config, &recorded);
+        assert_eq!(report.failures, 0, "{setting}: {:?}", report.lines);
+        assert_eq!(
+            report.lines.contains(&format!(
+                "notifications: the midstream fork of upstream/project has issues disabled; its direction is staged in {tracker}"
+            )),
+            !has_issues,
+            "{setting}, has_issues={has_issues}: {:?}",
+            report.lines
+        );
+        assert_eq!(config.poll(None).tracking_repo, tracker, "{setting}");
+    }
+}
+
 /// An operator answer must be read before PR activity even when scheduling's
 /// reservation is larger than the pass's entire remaining budget (#876).
 #[test]
@@ -24641,7 +24734,7 @@ fn notification_routes_require_verified_unambiguous_fork_parents() {
             false,
         ),
         (200, json!({"full_name": "o/fork", "fork": true}), false),
-        // Issues disabled: staged in the dispatch repository instead.
+        // Issues disabled: staged in the tracking repository instead.
         (
             200,
             json!({"full_name": "o/fork", "fork": true, "has_issues": false, "parent": {"full_name": "upstream/project"}}),
@@ -24653,12 +24746,12 @@ fn notification_routes_require_verified_unambiguous_fork_parents() {
             json!({"request": {"get": format!("{API_ROOT}repos/o/fork")},
             "answer": {"status": status, "body": body}}),
         );
-        let routes = midstream::routes(&recorded, &["o/fork".into()], "o/tracker");
+        let routes = midstream::routes(&recorded, &["o/fork".into()]);
         assert_eq!(routes.is_ok(), valid, "{status} {body}: {routes:?}");
         if valid && body["fork"] == true {
             let staging = match body["has_issues"] == false {
-                true => "o/tracker",
-                false => "o/fork",
+                true => poll::IntakeRoute::Fallback,
+                false => poll::IntakeRoute::Direct("o/fork".into()),
             };
             let routes = routes.unwrap();
             assert_eq!(routes.staging["upstream/project"], staging);
@@ -24692,21 +24785,9 @@ fn notification_routes_require_verified_unambiguous_fork_parents() {
         recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/{repo}")},
             "answer": {"status": 200, "body": {"full_name": repo, "fork": true, "parent": {"full_name": "upstream/project"}}}}));
     }
+    assert!(midstream::routes(&recorded, &["o/fork".into(), "o/another".into()]).is_err());
     assert!(
-        midstream::routes(
-            &recorded,
-            &["o/fork".into(), "o/another".into()],
-            "o/tracker"
-        )
-        .is_err()
-    );
-    assert!(
-        midstream::routes(
-            &recorded,
-            &vec!["o/fork".into(); POLL_REPOSITORY_LIMIT + 1],
-            "o/tracker"
-        )
-        .is_err()
+        midstream::routes(&recorded, &vec!["o/fork".into(); POLL_REPOSITORY_LIMIT + 1],).is_err()
     );
 }
 
@@ -24722,8 +24803,11 @@ fn authored_priority_maps_forks_not_staging() {
         "answer": {"status": 200, "body": {"full_name": "o/fork", "fork": true,
             "has_issues": false, "parent": {"full_name": "Upstream/Project"}}}}),
     );
-    let routes = midstream::routes(&recorded, &["o/fork".into()], "o/tracker").unwrap();
-    assert_eq!(routes.staging["upstream/project"], "o/tracker");
+    let routes = midstream::routes(&recorded, &["o/fork".into()]).unwrap();
+    assert_eq!(
+        routes.staging["upstream/project"],
+        poll::IntakeRoute::Fallback
+    );
     for (named, expected) in [
         ("o/fork", &["o/fork", "upstream/project"][..]),
         ("o/tracker", &["o/tracker"]),

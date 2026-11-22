@@ -507,6 +507,13 @@ pub struct Config {
     pub bot: String,
     /// Where the fix runs that markers name run.
     pub dispatch_repo: String,
+    /// Where the tracking issues of threads outside our own space and of
+    /// someone else's pull requests are filed and found again, with their
+    /// claims, and where a midstream fork with issues disabled stages its
+    /// upstream's direction ([`comments::Pass::tracking_repository`]): the
+    /// pass's `trackingRepo`, `dispatchRepo` unless set. Our own space is
+    /// still `dispatch_repo`'s organization.
+    pub tracking_repo: String,
     /// The review job's workflow file in each followed repository, whose runs'
     /// reviews of a head count as its verdict; none counts only the operator's.
     pub review_workflow: Option<String>,
@@ -675,6 +682,24 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
     known(POLL_OPTIONS, value, key)
 }
 
+/// Where pass intake stages direction for a topic-admitted fork.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntakeRoute {
+    /// The fork has its own issues, so upstream issue numbers are meaningful.
+    Direct(String),
+    /// The fork has issues disabled; stage in the configured tracking repository.
+    Fallback,
+}
+
+impl IntakeRoute {
+    pub(crate) fn repository<'a>(&'a self, tracker: &'a str) -> &'a str {
+        match self {
+            Self::Direct(fork) => fork,
+            Self::Fallback => tracker,
+        }
+    }
+}
+
 /// Optional settings from the caller's repository-owned agent-board.json.
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
@@ -775,10 +800,11 @@ pub struct PollPolicy {
     /// are routed to the operator's handling, a peer's research run or a
     /// line for a person ([`notify`]); none (the default) reads none.
     pub notifications: Option<notify::Notifications>,
-    /// Pass-only operator-direction search: upstream repository to topic-admitted
-    /// fork. None preserves standalone poll routing; empty admits only ours.
+    /// Pass-only operator-direction search: upstream repository to staging route
+    /// for its topic-admitted fork. None preserves standalone poll routing;
+    /// empty admits only ours.
     /// Reuses the operator search cursor; `notifications` stays optional.
-    pub notification_intake: Option<BTreeMap<String, String>>,
+    pub notification_intake: Option<BTreeMap<String, IntakeRoute>>,
     /// `brokerOutage`: where the inference broker's outages are recorded, so
     /// that a run they failed is not charged; none (the default) charges it.
     pub broker_outage: Option<BrokerOutage>,
@@ -10837,6 +10863,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         validate_repository(&at.repository)?;
         ensure!(at.issue > 0, "maintainerReport.issue must be positive");
     }
+    validate_repository(&config.tracking_repo)?;
     if let Some(workflow) = &config.review_workflow {
         validate_workflow(workflow)?;
     }
@@ -11735,6 +11762,7 @@ mod tests {
             operator: "cgwalters".into(),
             bot: BOT.into(),
             dispatch_repo: "cgwalters-forge/tracker".into(),
+            tracking_repo: "cgwalters-forge/tracker".into(),
             review_workflow: Some("review.yml".into()),
             policy: PollPolicy::default(),
         }
@@ -16276,6 +16304,7 @@ mod tests {
                 operator: operator.into(),
                 bot: BOT.into(),
                 dispatch_repo: dispatch.into(),
+                tracking_repo: dispatch.into(),
                 review_workflow: Some(review.into()),
                 policy: PollPolicy::default(),
             };

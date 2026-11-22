@@ -5,10 +5,11 @@
 //! the bot's, or a triage run on any other issue or pull request.
 //!
 //! A run's item on someone else's pull request is a tracking issue in
-//! `Config::dispatch_repo` instead (agent-board#106): the dispatch workflow
-//! takes only review and fix runs on a pull request. The thread's claim
-//! records the issue, so that later comments go to the same one. Only a
-//! public repository's comments are copied to the tracker that way.
+//! `Config::tracking_repo`, the tracker, instead (agent-board#106): the
+//! dispatch workflow takes only review and fix runs on a pull request. The
+//! thread's claim records the issue, so that later comments go to the same
+//! one. Only a public repository's comments are copied to the tracker that
+//! way.
 //!
 //! A thread outside our own space, the organization of `dispatch_repo` and
 //! the bot's own account, gets no write from a triage at all
@@ -276,6 +277,17 @@ pub(super) fn tracking_title(repo: &str, number: u64) -> String {
     format!("{repo}#{number}: operator request")
 }
 
+/// Match the exact GitHub API prefix and the whole case-insensitive repository
+/// name, not a transferred issue or a lookalike URL.
+pub(super) fn is_tracking_issue(issue: &Value, tracker: &str, bot: &str, title: &str) -> bool {
+    text(issue, "/repository_url")
+        .strip_prefix(&format!("{API_ROOT}repos/"))
+        .is_some_and(|repo| repo.eq_ignore_ascii_case(tracker))
+        && text(issue, "/user/login") == bot
+        && text(issue, "/title") == title
+        && issue.get("pull_request").is_none_or(Value::is_null)
+}
+
 /// The bot's issues in the tracker that track a thread outside our own
 /// space, oldest first, each with its comments ([`Pass::tracked`]).
 #[derive(Default)]
@@ -479,13 +491,15 @@ fn triage_brief(
         ),
         crate::plan::VALIDATE_PLAN_JSON.into(),
         crate::plan::project_work_brief(
-            &config.dispatch_repo,
+            &config.tracking_repo,
             config
                 .policy
                 .notification_intake
                 .iter()
                 .flat_map(|routes| routes.iter())
-                .map(|(upstream, fork)| (upstream.as_str(), fork.as_str())),
+                .map(|(upstream, route)| {
+                    (upstream.as_str(), route.repository(&config.tracking_repo))
+                }),
         ),
     ];
     lines.extend(quote(said, url, operator));
@@ -1886,7 +1900,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             (source["private"] != false || source["visibility"] != "public").then(|| {
                 format!(
                     "left: {repo} is not public, so nothing of it is copied to {}",
-                    self.config.dispatch_repo
+                    self.config.tracking_repo
                 )
             }),
         )
@@ -2102,11 +2116,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         ))
     }
 
-    /// The issue in `Config::dispatch_repo` that tracks someone else's pull
-    /// request, or a thread outside our own space, and its comments: the
-    /// one the newest claim of the bot's on the pull request names, or the
-    /// oldest open one of the `tracked`, with the new comments quoted on it;
-    /// else a new one that quotes them.
+    /// The issue in the tracker ([`Self::tracking_repository`]) that tracks
+    /// someone else's pull request, or a thread outside our own space, and
+    /// its comments: the one the newest claim of the bot's on the pull request
+    /// names, or the oldest open one of the `tracked`, with the new comments
+    /// quoted on it; else a new one that quotes them.
     fn tracking_issue(
         &mut self,
         repo: &str,
@@ -2176,12 +2190,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             // an open issue the bot opened for this pull request is reused,
             // so the run cannot be pointed at another issue in the tracker,
             // nor at one transferred out of it.
-            if text(&found, "/repository_url") == format!("{API_ROOT}repos/{tracker}")
-                && text(&found, "/user/login") == bot
-                && text(&found, "/title") == title
-                && found["state"] == "open"
-                && found.get("pull_request").is_none_or(Value::is_null)
-            {
+            if is_tracking_issue(&found, &tracker, &bot, &title) && found["state"] == "open" {
                 // Every claim naming the issue names the comments it quotes,
                 // as it is recorded before its dispatch: a retry after a
                 // refusal, or after a run whose claim was not recorded,
@@ -2240,14 +2249,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // The pass's intake routes come from verified fork-parent metadata.
         // A fallback tracker has no such parent, and a PR is not an issue.
+        // Keep the dispatch host's existing exclusion even if it is a fork.
         let upstream = if tracker != self.config.dispatch_repo
-            && self
-                .config
-                .policy
-                .notification_intake
-                .as_ref()
-                .and_then(|routes| routes.get(&repo.to_ascii_lowercase()))
-                == Some(&tracker)
+            && matches!(self.intake_route(repo), Some(IntakeRoute::Direct(_)))
             && url == format!("https://github.com/{repo}/issues/{number}")
         {
             format!("Upstream: #{number}\n\n")
@@ -2328,10 +2332,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // By number, which is by creation: the oldest first.
         let mut mine: BTreeMap<u64, Value> = BTreeMap::new();
         for issue in issues {
-            if text(&issue, "/repository_url") == format!("{API_ROOT}repos/{tracker}")
-                && text(&issue, "/user/login") == self.config.bot
-                && text(&issue, "/title") == title
-                && issue.get("pull_request").is_none_or(Value::is_null)
+            if is_tracking_issue(&issue, &tracker, &self.config.bot, &title)
                 && let Some(number) = issue["number"].as_u64()
             {
                 mine.insert(number, issue);
@@ -2345,14 +2346,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(tracked)
     }
 
+    /// Where `repo`'s tracking issues are: its intake route's staging
+    /// repository, else [`Config::tracking_repo`].
     pub(super) fn tracking_repository(&self, repo: &str) -> String {
+        let tracker = &self.config.tracking_repo;
+        self.intake_route(repo)
+            .map_or(tracker.as_str(), |route| route.repository(tracker))
+            .to_owned()
+    }
+
+    fn intake_route(&self, repo: &str) -> Option<&IntakeRoute> {
         self.config
             .policy
             .notification_intake
             .as_ref()
             .and_then(|routes| routes.get(&repo.to_ascii_lowercase()))
-            .unwrap_or(&self.config.dispatch_repo)
-            .clone()
     }
 
     /// [`Pass::dispatch`], not started unless the request budget leaves the
@@ -2409,6 +2417,7 @@ pub(super) mod tests {
             operator: OPERATOR.into(),
             bot: BOT.into(),
             dispatch_repo: DISPATCH.into(),
+            tracking_repo: DISPATCH.into(),
             review_workflow: None,
             policy: PollPolicy::from_json(
                 &json!({"operatorComments": {"repositories": ["upstream/*"]}, "kindPools": {"triage": "small"}}),
@@ -2422,21 +2431,30 @@ pub(super) mod tests {
         for (name, routes, expected) in [
             (
                 "one fork",
-                vec![("upstream/app", "upstream/midstream")],
+                vec![("upstream/app", Some("upstream/midstream"))],
                 vec!["upstream/app -> upstream/midstream"],
             ),
             (
                 "several forks",
-                vec![("source/a", "upstream/a"), ("source/b", "upstream/b")],
+                vec![
+                    ("source/a", Some("upstream/a")),
+                    ("source/b", Some("upstream/b")),
+                ],
                 vec!["source/a -> upstream/a", "source/b -> upstream/b"],
             ),
-            ("infrastructure", vec![("source/a", DISPATCH)], vec![]),
+            ("infrastructure", vec![("source/a", Some(DISPATCH))], vec![]),
+            ("fallback", vec![("source/a", None)], vec![]),
         ] {
             let mut config = config();
             config.policy.notification_intake = Some(
                 routes
                     .into_iter()
-                    .map(|(source, fork)| (source.to_owned(), fork.to_owned()))
+                    .map(|(source, fork)| {
+                        let route = fork.map_or(IntakeRoute::Fallback, |fork| {
+                            IntakeRoute::Direct(fork.to_owned())
+                        });
+                        (source.to_owned(), route)
+                    })
                     .collect(),
             );
             let brief = triage_brief(
@@ -3383,6 +3401,7 @@ pub(super) mod tests {
         let mut config = config();
         config.policy.own_space_only = true;
         config.dispatch_repo = "elsewhere/tracker".into();
+        config.tracking_repo = "elsewhere/tracker".into();
         assert!(!config.writes_in("upstream/app"));
         let outcome = pass_configured(&fake, &config, (None, None), true, now());
         assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
@@ -3419,6 +3438,128 @@ pub(super) mod tests {
             .get_mut(&format!("{API_ROOT}search"))
             .unwrap()["items"] = json!([hit(BOT_PULL, "someone", true, "2026-10-16T10:00:00Z")]);
         fake
+    }
+
+    /// Tracking issues are filed and found in the tracker, `trackingRepo`,
+    /// whether or not the runs are dispatched from it (agent-board#1157):
+    /// someone else's pull request in our own space, claimed on its thread,
+    /// and a thread outside it, claimed on the tracking issue. A later
+    /// comment finds the issue and its claim there, and the run URL names
+    /// the dispatch repository, which gets no other write.
+    #[test]
+    fn tracking_issues_stay_in_the_tracker_wherever_runs_are_dispatched() {
+        let ask = said(
+            400,
+            OPERATOR,
+            "2026-10-16T10:30:00Z",
+            "@worker is this still broken?",
+        );
+        for (dispatch, thread) in [
+            (DISPATCH, BOT_PULL),
+            ("upstream/dispatch", BOT_PULL),
+            (DISPATCH, "outside/app#3"),
+            ("upstream/dispatch", "outside/app#3"),
+        ] {
+            let case = format!("{thread} dispatched from {dispatch}");
+            let outside = thread.starts_with("outside/");
+            let mut config = config();
+            config.dispatch_repo = dispatch.into();
+            config.policy = PollPolicy::from_json(&json!({
+                "operatorComments": {"repositories": ["upstream/*", "outside/*"]},
+                "kindPools": {"triage": "small"}}))
+            .unwrap();
+            let fake = match outside {
+                true => one_thread(thread, false, json!([ask.clone()])),
+                false => someones_pull(),
+            };
+            let (repo, number) = thread.split_once('#').unwrap();
+            let list = format!("{API_ROOT}repos/{repo}/issues/{number}/comments?per_page=100");
+            let created = |fake: &Fake| -> Vec<u64> {
+                fake.rest
+                    .borrow()
+                    .iter()
+                    .filter(|(_, v)| v["user"]["login"] == BOT)
+                    .filter_map(|(k, _)| {
+                        k.strip_prefix(&format!("{API_ROOT}repos/{DISPATCH}/issues/"))?
+                            .parse()
+                            .ok()
+                    })
+                    .collect()
+            };
+            let claims = |fake: &Fake, page: &str| -> usize {
+                fake.rest.borrow()[page]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| parse_marker(CLAIM, text(c, "/body")).is_some())
+                    .count()
+            };
+
+            let first = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(first.errors, 0, "{case}: {:?}", first.lines);
+            let issue = match created(&fake)[..] {
+                [issue] => issue,
+                ref issues => panic!("{case}: opened {issues:?}"),
+            };
+            assert!(
+                first.lines[0].ends_with(&format!(
+                    "triage on {DISPATCH}#{issue} -> https://github.com/{dispatch}/actions/runs/1234"
+                )),
+                "{case}: {:?}",
+                first.lines
+            );
+            let inputs = dispatches(&fake);
+            assert_eq!(
+                (&inputs[0]["repo"], &inputs[0]["item"]),
+                (&json!(DISPATCH), &json!(issue.to_string())),
+                "{case}"
+            );
+            let on_issue =
+                format!("{API_ROOT}repos/{DISPATCH}/issues/{issue}/comments?per_page=100");
+            let claimed = (claims(&fake, &list), claims(&fake, &on_issue));
+            assert_eq!(claimed, if outside { (0, 1) } else { (1, 0) }, "{case}");
+
+            // A later comment reuses the issue and claim found in the tracker.
+            // GitHub may return the repository with a different spelling.
+            if dispatch != DISPATCH {
+                fake.rest
+                    .borrow_mut()
+                    .get_mut(&format!("{API_ROOT}repos/{DISPATCH}/issues/{issue}"))
+                    .unwrap()["repository_url"] =
+                    json!(format!("{API_ROOT}repos/{}", DISPATCH.to_ascii_uppercase()));
+            }
+            fake.rest
+                .borrow_mut()
+                .get_mut(&list)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(said(
+                    401,
+                    OPERATOR,
+                    "2026-10-16T11:50:00Z",
+                    "@worker and now?",
+                ));
+            let second = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(second.errors, 0, "{case}: {:?}", second.lines);
+            assert_eq!(created(&fake), [issue], "{case}");
+            let inputs = dispatches(&fake);
+            assert_eq!(inputs.len(), 2, "{case}");
+            assert_eq!(inputs[1]["item"], json!(issue.to_string()), "{case}");
+            assert_eq!(
+                (claims(&fake, &list), claims(&fake, &on_issue)),
+                if outside { (0, 2) } else { (2, 0) },
+                "{case}"
+            );
+            for (write, _) in fake.writes.borrow().iter() {
+                assert!(
+                    dispatch == DISPATCH
+                        || !write.contains(&format!("repos/{dispatch}/"))
+                        || write.ends_with("/dispatches"),
+                    "{case}: {write}"
+                );
+            }
+        }
     }
 
     #[test]

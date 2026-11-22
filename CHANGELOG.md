@@ -11,6 +11,12 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The pass's new `trackingRepo` (`dispatchRepo` unless set) names the host
+  for tracking issues and `midstream` direction staged when a fork has no
+  issues. Dispatch can move within the same owner while tracking receipts
+  stay in place. Run URLs, own-space membership and leases still follow
+  `dispatchRepo` (agent-board#1157).
+
 - The release train's optional `requestLimit` (default 200, at most 2000)
   raises a pass's GitHub request bound. A pass that runs caller discovery
   prints how many requests discovery used, and running out during discovery

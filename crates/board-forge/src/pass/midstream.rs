@@ -3,6 +3,7 @@
 //! than listed in `follow` and `pr.noMerge`. Stage 2 follows each and never
 //! merges in it, as if it were in both lists.
 use super::*;
+use crate::poll::IntakeRoute;
 
 /// The most pages of the organization's repositories one pass lists. More
 /// fails stage 2 rather than leave a midstream unlisted, and so mergeable.
@@ -15,11 +16,12 @@ const TOPIC_LIMIT: usize = 50;
 #[derive(Debug, Default)]
 pub(super) struct Routes {
     /// Where the intake stages the upstream's direction: the fork, or the
-    /// dispatch repository when the fork has issues disabled.
-    pub staging: BTreeMap<String, String>,
+    /// tracking repository ([`Config::tracking_repo`]) when the fork has
+    /// issues disabled.
+    pub staging: BTreeMap<String, IntakeRoute>,
     /// The midstream fork itself, wherever its direction is staged, so that
     /// an epic naming the fork prioritizes its upstream ([`super::authored`])
-    /// and one naming the dispatch repository prioritizes no upstream.
+    /// and one naming the tracking repository prioritizes no upstream.
     pub forks: BTreeMap<String, String>,
 }
 
@@ -27,12 +29,8 @@ pub(super) struct Routes {
 /// Ambiguous forks fail closed rather than putting work in the wrong tree.
 /// A fork with issues disabled cannot hold the tracking issue staged there,
 /// and GitHub refuses that write every pass (HTTP 410): its parent's
-/// direction is staged in `fallback`, the dispatch repository, instead.
-pub(super) fn routes(
-    client: &impl Rest,
-    repositories: &[String],
-    fallback: &str,
-) -> Result<Routes> {
+/// direction is staged in the tracking repository instead.
+pub(super) fn routes(client: &impl Rest, repositories: &[String]) -> Result<Routes> {
     ensure!(
         repositories.len() <= POLL_REPOSITORY_LIMIT,
         "too many midstream routes"
@@ -52,8 +50,8 @@ pub(super) fn routes(
         let parent = text(&fork, "/parent/full_name");
         validate_repository(parent).context("midstream parent")?;
         let staging = match fork["has_issues"] == false {
-            true => fallback,
-            false => repository,
+            true => IntakeRoute::Fallback,
+            false => IntakeRoute::Direct(repository.to_owned()),
         };
         let parent = parent.to_ascii_lowercase();
         ensure!(
@@ -62,7 +60,7 @@ pub(super) fn routes(
                 .is_none(),
             "multiple midstreams for {parent}"
         );
-        routes.staging.insert(parent, staging.to_owned());
+        routes.staging.insert(parent, staging);
     }
     Ok(routes)
 }
@@ -75,7 +73,7 @@ pub(super) fn planning(
     work: &[String],
     tracker: &str,
 ) -> Result<String> {
-    let read = routes(client, repositories, tracker)?;
+    let read = routes(client, repositories)?;
     Ok(plan::project_work_brief(
         tracker,
         read.forks.iter().filter_map(|(upstream, fork)| {

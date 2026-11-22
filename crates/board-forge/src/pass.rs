@@ -613,6 +613,14 @@ pub struct Config {
     pub dispatch_workflow: String,
     /// None: the caller repository's default branch.
     pub dispatch_ref: Option<String>,
+    /// None: `dispatchRepo`. The repository that hosts the issues the pass
+    /// files and finds again: the tracking issues of operator comments on
+    /// someone else's pull request or outside our own space, their claims,
+    /// and the staged direction of a midstream fork with issues disabled
+    /// ([`Self::tracking_repo`]). Run URLs still name `dispatchRepo`. Lets
+    /// dispatch move to another repository while the issues stay where
+    /// they are (cgwalters-forge/agent-board#1157).
+    pub tracking_repo: Option<String>,
     #[serde(default)]
     pub follow: Vec<String>,
     /// Off unless set: stage 2 also follows the repositories with this topic,
@@ -1593,6 +1601,20 @@ impl Config {
         if let Some(git_ref) = &self.dispatch_ref {
             self.target(git_ref).validate_for(naming)?;
         }
+        if let Some(tracking) = &self.tracking_repo {
+            naming
+                .validate_repository(tracking)
+                .context("trackingRepo")?;
+            // A tracker outside our own space would have its own tracking
+            // issues tracked again, in a new issue each, as threads outside
+            // it are.
+            ensure!(
+                poll::our_space(&self.dispatch_repo, &self.bot, tracking),
+                "trackingRepo {tracking} is outside our own space, {}'s owner and {}",
+                self.dispatch_repo,
+                self.bot
+            );
+        }
         let harness = self.harness_repositories();
         for (what, list) in [
             ("follow", &self.follow[..]),
@@ -1915,9 +1937,11 @@ impl Config {
                 direction.issue > 0,
                 "direction issue is not a positive number"
             );
-            // A run that could edit the direction would steer every brief.
+            // A run that could edit the direction would steer every brief;
+            // runs on tracking issues are in `trackingRepo`.
             let targets = [&self.dispatch_repo].into_iter();
             let targets = targets
+                .chain(&self.tracking_repo)
                 .chain(&self.work_repositories)
                 .chain(&self.follow)
                 .chain(self.epics.as_ref().map(|e| &e.repository));
@@ -2138,6 +2162,12 @@ impl Config {
         }
     }
 
+    /// The repository that hosts the pass's tracking issues and staged
+    /// direction: `trackingRepo`, else `dispatchRepo`.
+    pub(crate) fn tracking_repo(&self) -> &str {
+        self.tracking_repo.as_deref().unwrap_or(&self.dispatch_repo)
+    }
+
     /// Whether an epic in `repository` may be live: `epics.repository`, or
     /// with [`Epics::in_work_repositories`] a work repository.
     fn epic_repository(&self, repository: &str) -> bool {
@@ -2231,6 +2261,7 @@ impl Config {
             operator: self.operator.clone(),
             bot: self.bot.clone(),
             dispatch_repo: self.dispatch_repo.clone(),
+            tracking_repo: self.tracking_repo().to_owned(),
             review_workflow: self.pr.review_workflow.clone(),
             policy,
         }
@@ -6107,13 +6138,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // first.
         let mut routes = None;
         if config.notifications && config.pull.is_none() {
-            match midstream::routes(&self.client, &midstreams, &config.dispatch_repo) {
+            let tracking = config.tracking_repo();
+            match midstream::routes(&self.client, &midstreams) {
                 Ok(read) => {
-                    let staged = read.staging.iter();
-                    for parent in staged.filter(|(_, r)| **r == config.dispatch_repo) {
+                    for (parent, route) in &read.staging {
+                        if *route != poll::IntakeRoute::Fallback {
+                            continue;
+                        }
                         self.line(format!(
-                            "notifications: the midstream fork of {} has issues disabled; its direction is staged in {}",
-                            parent.0, config.dispatch_repo
+                            "notifications: the midstream fork of {parent} has issues disabled; its direction is staged in {tracking}"
                         ));
                     }
                     routes = Some(read);
@@ -10323,7 +10356,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     &self.client,
                     repositories,
                     &self.config.work_repositories,
-                    &self.config.dispatch_repo,
+                    self.config.tracking_repo(),
                 )
             });
         match routing {

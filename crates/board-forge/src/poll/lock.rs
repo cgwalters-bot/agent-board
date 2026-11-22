@@ -306,6 +306,7 @@ mod tests {
             operator: "operator".into(),
             bot: BOT.into(),
             dispatch_repo: "example/runners".into(),
+            tracking_repo: "example/runners".into(),
             review_workflow: None,
             policy: PollPolicy::from_json(&policy).unwrap(),
         };
@@ -472,6 +473,7 @@ mod tests {
             operator: "operator".into(),
             bot: BOT.into(),
             dispatch_repo: "example/runners".into(),
+            tracking_repo: "example/runners".into(),
             review_workflow: None,
             policy: PollPolicy::default(),
         };

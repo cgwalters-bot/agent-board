@@ -789,7 +789,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
         let bot = self.config.bot.clone();
         let mine = pull && text(issue, "/user/login") == bot;
-        // A tracking triage copies comments to the dispatch repository. Natural
+        // A tracking triage copies comments to the tracker. Natural
         // asks must not bypass the legacy notification path's public check.
         if !self.config.ours(repo)
             && let Some(why) = self.not_public(repo)?
@@ -869,10 +869,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 let tracker = self.tracking_repository(repo);
                 let target = self.get(&format!("repos/{tracker}/issues/{tracking}"))?;
                 ensure!(
-                    text(&target, "/repository_url") == format!("{API_ROOT}repos/{tracker}")
-                        && text(&target, "/user/login") == bot
-                        && text(&target, "/title") == comments::tracking_title(repo, number)
-                        && target.get("pull_request").is_none_or(Value::is_null),
+                    comments::is_tracking_issue(
+                        &target,
+                        &tracker,
+                        &bot,
+                        &comments::tracking_title(repo, number)
+                    ),
                     "notification: tracking issue identity changed"
                 );
                 format!("https://github.com/{tracker}/issues/{tracking}")
@@ -1043,6 +1045,7 @@ mod tests {
             operator: OPERATOR.into(),
             bot: BOT.into(),
             dispatch_repo: DISPATCH.into(),
+            tracking_repo: DISPATCH.into(),
             review_workflow: None,
             policy: PollPolicy::from_json(&policy).unwrap(),
         }
@@ -1165,7 +1168,7 @@ mod tests {
         let mut config = config(json!({}));
         config.policy.notification_intake = Some(BTreeMap::from([(
             OTHER.into(),
-            "upstream/midstream".into(),
+            IntakeRoute::Direct("upstream/midstream".into()),
         )]));
         config
     }
@@ -1649,14 +1652,19 @@ mod tests {
     }
 
     #[test]
-    fn upstream_association_excludes_prs_and_fallback_trackers() {
-        for (pull, fallback) in [(true, false), (false, true)] {
+    fn upstream_association_depends_on_route_not_destination() {
+        const TRACKER: &str = "upstream/midstream";
+        for (pull, route, upstream) in [
+            (true, IntakeRoute::Direct(TRACKER.into()), None),
+            (false, IntakeRoute::Fallback, None),
+            (false, IntakeRoute::Direct(TRACKER.into()), Some(2)),
+            (false, IntakeRoute::Direct(DISPATCH.into()), None),
+        ] {
             let fake = intake_github(OTHER, pull, "mention", OPERATOR);
             let mut config = search_intake(&fake, OTHER);
-            if fallback {
-                config.policy.notification_intake =
-                    Some(BTreeMap::from([(OTHER.into(), DISPATCH.into())]));
-            }
+            let destination = route.repository(TRACKER).to_owned();
+            config.tracking_repo = TRACKER.into();
+            config.policy.notification_intake = Some(BTreeMap::from([(OTHER.into(), route)]));
             let report = pass(&fake, &config, State::default(), true);
             assert_eq!(report.errors, 0, "{:?}", report.lines);
             let writes = fake.writes.borrow();
@@ -1666,8 +1674,12 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(issues.len(), 1);
             assert_eq!(
+                issues[0].0,
+                format!("POST {API_ROOT}repos/{destination}/issues")
+            );
+            assert_eq!(
                 crate::upstream::parse(text(&issues[0].1, "/body")).unwrap(),
-                None
+                upstream
             );
         }
     }
@@ -1818,7 +1830,7 @@ mod tests {
         // Once the fork exists, each waiting thread is retried and done.
         config.policy.notification_intake = Some(BTreeMap::from([(
             OTHER.into(),
-            "upstream/midstream".into(),
+            IntakeRoute::Direct("upstream/midstream".into()),
         )]));
         // A capped one stays to retry, a few runs each pass.
         let mut state = state;
@@ -2634,7 +2646,7 @@ mod tests {
             config.policy.operator_review_fixes = enabled;
             if !fix {
                 config.policy.notification_intake =
-                    Some(BTreeMap::from([(repo.into(), DISPATCH.into())]));
+                    Some(BTreeMap::from([(repo.into(), IntakeRoute::Fallback)]));
             }
             // This is not our space, but fixes on the bot's own PR are allowed.
             config.policy.own_space_only = true;
