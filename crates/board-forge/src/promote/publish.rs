@@ -8,7 +8,8 @@
 //! upstream commit they were validated or replayed on, and a publication is
 //! resumed, confirmed or skipped only while it records exactly the approved
 //! commits and upstream still contains that commit; an older receipt without
-//! that record only for a direct publication the current comparison proves.
+//! that record only for a direct publication the current comparison proves,
+//! or, once confirmed, one whose trees match a replay of the approved commits.
 //! A candidate that holds never stops the candidates after it.
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,67 @@ fn recorded_onto(
     Ok((onto, tip))
 }
 
+/// Bound the Git replay used to validate a confirmed receipt without a cut.
+const MIGRATION_COMMITS: usize = 10;
+
+/// A confirmed receipt written before receipts recorded a cut: rebuild it from
+/// upstream's comparison of the published head. The publication's commits must
+/// form one chain on an upstream commit. Return its base and immutable commit
+/// IDs for Git to check against a replay.
+fn migration_range(
+    client: &impl Rest,
+    target: &pass::promote::Fork,
+    record: &handoff::Record,
+    range: &Range,
+) -> Result<(String, Vec<String>)> {
+    const HOLD: &str = "confirmed publication does not record the approved commits";
+    let own = range.commits.shas();
+    hold!(
+        own.len() <= MIGRATION_COMMITS,
+        "{HOLD}, and its {} commits exceed the {MIGRATION_COMMITS} a migration compares; inspect and migrate it manually",
+        own.len()
+    );
+    let published = &record.published_oid;
+    let compare = comparison(
+        client,
+        &format!(
+            "repos/{}/compare/{}...{published}",
+            target.upstream, range.base
+        ),
+        published,
+    )?;
+    ensure!(
+        compare["base_commit"]["sha"] == range.base.as_str(),
+        "publication comparison base mismatch"
+    );
+    let onto = compare["merge_base_commit"]["sha"]
+        .as_str()
+        .context("missing publication merge base")?;
+    let rows = compare["commits"]
+        .as_array()
+        .context("missing publication commits")?;
+    hold!(
+        rows.len() == own.len(),
+        "{HOLD}: it carries {} commits beyond upstream, not the PR's {}; inspect and migrate it manually",
+        rows.len(),
+        own.len()
+    );
+    let mut parent = onto;
+    let mut shas = Vec::with_capacity(rows.len());
+    for row in rows {
+        let sha = row["sha"].as_str().context("invalid publication commit")?;
+        hold!(
+            row["parents"]
+                .as_array()
+                .is_some_and(|p| p.len() == 1 && p[0]["sha"] == parent),
+            "{HOLD}, and its commits are not one chain on upstream; inspect and migrate it manually"
+        );
+        shas.push(sha.to_owned());
+        parent = sha;
+    }
+    Ok((onto.to_owned(), shas))
+}
+
 /// What the candidate's receipt records, once the bot is known to have
 /// written it and nobody else to have edited it.
 enum Receipt {
@@ -72,6 +134,8 @@ enum Step {
     Line(String),
     /// The cap cannot cover this candidate's step; the invocation ends.
     Held(String),
+    /// A legacy check is optional; try it after all regular candidates.
+    Legacy,
     Publish(Box<Prepared>),
 }
 
@@ -167,7 +231,9 @@ pub(super) fn apply_with<C: Rest + Transport>(
                 .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot)),
             "publication credential must authenticate as configured bot"
         );
-        for (repo, target) in &targets(client, config)? {
+        let targets = targets(client, config)?;
+        let mut legacy = Vec::new();
+        for (repo, target) in &targets {
             // Reuse the pass's bounded hint query: ordinary waiting drafts
             // spend no per-PR reads. Hints never replace fresh authorization.
             let candidates = awaiting::candidates(client, config, repo).with_context(|| {
@@ -200,7 +266,7 @@ pub(super) fn apply_with<C: Rest + Transport>(
                         .is_some_and(|n| candidates.contains(&n))
                 })
                 .collect();
-            for (index, pull) in pulls.iter().enumerate() {
+            for (index, pull) in pulls.into_iter().enumerate() {
                 let number = pull["number"].as_u64().context("invalid pull number")?;
                 let pending = || {
                     format!(
@@ -210,30 +276,74 @@ pub(super) fn apply_with<C: Rest + Transport>(
                 };
                 // A candidate that cannot be published holds alone, before any
                 // write; the candidates after it are still read this invocation.
-                let prepared =
-                    match prepare(client, config, (repo, target), pull, now, max_writes, git) {
-                        Ok(Step::Publish(prepared)) => prepared,
-                        Ok(Step::Line(line)) => {
-                            lines.push(line);
-                            continue;
+                let prepared = match prepare(
+                    client,
+                    config,
+                    (repo, target),
+                    (&pull, false),
+                    now,
+                    max_writes,
+                    git,
+                ) {
+                    Ok(Step::Publish(prepared)) => prepared,
+                    Ok(Step::Legacy) => {
+                        legacy.push((repo, target, pull));
+                        continue;
+                    }
+                    Ok(Step::Line(line)) => {
+                        lines.push(line);
+                        continue;
+                    }
+                    Ok(Step::Held(line)) => {
+                        lines.push(line);
+                        return Ok(());
+                    }
+                    Err(error) if pass::budget_spent(&error) => {
+                        return Err(error.context(pending()));
+                    }
+                    Err(error) => {
+                        if error.is::<ScopeFailure>() {
+                            return Err(error);
                         }
-                        Ok(Step::Held(line)) => {
-                            lines.push(line);
-                            return Ok(());
-                        }
-                        Err(error) if pass::budget_spent(&error) => {
-                            return Err(error.context(pending()));
-                        }
-                        Err(error) => {
-                            if error.is::<ScopeFailure>() {
-                                return Err(error);
-                            }
-                            lines.push(format!("hold promote {repo}#{number}: {error:#}"));
-                            continue;
-                        }
-                    };
+                        lines.push(format!("hold promote {repo}#{number}: {error:#}"));
+                        continue;
+                    }
+                };
                 lines.push(publish(client, (repo, target), git, *prepared).with_context(pending)?);
                 return Ok(());
+            }
+        }
+        // Only use budget left over after normal publications, across all
+        // forks. Revalidate the legacy candidate rather than reusing evidence
+        // gathered before the rest of the scan.
+        for (repo, target, pull) in legacy {
+            let number = pull["number"].as_u64().context("invalid pull number")?;
+            let context = || format!("legacy receipt for {repo}#{number}");
+            match prepare(
+                client,
+                config,
+                (repo, target),
+                (&pull, true),
+                now,
+                max_writes,
+                git,
+            ) {
+                Ok(Step::Publish(prepared)) => {
+                    lines.push(
+                        publish(client, (repo, target), git, *prepared).with_context(context)?,
+                    );
+                    return Ok(());
+                }
+                Ok(Step::Line(line)) => lines.push(line),
+                Ok(Step::Held(line)) => {
+                    lines.push(line);
+                    return Ok(());
+                }
+                Ok(Step::Legacy) => anyhow::bail!("legacy candidate deferred twice"),
+                Err(error) if pass::budget_spent(&error) || error.is::<ScopeFailure>() => {
+                    return Err(error.context(context()));
+                }
+                Err(error) => lines.push(format!("hold promote {repo}#{number}: {error:#}")),
             }
         }
         Ok(())
@@ -246,7 +356,7 @@ fn prepare<C: Rest + Transport>(
     client: &C,
     config: &Config,
     (repo, target): (&str, &pass::promote::Fork),
-    pull: &Value,
+    (pull, legacy_only): (&Value, bool),
     now: OffsetDateTime,
     max_writes: usize,
     git: &mut impl rewrite::Rewrite,
@@ -333,22 +443,32 @@ fn prepare<C: Rest + Transport>(
         Ok(())
     };
     let mut confirmed = false;
+    let legacy = matches!(&recorded, Receipt::Confirmed(record)
+        if record.approved_oid == head && record.cut.is_none()
+            && !(range.direct && record.published_oid == head));
+    if legacy && !legacy_only {
+        return Ok(Step::Legacy);
+    }
+    hold!(
+        !legacy_only || legacy,
+        "legacy publication evidence changed; retry"
+    );
     let what = match recorded {
         Receipt::Confirmed(record) if record.approved_oid == head => {
             handoff::verify_record(repo, target, &fresh, &record)?;
             branch_of(&record.published_branch)?;
             // The same head may carry other commits under another fork base,
             // and an upstream rewind adds old upstream commits to a published
-            // range. An older receipt records neither; only a direct
-            // publication that the current comparison proves is reused.
+            // range. An older receipt records neither; prove a direct cut by
+            // comparison or verify the rewritten trees in the deferred scan.
             let onto = if record.cut.is_some() {
                 recorded_onto(client, target, record.cut.as_ref(), &range.commits)?.0
-            } else {
-                hold!(
-                    range.direct && record.published_oid == head,
-                    "confirmed publication does not record the approved commits; inspect and migrate it manually"
-                );
+            } else if range.direct && record.published_oid == head {
                 range.base.clone()
+            } else {
+                let (onto, published) = migration_range(client, target, &record, &range)?;
+                git.verify_replay(config, target, &fresh, &range.commits, &onto, &published)?;
+                onto
             };
             let existing =
                 upstream_pulls(client, &target.upstream, owner, &record.published_branch)?;
@@ -361,7 +481,18 @@ fn prepare<C: Rest + Transport>(
             Publication {
                 published: record.published_oid,
                 branch: record.published_branch,
-                base: None,
+                base: if legacy {
+                    let tip = tip_containing(client, target, &onto)?;
+                    // Containment alone is not enough: even a fast-forward
+                    // can integrate an approved commit and change the suffix.
+                    hold!(
+                        tip == range.base,
+                        "upstream base moved during legacy verification; retry"
+                    );
+                    Some(tip)
+                } else {
+                    None
+                },
                 onto,
                 rewrite: None,
                 existing: Some(pr),
