@@ -2083,6 +2083,9 @@ pub struct State {
     /// The changes diff's watermarks, which the caller reads from the store
     /// and never from this file: not serialized.
     pub changes: Option<crate::changes::diff::State>,
+    /// `publicState`'s positions, which the caller reads from and writes to
+    /// its own file and never this one: not serialized.
+    pub public: Option<crate::pass::public_state::Position>,
 }
 
 impl State {
@@ -2425,6 +2428,7 @@ impl State {
                 .get("changes_sweep")
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
             changes: None,
+            public: None,
         })
     }
 
@@ -5694,6 +5698,10 @@ struct Pass<'a, R, G> {
     /// Where the pass's share stopped the walk ([`Rest::share_left`]), as
     /// [`State::share_cursor`] names it; nothing more is walked after it.
     cut: Option<String>,
+    /// `publicState`'s start repository and how far its open pull requests
+    /// are rotated ([`crate::pass::public_state::Position::pull_rotation`]),
+    /// in place of a cursor naming a pull request.
+    rotation: Option<(String, u64)>,
     apply: Option<Apply<'a, R>>,
     dispatched: usize,
     /// See [`Outcome::merged`].
@@ -5883,6 +5891,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             evicted: 0,
             remaining: POLL_REQUEST_LIMIT,
             cut: None,
+            rotation: None,
             apply: None,
             dispatched: 0,
             merged: 0,
@@ -10590,6 +10599,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             })
             .collect();
         numbers.sort_unstable();
+        if let Some((_, rotation)) =
+            (self.rotation.as_ref()).filter(|(at, _)| at.eq_ignore_ascii_case(repo))
+            && let Some(len) = u64::try_from(numbers.len()).ok().filter(|len| *len > 0)
+        {
+            numbers.rotate_left(usize::try_from(rotation % len).unwrap_or(0));
+        }
         // Read whether or not a head waits for a review: a run of a head
         // pushed over since, or of a pull request closed, still takes a slot.
         if priority.is_none() {
@@ -11060,6 +11075,13 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
             "pull requests: clock rotation start point is {repo}"
         ));
     }
+    pass.rotation = (state.public.zip(state.share_cursor.as_ref())).map(|(position, start)| {
+        let rotation = position.pull_rotation(follow.len());
+        outcome.lines.push(format!(
+            "pull requests: publicState starts at {start}, its open pull requests rotated by {rotation}"
+        ));
+        (start.to_ascii_lowercase(), rotation)
+    });
     if config.policy.action_first {
         (action_first_cursor, upstream_cursor, action_first_positions) = pass.action_first(
             &pr_follow,
@@ -11273,6 +11295,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         changes_swept: None,
         changes_sweep: None,
         changes: None,
+        public: None,
     };
     Ok(outcome)
 }
@@ -27303,6 +27326,54 @@ mod tests {
         assert_eq!(whole.state.share_cursor, None);
     }
 
+    /// `publicState` keeps no cursor naming a pull request, so the walk's
+    /// start repository rotates its open pull requests each time it starts
+    /// again: a share that has room for one pull request a pass still
+    /// reaches each in turn, where a fixed order would decide only the first.
+    #[test]
+    fn public_state_rotates_the_start_repository_past_a_repeated_cut() {
+        let mut fake = github();
+        fake.page(
+            &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+            Some("\"p1\""),
+            None,
+            json!([{"number": 470, "user": {"login": BOT}}, {"number": 469, "user": {"login": BOT}}]),
+        );
+        fake.page(
+            &format!("repos/{REPO}/issues/469/comments?per_page=100"),
+            None,
+            None,
+            json!([]),
+        );
+        fake.pulls.insert(
+            469,
+            pull("pull-470", json!({"id": "pull-469", "number": 469})),
+        );
+        let follow = [REPO.to_owned()];
+        let decided = |turn: u64| {
+            let shared = Shared::new(&fake, 2);
+            let position = crate::pass::public_state::Position { turn, scan: None };
+            let state = crate::pass::public_state::state(position, &follow);
+            let outcome = run(&shared, &fake, &config(), state, &[], &follow, None, now()).unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let rotated = format!(
+                "pull requests: publicState starts at {REPO}, its open pull requests rotated by {turn}"
+            );
+            assert!(outcome.lines.contains(&rotated), "{:?}", outcome.lines);
+            [469, 470]
+                .into_iter()
+                .filter(|n| {
+                    let prefix = format!("{REPO}#{n} ");
+                    outcome.lines.iter().any(|l| l.starts_with(&prefix))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (0..4).map(decided).collect::<Vec<_>>(),
+            [[469], [470], [469], [470]]
+        );
+    }
+
     /// A repository the share leaves unwalked still has its review runs
     /// counted toward `wip`: the slots they hold are not freed for more
     /// reviews or for scheduling because the walk did not reach them.
@@ -27422,6 +27493,7 @@ mod tests {
             evicted: 0,
             remaining: POLL_REQUEST_LIMIT,
             cut: None,
+            rotation: None,
             apply: None,
             dispatched: 0,
             merged: 0,

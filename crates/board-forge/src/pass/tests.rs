@@ -819,6 +819,31 @@ fn a_stopped_scan_resumes_after_its_last_read_in_the_next_pass() {
         };
     }
     assert!(reached, "unchanged low headroom starved later ready work");
+    // `publicState` keeps the same place as an ordinal, naming no candidate.
+    let position = |scan| State {
+        public: Some(public_state::Position { turn: 0, scan }),
+        ..State::default()
+    };
+    let at = first.scan_position.unwrap();
+    let mut public = position(Some(at));
+    let mut reached = false;
+    for _ in 0..10 {
+        let pass = pass_from(&fixture, &cfg, public);
+        if !starts(&pass).is_empty() {
+            reached = true;
+            break;
+        }
+        assert!(
+            pass.lines
+                .iter()
+                .any(|l| l.contains("scan resumed after candidate ")),
+            "{:#?}",
+            pass.lines
+        );
+        assert_ne!(pass.scan_position, Some(at));
+        public = position(pass.scan_position);
+    }
+    assert!(reached, "unchanged low headroom starved later ready work");
     // A pass that never scans keeps the cursor.
     let full = config(json!({"topDown":true,"state":"pass-state.json","wip":0,"requestShare":50}));
     let idle = pass_from(&fixture, &full, next_state(&first));
@@ -3153,11 +3178,16 @@ fn pr_budget_is_derived_and_exhaustion_resumes_without_errors() {
         "answer": {"status": 200, "link": null, "body": {"resources": {
             "core": {"limit": 5000, "remaining": 1400, "reset": 1700000000},
             "graphql": {"limit": 5000, "remaining": 1400, "reset": 1700000000}}}}}));
-    let mut cfg = config(
-        json!({"wip": 0, "state": "pass-state.json", "requestShare": 50,
-        "follow": repositories, "pr": {"noMerge": repositories, "fixPools": ["claude"]}}),
-    );
-    cfg.epics = None;
+    let settings = |follow, public| {
+        let mut cfg = config(
+            json!({"wip": 0, "state": "pass-state.json", "requestShare": 50,
+            "follow": follow, "publicState": public,
+            "pr": {"noMerge": repositories, "fixPools": ["claude"]}}),
+        );
+        cfg.epics = None;
+        cfg
+    };
+    let cfg = settings(repositories, false);
     // requestShare derives 700 requests from the recorded headroom.
     let run = |state, limit| {
         block(run_within(
@@ -3179,6 +3209,8 @@ fn pr_budget_is_derived_and_exhaustion_resumes_without_errors() {
     };
     let first = run(State::default(), 700);
     assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    // A walk its share cut still ran, which `publicState`'s turn counts.
+    assert!(first.followed);
     assert!(
         first.spent.requests > poll::POLL_REQUEST_LIMIT,
         "{}",
@@ -3206,6 +3238,43 @@ fn pr_budget_is_derived_and_exhaustion_resumes_without_errors() {
         first_decision.starts_with(&format!("{cursor} ")),
         "{first_decision}; expected {cursor}"
     );
+
+    // A fresh public-state recording and its replay both run out of share,
+    // starting at the configured first repository, not the sorted first one.
+    let mut order = repositories;
+    order.rotate_right(1);
+    let public = settings(order, true);
+    let recorder = Recorder::new(&forge.replay);
+    let recorded = block(super::run(
+        &recorder,
+        &recorder,
+        &public,
+        State::default(),
+        (Mode::Preview, Limits::default()),
+        forge.replay.now,
+    ))
+    .unwrap();
+    let fixture = serde_json::from_str(&recorder.fixture(forge.replay.now).unwrap()).unwrap();
+    let replay = Replay::from_json(&fixture).unwrap();
+    let replayed = block(run_replay(&replay, &public, Limits::default(), false)).unwrap();
+    assert_eq!(recorded.failures, 0, "{:#?}", recorded.lines);
+    assert_eq!(recorded.lines, replayed.lines);
+    let first_decision = recorded
+        .lines
+        .iter()
+        .find(|line| line.starts_with("example/") && line.contains('#'))
+        .unwrap();
+    assert!(
+        first_decision.starts_with("example/zzz#1 "),
+        "{first_decision}"
+    );
+    assert!(
+        recorded
+            .lines
+            .iter()
+            .any(|line| line.starts_with("pull requests: the stage's request share is spent"))
+    );
+
     let rate_limit = forge
         .replay
         .requests
@@ -9790,6 +9859,8 @@ fn apply_stops_at_its_time_bound() {
     assert_eq!(report.lines.last().unwrap(), "status deferred: budget");
     assert_eq!(report.failures, 0);
     assert!(forge.writes.borrow().is_empty());
+    // Nor did the PR walk run, so `publicState` keeps its turn.
+    assert!(!report.followed);
 }
 
 /// An applying pass starts what the preview names, each with the triage
@@ -20225,6 +20296,7 @@ fn config_table() {
     let parsed = Config::parse(&minimal.to_string()).unwrap();
     for (edit, feature, state) in [
         (json!({}), "openPrCap", "unconfigured"),
+        (json!({"publicState": false}), "publicState", "disabled"),
         (json!({"openPrCap": 6}), "openPrCap", "enabled"),
         (json!({}), "pr.agentRecovery", "unconfigured"),
         (
@@ -21309,6 +21381,51 @@ fn config_table() {
         (pace.repository.as_str(), pace.issue, pace.bot.as_str()),
         ("cgwalters-forge/bot-ops", 1, "cgwalters-bot")
     );
+}
+
+#[test]
+fn public_state_needs_a_fixed_follow_walk_and_no_private_store() {
+    let valid = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller",
+        "dispatchWorkflow": "dispatch.yml", "follow": ["o/r"], "state": "state.json",
+        "publicState": true});
+    assert!(Config::parse(&valid.to_string()).unwrap().public_state);
+    for (key, value, message) in [
+        ("state", json!(""), "publicState needs state"),
+        (
+            "store",
+            json!("store.db"),
+            "publicState cannot be used with store",
+        ),
+        ("follow", json!([]), "publicState needs a fixed follow list"),
+        ("follow", json!(["o/R"]), "lowercase repository names"),
+        (
+            "follow",
+            json!(["o/a", "o/a", "o/b"]),
+            "unique follow repositories",
+        ),
+        (
+            "authored",
+            json!(1),
+            "publicState needs a fixed follow list",
+        ),
+        ("notifications", json!(true), "which need private state"),
+        ("issueIntake", json!(true), "which need private state"),
+        (
+            "holds",
+            json!({"repository": "o/caller", "issue": 1, "needsYou": true}),
+            "which need private state",
+        ),
+        (
+            "pr",
+            json!({"actionFirst": true}),
+            "which has its own discovery cursor",
+        ),
+    ] {
+        let mut settings = valid.clone();
+        settings[key] = value;
+        let error = Config::parse(&settings.to_string()).unwrap_err();
+        assert!(error.to_string().contains(message), "{key}: {error:#}");
+    }
 }
 
 #[test]

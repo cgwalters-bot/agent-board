@@ -282,6 +282,7 @@
     "cost.hourUtc": {"verdict": "refused", "reason": "publishes to a GitHub data branch"},
     "cost.cache": {"verdict": "refused", "reason": "caches GitHub run summaries"},
     "state": {"verdict": "refused", "reason": "the poll's cache, PR follow-up"},
+    "publicState": {"verdict": "refused", "reason": "the GitHub PR follow rotation"},
     "store": {"verdict": "refused", "reason": "dispatch records, triage verdicts, plans and holds are only recorded by GitHub scheduling"},
     "changeSweepHours": {"verdict": "refused", "reason": "the changes diff reads GitHub repositories, and narrows PR follow-up (stage 2)"},
     "pr.reviewWorkflow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},

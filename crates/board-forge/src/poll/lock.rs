@@ -488,6 +488,7 @@ mod tests {
             evicted: 0,
             remaining: 1 + ITEM_REQUESTS,
             cut: None,
+            rotation: None,
             apply: None,
             dispatched: 0,
             merged: 0,

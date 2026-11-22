@@ -266,6 +266,10 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         args.pull.is_none() || config.forgejo_board().is_none(),
         "unsupported_capability: --pull: GitHub-only"
     );
+    ensure!(
+        !config.public_state || !args.apply || args.pull.is_none(),
+        "publicState cannot be used with --apply --pull"
+    );
     config.pull = args.pull.clone();
     if !args.check_config {
         eprintln!("{}", config.off_feature_summary());
@@ -433,8 +437,13 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                             lost.join("; ")
                         );
                     }
-                    // Only an applying pass writes the cache; a preview reads it.
-                    let mut state = config.state.as_deref().map(load_state).unwrap_or_default();
+                    // Only an applying pass writes state; a preview reads it.
+                    let mut state = match config.state.as_deref() {
+                        Some(path) if config.public_state => public_start(path, &config.follow),
+                        Some(path) => load_state(path, None),
+                        None => State::default(),
+                    };
+                    let public = state.public;
                     if let (true, Some(path)) = (config.change_sweep_hours > 0, &config.store) {
                         state.changes = load_changes(path);
                     }
@@ -448,11 +457,16 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                     let dispatcher = dispatcher.as_ref().unwrap_or(&client);
                     let pass = pass::run(&client, dispatcher, &config, state, (mode, limits), now);
                     let report = runtime.block_on(pass)?;
-                    if let (true, Some(path), Some(state)) =
-                        (args.apply, &config.state, &report.state)
-                    {
-                        std::fs::write(path, serde_json::to_vec(&state.to_json())?)
-                            .with_context(|| format!("write {path}"))?;
+                    if let (true, Some(path)) = (args.apply, &config.state) {
+                        if let Some(public) = public {
+                            // Written once the pass has validated its inputs
+                            // and run, whatever failures it reports; the caller
+                            // uploads it by its format (docs/pass.md#public-state).
+                            pass::public_state::save(path.as_ref(), public.after(&report))?;
+                        } else if let Some(state) = &report.state {
+                            std::fs::write(path, serde_json::to_vec(&state.to_json())?)
+                                .with_context(|| format!("write {path}"))?;
+                        }
                     }
                     if let (true, Some(path)) = (args.apply, &config.store) {
                         save_store(path, &report, now);
@@ -500,7 +514,7 @@ fn gh_token(mut command: std::process::Command) -> Result<String> {
 
 /// This file is supplied only by the trusted previous pass in the chain.
 /// Missing, oversized or unreadable state costs requests, not availability.
-fn load_state(path: &str) -> State {
+fn load_state(path: &str, public_follow: Option<&[String]>) -> State {
     let load = || -> Result<State> {
         use std::io::Read;
         let file = std::fs::File::open(path)?;
@@ -510,7 +524,11 @@ fn load_state(path: &str) -> State {
             bytes.len() as u64 <= pass::STATE_BYTES,
             "pass state is too large"
         );
-        State::from_json(&serde_json::from_slice(&bytes)?)
+        if let Some(follow) = public_follow {
+            pass::public_state::decode(&bytes, follow)
+        } else {
+            State::from_json(&serde_json::from_slice(&bytes)?)
+        }
     };
     match load() {
         Ok(state) => state,
@@ -519,6 +537,15 @@ fn load_state(path: &str) -> State {
             State::default()
         }
     }
+}
+
+/// Where a `publicState` pass starts, from the first position where the file
+/// is missing or not a public one. Nothing writes the file before the pass
+/// has validated its inputs and run, so a rejected configuration cannot
+/// clobber a file the state path aliases.
+fn public_start(path: &str, follow: &[String]) -> State {
+    let position = load_state(path, Some(follow)).public.unwrap_or_default();
+    pass::public_state::state(position, follow)
 }
 
 /// The changes watermarks in the store, read only, for stage 0; none where
@@ -637,23 +664,55 @@ mod next_tests {
             std::process::id()
         ));
         let name = path.to_str().unwrap();
-        assert_eq!(load_state(name), State::default());
+        assert_eq!(load_state(name, None), State::default());
         std::fs::write(&path, b"not JSON").unwrap();
-        assert_eq!(load_state(name), State::default());
+        assert_eq!(load_state(name, None), State::default());
         let state = State {
             interval_seconds: board_forge::poll::MIN_INTERVAL_SECONDS,
             ..State::default()
         };
         std::fs::write(&path, serde_json::to_vec(&state.to_json()).unwrap()).unwrap();
-        assert_eq!(load_state(name), state);
+        assert_eq!(load_state(name, None), state);
+        assert_eq!(load_state(name, Some(&[])), State::default());
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .unwrap()
             .set_len(pass::STATE_BYTES + 1)
             .unwrap();
-        assert_eq!(load_state(name), State::default());
+        assert_eq!(load_state(name, None), State::default());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn public_state_starts_from_the_saved_position_without_writing() {
+        let follow = ["o/a", "o/b", "o/c"].map(str::to_owned);
+        let dir =
+            std::env::temp_dir().join(format!("agent-board-public-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let name = path.to_str().unwrap();
+        let legacy = State {
+            share_cursor: Some("o/b#7".into()),
+            holds_pending: vec!["o/private#1".into()],
+            ..State::default()
+        };
+        let legacy = serde_json::to_vec(&legacy.to_json()).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+        // A legacy file is not decoded, and only the pass's save replaces it.
+        let first = public_start(name, &follow);
+        assert_eq!(first.share_cursor.as_deref(), Some("o/a"));
+        assert_eq!(first.scan_cursor, None);
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        let next = first.public.unwrap().next(true, Some(2));
+        pass::public_state::save(&path, next).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"turn":1,"scan":2}"#);
+        let second = public_start(name, &follow);
+        assert_eq!(second.share_cursor.as_deref(), Some("o/b"));
+        assert_eq!(second.public, Some(next));
+        let missing = dir.join("missing").join("state.json");
+        assert_eq!(public_start(missing.to_str().unwrap(), &follow), first);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[derive(Parser)]

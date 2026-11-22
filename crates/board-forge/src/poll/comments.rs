@@ -4459,6 +4459,7 @@ pub(super) mod tests {
                 evicted: 0,
                 remaining,
                 cut: None,
+                rotation: None,
                 apply: Some(apply),
                 dispatched: 0,
                 merged: 0,

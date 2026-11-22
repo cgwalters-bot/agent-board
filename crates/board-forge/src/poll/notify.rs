@@ -4075,6 +4075,7 @@ mod tests {
                 evicted: 0,
                 remaining,
                 cut: None,
+                rotation: None,
                 apply: Some(Apply {
                     dispatcher: &fake,
                     workflow: "dispatch.yml".into(),

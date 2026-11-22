@@ -810,6 +810,9 @@ pub struct Config {
     pub cost: Option<crate::cost::Publish>,
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
+    /// Persist only the walks' positions, as numbers ([`public_state`]).
+    #[serde(default)]
+    pub public_state: bool,
     /// Off unless set: the SQLite store ([`crate::store`]) an applying pass
     /// records its dispatch records, triage verdicts, plans and holds in.
     pub store: Option<String>,
@@ -1469,6 +1472,42 @@ impl Config {
             ensure!(
                 !others.into_iter().flatten().any(|other| other == store),
                 "store must differ from state and livingStatus"
+            );
+        }
+        if config.public_state {
+            ensure!(
+                config.state.as_ref().is_some_and(|path| !path.is_empty()),
+                "publicState needs state"
+            );
+            ensure!(
+                config.store.is_none(),
+                "publicState cannot be used with store: it exports only walk positions; keep state and store private for this pass"
+            );
+            ensure!(
+                !config.notifications
+                    && !config.issue_intake
+                    && config.maintain.is_none()
+                    && config.holds.is_none(),
+                "publicState cannot be used with notifications, issueIntake, maintain or holds, which need private state"
+            );
+            ensure!(
+                !config.pr.poll.action_first,
+                "publicState cannot be used with pr.actionFirst, which has its own discovery cursor"
+            );
+            ensure!(
+                sources.is_empty()
+                    && !config.follow.is_empty()
+                    && config
+                        .follow
+                        .iter()
+                        .all(|repo| !repo.bytes().any(|b| b.is_ascii_uppercase()))
+                    && config.midstream.is_none()
+                    && config.authored.is_none(),
+                "publicState needs a fixed follow list of lowercase repository names"
+            );
+            ensure!(
+                config.follow.iter().collect::<BTreeSet<_>>().len() == config.follow.len(),
+                "publicState needs unique follow repositories"
             );
         }
         if sources.is_empty() {
@@ -4322,6 +4361,12 @@ pub struct Report {
     /// `state` for the next pass to resume after; none at the walk's end,
     /// and the last pass's where this one scanned nothing.
     pub scan_cursor: Option<String>,
+    /// The same as `scan_cursor`, as the candidate's ordinal, which
+    /// `publicState` keeps instead ([`public_state`]).
+    pub scan_position: Option<usize>,
+    /// Whether stage 2's PR walk ran, which `publicState`'s turn counts
+    /// ([`public_state::Position::after`]).
+    pub followed: bool,
     /// `leanReads`' holds for the next pass to carry ([`lean`]), where stage
     /// 4 walked its candidates; none keeps the last pass's.
     pub carried_holds: Option<BTreeMap<String, lean::Carried>>,
@@ -4487,7 +4532,7 @@ pub async fn run<C: Rest + Transport + crate::github::GraphQl + Broker>(
     .await
 }
 
-/// Preview a GitHub recording from empty pass state, optionally attributing
+/// Preview a GitHub recording from fresh pass state, optionally attributing
 /// its charged REST root reads. This diagnostic has no live or apply mode.
 pub async fn run_replay(
     replay: &Replay,
@@ -4548,6 +4593,11 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds: &Bounds,
 ) -> Result<Report> {
     config.check_pace(now)?;
+    // Record and replay deliberately start cold. Use the same first position
+    // as a live public pass with no saved file, not the sorted private walk.
+    if config.public_state && state.public.is_none() {
+        state = public_state::state(public_state::Position::default(), &config.follow);
+    }
     ensure!(
         !config.cleanup_history || config.living_status.is_some(),
         "cleanupHistory requires livingStatus"
@@ -4560,12 +4610,18 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         store.read_only = matches!(mode, Mode::Preview);
         *bounds.living.borrow_mut() = Some(store);
     }
-    bounds.cache_enabled.set(config.state.is_some());
+    bounds
+        .cache_enabled
+        .set(config.state.is_some() && !config.public_state);
     *bounds.publication_pending.borrow_mut() = state.holds_pending.clone();
     *bounds.publication_summary_cursor.borrow_mut() = state.holds_summary_cursor.clone();
     // No context means no persistent shared cache (including recordings and
     // transports without an authenticated identity). The old poll stays usable.
-    let context = config.state.as_ref().and_then(|_| client.cache_context());
+    let context = config
+        .state
+        .as_ref()
+        .filter(|_| !config.public_state)
+        .and_then(|_| client.cache_context());
     let scope = context.as_ref().map(|context| {
         format!(
             "{:x}",
@@ -4704,6 +4760,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     let mut report = Report {
         // Kept as it was by a pass whose stage 4 scans nothing.
         scan_cursor: state.scan_cursor.clone(),
+        scan_position: state.public.and_then(|public| public.scan),
         issue_intake: state.issue_intake.clone(),
         ..Report::default()
     };
@@ -4765,6 +4822,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         unread: 0,
         budget_stop: None,
         scan_cursor: state.scan_cursor.clone(),
+        scan_position: state.public.and_then(|public| public.scan),
         lean: RefCell::new(lean::Lean::new(state.carried_holds.clone(), now)),
         ended: RefCell::new(BTreeMap::new()),
         kept: RefCell::default(),
@@ -5477,6 +5535,8 @@ struct Scheduler<'a, C> {
     /// Where the last pass's scan stopped ([`poll::State::scan_cursor`]):
     /// this pass's scan resumes after it ([`Self::start`]).
     scan_cursor: Option<String>,
+    /// `publicState`'s ordinal of the same ([`Report::scan_position`]).
+    scan_position: Option<usize>,
     /// `leanReads`' carried holds ([`lean`]).
     lean: RefCell<lean::Lean>,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
@@ -6531,6 +6591,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .failed_operations
             .extend(outcome.failed_operations);
         self.report.state = Some(outcome.state);
+        self.report.followed = true;
         self.reviewing = outcome.reviewing;
         self.progressed += outcome.merged;
         self.followed = Some((outcome.waits, outcome.undecided));
@@ -6946,6 +7007,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let at = (candidates.iter()).position(|(_, f)| f.issue.display() == cursor)?;
             Some((cursor, at + 1))
         });
+        // `publicState` names no candidate: an ordinal past the board's end
+        // scans in order.
+        let resume = resume.or_else(|| {
+            let at = self
+                .scan_position
+                .take()
+                .filter(|at| *at < candidates.len())?;
+            Some((format!("candidate {}", at + 1), at + 1))
+        });
         let order: Vec<usize> = match &resume {
             Some((_, at)) if *at <= children => ((*at..children).chain(0..*at))
                 .chain(children..candidates.len())
@@ -6960,7 +7030,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 "schedule: scan resumed after {cursor}, where the last pass's scan stopped"
             ));
         }
-        let mut last: Option<String> = None;
+        let mut last: Option<(String, usize)> = None;
         let mut budget_stopped = false;
         for (visited, n) in order.into_iter().enumerate() {
             let (_, facts) = &candidates[n];
@@ -7001,7 +7071,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 // Only rotate once consideration begins, past the reserve
                 // guard. Interrupted reads rotate too, so an expensive
                 // candidate cannot block later work until headroom grows.
-                last = Some(issue.clone());
+                last = Some((issue.clone(), n));
                 if s.config.top_down && let Some(parent) = &facts.parent {
                 let held = match s.live(parent) {
                     Ok(true) => None,
@@ -7129,8 +7199,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         if !budget_stopped {
             self.report.scan_cursor = None;
-        } else if let Some(last) = last {
+            self.report.scan_position = None;
+        } else if let Some((last, at)) = last {
             self.report.scan_cursor = Some(last);
+            self.report.scan_position = Some(at);
         }
         self.lean_report();
         if taken == 0
@@ -11002,6 +11074,7 @@ pub mod next;
 mod pat;
 pub(crate) mod pressure;
 pub mod promote;
+pub mod public_state;
 mod pull_links;
 mod resets;
 pub mod revisit;

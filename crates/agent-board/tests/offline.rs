@@ -4532,6 +4532,63 @@ fn pass_local_apply_needs_both_caps() {
 }
 
 #[test]
+fn pass_public_state_rejected_pass_leaves_an_aliased_input_unchanged() {
+    let ledger = br#"{"schema":"living-status-ledger","entries":{}}"#.as_slice();
+    // The state path names the ledger, or the configuration itself with a
+    // pace override that only the pass rejects.
+    let pace = serde_json::json!({
+        "overrides": [{"pool": "claude", "until": "2999-01-01T00:00:00Z", "mode": "hold"}]
+    });
+    for (name, state, pace, expected) in [
+        ("ledger", "./ledger.json", None, "livingStatus must differ"),
+        ("config", "./config.json", Some(&pace), "days ahead"),
+    ] {
+        let dir =
+            std::env::temp_dir().join(format!("agent-board-{name}-alias-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("ledger.json"), ledger).unwrap();
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+        config["follow"] = serde_json::json!(["cgwalters-forge/tracker"]);
+        config["pr"] = serde_json::json!({"fixPools": ["claude", "openai"]});
+        config["publicState"] = true.into();
+        config["livingStatus"] = "ledger.json".into();
+        config["state"] = state.into();
+        if let Some(pace) = pace {
+            config["pace"] = pace.clone();
+        }
+        let config = config.to_string();
+        std::fs::write(dir.join("config.json"), &config).unwrap();
+
+        let output = command()
+            .args([
+                "pass",
+                "--config",
+                "config.json",
+                "--apply",
+                "--max-dispatch",
+                "0",
+                "--max-writes",
+                "0",
+            ])
+            .current_dir(&dir)
+            .env_remove("GITHUB_ACTIONS")
+            .env("GH_TOKEN", "unused")
+            .output()
+            .unwrap();
+        let saved = [
+            std::fs::read(dir.join("ledger.json")).unwrap(),
+            std::fs::read(dir.join("config.json")).unwrap(),
+        ];
+        std::fs::remove_dir_all(dir).unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{name}: {stderr}");
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert_eq!(saved, [ledger, config.as_bytes()], "{name}");
+    }
+}
+
+#[test]
 fn changes_replay_lists_the_recorded_diff_without_credentials() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     let state = std::env::temp_dir().join(format!("agent-board-changes-{}", std::process::id()));

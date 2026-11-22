@@ -146,7 +146,7 @@ The deterministic catalog is in `pass/features.rs`. It includes behavioral
 opt-ins, not every optional key. The GitHub catalog consists of:
 
 - Boolean switches: `notifications`, `issueIntake`, `reserveScheduling`,
-  `poolHeadroom`, `skipActiveWork`, `idleReplan`, `existingChildPlans`,
+  `poolHeadroom`, `publicState`, `skipActiveWork`, `idleReplan`, `existingChildPlans`,
   `researchPlans`, `fixPlans`, `sessionPlans`, `triageClose`, `replanInvalid`, `operatorQuestionsOnly`,
   `reserveOperator`, `assignHolds`, `readFreeHolds`, `leanReads`, `bodyPlans`, `leases`,
   `reruns`, `reapOverdueRuns`, `cleanupHistory`, `topDown`, `usage.probe`,
@@ -3557,6 +3557,95 @@ changed sub-issue belongs to.
 Caller: `cgwalters-forge/tracker`, `.github/pass.json`, set
 `changeSweepHours` (for example `6`) where `store` and `state` are set.
 
+### Public state
+
+`publicState: true` is for cursor-only publication. It keeps a GitHub pass's walks moving without
+putting repository names, item numbers or data in the published `state` file.
+It is off by default. The file holds two numbers, `{"turn":N,"scan":M}`, in
+place of the private cursors that name items:
+
+- `turn` counts applying passes whose PR walk ran. It picks the repository in the
+  fixed `follow` list that starts the PR walk, and rotates that repository's
+  open pull requests, in number order, one further each time it starts the
+  walk again. So while its open pull requests stay the same, one that older
+  ones keep out of the share gets its turn within as many of that
+  repository's starts as there are open pull requests, and each repository
+  starts one pass in as many as `follow` names. That is slower than the
+  private `share_cursor`, which resumes where the share ran out.
+  `turn` does not depend on where the walk stopped.
+- `scan` is the ordinal, in stage 4's candidate order, of the last candidate a
+  budget-stopped scan visited; the next scan resumes after it, as after the
+  private `scan_cursor`, and a completed scan clears it. An ordinal past the
+  end of the board scans in order. Candidates added or closed between passes
+  shift it, so a few candidates may be visited twice or skipped once.
+
+Each number follows its own walk, as the private cursors do: a pass that
+reports a failure in another stage, and so exits nonzero, still saves both,
+so a failure that recurs on every pass cannot pin either walk. A missing
+file or one in another format starts at the first configured repository and
+scans in order. Neither number reserves requests: a pass can run out of
+requests before the walk begins.
+
+This mode does not export response caches, holds, watermarks, or other
+repository-derived state, even for public repositories, beyond what `scan`
+says: a lower bound on the number of stage 4 candidates and how far a
+budget-stopped scan got. A visibility check by
+name cannot say where an earlier read came from, and a hold on a public item
+can still describe a private child, so the pass caches no responses in this
+mode, not even public ones. The public file uses a separate format, and only
+an applying pass that validated its inputs and ran writes it, replacing
+whatever the file held. A pass that stops before saving can leave an old,
+private state file. Never upload the input file itself. Read exactly one
+position object and serialize only its two fields into a fresh staging file.
+For example, with `state` set to the local state path:
+
+```sh
+publish_dir=$(mktemp -d) || exit 1
+jq -sce '
+  def ordinal: type == "number" and . >= 0 and . <= 9007199254740991 and floor == .;
+  if length == 1 and (.[0] | type == "object" and keys == ["scan", "turn"]
+    and (.turn | ordinal) and (.scan == null or (.scan | ordinal)))
+  then .[0] | {turn: (.turn | floor), scan: (.scan | if . == null then . else floor end)}
+  else error("expected exactly one public pass position") end
+' -- "$state" > "$publish_dir/state.json" || exit 1
+```
+
+Upload only `"$publish_dir/state.json"` after this command succeeds, never a
+glob or the original `state` file. The integer limit keeps both fields exactly
+representable in jq. Do not substitute a stream predicate: its exit status can
+reflect only the last result. Run this export after an applying pass even if
+the pass reported failures; dropping all positions saved by failing passes
+would let a recurring failure pin both walks again. If export fails, skip the
+upload. A recording and its replay both start at the first configured
+repository and ignore the saved position; a plain live preview reads it.
+
+Set `state` and a fixed `follow` list of unique lowercase names. Do not set `store`, `changeSweepHours`,
+organization repository sources, `midstream`, `authored`, `pr.actionFirst`,
+`notifications`, `issueIntake`, `maintain`, or `holds`: they either use a different
+rotation or need state this file does not preserve. A targeted `--apply --pull`
+is also unsupported. Only the `state` file is covered, not
+other pass outputs or SQLite files left by earlier runs.
+
+This is not a drop-in replacement for a private `state` and `store`. In
+particular, do **not** enable it on Tracker's operational pass by adding the
+key to `.github/pass.json`. If the pass needs its store, change sweep, holds
+publication or other operational state, keep that pass's state and store on
+private storage and leave `publicState` off. This option neither migrates nor
+sanitizes those files.
+
+For a pass that needs only walk positions, change the caller workflow before
+enabling public uploads: stop restoring private state and store files into
+that pass, remove any restored copies from its workspace, and remove all
+uploads of those paths. Remove the incompatible config keys above, enable
+`publicState`, and check the configuration with `pass --check-config`. Only
+then enable upload of the separate export produced above. To turn the mode
+off, stop the public export first: without the setting the pass writes its
+full private state to the configured path.
+
+Upgrading from
+a version without `publicState` can cause one cold cache and full change sweep
+even with the option off, because the stored configuration scopes change.
+
 ### Top-down discovery
 
 The concrete failure `topDown: true` prevents is spending scheduling's
@@ -6367,6 +6456,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `store` | The [state store](#the-state-store)'s SQLite path, distinct from `state` and `livingStatus`, which an applying pass records its dispatch records, triage verdicts, plans, holds and changes watermarks in; GitHub only; absent (off) |
 | `changeSweepHours` | Hours, 1–168, between full pull request walks; between them stage 2 visits only what the stage 0 changes diff lists ([change-driven walk](#change-driven-pull-request-walk)); needs `store` and `state`; GitHub only; 0 or absent (off) |
+| `publicState` | `true`: persist only the PR walk's and board scan's positions, as numbers ([public state](#public-state)); needs `state`, does not allow `store`; GitHub only; absent (off) |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |
 | `pr.reviewDispatchRepositories` | Exact followed base repositories using ordinary `dispatch.yml` reviews and separate all-author intake; `[]` by default; needs `pr.reviewPools`; at most 50; GitHub only |

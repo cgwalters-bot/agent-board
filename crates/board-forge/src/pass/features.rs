@@ -59,6 +59,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
         "issueIntake",
         "reserveScheduling",
         "poolHeadroom",
+        "publicState",
         "skipActiveWork",
         "idleReplan",
         "existingChildPlans",
