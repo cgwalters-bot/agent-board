@@ -557,10 +557,10 @@ work, without weakening the current-head authorization boundary.
   A behind approved head needs no fresh approval after a clean rebase; a
   conflict holds without publishing. Rewriting requires the PR's own commits
   to be a linear chain by the bot or operator; other authors and merge commits
-  hold. For an explicitly unmapped author, `promote.botAuthorEmails` can name a
-  former bot email exactly. An email alone is self-asserted, so the exception
-  also requires GitHub to attribute the committer to the configured bot or
-  `github-actions[bot]`. This is attribution, not authentication; current-head
+  hold. Replay and sign-off share the author check. For an explicitly unmapped
+  author, `promote.botAuthorEmails` can name a former bot email exactly. An email
+  alone is self-asserted, so GitHub must attribute the committer to the configured
+  bot or `github-actions[bot]`. This is attribution, not authentication; current-head
   approval is still required to publish. The fork's own marker and merge
   commits under them are never published. Original authors, author dates and
   existing trailers are preserved.

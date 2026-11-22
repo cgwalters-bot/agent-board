@@ -21,8 +21,8 @@ pub struct Promote {
     #[serde(default)]
     pub on_approval: bool,
 
-    /// Exact former Git author emails for replay of commits with no mapped
-    /// author and an expected bot committer. Empty leaves this exception off.
+    /// Exact former Git author emails for replay and sign-off of commits with
+    /// no mapped author and an expected bot committer. Empty leaves this exception off.
     #[serde(default)]
     pub bot_author_emails: Vec<String>,
 
