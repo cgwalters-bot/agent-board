@@ -426,10 +426,28 @@ pub fn newest_plan<'a>(
     writers: &[&str],
 ) -> Result<(JobPlan, &'a Comment)> {
     let newest = newest_fenced(comments, writers, PLAN_FENCE)?;
-    let plan = JobPlan::from_comment(&newest.body)
+    Ok((parse_plan(newest)?, newest))
+}
+
+/// Only implement plans can carry a stack. Skip valid plans of other kinds,
+/// but do not fall back past a malformed or foreign-edited plan: it could
+/// have replaced an implement plan, including by removing its fence.
+pub(crate) fn newest_implement_plan(
+    comments: &[Comment],
+    writers: &[&str],
+) -> Result<Option<JobPlan>> {
+    newest_fenced_matching(comments, writers, PLAN_FENCE, |comment| {
+        !JobPlan::from_comment(&comment.body)
+            .is_ok_and(|p| p.is_some_and(|p| p.kind != "implement"))
+    })?
+    .map(parse_plan)
+    .transpose()
+}
+
+fn parse_plan(newest: &Comment) -> Result<JobPlan> {
+    JobPlan::from_comment(&newest.body)
         .with_context(|| format!("newest plan {}", newest.url))?
-        .context("plan fence vanished")?;
-    Ok((plan, newest))
+        .context("plan fence vanished")
 }
 
 /// Durable introduction on the pass's single invalid-plan repair request.
@@ -482,15 +500,27 @@ pub(crate) fn newest_fenced<'a>(
     writers: &[&str],
     fence: &str,
 ) -> Result<&'a Comment> {
+    newest_fenced_matching(comments, writers, fence, |_| true)?
+        .with_context(|| format!("no plan on this issue from an accepted writer ({fence})"))
+}
+
+fn newest_fenced_matching<'a>(
+    comments: &'a [Comment],
+    writers: &[&str],
+    fence: &str,
+    relevant: impl Fn(&Comment) -> bool,
+) -> Result<Option<&'a Comment>> {
     for writer in writers {
         ensure!(is_github_login(writer), "invalid login {writer:?}");
     }
-    let newest = comments
+    let Some(newest) = comments
         .iter()
-        .filter(|c| weighed(c, writers, fence))
+        .filter(|c| weighed(c, writers, fence) && (foreign_edit(c, writers) || relevant(c)))
         // max_by_key keeps the last of equals: the later comment wins a tie.
         .max_by_key(|c| c.changed)
-        .with_context(|| format!("no plan on this issue from an accepted writer ({fence})"))?;
+    else {
+        return Ok(None);
+    };
     ensure!(
         !foreign_edit(newest, writers),
         "newest plan {} was last edited by {}, who may not write plans",
@@ -500,7 +530,7 @@ pub(crate) fn newest_fenced<'a>(
             .as_deref()
             .unwrap_or("an unidentified account")
     );
-    Ok(newest)
+    Ok(Some(newest))
 }
 
 fn trusted(writers: &[&str], login: &Option<String>) -> bool {

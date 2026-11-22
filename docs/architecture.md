@@ -393,16 +393,18 @@ work, without weakening the current-head authorization boundary.
   A head that is behind, or carries the fork's own commits, is
   reported ready after a publication rebase when its own commits form a linear
   bot- or operator-authored chain; only `--apply` finds and holds a conflict,
-  and the awaiting queue still holds it. Then the issue's accepted plan's
-  `stacks_on`; DCO facts from required
+  and the awaiting queue still holds it. Then `stacks_on` from the issue's
+  newest accepted implement plan; DCO facts from required
   base-branch checks or base-head check runs; and unchanged title/body text.
   This prevents duplicate publication, stale bases, unmerged dependencies,
    unsafe sign-off rewrites and references changing meaning upstream. Only a
   unique closing or `Part of` reference to an issue in the fork ties a PR to
-  its plan; ambiguous/missing linkage holds. No plan or no `stacks_on` means
-  unstacked. A parent's open fork PR, open upstream PR or closed-unmerged PR
-  holds; only its matching-head upstream PR merged into the configured base
-  passes. Accepted-plan comments require complete edit metadata. DCO never comes from CONTRIBUTING.
+  its plan; ambiguous/missing linkage holds. A later valid fix plan for the
+  PR does not replace the implement plan for this check. No implement plan
+  or no `stacks_on` means unstacked. A parent's open fork PR, open upstream
+  PR or closed-unmerged PR holds; only its matching-head upstream PR merged
+  into the configured base passes. Accepted-plan comments require complete
+  edit metadata. DCO never comes from CONTRIBUTING.
   When required, report missing operator sign-offs; commits needing a sign-off
   that are merges or by neither bot nor operator hold. Empty bodies, bare
   `#N` references, closing references to the fork and any other reference

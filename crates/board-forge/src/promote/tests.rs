@@ -2040,6 +2040,67 @@ fn plan_node(lower: Option<u64>) -> Value {
     json!({"url":format!("https://github.com/{REPO}/issues/31#issuecomment-2"),"author":{"login":"cgwalters-bot"},"editor":null,"lastEditedAt":null,"createdAt":COMMAND,"body":format!("```agent-board-plan\n{plan}\n```")})
 }
 
+fn pr_fix_plan_node() -> Value {
+    let plan = json!({"schema":"agent-board/job-plan/v1","repo":REPO,"item":34,"kind":"fix","runner":"hosted","pool":"openai","brief":"Repair the fork PR"});
+    json!({"url":format!("https://github.com/{REPO}/issues/31#issuecomment-4"),"author":{"login":"cgwalters-bot"},"editor":null,"lastEditedAt":null,"createdAt":"2026-10-23T00:01:00Z","body":format!("```agent-board-plan\n{plan}\n```")})
+}
+
+#[test]
+fn stack_plan_selection_ignores_a_later_pr_fix_plan() {
+    let config = Config::parse(CONFIG).unwrap();
+    let mut mismatch = plan_node(None);
+    mismatch["url"] = json!(format!(
+        "https://github.com/{REPO}/issues/31#issuecomment-3"
+    ));
+    mismatch["createdAt"] = json!("2026-10-23T00:00:30Z");
+    mismatch["body"] = json!(
+        mismatch["body"]
+            .as_str()
+            .unwrap()
+            .replace("\"item\":31", "\"item\":34")
+    );
+    let mut foreign = pr_fix_plan_node();
+    foreign["lastEditedAt"] = foreign["createdAt"].clone();
+    foreign["editor"] = json!({"login":"visitor"});
+    let mut invalid = pr_fix_plan_node();
+    invalid["body"] = json!(
+        invalid["body"]
+            .as_str()
+            .unwrap()
+            .replace("\"item\":34", "\"item\":0")
+    );
+    for (nodes, expected) in [
+        (json!([pr_fix_plan_node()]), candidate(false)),
+        (
+            json!([plan_node(None), pr_fix_plan_node()]),
+            candidate(false).replace("stack=none (no plan)", "stack=none"),
+        ),
+        (
+            json!([plan_node(None), mismatch, pr_fix_plan_node()]),
+            gate_hold("accepted plan issue mismatch"),
+        ),
+    ] {
+        let mut replay = scenario();
+        plan_comments(&mut replay, nodes);
+        assert_eq!(
+            run(replay, &config).0.unwrap(),
+            [expected, REMAINING.into()]
+        );
+    }
+    for (node, reason) in [
+        (foreign, "was last edited by visitor"),
+        (invalid, "newest plan"),
+    ] {
+        let mut replay = scenario();
+        plan_comments(&mut replay, json!([plan_node(None), node]));
+        let lines = run(replay, &config).0.unwrap();
+        assert!(
+            lines[0].starts_with("hold promote") && lines[0].contains(reason),
+            "{lines:?}"
+        );
+    }
+}
+
 #[test]
 fn plan_absence_is_distinct_from_unreadable_or_invalid_plan() {
     let config = Config::parse(CONFIG).unwrap();
@@ -2395,7 +2456,10 @@ fn accepted_plan_is_the_only_stack_source() {
         "merged different head",
     ] {
         let mut replay = scenario();
-        plan_comments(&mut replay, json!([plan_node(Some(30))]));
+        plan_comments(
+            &mut replay,
+            json!([plan_node(Some(30)), pr_fix_plan_node()]),
+        );
         let mut parent = pull(&mut replay).clone();
         parent["number"] = json!(33);
         parent["body"] = json!("Part of #30");

@@ -972,11 +972,11 @@ fn stack_gate(
     promotion_body(client, repo, pull, upstream)?;
     let comments = crate::plan::issue_comments_with_edit_evidence(client, &issue)?;
     let writers = [&*config.operator, &*config.bot];
-    if crate::plan::no_plan(&comments, &writers) {
+    let Some(plan) = crate::plan::newest_implement_plan(&comments, &writers)
+        .map_err(|e| Held(format!("{e:#}")))?
+    else {
         return Ok("stack=none (no plan)".into());
-    }
-    let (plan, _) =
-        crate::plan::newest_plan(&comments, &writers).map_err(|e| Held(format!("{e:#}")))?;
+    };
     hold!(
         plan.repo.eq_ignore_ascii_case(repo) && plan.item == issue.number,
         "accepted plan issue mismatch"
