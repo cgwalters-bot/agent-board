@@ -2618,7 +2618,8 @@ mod tests {
             fake.page(
                 &format!("repos/{repo}/pulls/2"),
                 json!({
-                "head": {"sha": "abcdef0123456789"}, "labels": []}),
+                    "state": "open", "user": {"login": BOT},
+                    "head": {"sha": "abcdef0123456789"}, "labels": []}),
             );
             let mut config = search_intake(&fake, repo);
             config.policy.operator_review_fixes = enabled;
@@ -2714,6 +2715,8 @@ mod tests {
     fn operator_review_fixes_keep_existing_holds_and_caps() {
         for case in [
             "label",
+            "closed",
+            "foreign author",
             "rounds",
             "running",
             "dispatch cap",
@@ -2750,11 +2753,31 @@ mod tests {
                 &format!("repos/{repo}/pulls/2/comments?per_page=100"),
                 json!([]),
             );
-            fake.page(
-                &format!("repos/{repo}/pulls/2"),
-                json!({"head": {"sha": "abcdef0123456789"},
-                "labels": if case == "label" { json!([{"name": LABEL}]) } else { json!([]) }}),
-            );
+            let path = format!("repos/{repo}/pulls/2");
+            let url = format!("{API_ROOT}{path}");
+            let open = json!({"state": "open", "user": {"login": BOT},
+                "head": {"sha": "abcdef0123456789"}, "labels": []});
+            let mut pull = open.clone();
+            let mut previous = State::default();
+            match case {
+                "label" => pull["labels"] = json!([{"name": LABEL}]),
+                "closed" => pull["state"] = json!("closed"),
+                "foreign author" => pull["user"]["login"] = json!("someone"),
+                _ => (),
+            }
+            let changed = matches!(case, "closed" | "foreign author");
+            if changed {
+                // Both the issue view and a conditional GET of the PR would
+                // still show the old admission facts.
+                fake.modified
+                    .borrow_mut()
+                    .insert(url.clone(), UPDATED.into());
+                previous.responses.insert(
+                    url,
+                    crate::pass::cache::seal(json!({"last_modified": UPDATED, "body": open})),
+                );
+            }
+            fake.page(&path, pull);
             let mut config = search_intake(&fake, repo);
             config.policy.operator_review_fixes = true;
             if case == "fix bounds" {
@@ -2773,7 +2796,7 @@ mod tests {
                 &fake,
                 &fake,
                 &config,
-                State::default(),
+                previous,
                 (&[], &[]),
                 Some(Apply {
                     dispatcher: &fake,
@@ -2786,6 +2809,15 @@ mod tests {
             )
             .unwrap();
             assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            if changed {
+                assert!(
+                    outcome.lines.iter().any(|line| {
+                        line.contains("the pull request is no longer open and bot-authored")
+                    }),
+                    "{case}: {:?}",
+                    outcome.lines
+                );
+            }
             assert!(dispatches(&fake).is_empty(), "{case}: {:?}", outcome.lines);
             assert!(
                 fake.writes.borrow().is_empty(),

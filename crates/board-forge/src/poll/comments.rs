@@ -1581,7 +1581,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let (done, what) = if let Some(why) = private {
             (true, why)
         } else if mine && (!directed || review_fix) {
-            let (done, what) = self.comment_fix(repo, number, hit, comments, &said)?;
+            let (done, what) = self.comment_fix(repo, number, hit, comments, &said, review_fix)?;
             let what = if review_fix {
                 format!("intent=requested-changes (review state): {what}")
             } else {
@@ -1654,11 +1654,27 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         hit: &Value,
         read: &[Value],
         said: &[Said],
+        review_fix: bool,
     ) -> Result<Handled> {
         if hit["state"] != "open" {
             return Ok((true, "left: the pull request is closed".into()));
         }
-        let pull = self.get(&format!("repos/{repo}/pulls/{number}"))?;
+        let pull = self
+            .get_url(
+                &format!("{API_ROOT}repos/{repo}/pulls/{number}"),
+                Value::clone,
+                review_fix && self.apply.is_some(),
+            )?
+            .0;
+        // Intake admitted this review against the issue view. Before writing a
+        // claim or dispatching, check the pull request we will actually use.
+        if review_fix && (pull["state"] != "open" || text(&pull, "/user/login") != self.config.bot)
+        {
+            return Ok((
+                true,
+                "left: the pull request is no longer open and bot-authored".into(),
+            ));
+        }
         let head = text(&pull, "/head/sha").to_owned();
         ensure!(!head.is_empty(), "the pull request has no head");
         if nodes(&pull, "/labels").iter().any(|l| l["name"] == LABEL) {
