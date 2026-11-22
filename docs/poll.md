@@ -575,7 +575,7 @@ the classifier never starts fix work to make a draft quick.
 
 ## Failed checks before fix rounds
 
-A transient CI or infrastructure failure can spend both paid fix rounds on
+A transient CI or infrastructure failure can spend the paid fix rounds on
 work the agent cannot repair, then leave the PR at `needs-human`. The pass's
 [`pr.checkReruns: true`](pass.md#reruns) (off by default; a standalone poll's `checkReruns`)
 offers the failed Actions checks one rerun before a fix round or stop. This
@@ -1033,9 +1033,11 @@ not be read, stage 2 starts nothing either.
 
 `fixRounds` (1 to 5, default 2) is the fix rounds a pull request gets before
 its budget is exhausted (agent-board#1025); each round stays one bounded agent
-run. The default is the two the tracker's polling job may start without
-per-run approval ([AGENTS.md](../AGENTS.md), [design](design.md)); more needs
-that bound changed first. Exhausted, the pull request goes
+run. The polling job's approval-free bound is the caller's `fixRounds`, at most
+five (agent-board#1141, [AGENTS.md](../AGENTS.md), [design](design.md)), so a
+caller may set up to five without per-run approval. Every round past the old
+two goes through the same checks as the first; a labelled or queued pull
+request, for one, starts none. Exhausted, the pull request goes
 to [agent recovery](#agent-recovery-instead-of-operator-parking-992) where
 `agentRecovery` is on, else to `needs-human`. In pass it is `pr.fixRounds`.
 

@@ -57,9 +57,9 @@ homegit and its running controllers untouched ([design scope](docs/design.md#1-s
 Do not edit workflow/security configuration unless the task explicitly needs it.
 
 Runs started by the [tracker polling job](https://github.com/cgwalters-forge/tracker#the-pull-request-poll)
-within its fixed bounds (our repositories, at most 2 fix rounds per PR, auto-merge
-only on review success and green required checks) need no per-run approval; do not
-refuse work for lack of one.
+within its bounds (our repositories, at most the caller's `fixRounds`, up to 5,
+fix rounds per PR, auto-merge only on review success and green required checks)
+need no per-run approval; do not refuse work for lack of one.
 
 ## Planning and hand-back
 

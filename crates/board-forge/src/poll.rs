@@ -80,14 +80,14 @@ pub(crate) const OPERATOR_APPROVAL_LABEL: &str = "needs-operator-approval";
 /// `pr.operatorPaths` without the operator's approval of its head.
 const OPERATOR_PATHS_WAIT: &str = "pr.operatorPaths: ";
 /// Fix rounds of one pull request before its budget is exhausted, unless
-/// `fixRounds` says otherwise: the two the tracker's polling job may start
-/// without approval (AGENTS.md).
+/// `fixRounds` says otherwise.
 pub const FIX_ROUNDS: u64 = 2;
 /// The fixed budget markers were written under before `fixRounds`
 /// ([`Marker::diagnosed`]).
 const LEGACY_FIX_ROUNDS: u64 = 2;
 /// The most `fixRounds` may ask for: each round is an agent run, and a
-/// change that keeps failing cannot start runs without end.
+/// change that keeps failing cannot start runs without end. Also the
+/// tracker's polling job's approval-free bound (AGENTS.md).
 pub const FIX_ROUNDS_LIMIT: u64 = 5;
 /// The ref fix runs are started at, as poll.cjs starts dispatch.yml.
 const DISPATCH_REF: &str = "main";
@@ -15991,6 +15991,49 @@ mod tests {
                 "{fix_rounds:?} {state}: {}",
                 decision.reason
             );
+        }
+        // A caller at the most rounds, five, gets each of them
+        // past the old two, and each round keeps the same checks: a labelled
+        // or queued pull request starts none.
+        let mut cfg = config();
+        cfg.policy.fix_rounds = Some(FIX_ROUNDS_LIMIT);
+        for rounds in 0..=FIX_ROUNDS_LIMIT {
+            for (change, expected) in [
+                (
+                    json!({}),
+                    if rounds < FIX_ROUNDS_LIMIT {
+                        ("fix", Some(rounds + 1))
+                    } else {
+                        ("needs-human", None)
+                    },
+                ),
+                (
+                    json!({"labels": {"nodes": [{"name": LABEL}]}}),
+                    ("skip", None),
+                ),
+                (json!({"mergeQueueEntry": {}}), ("skip", None)),
+            ] {
+                let mut pull = failing.clone();
+                for (key, value) in change.as_object().into_iter().flatten() {
+                    pull[key] = value.clone();
+                }
+                let decision = decide(
+                    &cfg,
+                    &pull,
+                    &classify_checks(&pull, &required()),
+                    // As written past the old budget (`Marker::diagnosed`).
+                    &marker(json!({"rounds": rounds, "diagnosed": false, "sha": "older"})),
+                    (None, None),
+                    &Outages::Off,
+                    now(),
+                );
+                assert_eq!(
+                    (decision.action, decision.round),
+                    expected,
+                    "{rounds} {change}: {}",
+                    decision.reason
+                );
+            }
         }
         // Past the old budget the marker says which its last round was.
         for diagnosed in [false, true] {
