@@ -1264,7 +1264,9 @@ topic-selected midstream fork. Its decision line logs
 `intent=requested-changes (review state)`. Existing fix bounds, ownership,
 `needs-human` holds, running-round exclusion, two-round limit, per-pass caps
 and comment-ID receipts still apply; `ownSpaceOnly` permits these fixes on
-the bot's own PR outside our space as before. Existing tracking receipts are
+the bot's own PR outside our space as before. Apply reads the PR without a
+cache validator and requires it to still be open and bot-authored before
+claiming or dispatching the fix. Existing tracking receipts are
 read too, so enabling this cannot replay reviews already triaged.
 A later operator review that no longer requests changes, including a bodyless
 approval, prevents the older review from authorizing a fix, even if a newer
