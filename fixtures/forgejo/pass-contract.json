@@ -169,6 +169,7 @@
     "dispatchRepo": {"verdict": "native", "forgejo": "the caller repository on this instance"},
     "dispatchWorkflow": {"verdict": "native", "forgejo": "the caller's Forgejo Actions workflow file"},
     "dispatchRef": {"verdict": "native", "forgejo": "the dispatch ref"},
+    "trackingRepo": {"verdict": "refused", "reason": "the tracking issues it hosts come from the GitHub operator-direction intake (stage 2)"},
     "follow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "midstream.owner": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "midstream.topic": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},

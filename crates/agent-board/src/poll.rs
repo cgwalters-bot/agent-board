@@ -133,16 +133,20 @@ pub fn run(
         Some(path) if path.exists() => State::from_json(&read(path)?)?,
         _ => State::default(),
     };
+    let dispatch_repo = args
+        .dispatch_repo
+        .clone()
+        .context("missing --dispatch-repo or config dispatchRepo")?;
     let config = poll::Config {
         operator: args
             .operator
             .clone()
             .context("missing --operator or config operator")?,
         bot: args.bot.clone().context("missing --bot or config bot")?,
-        dispatch_repo: args
-            .dispatch_repo
-            .clone()
-            .context("missing --dispatch-repo or config dispatchRepo")?,
+        // The standalone poll has no `trackingRepo`: its tracking issues
+        // stay in the dispatch repository.
+        tracking_repo: dispatch_repo.clone(),
+        dispatch_repo,
         review_workflow: args.review_workflow.clone(),
         policy,
     };
@@ -349,6 +353,7 @@ mod tests {
                 operator: "operator".into(),
                 bot: "worker".into(),
                 dispatch_repo: "example/runners".into(),
+                tracking_repo: "example/runners".into(),
                 review_workflow: None,
                 policy: poll::PollPolicy::default(),
             };

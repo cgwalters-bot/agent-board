@@ -619,9 +619,25 @@ Other public upstream threads are staged as issues in the matching
 not the thread body, title or a guessed repository name. One metadata read per
 selected repository (at most 50) resolves those routes; ambiguity or unreadable
 metadata fails stage 2. A matching fork with issues disabled cannot hold the
-staging issue, so its upstream's direction is staged in `dispatchRepo` instead,
-with a `notifications:` line saying so. A thread with no matching fork waits
-for one; see below. Private upstream threads are never copied into a fork.
+staging issue, so its upstream's direction is staged in the tracker instead,
+with a `notifications:` line saying so. The tracker is `trackingRepo`, and
+`dispatchRepo` unless it is set. It hosts tracking issues for operator comments
+on someone else's pull request or outside our own space, including claims on
+outside-space requests. It is also the tracker named in cross-project triage
+filing advice (agent-board#1157). It must be in our own space, `dispatchRepo`'s
+owner or the bot's account, so the pass does not track its own tracking issues.
+
+To move dispatch **within the same owner** without losing tracking receipts,
+first pin `trackingRepo` to the old issue host, then change `dispatchRepo` in a
+later change. A bare tracking issue number resolves only in the current
+tracker. This is not a receipt migration across owners: changing the own-space
+boundary can switch claim lookup between the source thread and the tracking
+issue and cause an already handled request to run again. Run URLs, own-space
+membership and leases still follow `dispatchRepo`, as does the
+[standalone poll](poll.md), which has no such setting.
+
+A thread with no matching fork waits for one; see below. Private upstream
+threads are never copied into a fork.
 Direction the bot already answered by hand on the thread (a later comment of
 the bot's that carries no marker, so neither the poll's nor a run's) starts
 nothing; within one second, issue comment ids order them, and direction that
@@ -3153,8 +3169,9 @@ A pass captures one clock and performs these stages in order:
     waiting; and, with `notifications`, the upstream of any `midstream`
     fork so named, so an epic naming `ORG/ostree#5` puts `ostreedev/ostree`
     first, even when that fork has issues disabled and its upstream's
-    direction is staged in `dispatchRepo` (an epic naming `dispatchRepo`
-    puts no upstream first). Stage 2 reads stage 3's listing of the open
+    direction is staged in the tracker (an epic naming the tracker,
+    `trackingRepo` or else `dispatchRepo`, puts no upstream first). Stage 2
+    reads stage 3's listing of the open
     epics for this, in the same pass, and stage 3 takes that listing rather
     than read it again, so no request is added; its requests still count to
     stage 3, which therefore sees the epics as they were before stage 2's
@@ -4081,8 +4098,9 @@ is where the procedure in the families above moves as each is cut down to its
 protocol. Still unimplemented for #788: the pass neither fetches nor checks
 those files (the brief asks the run to say when it cannot read one), an
 unpinned entry records no revision, there is no precedence between sources,
-and a fork whose issues are tracked in `dispatchRepo` gets that repository's
-entry, not its own. This audit is recorded here because
+and a fork whose issues are tracked in the tracker (`trackingRepo`, else
+`dispatchRepo`) gets that repository's entry, not its own. This audit is
+recorded here because
 the worker handback cannot post a comment directly to that issue.
 
 Work already promoted upstream is the exception (agent-board#735). Its
@@ -6299,6 +6317,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | --- | --- |
 | `operator`, `bot` | Direction/plan writer and applying bot logins; required |
 | `dispatchRepo`, `dispatchWorkflow`, `dispatchRef` | Caller repository/workflow/ref; required, required, caller default branch |
+| `trackingRepo` | The repository that hosts the tracking issues of operator comments on someone else's pull request or outside our own space, their claims, the staged direction of a `midstream` fork with issues disabled and the filing destination triage briefs name, see [operator direction](#github-operator-direction-intake); run URLs, own-space membership and leases keep following `dispatchRepo`, and `direction.repository` may not be it; `dispatchRepo` |
 | `follow` | Exact repositories for existing PR follow-up; `[]` |
 | `midstream.owner`, `midstream.topic` | The organization, `dispatchRepo`'s owner, whose repositories with the GitHub topic stage 2 follows and never merges in, as if in `follow` and `pr.noMerge`, read with one listing of at most 5 pages a pass; absent is off with no reads |
 | `authored` | The most repositories, 1–10, a pass adds to `follow` from the search for the bot's open pull requests (at most 3 pages a pass), taking turns from a cursor in the state, never merging in them, following only the bot's pull requests there and writing nothing there outside our own space; absent is off with no reads |

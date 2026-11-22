@@ -80,7 +80,8 @@ pub(super) struct Turn {
 /// (`OWNER/REPO#N`), and the upstream of each midstream fork among them by
 /// `forks`, upstream to fork, where the notification intake read them. Not
 /// the intake's staging routes: those map a fork with issues disabled's
-/// upstream to the dispatch repository, which every epic may name.
+/// upstream to the tracker (`trackingRepo`, else `dispatchRepo`), which
+/// every epic may name.
 pub(super) fn priority<'a>(
     named: &[String],
     waiting: impl IntoIterator<Item = &'a str>,
