@@ -95,6 +95,9 @@ const LEGACY_FIX_ROUNDS: u64 = 2;
 /// change that keeps failing cannot start runs without end. Also the
 /// tracker's polling job's approval-free bound (AGENTS.md).
 pub const FIX_ROUNDS_LIMIT: u64 = 5;
+
+const STALLED_HEAD_REPORT_LIMIT: usize = 3;
+pub const STALLED_HEAD_SUFFIX: &str = "; stalled-head: ";
 /// The ref fix runs are started at, as poll.cjs starts dispatch.yml.
 const DISPATCH_REF: &str = "main";
 /// fix.toml's replacement_max_commits: the series a fix may hand back.
@@ -627,6 +630,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "holdMissingData",
     "stopReasons",
     "fixRounds",
+    "stalledHeadReports",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -796,6 +800,9 @@ pub struct PollPolicy {
     /// [`FIX_ROUNDS_LIMIT`]; none is [`FIX_ROUNDS`]. Read with
     /// [`Self::fix_rounds`].
     pub fix_rounds: Option<u64>,
+    /// `stalledHeadReports`: maximum public fix-limit log receipts per pass;
+    /// zero disables them. This does not start research.
+    pub stalled_head_reports: usize,
     /// `operatorComments.repositories`: where the operator's comments start
     /// runs ([`comments`]), as `OWNER/*` or `OWNER/REPO`. Empty (the default)
     /// reads none.
@@ -1215,6 +1222,8 @@ pub const OPERATOR_PATHS_LIMIT: usize = 50;
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrOptions {
+    #[serde(default)]
+    pub stalled_head_reports: usize,
     #[serde(default, deserialize_with = "maintainer_names")]
     pub maintainers: Vec<String>,
     #[serde(default)]
@@ -1420,6 +1429,10 @@ impl PrOptions {
                 .is_none_or(|r| (1..=FIX_ROUNDS_LIMIT).contains(&r)),
             "{at}fixRounds is not 1 to {FIX_ROUNDS_LIMIT}"
         );
+        ensure!(
+            self.stalled_head_reports <= STALLED_HEAD_REPORT_LIMIT,
+            "{at}stalledHeadReports is not 0 to {STALLED_HEAD_REPORT_LIMIT}"
+        );
         Ok(())
     }
 
@@ -1452,6 +1465,7 @@ impl PrOptions {
             operator_paths,
             stale_days,
             fix_rounds,
+            stalled_head_reports,
         } = self.clone();
         policy.maintainers = maintainers
             .into_iter()
@@ -1482,6 +1496,7 @@ impl PrOptions {
         policy.operator_paths = operator_paths;
         policy.stale_days = stale_days;
         policy.fix_rounds = fix_rounds;
+        policy.stalled_head_reports = stalled_head_reports;
     }
 }
 
@@ -1640,6 +1655,7 @@ impl PollPolicy {
             operator_paths: Vec::new(),
             stale_days: 0,
             fix_rounds: None,
+            stalled_head_reports: 0,
             check_reruns: false,
             unstall: false,
             hold_missing_data: false,
@@ -3487,6 +3503,16 @@ impl Marker {
             format!("fix round {}", self.rounds)
         }
     }
+
+    /// `rounds` without the diagnostic round counted in it.
+    fn ordinary_rounds(&self) -> u64 {
+        self.rounds.saturating_sub(u64::from(self.diagnosed))
+    }
+
+    /// Whether the ordinary fix rounds of [`PollPolicy::fix_rounds`] are spent.
+    fn fix_limit(&self, config: &Config) -> bool {
+        self.ordinary_rounds() >= config.policy.fix_rounds()
+    }
 }
 
 fn marker_body(state: &Value, text: &str, footer: &Footer) -> String {
@@ -3683,6 +3709,23 @@ fn holds(labels: &[Value]) -> bool {
 /// Whether `pull`, as [`PULL_QUERY`] read it, is held ([`HOLD_LABEL`]).
 fn is_held(pull: &Value) -> bool {
     holds(nodes(pull, "/labels/nodes"))
+}
+
+/// A receipt claims a fresh stop only when the label read establishes that
+/// neither a stop nor a hold is already on the PR. This does not gate writes.
+fn stall_labels_clear(pull: &Value) -> bool {
+    pull.pointer("/labels/pageInfo/hasNextPage") == Some(&Value::Bool(false))
+        && pull
+            .pointer("/labels/nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|labels| {
+                !holds(labels)
+                    && labels.iter().all(|label| {
+                        label["name"]
+                            .as_str()
+                            .is_some_and(|name| !name.eq_ignore_ascii_case(LABEL))
+                    })
+            })
 }
 
 /// The bot's own pull request from its fork, whatever the head branch: a
@@ -4398,6 +4441,8 @@ pub struct Decision {
     /// whose reason [`PollPolicy::stop_reasons`] quotes. A step that replaces
     /// the stop, such as a broken stack's, does not carry it.
     pub empty_run: bool,
+    /// This decision came from exhausting the ordinary fix-round budget.
+    pub fix_limit: bool,
 }
 
 /// Wait semantics decided by the poll, independent of diagnostic wording.
@@ -4418,7 +4463,10 @@ impl Decision {
     /// own. An operator's answer or comments that pushed nothing is theirs,
     /// whatever ended the run; so is a stale stop's round, whose close
     /// ([`stale`]) needs the operator's label to stay on.
-    fn empty_round(self, marker: &Marker) -> Self {
+    fn empty_round(mut self, config: &Config, marker: &Marker) -> Self {
+        // Classify the exhausted no-new-head stop wherever the run was checked.
+        self.fix_limit =
+            !marker.answering && !marker.continuing && !marker.rebasing && marker.fix_limit(config);
         if marker.answering || !marker.comments.is_empty() {
             self
         } else {
@@ -4468,6 +4516,7 @@ fn step(action: &'static str, reason: impl Into<String>) -> Decision {
         waiting: WaitReason::Person,
         infrastructure: None,
         empty_run: false,
+        fix_limit: false,
     }
 }
 
@@ -4718,7 +4767,7 @@ fn started(
                     short(head)
                 ),
             )
-            .empty_round(marker)
+            .empty_round(config, marker)
             .empty_run();
         }
     }
@@ -4730,7 +4779,7 @@ fn started(
                 short(head)
             ),
         )
-        .empty_round(marker);
+        .empty_round(config, marker);
     }
     step("wait", format!("{round}{RUNNING}{}", short(head))).followed(since)
 }
@@ -4861,6 +4910,7 @@ pub fn decide(
                     waiting: WaitReason::Person,
                     infrastructure: None,
                     empty_run: false,
+                    fix_limit: false,
                 };
                 let refits = !config.policy.agent_recovery
                     && config.policy.unstall
@@ -4898,6 +4948,7 @@ pub fn decide(
                     waiting: WaitReason::Person,
                     infrastructure: None,
                     empty_run: false,
+                    fix_limit: false,
                 };
             }
         }
@@ -4972,6 +5023,7 @@ pub fn decide(
                 waiting: WaitReason::Person,
                 infrastructure: None,
                 empty_run: false,
+                fix_limit: false,
             };
         }
         // The diagnostic round is one more, counted in `rounds` as the next
@@ -4991,6 +5043,7 @@ pub fn decide(
                 waiting: WaitReason::Person,
                 infrastructure: None,
                 empty_run: false,
+                fix_limit: false,
             };
         }
         if marker.rounds >= rounds || marker.diagnosed {
@@ -5002,10 +5055,13 @@ pub fn decide(
             } else {
                 format!("{} fix rounds", marker.rounds)
             };
-            return recovery::exhausted(
-                config,
-                format!("{used} used and {} still fails ({why})", short(head)),
-            );
+            return Decision {
+                fix_limit: marker.fix_limit(config),
+                ..recovery::exhausted(
+                    config,
+                    format!("{used} used and {} still fails ({why})", short(head)),
+                )
+            };
         }
         return Decision {
             action: "fix",
@@ -5023,6 +5079,7 @@ pub fn decide(
             waiting: WaitReason::Person,
             infrastructure: None,
             empty_run: false,
+            fix_limit: false,
         };
     }
     let unwritten = undescribed(pull);
@@ -5377,6 +5434,8 @@ pub struct Outcome {
     /// Fenced maintainer report, printed verbatim by the CLI in a dry run.
     pub maintainer_report: Option<String>,
     pub lines: Vec<String>,
+    /// Receipt data keyed by its decision line's index in `lines`.
+    pub stalled_heads: BTreeMap<usize, Value>,
     pub errors: usize,
     pub failed_operations: Vec<String>,
     pub activity: usize,
@@ -5779,6 +5838,7 @@ struct Pass<'a, R, G> {
     cut: Option<String>,
     apply: Option<Apply<'a, R>>,
     dispatched: usize,
+    stalled_heads_reported: usize,
     /// See [`Outcome::merged`].
     merged: usize,
     /// Preview merge decisions, including followed non-bot authors.
@@ -5968,6 +6028,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             cut: None,
             apply: None,
             dispatched: 0,
+            stalled_heads_reported: 0,
             merged: 0,
             preview_merges: 0,
             queues: BTreeMap::new(),
@@ -9415,6 +9476,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         number: u64,
         (merge_only, priority): (bool, Option<PriorityTurn>),
         required: &mut BTreeMap<String, (Vec<Value>, bool)>,
+        stalled_head: &mut Option<Value>,
     ) -> Result<(String, bool, Option<Wait>, Option<Stepped>)> {
         let (owner, name) = repo.split_once('/').context("repository")?;
         let red_only = priority == Some(PriorityTurn::RedCheck);
@@ -10167,8 +10229,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // on since the read above stops it too. A quoted reason is the head's,
         // and so is a stop whose reason could not be read.
         let revalidate_stop = supervisor_empty_fix || quoted_stop;
+        let mut receipt_reread = !writing;
         let hold = if writing {
             self.read_pull(owner, name, number).and_then(|mut p| {
+                receipt_reread = p["state"] == "OPEN"
+                    && p["headRefOid"] == head
+                    && p["baseRepository"]["isPrivate"] == false
+                    && stall_labels_clear(&p);
                 if let Some(review) = &priority_review {
                     self.review_turn_candidate(repo, number, &p)?;
                     if p["headRefOid"] != head || p["baseRefName"] != base {
@@ -10373,6 +10440,46 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if let Some(error) = evidence_error.filter(|_| ran) {
             done.push_str(&format!("; run reason not added: {error:#}"));
         }
+        // Give a log consumer an exact head and run to investigate without
+        // parsing stop prose. This neither reads evidence nor reserves work.
+        let reports = self.caps.map_or(self.stalled_heads_reported, |caps| {
+            caps.stalled_head_reports.get()
+        });
+        let report_limit = self.config.policy.stalled_head_reports;
+        let receipt = if reports < report_limit.min(STALLED_HEAD_REPORT_LIMIT)
+            && ran
+            && decision.action == "needs-human"
+            && decision.fix_limit
+            && receipt_reread
+            && stall_labels_clear(&pull)
+            && pull["baseRepository"]["isPrivate"] == false
+            && !merge_only
+            && self.config.policy.pull.is_none()
+            && self.config.ours(repo)
+            && self.config.held_in(repo).is_none()
+            && is_harness(&pull, self.config)
+            && answer.is_empty()
+            && retarget.is_none()
+            && stale.is_none()
+        {
+            if let Some(caps) = self.caps {
+                caps.stalled_head_reports.set(reports + 1);
+            } else {
+                self.stalled_heads_reported += 1;
+            }
+            let failed: Vec<_> = (checks.failed.iter())
+                .map(|(name, url)| json!({"name": name, "untrusted_reported_url": url}))
+                .collect();
+            Some(json!({
+                "kind": "fix-round-limit", "repository": repo, "pull": number,
+                "mode": if self.apply.is_some() { "apply" } else { "preview" },
+                "head": head, "rounds_used": marker.ordinary_rounds(),
+                "round_limit": fix_rounds, "diagnosed": marker.diagnosed,
+                "recorded_run": marker.run, "failed_checks": failed,
+            }))
+        } else {
+            None
+        };
         // As in `stop`, which labels nothing where the operator takes it.
         let supervisor = self.config.policy.supervisor_holds
             && decision.action == "needs-human"
@@ -10498,6 +10605,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 at: (0, None),
             });
         }
+        *stalled_head = receipt;
         Ok((
             line,
             text(&pull, "/author/login") == self.config.bot
@@ -10788,6 +10896,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             } else {
                 LABEL
             };
+            let mut stalled_head = None;
             let read = match (left.get(&number), quiet) {
                 (Some(listed), _) => {
                     Ok(self.labelled_skip(repo, number, merge_only, (listed, label)))
@@ -10800,6 +10909,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                         number,
                         (merge_only, priority.map(|(turn, _)| turn)),
                         &mut required,
+                        &mut stalled_head,
                     );
                     self.turn_floor = None;
                     if priority.is_none() {
@@ -10832,6 +10942,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                         let step = stepped.as_ref().map(|_| outcome.steps.len());
                         review.at = (outcome.lines.len(), step);
                         self.deferred.push(review);
+                    }
+                    if let Some(receipt) = stalled_head {
+                        outcome.stalled_heads.insert(outcome.lines.len(), receipt);
                     }
                     outcome.lines.push(line);
                     outcome.in_flight += usize::from(flying);
@@ -10919,6 +11032,11 @@ pub fn run_capped<R: Rest, G: Transport>(
     )?;
     if let Some(line) = config.policy.handover_line() {
         outcome.lines.insert(0, line);
+        outcome.stalled_heads = outcome
+            .stalled_heads
+            .into_iter()
+            .map(|(index, receipt)| (index + 1, receipt))
+            .collect();
     }
     Ok(outcome)
 }
@@ -16563,6 +16681,13 @@ mod tests {
                 ("needs-human", None),
             ),
             (Some(5), json!({"rounds": 3}), "", ("needs-human", None)),
+            // The diagnostic round ends the rounds, short of the raised limit.
+            (
+                Some(3),
+                json!({"rounds": 3, "diagnosed": true}),
+                "large",
+                ("needs-human", None),
+            ),
             (
                 Some(3),
                 json!({"rounds": 3, "diagnosed": false}),
@@ -16601,6 +16726,14 @@ mod tests {
                 expected,
                 "{fix_rounds:?} {state}: {}",
                 decision.reason
+            );
+            // Only ordinary rounds count, never the diagnostic one.
+            let read = marker(state.clone());
+            let ordinary = read.rounds - u64::from(read.diagnosed);
+            assert_eq!(
+                decision.fix_limit,
+                decision.action == "needs-human" && ordinary >= cfg.policy.fix_rounds(),
+                "{fix_rounds:?} {state}"
             );
         }
         // A caller at the most rounds, five, gets each of them
@@ -25118,6 +25251,372 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stalled_head_report_cap_validation() {
+        for (value, valid) in [
+            (json!(0), true),
+            (json!(1), true),
+            (json!(3), true),
+            (json!(4), false),
+            (json!(true), false),
+            (json!(-1), false),
+        ] {
+            let options = PollPolicy::from_json(&json!({"stalledHeadReports": value}));
+            assert_eq!(options.is_ok(), valid, "{value}");
+            if let Ok(options) = options {
+                assert_eq!(options.stalled_head_reports as u64, value.as_u64().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn stalled_head_report_requires_a_stable_public_head() {
+        let exhausted = json!({"rounds": FIX_ROUNDS, "sha": "1".repeat(40)});
+        // The last round's run, which left the head as it was.
+        let unmoved = |rounds| json!({"rounds": rounds, "sha": HEAD, "run": 7});
+        let labels = |names: &[&str], more| {
+            json!({"labels": {"nodes": names.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
+                "pageInfo": {"hasNextPage": more}}})
+        };
+        // `rounds_used` of the receipt expected, if any.
+        for (case, visibility, late, state, expected) in [
+            (
+                "labels truncated meanwhile",
+                json!(false),
+                Some(labels(&[], true)),
+                exhausted.clone(),
+                None,
+            ),
+            (
+                "public",
+                json!(false),
+                None,
+                exhausted.clone(),
+                Some(FIX_ROUNDS),
+            ),
+            ("private", json!(true), None, exhausted.clone(), None),
+            ("unknown", Value::Null, None, exhausted.clone(), None),
+            (
+                "moved",
+                json!(false),
+                Some(json!({"headRefOid": "2".repeat(40)})),
+                exhausted.clone(),
+                None,
+            ),
+            (
+                "closed",
+                json!(false),
+                Some(json!({"state": "CLOSED"})),
+                exhausted.clone(),
+                None,
+            ),
+            (
+                "made private",
+                json!(false),
+                Some(json!({"baseRepository": {"isPrivate": true}})),
+                exhausted.clone(),
+                None,
+            ),
+            (
+                "stopped meanwhile",
+                json!(false),
+                Some(labels(&[LABEL], false)),
+                exhausted.clone(),
+                None,
+            ),
+            (
+                "stopped meanwhile with mixed-case label",
+                json!(false),
+                Some(labels(&["Needs-Human"], false)),
+                exhausted.clone(),
+                None,
+            ),
+            (
+                "label completeness unknown",
+                json!(false),
+                Some(json!({"labels": {"nodes": []}})),
+                exhausted.clone(),
+                None,
+            ),
+            // `redChecks`' fresh read holds the stop, and so its receipt.
+            (
+                "checks recovered meanwhile",
+                json!(false),
+                Some(json!({"commits": pull("pull-470", json!({}))["commits"]})),
+                exhausted.clone(),
+                None,
+            ),
+            (
+                "delimiter",
+                json!(false),
+                None,
+                exhausted.clone(),
+                Some(FIX_ROUNDS),
+            ),
+            (
+                "after the diagnostic round",
+                json!(false),
+                None,
+                json!({"rounds": FIX_ROUNDS + 1, "diagnosed": true, "sha": "1".repeat(40)}),
+                Some(FIX_ROUNDS),
+            ),
+            (
+                "last round pushed nothing",
+                json!(false),
+                None,
+                unmoved(FIX_ROUNDS),
+                Some(FIX_ROUNDS),
+            ),
+            (
+                "earlier round pushed nothing",
+                json!(false),
+                None,
+                unmoved(FIX_ROUNDS - 1),
+                None,
+            ),
+            (
+                "last round pushed nothing on partial work",
+                json!(false),
+                None,
+                unmoved(FIX_ROUNDS),
+                Some(FIX_ROUNDS),
+            ),
+        ] {
+            let mut fake = github();
+            fake.late_pull_fields = late;
+            fake.page(
+                "repos/cgwalters-forge/tracker/actions/runs/7",
+                None,
+                None,
+                json!({"status": "completed", "conclusion": "failure", "run_attempt": 1,
+                    "created_at": "2026-10-12T01:00:00Z", "updated_at": "2026-10-12T01:30:00Z"}),
+            );
+            let check = if case == "delimiter" {
+                "ci; stalled-head: not a receipt"
+            } else {
+                "ci"
+            };
+            let partial = case == "last round pushed nothing on partial work";
+            let recovered = case == "checks recovered meanwhile";
+            let mut policy =
+                PollPolicy::from_json(&json!({"stalledHeadReports": 1, "unstall": partial}))
+                    .unwrap();
+            if recovered {
+                policy.red_checks = Some(RedChecks::default());
+                for status in ["failure", "pending"] {
+                    fake.page(
+                        &format!("search/issues?q=author%3A{BOT}+user%3Acgwalters-forge+user%3A{BOT}+is%3Apr+is%3Aopen+status%3A{status}+archived%3Afalse&sort=updated&order=asc&per_page=100"),
+                        None,
+                        None,
+                        json!({"incomplete_results": false, "total_count": 0, "items": []}),
+                    );
+                }
+            }
+            let (outcome, fake, dispatcher) = applied_policy(
+                fake,
+                policy,
+                json!({
+                    "baseRepository": {"nameWithOwner": REPO, "isPrivate": visibility,
+                        "defaultBranchRef": {"name": "main"}},
+                    "title": if partial { "[partial: runtime] Example" } else { "Example" },
+                    "contexts": {"ci": {"name": check, "conclusion": "FAILURE",
+                        "detailsUrl": "https://example.org/reported"}},
+                }),
+                state,
+            );
+            assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            assert_eq!(
+                outcome
+                    .steps
+                    .iter()
+                    .any(|s| s.action == "needs-human" && s.ran),
+                !recovered,
+                "{case}: {:?}",
+                outcome.lines
+            );
+            assert_eq!(fake.writes.borrow().is_empty(), recovered, "{case}");
+            assert!(dispatcher.writes.borrow().is_empty(), "{case}");
+            if partial {
+                assert!(
+                    outcome
+                        .lines
+                        .iter()
+                        .any(|line| line.contains("(unfinished work)")),
+                    "{case}: {:?}",
+                    outcome.lines
+                );
+            }
+            if case == "delimiter" {
+                assert!(
+                    outcome.lines.iter().any(|line| {
+                        line.contains("check ci; stalled-head: not a receipt failed")
+                    }),
+                    "{:?}",
+                    outcome.lines
+                );
+            }
+            let notes: Vec<_> = outcome.stalled_heads.iter().collect();
+            assert_eq!(
+                notes.len(),
+                usize::from(expected.is_some()),
+                "{case}: {:?}",
+                outcome.lines
+            );
+            if let [(index, receipt)] = notes.as_slice() {
+                assert!(outcome.lines[**index].contains(&format!("{REPO}#")));
+                assert_eq!(receipt["head"], HEAD, "{case}");
+                assert_eq!(receipt["rounds_used"].as_u64(), expected, "{case}");
+                assert_eq!(
+                    receipt["failed_checks"],
+                    json!([{"name": check,
+                    "untrusted_reported_url": "https://example.org/reported"}]),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stalled_head_reports_do_not_take_the_later_fix_slot() {
+        let numbers = [470, 471, 472];
+        for (apply, action_first) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut baseline = None;
+            for policy in [
+                PollPolicy::default(),
+                PollPolicy::from_json(&json!({"stalledHeadReports": 1})).unwrap(),
+            ] {
+                let cap = policy.stalled_head_reports;
+                let mut fake = github();
+                fake.page(
+                    &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+                    None,
+                    None,
+                    numbers
+                        .iter()
+                        .map(|n| json!({"number": n, "user": {"login": BOT}}))
+                        .collect(),
+                );
+                for n in numbers {
+                    let comments = if n < 472 {
+                        json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(
+                            &json!({"rounds": FIX_ROUNDS, "sha": "1".repeat(40)}), "Fix round.") }])
+                    } else {
+                        json!([])
+                    };
+                    fake.page(
+                        &format!("repos/{REPO}/issues/{n}/comments?per_page=100"),
+                        None,
+                        None,
+                        comments,
+                    );
+                    fake.pulls.insert(
+                        n,
+                        pull(
+                            "pull-470",
+                            json!({
+                                "number": n, "contexts": {"ci": {"conclusion": "FAILURE"}}
+                            }),
+                        ),
+                    );
+                }
+                let mut cfg = config();
+                cfg.policy = policy;
+                cfg.policy.action_first = action_first;
+                let dispatcher = Fake::default();
+                let caps = caps::Caps::new(caps::Limits {
+                    dispatch: Some(1),
+                    ..Default::default()
+                });
+                let applying_now = || applying(&dispatcher).filter(|_| apply);
+                let follow = [REPO.into()];
+                let approved = action_first.then(|| {
+                    fake.page(
+                        &action_first::approved_path(&cfg),
+                        None,
+                        None,
+                        json!({
+                            "incomplete_results": false, "total_count": 1,
+                            "items": [{"repository_url": format!("{API_ROOT}repos/{REPO}"),
+                                "number": 470, "user": {"login": BOT}, "pull_request": {}}],
+                        }),
+                    );
+                    let prior = action_first::run_approved_capped(
+                        &fake,
+                        &fake,
+                        &cfg,
+                        &follow,
+                        applying_now(),
+                        &caps,
+                        now(),
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(prior.0.errors, 0, "{:?}", prior.0.lines);
+                    assert!(prior.0.steps.iter().any(|s| s.number == 470 && s.ran));
+                    prior
+                });
+                let outcome = run_capped_after_direction(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    (&[], &follow),
+                    applying_now(),
+                    Some(&caps),
+                    now(),
+                    approved,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                let taken: Vec<_> = outcome
+                    .steps
+                    .iter()
+                    .filter(|s| s.ran)
+                    .map(|s| (s.number, s.action))
+                    .collect();
+                assert_eq!(
+                    taken,
+                    [(470, "needs-human"), (471, "needs-human"), (472, "fix")]
+                );
+                let notes: Vec<_> = outcome.stalled_heads.iter().collect();
+                assert_eq!(notes.len(), cap);
+                if let [(index, report)] = notes.as_slice() {
+                    assert!(outcome.lines[**index].starts_with(&format!("{REPO}#470 ")));
+                    assert_eq!(
+                        **report,
+                        json!({
+                            "kind": "fix-round-limit", "repository": REPO, "pull": 470,
+                            "mode": if apply { "apply" } else { "preview" },
+                            "head": HEAD, "rounds_used": FIX_ROUNDS, "round_limit": FIX_ROUNDS,
+                            "diagnosed": false, "recorded_run": null,
+                            "failed_checks": [{"name": "ci", "untrusted_reported_url": format!(
+                                "https://github.com/{REPO}/actions/runs/38189583254/job/114620746365"
+                            )}],
+                        })
+                    );
+                }
+                let starts = dispatcher.writes.into_inner();
+                assert_eq!(starts.len(), usize::from(apply));
+                if let [(_, start)] = starts.as_slice() {
+                    assert_eq!(start["inputs"]["kind"], "fix");
+                    assert_eq!(start["inputs"]["item"], "472");
+                }
+                let effects = (
+                    caps.summary(),
+                    fake.sent.into_inner(),
+                    fake.writes.into_inner(),
+                    starts,
+                );
+                if cap == 0 {
+                    baseline = Some(effects);
+                } else {
+                    assert_eq!(baseline.as_ref(), Some(&effects));
+                }
+            }
+        }
+    }
+
     /// A capped pass takes steps up to its caps and holds the rest whole,
     /// writing nothing of them; a preview plans as many as an apply takes.
     /// A fix round is a dispatch, a merge a write, each one step however
@@ -26223,7 +26722,13 @@ mod tests {
                     ..Pass::new(&fake, &fake, &cfg, now())
                 };
                 let (line, _, _, step) = pass
-                    .pull(REPO, 470, (false, priority), &mut BTreeMap::new())
+                    .pull(
+                        REPO,
+                        470,
+                        (false, priority),
+                        &mut BTreeMap::new(),
+                        &mut None,
+                    )
                     .unwrap();
                 let step = step.unwrap();
                 assert_eq!(step.action, action, "{case}: {line}");
@@ -27808,6 +28313,7 @@ mod tests {
             cut: None,
             apply: None,
             dispatched: 0,
+            stalled_heads_reported: 0,
             merged: 0,
             preview_merges: 0,
             queues: BTreeMap::new(),

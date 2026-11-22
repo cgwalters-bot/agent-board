@@ -57,6 +57,8 @@ impl Limits {
 pub struct Caps {
     limits: Limits,
     dispatched: Cell<usize>,
+    // Display only; shared by the approved search and ordinary PR walk.
+    pub(crate) stalled_head_reports: Cell<usize>,
     written: Cell<usize>,
     held: Cell<usize>,
 }

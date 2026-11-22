@@ -22038,6 +22038,26 @@ fn budget_refuses_past_its_limit() {
     assert_eq!(error.to_string(), spent);
 }
 
+#[test]
+fn prepending_pass_diagnostics_keeps_stalled_head_on_its_decision() {
+    let stop = "o/r#7 abc needs-human: fix limit reached";
+    let receipt = json!({"pull": 7});
+    for prefix in [
+        vec![],
+        vec!["budget: requestShare", "repositories: resolved"],
+    ] {
+        let mut report = Report {
+            lines: vec!["follow: o/r".into(), stop.into(), "status: off".into()],
+            stalled_heads: [(1, receipt.clone())].into(),
+            ..Report::default()
+        };
+        let index = prefix.len() + 1;
+        report.prepend_lines(prefix.into_iter().map(String::from).collect());
+        assert_eq!(report.lines[index], stop);
+        assert_eq!(report.stalled_heads, [(index, receipt.clone())].into());
+    }
+}
+
 /// With `requestShare`, the pass's request ceiling is sized from the smaller
 /// rate-limit pool's remaining, read free before any request is spent, and
 /// says so; where the read fails, the fixed limit holds and it says that.
