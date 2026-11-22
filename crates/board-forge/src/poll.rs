@@ -14196,6 +14196,7 @@ mod tests {
         /// The `mergeQueue` the report's query gives, null for a read that
         /// fails; none gives a repository without a merge queue.
         report_queue: Option<Value>,
+        report_visibility: BTreeMap<String, Value>,
     }
 
     impl Fake {
@@ -14387,7 +14388,14 @@ mod tests {
                     self.report_queue.is_none() || !queue.is_null(),
                     "GraphQL: unavailable"
                 );
-                return Ok(json!({"repository": {"mergeQueue": queue}}));
+                let repo = format!(
+                    "{}/{}",
+                    text(&variables, "/owner"),
+                    text(&variables, "/name")
+                );
+                return Ok(
+                    json!({"repository": {"visibility": self.report_visibility.get(&repo), "mergeQueue": queue}}),
+                );
             }
             assert_eq!(query, PULL_QUERY);
             let number = variables["number"].as_u64().unwrap();
