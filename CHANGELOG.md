@@ -11,6 +11,11 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The release train's optional `requestLimit` (default 200, at most 2000)
+  raises a pass's GitHub request bound. A pass that runs caller discovery
+  prints how many requests discovery used, and running out during discovery
+  names the repository it had reached (agent-board#1166).
+
 - The pass's new GitHub-only `changeSweepHours` (off at 0, needs `store`
   and `state`) runs the changes diff as stage 0 from watermarks kept in the
   store, and stage 2 then visits only the pull requests it lists, every one

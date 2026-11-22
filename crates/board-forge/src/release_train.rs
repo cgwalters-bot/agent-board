@@ -24,8 +24,12 @@ use std::io::Write;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-/// Requests a pass may make, however the API answers.
+/// Requests a pass may make, however the API answers, unless `requestLimit`
+/// says otherwise.
 pub const REQUEST_LIMIT: u32 = 200;
+/// The largest `requestLimit`: discovery grows with the owner's
+/// repositories, but a misconfigured limit must not spend the rate limit.
+pub const MAX_REQUEST_LIMIT: u32 = 2000;
 /// Maximum page size; inventory listings continue to an empty/short page.
 pub const PAGE_SIZE: u64 = 100;
 pub const CACHE_SCHEMA: &str = "agent-board.release-train-cache.v1";
@@ -368,6 +372,7 @@ const KEYS: &[&str] = &[
     "wrappers",
     "callers",
     "secureHost",
+    "requestLimit",
 ];
 
 /// A problem with what is to be edited rather than with the API: retrying
@@ -510,6 +515,8 @@ pub struct Config {
     pub callers: Vec<Target>,
     /// Off unless configured: publish the image pin before its consumers.
     pub secure_host: Option<Target>,
+    /// Requests a pass may make, [`REQUEST_LIMIT`] unless configured.
+    pub request_limit: u32,
 }
 
 fn text(value: &Value, key: &str, what: &str) -> Result<String> {
@@ -619,6 +626,18 @@ impl Config {
             .flatten()
             .map(|c| target(c, "caller", files))
             .collect::<Result<_>>()?;
+        let request_limit = value
+            .get("requestLimit")
+            .map(|v| {
+                v.as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| (1..=MAX_REQUEST_LIMIT).contains(n))
+                    .with_context(|| {
+                        format!("requestLimit must be a count from 1 to {MAX_REQUEST_LIMIT}")
+                    })
+            })
+            .transpose()?
+            .unwrap_or(REQUEST_LIMIT);
         Ok(Self {
             bot,
             release,
@@ -630,6 +649,7 @@ impl Config {
             wrappers,
             callers,
             secure_host,
+            request_limit,
         })
     }
 
@@ -1311,6 +1331,8 @@ struct Pass<'a> {
     /// Once checked, why callers at `FOLLOWED_BRANCH` may not run the merged
     /// wrappers bump, if they may not.
     followed: Option<Option<String>>,
+    /// While discovering callers, the step it is at, for a budget error.
+    discovering: Option<String>,
 }
 
 /// One pass: prints its decisions to `out`, a line each, and with `apply`
@@ -1355,6 +1377,7 @@ pub fn pass_with_cache(
         read_bytes: 0,
         callers: vec![],
         followed: None,
+        discovering: None,
     }
     .run();
     crate::pass::cache::bound(&mut cache.0).warn();
@@ -1377,14 +1400,10 @@ impl Pass<'_> {
                 .map(|e| e["body"].clone())
                 .context("missing memoized discovery read");
         }
+        self.spend()?;
         let previous = context
             .and_then(|_| self.reads.0.get(&key))
             .filter(|e| crate::pass::cache::intact(e));
-        ensure!(
-            self.requests < REQUEST_LIMIT,
-            "request budget exhausted during discovery"
-        );
-        self.requests += 1;
         let entry = self.api.discovery_get(path, previous)?;
         let body = entry["body"].clone();
         self.read_bytes += entry.to_string().len();
@@ -1487,6 +1506,7 @@ impl Pass<'_> {
             if archived || fork {
                 continue;
             }
+            self.discovering = Some(name.clone());
             let base = string(&repo, "/default_branch")?;
             let head = match self.get(&format!("/repos/{name}/commits/{}", encode(&base))) {
                 Err(e) if status(&e) == Some(409) && repo["size"] == 0 => continue,
@@ -1522,6 +1542,7 @@ impl Pass<'_> {
             if paths.is_empty() {
                 continue;
             }
+            self.discovering = Some(repo.clone());
             let sha = match heads.get(&repo) {
                 Some(sha) => sha.clone(),
                 None => {
@@ -1559,6 +1580,7 @@ impl Pass<'_> {
         }
         // Include private and renamed bot forks; the short name conveys no
         // parent identity. Never create a missing fork on the operator's behalf.
+        self.discovering = Some("the bot's forks".into());
         let forks = if pinned.is_empty() {
             vec![]
         } else {
@@ -1680,10 +1702,25 @@ impl Pass<'_> {
         decode(&file["content"])
     }
 
-    fn request(&mut self, method: &str, path: &str, body: &Value) -> Result<Value> {
-        // Bounds a pass however the API answers.
-        ensure!(self.requests < REQUEST_LIMIT, "request budget exhausted");
+    /// Counts a request against the pass's limit, which bounds it however the
+    /// API answers. Running out during discovery names the repository it
+    /// reached, so an operator can tell how far a larger limit must go.
+    fn spend(&mut self) -> Result<()> {
+        let limit = self.config.request_limit;
+        if self.requests >= limit {
+            let at = self
+                .discovering
+                .as_ref()
+                .map(|at| format!(" during discovery at {at}; raise requestLimit"))
+                .unwrap_or_default();
+            anyhow::bail!("request budget of {limit} exhausted{at}");
+        }
         self.requests += 1;
+        Ok(())
+    }
+
+    fn request(&mut self, method: &str, path: &str, body: &Value) -> Result<Value> {
+        self.spend()?;
         self.api.request(method, path, body)
     }
 
@@ -1948,7 +1985,7 @@ impl Pass<'_> {
         let q = format!("repo:{repo} is:pr is:merged base:{base} merged:>{published}");
         let path = format!("/search/issues?q={}&per_page={PAGE_SIZE}", encode(&q));
         // Labels decide the bump and the urgency: all of them or none. Every
-        // page counts against REQUEST_LIMIT, which bounds the loop.
+        // page counts against the request limit, which bounds the loop.
         let mut items = vec![];
         for page in 1.. {
             let found = self.get(&if page == 1 {
@@ -2275,7 +2312,16 @@ impl Pass<'_> {
                     .context("the wrappers' pin bump has no merge commit")?;
                 ensure!(full_sha(merge), "wrappers merge is not a full commit SHA");
                 self.on_default(&c.wrappers.repository, merge, "the wrappers' pin bump")?;
-                self.callers = self.discover_callers(merge)?;
+                let start = self.requests;
+                self.discovering = Some("the repository inventory".into());
+                let callers = self.discover_callers(merge);
+                self.discovering = None;
+                self.callers = callers?;
+                self.log(&format!(
+                    "discovery used {} of {} requests",
+                    self.requests - start,
+                    c.request_limit
+                ))?;
                 for caller in self.callers.clone() {
                     let mut pr = self.pull(&caller, &branch, since)?;
                     let base = self.default_branch(&caller.repository)?;
