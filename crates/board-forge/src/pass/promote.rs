@@ -1,6 +1,8 @@
 //! Shared promotion configuration and read-only pass visibility.
 use super::*;
 
+const MAX_BOT_AUTHOR_EMAILS: usize = 16;
+
 /// `promote` in the configuration ([`Config::promote`]): which of our forks
 /// send command-authorized pull requests to which upstream, and as whom. Configuration,
 /// never a pull request's body, which anyone can edit, says where one goes.
@@ -18,6 +20,11 @@ pub struct Promote {
     /// still triggers.
     #[serde(default)]
     pub on_approval: bool,
+
+    /// Exact former Git author emails for replay of commits with no mapped
+    /// author and an expected bot committer. Empty leaves this exception off.
+    #[serde(default)]
+    pub bot_author_emails: Vec<String>,
 
     /// Legacy scope/base hints, accepted for one release. GitHub fork parent,
     /// origin=fork and bot-midstream metadata are required before use.
@@ -49,6 +56,15 @@ pub struct Signoff {
 
 impl Promote {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
+        // Keep the per-commit scan and the scope of this exception small.
+        ensure!(
+            self.bot_author_emails.len() <= MAX_BOT_AUTHOR_EMAILS,
+            "promote botAuthorEmails allows at most {MAX_BOT_AUTHOR_EMAILS} entries"
+        );
+        ensure!(
+            self.bot_author_emails.iter().all(|e| !e.trim().is_empty()),
+            "promote botAuthorEmails entries must not be blank"
+        );
         // A different topic would let metadata-only promotion forks evade
         // stage 2's no-merge admission while ordinary follow can still write.
         ensure!(

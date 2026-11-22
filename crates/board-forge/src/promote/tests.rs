@@ -3271,6 +3271,132 @@ fn publication_rebases_and_signs_independently_of_dco() {
 }
 
 #[test]
+fn publication_replays_approved_drafts_with_configured_former_bot_authors() {
+    const EMAIL: &str = "agentic-job@users.noreply.github.com";
+    for (case, expected) in [
+        ("former composefs identity with existing sign-off", true),
+        ("configured bot committer and null login", true),
+        ("off by default", false),
+        ("other email", false),
+        ("different email case", false),
+        ("unexpected committer", false),
+        ("unmapped committer", false),
+        ("another mapped author", false),
+        ("missing author login", false),
+        ("six composefs drafts' unsigned shape", false),
+        ("DCO still requires sign-off", false),
+        ("missing approval", false),
+    ] {
+        let (mut forge, mut config) = publication();
+        let promote = config.promote.as_mut().unwrap();
+        promote.on_approval = true;
+        if case != "off by default" {
+            promote.bot_author_emails = vec![EMAIL.into()];
+        }
+        forge.fresh["draft"] = json!(true);
+        *pull(&mut forge.replay) = forge.fresh.clone();
+        *comments(&mut forge.replay) = json!([]);
+        timeline(&mut forge.replay, json!([]));
+        // The six drafts' upstream does not advertise a DCO check. Keep the
+        // recorded DCO requirement in one case to prove that gate still holds.
+        if case != "DCO still requires sign-off" {
+            *body(&mut forge.replay, "/rules/branches/") = json!([]);
+            *body(&mut forge.replay, "/check-runs") = json!({"check_runs":[], "total_count":0});
+        }
+        let compare = body(&mut forge.replay, "/compare/");
+        compare["behind_by"] = json!(34);
+        let commit = &mut compare["commits"][0];
+        commit["author"] = Value::Null;
+        commit["commit"]["author"] = json!({"name":"agentic-job", "email":EMAIL});
+        commit["committer"] = json!({"login":"github-actions[bot]"});
+        match case {
+            "configured bot committer and null login" => {
+                commit["author"] = json!({"login":null});
+                commit["committer"]["login"] = json!(config.bot);
+            }
+            "other email" => commit["commit"]["author"]["email"] = json!("other@example.invalid"),
+            "different email case" => {
+                commit["commit"]["author"]["email"] = json!(EMAIL.to_uppercase())
+            }
+            "unexpected committer" => commit["committer"]["login"] = json!("visitor"),
+            "unmapped committer" => commit["committer"] = Value::Null,
+            "another mapped author" => commit["author"] = json!({"login":"visitor"}),
+            "missing author login" => commit["author"] = json!({}),
+            "six composefs drafts' unsigned shape" | "DCO still requires sign-off" => {
+                commit["commit"]["message"] = json!("Implement");
+            }
+            "missing approval" => *reviews(&mut forge.replay) = json!([]),
+            _ => {}
+        }
+        sync_metadata(&mut forge.replay);
+        if case == "six composefs drafts' unsigned shape" {
+            // The replay author gate now passes, but apply also checks sign-off
+            // eligibility even when the upstream does not require DCO.
+            let preview = preview(&forge, &config, forge.replay.now).unwrap();
+            assert!(preview[0].starts_with("would promote "), "{preview:?}");
+        }
+        let mut git = FakeRewrite::new(&forge);
+        let lines = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+        let writes = forge.writes.borrow();
+        if expected {
+            assert!(lines[0].starts_with("promoted "), "{case}: {lines:?}");
+            assert_eq!(git.prepared.len(), 1, "{case}");
+            assert_eq!(git.prepared[0]["commits"][0]["sha"], HEAD, "{case}");
+            assert_eq!(
+                writes[1].2["head"],
+                format!("cgwalters-bot:{}", rewrite::branch(HEAD))
+            );
+            assert_eq!(writes[1].2["draft"], true);
+        } else {
+            assert!(writes.is_empty() && git.prepared.is_empty(), "{case}");
+            let reason = match case {
+                "missing approval" => None,
+                "six composefs drafts' unsigned shape" => Some("missing sign-off"),
+                "DCO still requires sign-off" => Some("dco=required: missing sign-off"),
+                _ => Some("promotion refuses another author's commit"),
+            };
+            if let Some(reason) = reason {
+                assert!(lines[0].contains(reason), "{case}: {lines:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn former_bot_author_email_configuration_is_bounded() {
+    let mut config: Value = serde_json::from_str(CONFIG).unwrap();
+    assert!(
+        Config::parse(CONFIG)
+            .unwrap()
+            .promote
+            .unwrap()
+            .bot_author_emails
+            .is_empty()
+    );
+    config["promote"]["botAuthorEmails"] = json!(vec!["former@example.invalid"; 16]);
+    assert_eq!(
+        Config::parse(&config.to_string())
+            .unwrap()
+            .promote
+            .unwrap()
+            .bot_author_emails
+            .len(),
+        16
+    );
+    for (entries, reason) in [
+        (
+            json!(vec!["former@example.invalid"; 17]),
+            "at most 16 entries",
+        ),
+        (json!([" "]), "must not be blank"),
+    ] {
+        config["promote"]["botAuthorEmails"] = entries;
+        let err = Config::parse(&config.to_string()).unwrap_err();
+        assert!(format!("{err:#}").contains(reason), "{err:#}");
+    }
+}
+
+#[test]
 fn publication_refusals_never_publish_an_unapproved_head() {
     for case in [
         "disabled",

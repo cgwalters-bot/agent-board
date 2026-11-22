@@ -104,7 +104,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
     ] {
         catalog.insert(name.to_owned(), Positive);
     }
-    for name in ["mix", "follow"] {
+    for name in ["mix", "follow", "promote.botAuthorEmails"] {
         catalog.insert(name.to_owned(), Nonempty);
     }
     for name in [
@@ -213,6 +213,18 @@ mod tests {
         let github = classify(&json!({})).unwrap();
         assert!(github.unconfigured.contains("openPrCap"));
         assert!(github.unconfigured.contains("pr.agentRecovery"));
+        assert!(github.unconfigured.contains("promote.botAuthorEmails"));
+        for (emails, disabled) in [
+            (json!([]), true),
+            (json!(["former@example.invalid"]), false),
+        ] {
+            let github = classify(&json!({"promote": {"botAuthorEmails": emails}})).unwrap();
+            assert!(!github.unconfigured.contains("promote.botAuthorEmails"));
+            assert_eq!(
+                github.disabled.contains("promote.botAuthorEmails"),
+                disabled
+            );
+        }
         assert!(!github.unconfigured.contains("pr.quietWaits"));
         assert!(!github.unconfigured.contains("pr.fixRounds"));
         assert!(!github.unconfigured.contains("forgejoIntake"));
