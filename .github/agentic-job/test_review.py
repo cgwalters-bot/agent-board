@@ -51,11 +51,17 @@ class ReviewContracts(unittest.TestCase):
 
     def test_caller_uses_a_pinned_wrapper_and_never_checks_out_the_head(self):
         caller = (ROOT / ".github/workflows/review.yml").read_text()
-        self.assertRegex(
+        # The pin itself is read from review.yml, which the release train
+        # rewrites, so a wrapper bump touches no other file; the test holds
+        # its form: one wrapper call, at a full commit, naming its release.
+        pins = re.findall(
+            r"^    uses: cgwalters-forge/actions/\.github/workflows/cgwalters-review\.yml"
+            r"@([0-9a-f]{40}) # agentic-job (v\d+\.\d+\.\d+)\b",
             caller,
-            r"uses: cgwalters-forge/actions/\.github/workflows/cgwalters-review\.yml@[0-9a-f]{40} # ",
+            re.MULTILINE,
         )
-        self.assertIn("@b590d3260a18cc59ceb3eb850e62fb62ff967d37 # agentic-job v0.6.16", caller)
+        self.assertEqual(len(pins), 1, pins)
+        self.assertEqual(len(re.findall(r"^\s*(?:-\s+)?uses:", caller, re.MULTILINE)), 1)
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", caller)
         self.assertIn("issue_comment:\n    types: [created]", caller)
         self.assertIn("github.event.issue.pull_request && startsWith", caller)
