@@ -150,6 +150,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
     for (name, activation) in [
         ("pr.rebaseRounds", Positive),
         ("pr.staleDays", Positive),
+        ("pr.stalledHeadReports", Positive),
         ("pr.mergeQueue", Present),
         ("pr.reviewTurn", Present),
         ("pr.reviewPools", Nonempty),

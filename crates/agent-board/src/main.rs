@@ -438,8 +438,14 @@ fn main() {
         .enable_all()
         .build()
         .context("start the async runtime");
+    let receipt_output = matches!(&cli.command, Command::Poll(_) | Command::Pass(_));
     if let Err(error) = runtime.and_then(|runtime| execute(cli, &runtime)) {
-        eprintln!("error: {error:#}");
+        if receipt_output {
+            let message = format!("{error:#}");
+            eprintln!("error: {}", poll::escape_stalled_head_delimiter(&message));
+        } else {
+            eprintln!("error: {error:#}");
+        }
         std::process::exit(live::error_exit_code(&error));
     }
 }

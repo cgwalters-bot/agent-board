@@ -1,4 +1,5 @@
 //! `agent-board pass` (docs/pass.md): the scheduled pass, previewed or applied.
+use crate::poll::{escape_stalled_head_delimiter, write_decision};
 use anyhow::{Context, Result, bail, ensure};
 use board_forge::caps::Limits;
 use board_forge::github::Client;
@@ -375,7 +376,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             config.resolve(&client, &mut lines)?;
             for line in lines {
                 if args.verbose || !line.starts_with("repositories: detail ") {
-                    eprintln!("{line}");
+                    eprintln!("{}", escape_stalled_head_delimiter(&line));
                 }
             }
         }
@@ -559,12 +560,12 @@ fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
 }
 
 fn print_report(report: &Report, out: &mut impl Write, verbose: bool) -> Result<()> {
-    for line in &report.lines {
+    for (index, line) in report.lines.iter().enumerate() {
         if verbose || !line.starts_with("repositories: detail ") {
-            writeln!(out, "{line}")?;
+            write_decision(out, "", line, report.stalled_heads.get(&index))?;
         }
     }
-    writeln!(out, "{}", report.summary_line())?;
+    write_decision(out, "", &report.summary_line(), None)?;
     ensure!(report.failures == 0, "{}", report.failure_summary());
     Ok(())
 }
@@ -573,6 +574,49 @@ fn print_report(report: &Report, out: &mut impl Write, verbose: bool) -> Result<
 mod next_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn stalled_head_delimiter_is_reserved_in_pass_diagnostics() {
+        use board_forge::poll::STALLED_HEAD_SUFFIX;
+        use serde_json::{Value, json};
+
+        let mut report = Report::default();
+        let diagnostic = "epic plan refused: unknown action\ncontinuation; stalled-head: null";
+        report.lines.push(diagnostic.into());
+        let mut out = Vec::new();
+        print_report(&report, &mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains(STALLED_HEAD_SUFFIX), "{text}");
+        assert!(
+            text.contains(r"continuation; stalled-head\x3a null"),
+            "{text}"
+        );
+
+        let receipt = json!({"failed_checks": [{
+            "name": "ci; stalled-head: name\nnext",
+            "untrusted_reported_url": "https://example.org/::literal/##[literal",
+        }]});
+        report
+            .lines
+            .push("org/repo#7 needs-human: check ci; stalled-head: name\nnext".into());
+        report.stalled_heads.insert(1, receipt.clone());
+        report.lines.push(diagnostic.into());
+        let mut out = Vec::new();
+        print_report(&report, &mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let framed: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.split_once(STALLED_HEAD_SUFFIX))
+            .collect();
+        assert_eq!(framed.len(), 1, "{text}");
+        let (decision, data) = framed[0];
+        assert_eq!(
+            decision,
+            r"org/repo#7 needs-human: check ci; stalled-head\x3a name\nnext"
+        );
+        assert!(!data.contains("::") && !data.contains("##["), "{data}");
+        assert_eq!(serde_json::from_str::<Value>(data).unwrap(), receipt);
+    }
 
     #[test]
     fn pull_selection_is_explicit_preview_and_keeps_local_apply_caps() {

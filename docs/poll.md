@@ -691,7 +691,7 @@ and `notifications` read before the followed repositories rather than after
 them), `ownerBranches`, `ownSpaceOnly`,
 `foldRounds`, `reviewPools`, `reviewDispatchRepositories`,
 `draftReviewRepositories`, `headOwners`, `noMerge`, `operatorPaths`,
-`staleDays` and `fixRounds`, besides `mergeAuthors`, `toilFixPool`, `conflictFixPool`,
+`staleDays`, `fixRounds` and `stalledHeadReports`, besides `mergeAuthors`, `toilFixPool`, `conflictFixPool`,
 `mergeQueue` and `rebaseRounds` above. As in the pass, `reviewPools` needs
 `reviewWorkflow`, and `reviewDispatchRepositories` names only followed
 repositories. Under the pass, `unstall` also refuses a configuration that

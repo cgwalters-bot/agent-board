@@ -4602,6 +4602,7 @@ pub(super) mod tests {
                 cut: None,
                 apply: Some(apply),
                 dispatched: 0,
+                stalled_heads_reported: 0,
                 merged: 0,
                 preview_merges: 0,
                 queues: BTreeMap::new(),

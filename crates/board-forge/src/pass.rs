@@ -3298,7 +3298,20 @@ impl Bounds {
         let Some(why) = self.rate_limited.borrow().clone() else {
             return;
         };
-        report.lines.retain(|line| !line.contains(NOT_SENT));
+        let mut receipts = std::mem::take(&mut report.stalled_heads);
+        let (mut original, mut kept) = (0, 0);
+        report.lines.retain(|line| {
+            let receipt = receipts.remove(&original);
+            original += 1;
+            if line.contains(NOT_SENT) {
+                return false;
+            }
+            if let Some(receipt) = receipt {
+                report.stalled_heads.insert(kept, receipt);
+            }
+            kept += 1;
+            true
+        });
         let before = report.failed_operations.len();
         report
             .failed_operations
@@ -4436,6 +4449,8 @@ pub struct Report {
     /// Previewed starts, never included in confirmed effects or daily totals.
     pub planned_starts: BTreeMap<String, u64>,
     pub lines: Vec<String>,
+    /// The poll's receipt data keyed by its decision line's index in `lines`.
+    pub stalled_heads: BTreeMap<usize, Value>,
     pub summary: String,
     pub spent: Spent,
     /// Stage 4's candidates it screened out or read and did not start, by
@@ -4469,6 +4484,18 @@ pub struct Report {
 }
 
 impl Report {
+    fn prepend_lines(&mut self, mut prefix: Vec<String>) {
+        let offset = prefix.len();
+        if offset != 0 {
+            self.stalled_heads = std::mem::take(&mut self.stalled_heads)
+                .into_iter()
+                .map(|(index, receipt)| (offset + index, receipt))
+                .collect();
+            prefix.append(&mut self.lines);
+            self.lines = prefix;
+        }
+    }
+
     fn failure(&mut self, reason: String) {
         self.failures += 1;
         self.failed_operations.push(reason.clone());
@@ -4757,8 +4784,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         &caps,
     )
     .await;
-    lines.append(&mut report.lines);
-    report.lines = lines;
+    report.prepend_lines(lines);
     report.network_sends = network()
         .zip(network_before)
         .map(|(after, before)| after.saturating_sub(before));
@@ -6656,6 +6682,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         }
+        let offset = self.report.lines.len();
+        self.report.stalled_heads.extend(
+            outcome
+                .stalled_heads
+                .into_iter()
+                .map(|(index, receipt)| (offset + index, receipt)),
+        );
         self.report.lines.extend(outcome.lines);
         self.report.failures += outcome.errors;
         self.report

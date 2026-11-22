@@ -1,6 +1,7 @@
 use crate::supervise::read;
 use anyhow::{Context, Result, ensure};
 use board_forge::poll::{self, State, bounds::FixBoundsSet};
+use std::borrow::Cow;
 use std::{io::Write, path::PathBuf};
 
 #[derive(Clone, clap::Args)]
@@ -193,11 +194,11 @@ pub fn run(
     }
     let mut out = std::io::stdout().lock();
     let prefix = if args.apply { "" } else { "[dry-run] " };
-    for line in &outcome.lines {
-        writeln!(out, "{prefix}{line}")?;
+    for (index, line) in outcome.lines.iter().enumerate() {
+        write_decision(&mut out, prefix, line, outcome.stalled_heads.get(&index))?;
     }
     if let Some(body) = &outcome.maintainer_report {
-        write!(out, "{body}")?;
+        write!(out, "{}", escape_stalled_head_delimiter(body))?;
     }
     eprintln!(
         "{} pull request(s) in flight, {} activity line(s)",
@@ -218,6 +219,41 @@ pub fn run(
         "status preview failed: {}",
         preview_error.unwrap_or_default()
     );
+    Ok(())
+}
+
+/// Diagnostics and receipts share stdout; only receipt data may emit the delimiter.
+pub(crate) fn escape_stalled_head_delimiter(text: &str) -> Cow<'_, str> {
+    if text.contains(poll::STALLED_HEAD_SUFFIX) {
+        text.replace(poll::STALLED_HEAD_SUFFIX, r"; stalled-head\x3a ")
+            .into()
+    } else {
+        text.into()
+    }
+}
+
+pub(crate) fn write_decision(
+    out: &mut impl Write,
+    prefix: &str,
+    line: &str,
+    receipt: Option<&serde_json::Value>,
+) -> Result<()> {
+    let line = escape_stalled_head_delimiter(line);
+    if let Some(receipt) = receipt {
+        // Keep a genuine receipt on the decision's physical line even if a
+        // check name or run diagnostic contains a line break.
+        let line = line.replace('\r', r"\r").replace('\n', r"\n");
+        // The caller may tee stdout to Actions. Neither command introducer
+        // can occur in JSON syntax outside a string, so escaping them on the
+        // wire preserves the decoded data without exposing runner commands.
+        let receipt = receipt
+            .to_string()
+            .replace("::", r"\u003a\u003a")
+            .replace("##[", r"\u0023\u0023[");
+        writeln!(out, "{prefix}{line}{}{receipt}", poll::STALLED_HEAD_SUFFIX)?;
+    } else {
+        writeln!(out, "{prefix}{line}")?;
+    }
     Ok(())
 }
 

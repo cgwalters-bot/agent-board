@@ -5144,6 +5144,45 @@ write failed) loses it: the next pass that publishes may raise an idle
 alarm from the older `progress_at`, which the next pass that makes progress
 clears.
 
+### Stalled-head reporting
+
+On GitHub, `pr.stalledHeadReports` adds a `; stalled-head: ` JSON suffix to the logs
+of up to that many (at most three) ordinary `needs-human` stops per pass, in
+poll order. It is off by default. A stop is reported when the PR's ordinary
+fix rounds are spent: the budget is exhausted with checks still failing, or
+the last ordinary round's run ended without pushing a new head. The
+diagnostic round does not count as an ordinary round. The record names the
+repository, PR, exact head, ordinary fix rounds used and their configured
+limit, the fix marker's `diagnosed` flag, any run ID already in the bot's fix
+marker, and the failed checks. `diagnosed` records that the diagnostic round
+was given, and is set before its dispatch, so it is not evidence that a run
+started. The failed checks are those the stop judged; for a promoted fork PR
+they may be the upstream publication's, named with an `upstream owner/repo#N: `
+prefix, so the receipt does not attest that they ran at `head`. A check's `untrusted_reported_url` is the
+integration's reported URL, or null if none was reported. It need not point to
+a job log or even to GitHub; do not fetch it automatically. The `mode` field
+distinguishes `preview` (a stop the pass would take) from `apply` (a stop it took).
+Only public PRs in the caller's own space are reported. Apply omits the
+receipt if the existing pre-write reread cannot confirm the same open,
+public head and a complete label page without `needs-human` or a hold. Explicit `--pull`
+runs and already held or labelled PRs are not reported. An empty last round
+that `pr.supervisorHolds` turns into a supervisor stop is reported too. Read
+receipts from the command's stdout, not a combined job log. The stdout
+renderer escapes the delimiter's colon as `\x3a` in all diagnostic prose,
+even when there are no receipts. A receipt starts at the delimiter's first
+occurrence on its line. Parse the JSON after that delimiter; Actions command
+introducers are escaped on the wire without changing decoded string values.
+
+The receipts are a lossy, capped sample, not a complete feed: stops past the
+cap and stops a pass caps or holds are not reported, a PR already stopped is
+not reported again, and nothing records which heads were reported. The log is
+informational, not authorization to act on a PR.
+
+This only annotates the poll's output. It adds no API reads, PR writes, or
+start reservations. Repeated-review classification and agent diagnosis are
+deferred: the ordinary research job can publish to arbitrary items in the
+target repository, so it is not suitable for automated diagnosis of PR text.
+
 ## Blockers
 
 An overlap hold keeps an issue waiting for the bot's open pull request that
@@ -6413,6 +6452,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.operatorPaths` | Files, directories ending in `/`, or a JSON file's values other than its `FILE#/json/pointer` exemptions, a pull request changing any of which merges or is enqueued only on the operator's approval of its head, waiting as an approve row naming them, see [the poll](poll.md#configuration); relative, no globs, at most 50; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.fixRounds` | Fix rounds a pull request gets before its budget is exhausted and it goes to `pr.agentRecovery`'s triage, else `needs-human`; 1–5, all within the polling job's approval-free bound; `2`, see [the poll](poll.md) |
+| `pr.stalledHeadReports` | [Fix-limit stop annotations](#stalled-head-reporting) per pass; 0–3, default 0 (off) |
 | `pr.ownerBranches` | Skip a round, leaving it to the operator, on a head other than the bot's fork whose repository's default branch has no `.github/agentic-job/accept-owner-branches` naming it, which agentic-job's apply would refuse to push to; one contents read per such round, see [the poll](poll.md); `false` |
 | `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md). Stage 4 likewise starts no plan whose item is outside our own space: its candidate waits on the operator (`needs-operator`, `hold OWNER/REPO#N: its plan's OWNER/REPO#N is outside our own space …`) and draws no revisit. The bot's own pull requests are exempt: on them stage 2 takes its rounds, rebases and edits of them, and stage 4 starts `fixPlans`' fix runs, writing only on that pull request; a merge or stop there stays held; `false` |
 | `pr.operatorReviewFixes` | With `notifications`, route nonempty operator changes-requested reviews on the bot's PR to existing bounded fix rounds instead of intake triage; mixed batches and other intents stay in triage. See [operator intake](poll.md); `false` |
