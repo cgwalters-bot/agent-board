@@ -2502,6 +2502,7 @@ struct PublishingForge {
     fresh: Value,
     moved: bool,
     upstream_rewind_after_writes: Option<usize>,
+    legacy_upstream_tip: Rc<Cell<Option<char>>>,
     returned_head: bool,
     fail: Option<usize>,
     writer: String,
@@ -2519,6 +2520,10 @@ struct PublishingForge {
 /// advance gives another head on the same branch, as the real replay does.
 struct FakeRewrite {
     conflict: bool,
+    legacy_tree_mismatch: bool,
+    move_upstream_during_legacy_replay: Option<char>,
+    legacy_upstream_tip: Rc<Cell<Option<char>>>,
+    legacy_checks: usize,
     /// Every compare prepared: a rebuild is one Git run.
     prepared: Vec<Value>,
     pushed: Rc<RefCell<Option<String>>>,
@@ -2528,6 +2533,10 @@ impl FakeRewrite {
     fn new(forge: &PublishingForge) -> Self {
         FakeRewrite {
             conflict: false,
+            legacy_tree_mismatch: false,
+            move_upstream_during_legacy_replay: None,
+            legacy_upstream_tip: Rc::clone(&forge.legacy_upstream_tip),
+            legacy_checks: 0,
             prepared: vec![],
             pushed: Rc::clone(&forge.promote_ref),
         }
@@ -2555,6 +2564,25 @@ impl rewrite::Rewrite for FakeRewrite {
             rewrite::branch(pull["head"]["sha"].as_str().unwrap()),
         ))
     }
+    fn verify_replay(
+        &mut self,
+        _: &Config,
+        _: &pass::promote::Fork,
+        _: &Value,
+        _: &rewrite::Commits,
+        _: &str,
+        _: &[String],
+    ) -> Result<()> {
+        self.legacy_checks += 1;
+        self.legacy_upstream_tip
+            .set(self.move_upstream_during_legacy_replay);
+        ensure!(
+            !self.legacy_tree_mismatch,
+            "does not match the approved replay tree"
+        );
+        Ok(())
+    }
+
     fn publish(&mut self, _: &str, _: &str, head: &str, previous: Option<&str>) -> Result<()> {
         let mut pushed = self.pushed.borrow_mut();
         if let Some(existing) = pushed.as_deref() {
@@ -2574,16 +2602,26 @@ impl Rest for PublishingForge {
         let value = if url == format!("{API}user") {
             Some(json!({"login":self.writer}))
         } else if url == format!("{API}repos/composefs/composefs-rs/branches/main")
-            && self
-                .upstream_rewind_after_writes
-                .is_some_and(|n| self.writes.borrow().len() >= n)
+            && let Some(tip) = self.legacy_upstream_tip.get().or_else(|| {
+                self.upstream_rewind_after_writes
+                    .filter(|n| self.writes.borrow().len() >= *n)
+                    .map(|_| 'a')
+            })
         {
-            Some(json!({"commit":{"sha":"a".repeat(40)}}))
+            Some(json!({"commit":{"sha":tip.to_string().repeat(40)}}))
         } else if let Some((base, head)) = url
             .strip_prefix(&format!("{API}repos/composefs/composefs-rs/compare/"))
             .and_then(|s| s.strip_suffix("?per_page=100&page=1"))
             .and_then(|s| s.split_once("..."))
             .filter(|(base, head)| oid(base) && oid(head))
+            // A test's own recorded comparison answers as recorded.
+            .filter(|_| {
+                !self
+                    .replay
+                    .requests
+                    .iter()
+                    .any(|r| r["request"]["get"] == url)
+            })
         {
             let branch = self
                 .replay
@@ -2774,6 +2812,7 @@ fn publication() -> (PublishingForge, Config) {
         writes: RefCell::new(vec![]),
         moved: false,
         upstream_rewind_after_writes: None,
+        legacy_upstream_tip: Rc::new(Cell::new(None)),
         returned_head: false,
         fail: None,
         writer: "cgwalters-bot".into(),
@@ -3967,12 +4006,160 @@ fn without_cut(receipt: &str) -> String {
     format!("{}{}", &receipt[..start], &receipt[end..])
 }
 
+/// Record a confirmed rewritten publication on an older upstream base.
+fn legacy_publication(forge: &mut PublishingForge, case: &str) {
+    let tip = body(&mut forge.replay, "composefs-rs/branches/main")["commit"]["sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let published = forge.promote_ref.borrow().clone().unwrap();
+    // As for composefs-rs#66, upstream moved on from the replay's base.
+    let onto = "9".repeat(40);
+    let count = match case {
+        "ten commits" => 10,
+        "legacy forward" => 2,
+        _ => 1,
+    };
+    let mut parent = onto.clone();
+    let mut commits = Vec::new();
+    for i in 1..=count {
+        let sha = if i == count {
+            published.clone()
+        } else {
+            format!("{:040x}", i + 100)
+        };
+        commits.push(json!({"sha": sha, "parents": [{"sha": parent}]}));
+        parent = sha;
+    }
+    let dropped = "c".repeat(40);
+    match case {
+        // An upstream commit dropped since: the publication carries it too.
+        "extra" => {
+            commits[0]["parents"] = json!([{ "sha": dropped }]);
+            commits.insert(0, json!({"sha": dropped, "parents": [{"sha": onto}]}));
+        }
+        // The one commit sits on a commit outside upstream.
+        "chain" => commits[0]["parents"] = json!([{ "sha": dropped }]),
+        _ => {}
+    }
+    let base = if case == "wrong base" { &dropped } else { &tip };
+    let rewind = "a".repeat(40);
+    forge.replay.requests.extend([
+        json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/compare/{tip}...{published}?per_page=100&page=1")},
+            "answer":{"status":200,"body":{"base_commit":{"sha":base},"merge_base_commit":{"sha":onto},
+                "ahead_by":commits.len(),"total_commits":commits.len(),"behind_by":1,"commits":commits}}}),
+        json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/compare/{onto}...{tip}?per_page=1")},
+            "answer":{"status":200,"body":{"base_commit":{"sha":onto},"merge_base_commit":{"sha":onto},"behind_by":0}}}),
+        json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/compare/{onto}...{rewind}?per_page=1")},
+            "answer":{"status":200,"body":{"base_commit":{"sha":onto},"merge_base_commit":{"sha":rewind},"behind_by":1}}}),
+    ]);
+    if case == "legacy forward" {
+        // Upstream integrates the first approved commit but not its rewrite.
+        // The same publication now has two commits against an approved suffix of one.
+        let advance = "d".repeat(40);
+        let mut suffix = body(&mut forge.replay, "/compare/").clone();
+        suffix["base_commit"]["sha"] = json!(advance);
+        suffix["merge_base_commit"]["sha"] = suffix["commits"][1]["sha"].clone();
+        suffix["commits"] = json!([suffix["commits"][2]]);
+        suffix["ahead_by"] = json!(1);
+        suffix["total_commits"] = json!(1);
+        forge.replay.requests.extend([
+            json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/compare/{onto}...{advance}?per_page=1")},
+                "answer":{"status":200,"body":{"base_commit":{"sha":onto},"merge_base_commit":{"sha":onto},"behind_by":0}}}),
+            json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/compare/{advance}...{HEAD}?per_page=100&page=1")},
+                "answer":{"status":200,"body":suffix}}),
+            json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/compare/{advance}...{published}?per_page=100&page=1")},
+                "answer":{"status":200,"body":{"base_commit":{"sha":advance},"merge_base_commit":{"sha":onto},
+                    "ahead_by":count,"total_commits":count,"behind_by":2,"commits":commits}}}),
+        ]);
+    }
+}
+
+#[test]
+fn legacy_receipt_does_not_starve_new_publication_at_fixed_request_share() {
+    let setup = |case| {
+        let (mut forge, config) = publication();
+        with_second(&mut forge);
+        body(&mut forge.replay, "/compare/")["behind_by"] = json!(1);
+        let mut git = FakeRewrite::new(&forge);
+        let first = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+        assert!(first[0].contains("#34 ->"), "{first:?}");
+        let mut writes = forge.writes.take();
+        writes[2].2["body"] = json!(without_cut(writes[2].2["body"].as_str().unwrap()));
+        keep_rewritten(&mut forge, &writes);
+        body(&mut forge.replay, "/compare/")["behind_by"] = json!(0);
+        legacy_publication(&mut forge, case);
+        forge.reads.take();
+        (forge, config)
+    };
+    let (baseline, config) = setup("chain");
+    let lines = apply(&baseline, &config, baseline.replay.now, 4).unwrap();
+    assert!(
+        lines.iter().any(|line| line.contains("#35 ->")),
+        "{lines:?}"
+    );
+    // Fix the share at the requests needed to publish #35 without proving
+    // the old receipt, including the four requests reserved for writes.
+    let limit = baseline.reads.borrow().len() + baseline.writes.borrow().len() + 4;
+    let (mut forge, mut config) = setup("legacy");
+    request_share(&mut forge.replay, &mut config, limit);
+    let mut git = FakeRewrite::new(&forge);
+    let lines = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+    assert!(
+        lines.iter().any(|line| line.contains("#35 ->")),
+        "{lines:?}"
+    );
+    let writes = forge.writes.borrow();
+    assert_eq!(writes.len(), 3);
+    assert!(writes[0].1.ends_with("/issues/35/comments"));
+    assert_eq!(git.legacy_checks, 0);
+}
+
 #[test]
 fn confirmed_publication_is_reused_only_while_it_carries_the_approved_commits() {
-    for case in ["advanced", "reset", "rewound", "legacy"] {
+    for case in [
+        "advanced",
+        "reset",
+        "rewound",
+        "legacy",
+        "unequal",
+        "extra",
+        "chain",
+        "wrong base",
+        "legacy rewind",
+        "legacy forward",
+        "legacy text rewind",
+        "legacy text update",
+        "ten commits",
+        "eleven commits",
+    ] {
         let (mut forge, config) = publication();
         fork_marker(&mut forge, BASE_SET);
         let marker = "e".repeat(40);
+        let count = match case {
+            "ten commits" => 10,
+            "eleven commits" => 11,
+            "legacy forward" => 2,
+            _ => 1,
+        };
+        let compare = body(&mut forge.replay, "/compare/");
+        let rows = compare["commits"].as_array_mut().unwrap();
+        let template = rows[1].clone();
+        let mut parent = marker.clone();
+        let mut approved = Vec::new();
+        for i in 1..count {
+            let sha = format!("{i:040x}");
+            let mut commit = template.clone();
+            commit["sha"] = json!(sha);
+            commit["parents"] = json!([{"sha":parent}]);
+            rows.insert(i, commit);
+            approved.push(sha.clone());
+            parent = sha;
+        }
+        approved.push(HEAD.into());
+        rows[count]["parents"] = json!([{"sha":parent}]);
+        compare["ahead_by"] = json!(count + 1);
+        compare["total_commits"] = json!(count + 1);
         let mut git = FakeRewrite::new(&forge);
         let lines = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
         assert!(lines[0].starts_with("promoted "), "{lines:?}");
@@ -3982,12 +4169,25 @@ fn confirmed_publication_is_reused_only_while_it_carries_the_approved_commits() 
         let tip = body(&mut forge.replay, "composefs-rs/branches/main")["commit"]["sha"].clone();
         assert_eq!(
             serde_json::to_value(record.cut.unwrap()).unwrap(),
-            json!({"fork_base": marker, "commits": [HEAD], "onto": tip})
+            json!({"fork_base": marker, "commits": approved, "onto": tip})
         );
-        if case == "legacy" {
+        let legacy = !matches!(case, "advanced" | "reset" | "rewound");
+        if legacy {
             writes[2].2["body"] = json!(without_cut(&receipt));
         }
         keep_rewritten(&mut forge, &writes);
+        if legacy {
+            legacy_publication(&mut forge, case);
+        }
+        git.legacy_tree_mismatch = case == "unequal";
+        git.move_upstream_during_legacy_replay = match case {
+            "legacy rewind" | "legacy text rewind" => Some('a'),
+            "legacy forward" => Some('d'),
+            _ => None,
+        };
+        if matches!(case, "legacy text rewind" | "legacy text update") {
+            forge.promoted.borrow_mut()[0]["title"] = json!("Different upstream title");
+        }
         let reason = match case {
             // A fork base that advanced off the head's history leaves the
             // PR's one commit; one reset below the marker adds the marker.
@@ -4016,15 +4216,59 @@ fn confirmed_publication_is_reused_only_while_it_carries_the_approved_commits() 
                 move_upstream_base(&mut forge, true);
                 Some("upstream no longer contains the publication's base")
             }
-            _ => Some("confirmed publication does not record the approved commits"),
+            // composefs-rs#66: replayed before receipts recorded a cut, its
+            // one commit has the approved replay tree on an older base.
+            "legacy" | "legacy text update" | "ten commits" => None,
+            "unequal" => Some("does not match the approved replay tree"),
+            "extra" => Some("carries 2 commits beyond upstream, not the PR's 1"),
+            "wrong base" => Some("publication comparison base mismatch"),
+            "legacy rewind" | "legacy text rewind" => Some("upstream no longer contains"),
+            "legacy forward" => Some("upstream base moved during legacy verification"),
+            "eleven commits" => Some("11 commits exceed the 10 a migration compares"),
+            _ => Some("its commits are not one chain on upstream"),
         };
         let lines = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
         match reason {
             Some(reason) => assert!(lines[0].contains(reason), "{case}: {lines:?}"),
+            None if case == "legacy text update" => {
+                assert!(lines[0].starts_with("promoted "), "{lines:?}");
+                let writes = forge.writes.borrow();
+                assert_eq!(writes.len(), 1);
+                assert_eq!(writes[0].0, "PATCH");
+                assert!(writes[0].1.ends_with("/pulls/70"));
+            }
             None => assert!(lines[0].starts_with("already promoted "), "{lines:?}"),
         }
-        assert!(forge.writes.borrow().is_empty(), "{case}");
+        if case != "legacy text update" {
+            assert!(forge.writes.borrow().is_empty(), "{case}");
+        }
         assert_eq!(git.prepared.len(), 1, "{case}");
+        assert_eq!(
+            git.legacy_checks,
+            usize::from(matches!(
+                case,
+                "legacy"
+                    | "unequal"
+                    | "legacy rewind"
+                    | "legacy forward"
+                    | "legacy text rewind"
+                    | "legacy text update"
+                    | "ten commits"
+            )),
+            "{case}"
+        );
+        if case == "legacy forward" {
+            forge.legacy_upstream_tip.set(None);
+            advance_base(&mut forge);
+            let lines =
+                publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+            assert!(
+                lines[0].contains("carries 2 commits beyond upstream, not the PR's 1"),
+                "{lines:?}"
+            );
+            assert!(forge.writes.borrow().is_empty());
+            assert_eq!(git.legacy_checks, 1);
+        }
         if case == "rewound" {
             // Neither the handoff nor a stacked child takes it as current.
             let comments = comments(&mut forge.replay).as_array().unwrap().clone();

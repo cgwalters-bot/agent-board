@@ -599,7 +599,11 @@ work, without weakening the current-head authorization boundary.
   resumes, confirms or skips a publication only while it records exactly the
   approved commits and upstream still contains that commit (an older receipt
   without that record only for a direct publication the current comparison
-  proves); the handoff
+  proves, or a confirmed one whose commits beyond upstream form one chain
+  and whose Git trees, including file modes, match a replay of at most ten
+  approved commits onto that chain's base). Normal publication candidates
+  get the request budget before these optional legacy rechecks. The target tip
+  must still match the comparison and contain the replay base after verification. The handoff
   treats an open publication with such a record as current only while
   upstream still contains it. It creates a deterministic
   `bot/promote/APPROVED_OID` branch in the same head repository,

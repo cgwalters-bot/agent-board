@@ -227,6 +227,15 @@ pub(super) trait Rewrite {
         commits: &Commits,
         onto: &str,
     ) -> Result<(String, String)>;
+    fn verify_replay(
+        &mut self,
+        config: &Config,
+        target: &pass::promote::Fork,
+        pull: &Value,
+        commits: &Commits,
+        onto: &str,
+        published: &[String],
+    ) -> Result<()>;
     fn publish(
         &mut self,
         repo: &str,
@@ -338,17 +347,8 @@ impl Git {
             .trim_end()
             .into())
     }
-}
 
-impl Rewrite for Git {
-    fn prepare(
-        &mut self,
-        config: &Config,
-        target: &pass::promote::Fork,
-        pull: &Value,
-        commits: &Commits,
-        onto: &str,
-    ) -> Result<(String, String)> {
+    fn fetch(&mut self, heads: &[(&str, &str)]) -> Result<()> {
         self.init()?;
         let token = std::env::var("GH_TOKEN")
             .ok()
@@ -359,12 +359,8 @@ impl Rewrite for Git {
             "AUTHORIZATION: basic {}",
             STANDARD.encode(format!("x-access-token:{token}"))
         ));
-        let repo = pull["head"]["repo"]["full_name"]
-            .as_str()
-            .context("missing head repository")?;
-        let head = pull["head"]["sha"].as_str().context("missing head")?;
-        ensure!(oid(onto), "invalid publication base");
-        for (repo, sha) in [(repo, head), (target.upstream.as_str(), onto)] {
+        for &(repo, sha) in heads {
+            ensure!(oid(sha), "invalid promotion fetch commit");
             self.run(
                 &[
                     "fetch",
@@ -377,7 +373,75 @@ impl Rewrite for Git {
                 &[],
             )?;
         }
+        Ok(())
+    }
+
+    fn compare_replay_trees(&self, onto: &str, replayed: &str, published: &[String]) -> Result<()> {
+        let chain = self.run(
+            &[
+                "rev-list",
+                "--reverse",
+                "--first-parent",
+                &format!("{onto}..{replayed}"),
+            ],
+            &[],
+        )?;
+        ensure!(
+            chain.lines().count() == published.len(),
+            "incomplete legacy replay"
+        );
+        for (replayed, published) in chain.lines().zip(published) {
+            let tree =
+                |sha: &str| self.run(&["rev-parse", "--verify", &format!("{sha}^{{tree}}")], &[]);
+            hold!(
+                tree(replayed)? == tree(published)?,
+                "published commit {published} does not match the approved replay tree; inspect and migrate it manually"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Rewrite for Git {
+    fn prepare(
+        &mut self,
+        config: &Config,
+        target: &pass::promote::Fork,
+        pull: &Value,
+        commits: &Commits,
+        onto: &str,
+    ) -> Result<(String, String)> {
+        let repo = pull["head"]["repo"]["full_name"]
+            .as_str()
+            .context("missing head repository")?;
+        let head = pull["head"]["sha"].as_str().context("missing head")?;
+        self.fetch(&[(repo, head), (&target.upstream, onto)])?;
         self.replay(config, pull, commits, onto)
+    }
+
+    fn verify_replay(
+        &mut self,
+        config: &Config,
+        target: &pass::promote::Fork,
+        pull: &Value,
+        commits: &Commits,
+        onto: &str,
+        published: &[String],
+    ) -> Result<()> {
+        let repo = pull["head"]["repo"]["full_name"]
+            .as_str()
+            .context("missing head repository")?;
+        let head = published.last().context("missing published commit")?;
+        // Keep the migration read-only and isolate each check from the Git
+        // state of other candidates.
+        let mut git = Self::default();
+        git.fetch(&[
+            (repo, commits.head()),
+            (&target.upstream, onto),
+            (repo, head),
+        ])?;
+        let (replayed, _) = git.replay(config, pull, commits, onto)?;
+        git.compare_replay_trees(onto, &replayed, published)
     }
 
     fn publish(
@@ -515,6 +579,17 @@ mod tests {
     /// A commit on the first parent's tree (empty without one) that writes
     /// `content` to `path`.
     fn commit(git: &Git, parents: &[&str], path: &str, content: &str, message: &str) -> String {
+        commit_with_mode(git, parents, path, content, "100644", message)
+    }
+
+    fn commit_with_mode(
+        git: &Git,
+        parents: &[&str],
+        path: &str,
+        content: &str,
+        mode: &str,
+        message: &str,
+    ) -> String {
         let identity = [
             ("GIT_AUTHOR_NAME", "Original author"),
             ("GIT_AUTHOR_EMAIL", "author@example.invalid"),
@@ -536,7 +611,7 @@ mod tests {
                 "update-index",
                 "--add",
                 "--cacheinfo",
-                &format!("100644,{blob},{path}"),
+                &format!("{mode},{blob},{path}"),
             ],
             &[],
         )
@@ -547,6 +622,52 @@ mod tests {
             args.extend(["-p", parent]);
         }
         git.run(&args, &identity).unwrap()
+    }
+
+    #[test]
+    fn legacy_replay_compares_the_entire_tree_including_modes() {
+        let config = config();
+        let mut git = Git::default();
+        git.init().unwrap();
+        let path = "script";
+        let ancestor = commit(&git, &[], path, "before\na\nb\nc\noriginal\n", "Initial");
+        let approved = commit(
+            &git,
+            &[&ancestor],
+            path,
+            "before\na\nb\nc\ntopic\n",
+            "Approved",
+        );
+        let onto = commit(
+            &git,
+            &[&ancestor],
+            path,
+            "upstream\na\nb\nc\noriginal\n",
+            "Upstream",
+        );
+        let pull = json!({"head":{"sha":approved}});
+        let commits = Commits {
+            fork_base: ancestor.clone(),
+            parent: ancestor.clone(),
+            rows: vec![json!({"sha":approved,"parents":[{"sha":ancestor}],
+                "author":{"login":config.bot},"commit":{"message":"Approved"}})],
+            suffix: None,
+        };
+        let (replayed, _) = git.replay(&config, &pull, &commits, &onto).unwrap();
+        for (mode, matches) in [("100644", true), ("100755", false)] {
+            let head = commit_with_mode(
+                &git,
+                &[&onto],
+                path,
+                "upstream\na\nb\nc\ntopic\n",
+                mode,
+                "Historical replay",
+            );
+            assert_eq!(
+                git.compare_replay_trees(&onto, &replayed, &[head]).is_ok(),
+                matches
+            );
+        }
     }
 
     #[test]
