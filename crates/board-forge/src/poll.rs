@@ -89,6 +89,9 @@ const LEGACY_FIX_ROUNDS: u64 = 2;
 /// The most `fixRounds` may ask for: each round is an agent run, and a
 /// change that keeps failing cannot start runs without end.
 pub const FIX_ROUNDS_LIMIT: u64 = 5;
+
+const STALLED_HEAD_REPORT_LIMIT: usize = 3;
+const STALLED_HEAD_SUFFIX: &str = "; stalled-head: ";
 /// The ref fix runs are started at, as poll.cjs starts dispatch.yml.
 const DISPATCH_REF: &str = "main";
 /// fix.toml's replacement_max_commits: the series a fix may hand back.
@@ -598,6 +601,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "agentRecovery",
     "holdMissingData",
     "fixRounds",
+    "stalledHeadReports",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -743,6 +747,9 @@ pub struct PollPolicy {
     /// [`FIX_ROUNDS_LIMIT`]; none is [`FIX_ROUNDS`]. Read with
     /// [`Self::fix_rounds`].
     pub fix_rounds: Option<u64>,
+    /// `stalledHeadReports`: maximum public fix-limit log receipts per pass;
+    /// zero disables them. This does not start research.
+    pub stalled_head_reports: usize,
     /// `operatorComments.repositories`: where the operator's comments start
     /// runs ([`comments`]), as `OWNER/*` or `OWNER/REPO`. Empty (the default)
     /// reads none.
@@ -1157,6 +1164,8 @@ pub const OPERATOR_PATHS_LIMIT: usize = 50;
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrOptions {
+    #[serde(default)]
+    pub stalled_head_reports: usize,
     #[serde(default, deserialize_with = "maintainer_names")]
     pub maintainers: Vec<String>,
     #[serde(default)]
@@ -1343,6 +1352,10 @@ impl PrOptions {
                 .is_none_or(|r| (1..=FIX_ROUNDS_LIMIT).contains(&r)),
             "{at}fixRounds is not 1 to {FIX_ROUNDS_LIMIT}"
         );
+        ensure!(
+            self.stalled_head_reports <= STALLED_HEAD_REPORT_LIMIT,
+            "{at}stalledHeadReports is not 0 to {STALLED_HEAD_REPORT_LIMIT}"
+        );
         Ok(())
     }
 
@@ -1372,6 +1385,7 @@ impl PrOptions {
             operator_paths,
             stale_days,
             fix_rounds,
+            stalled_head_reports,
         } = self.clone();
         policy.maintainers = maintainers
             .into_iter()
@@ -1399,6 +1413,7 @@ impl PrOptions {
         policy.operator_paths = operator_paths;
         policy.stale_days = stale_days;
         policy.fix_rounds = fix_rounds;
+        policy.stalled_head_reports = stalled_head_reports;
     }
 }
 
@@ -1548,6 +1563,7 @@ impl PollPolicy {
             operator_paths: Vec::new(),
             stale_days: 0,
             fix_rounds: None,
+            stalled_head_reports: 0,
             check_reruns: false,
             unstall: false,
             hold_missing_data: false,
@@ -4201,6 +4217,8 @@ pub struct Decision {
     pub waiting: WaitReason,
     /// Controller-owned category, never inferred from diagnostic prose.
     pub infrastructure: Option<crate::stop::Cause>,
+    /// This decision came from exhausting the ordinary fix-round budget.
+    pub fix_limit: bool,
 }
 
 /// Wait semantics decided by the poll, independent of diagnostic wording.
@@ -4265,6 +4283,7 @@ fn step(action: &'static str, reason: impl Into<String>) -> Decision {
         queue: None,
         waiting: WaitReason::Person,
         infrastructure: None,
+        fix_limit: false,
     }
 }
 
@@ -4655,6 +4674,7 @@ pub fn decide(
                     queue: None,
                     waiting: WaitReason::Person,
                     infrastructure: None,
+                    fix_limit: false,
                 };
                 let refits = !config.policy.agent_recovery
                     && config.policy.unstall
@@ -4691,6 +4711,7 @@ pub fn decide(
                     queue: None,
                     waiting: WaitReason::Person,
                     infrastructure: None,
+                    fix_limit: false,
                 };
             }
         }
@@ -4764,6 +4785,7 @@ pub fn decide(
                 queue: None,
                 waiting: WaitReason::Person,
                 infrastructure: None,
+                fix_limit: false,
             };
         }
         // The diagnostic round is one more, counted in `rounds` as the next
@@ -4782,6 +4804,7 @@ pub fn decide(
                 queue: None,
                 waiting: WaitReason::Person,
                 infrastructure: None,
+                fix_limit: false,
             };
         }
         if marker.rounds >= rounds || marker.diagnosed {
@@ -4793,10 +4816,13 @@ pub fn decide(
             } else {
                 format!("{} fix rounds", marker.rounds)
             };
-            return recovery::exhausted(
-                config,
-                format!("{used} used and {} still fails ({why})", short(head)),
-            );
+            return Decision {
+                fix_limit: marker.rounds >= rounds,
+                ..recovery::exhausted(
+                    config,
+                    format!("{used} used and {} still fails ({why})", short(head)),
+                )
+            };
         }
         return Decision {
             action: "fix",
@@ -4813,6 +4839,7 @@ pub fn decide(
             queue: None,
             waiting: WaitReason::Person,
             infrastructure: None,
+            fix_limit: false,
         };
     }
     let unwritten = undescribed(pull);
@@ -5569,6 +5596,7 @@ struct Pass<'a, R, G> {
     cut: Option<String>,
     apply: Option<Apply<'a, R>>,
     dispatched: usize,
+    stalled_heads_reported: usize,
     /// See [`Outcome::merged`].
     merged: usize,
     /// Preview merge decisions, including followed non-bot authors.
@@ -5755,6 +5783,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             cut: None,
             apply: None,
             dispatched: 0,
+            stalled_heads_reported: 0,
             merged: 0,
             preview_merges: 0,
             queues: BTreeMap::new(),
@@ -9701,8 +9730,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         // The hold is read again just before the step's first write: one put
         // on since the read above stops it too.
+        let mut receipt_head_matches = !writing;
         let hold = if writing {
             self.read_pull(owner, name, number).map(|p| {
+                receipt_head_matches = p["state"] == "OPEN"
+                    && p["headRefOid"] == head
+                    && p["baseRepository"]["isPrivate"] == false;
                 if is_held(&p) {
                     Some(format!("labelled {HOLD_LABEL}"))
                 } else if supervisor_empty_fix
@@ -9856,6 +9889,40 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if let Some(error) = evidence_error.filter(|_| ran) {
             done.push_str(&format!("; run reason not added: {error:#}"));
         }
+        // Give a log consumer an exact head and run to investigate without
+        // parsing stop prose. This neither reads evidence nor reserves work.
+        let reports = self.caps.map_or(self.stalled_heads_reported, |caps| {
+            caps.stalled_head_reports.get()
+        });
+        let report_limit = self.config.policy.stalled_head_reports;
+        let receipt = if reports < report_limit.min(STALLED_HEAD_REPORT_LIMIT)
+            && ran
+            && decision.action == "needs-human"
+            && decision.fix_limit
+            && receipt_head_matches
+            && pull["baseRepository"]["isPrivate"] == false
+            && !merge_only
+            && self.config.policy.pull.is_none()
+            && self.config.ours(repo)
+            && self.config.held_in(repo).is_none()
+            && is_harness(&pull, self.config)
+            && answer.is_empty()
+            && retarget.is_none()
+            && stale.is_none()
+        {
+            if let Some(caps) = self.caps {
+                caps.stalled_head_reports.set(reports + 1);
+            } else {
+                self.stalled_heads_reported += 1;
+            }
+            Some(json!({
+                "kind": "fix-round-limit", "repository": repo, "pull": number,
+                "head": head, "rounds_used": marker.rounds, "round_limit": fix_rounds,
+                "recorded_run": marker.run,
+            }))
+        } else {
+            None
+        };
         // As in `stop`, which labels nothing where the operator takes it.
         let supervisor = self.config.policy.supervisor_holds
             && decision.action == "needs-human"
@@ -9870,13 +9937,20 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             &decision.reason,
         );
         // A rerun's line leads with it, `review rerun OWNER/REPO#N …`.
-        let line = if action == "merge" && reason.starts_with("approved by the operator at ") {
+        let mut line = if action == "merge" && reason.starts_with("approved by the operator at ") {
             format!("merge {repo}#{number}: {reason}{done}")
         } else if matches!(action, REVIEW | REVIEW_RERUN | RUN_RERUN | CHECK_RERUN) {
             format!("{action} {repo}#{number} {}: {reason}{done}", short(head))
         } else {
             format!("{repo}#{number} {} {action}: {reason}{done}", short(head))
         };
+        if report_limit > 0 && line.contains(STALLED_HEAD_SUFFIX) {
+            // Check names and other diagnostic prose must not open a receipt.
+            line = line.replace(STALLED_HEAD_SUFFIX, r"; stalled-head\x3a ");
+        }
+        if let Some(receipt) = receipt {
+            line.push_str(&format!("{STALLED_HEAD_SUFFIX}{receipt}"));
+        }
         // Publication only: a controller PR still cannot merge on a job's
         // approval. Its operator decision must not disappear behind a skip.
         // Read display provenance only after deciding that this PR otherwise
@@ -15990,6 +16064,10 @@ mod tests {
                 expected,
                 "{fix_rounds:?} {state}: {}",
                 decision.reason
+            );
+            assert_eq!(
+                decision.fix_limit,
+                decision.action == "needs-human" && marker(state).rounds >= cfg.policy.fix_rounds()
             );
         }
         // Past the old budget the marker says which its last round was.
@@ -24213,6 +24291,249 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stalled_head_report_cap_validation() {
+        for (value, valid) in [
+            (json!(0), true),
+            (json!(1), true),
+            (json!(3), true),
+            (json!(4), false),
+            (json!(true), false),
+            (json!(-1), false),
+        ] {
+            let options = PollPolicy::from_json(&json!({"stalledHeadReports": value}));
+            assert_eq!(options.is_ok(), valid, "{value}");
+            if let Ok(options) = options {
+                assert_eq!(options.stalled_head_reports as u64, value.as_u64().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn stalled_head_report_requires_a_stable_public_head() {
+        for (case, visibility, late, expected) in [
+            ("public", json!(false), None, true),
+            ("private", json!(true), None, false),
+            ("unknown", Value::Null, None, false),
+            (
+                "moved",
+                json!(false),
+                Some(json!({"headRefOid": "2".repeat(40)})),
+                false,
+            ),
+            (
+                "closed",
+                json!(false),
+                Some(json!({"state": "CLOSED"})),
+                false,
+            ),
+            (
+                "made private",
+                json!(false),
+                Some(json!({"baseRepository": {"isPrivate": true}})),
+                false,
+            ),
+            ("delimiter", json!(false), None, true),
+        ] {
+            let mut fake = github();
+            fake.late_pull_fields = late;
+            let check = if case == "delimiter" {
+                "ci; stalled-head: not a receipt"
+            } else {
+                "ci"
+            };
+            let (outcome, fake, dispatcher) = applied_policy(
+                fake,
+                PollPolicy::from_json(&json!({"stalledHeadReports": 1})).unwrap(),
+                json!({
+                    "baseRepository": {"nameWithOwner": REPO, "isPrivate": visibility,
+                        "defaultBranchRef": {"name": "main"}},
+                    "contexts": {"ci": {"name": check, "conclusion": "FAILURE"}},
+                }),
+                json!({"rounds": FIX_ROUNDS, "sha": "1".repeat(40)}),
+            );
+            assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            assert!(
+                outcome
+                    .steps
+                    .iter()
+                    .any(|s| s.action == "needs-human" && s.ran),
+                "{case}: {:?}",
+                outcome.lines
+            );
+            assert!(!fake.writes.borrow().is_empty(), "{case}");
+            assert!(dispatcher.writes.borrow().is_empty(), "{case}");
+            if case == "delimiter" {
+                assert!(
+                    outcome.lines.iter().any(|line| {
+                        line.contains(r"check ci; stalled-head\x3a not a receipt failed")
+                    }),
+                    "{:?}",
+                    outcome.lines
+                );
+            }
+            let notes: Vec<_> = outcome
+                .lines
+                .iter()
+                .filter_map(|line| {
+                    line.split_once(STALLED_HEAD_SUFFIX)
+                        .map(|(_, receipt)| receipt)
+                })
+                .collect();
+            assert_eq!(
+                notes.len(),
+                usize::from(expected),
+                "{case}: {:?}",
+                outcome.lines
+            );
+            if let [receipt] = notes.as_slice() {
+                let receipt: Value = serde_json::from_str(receipt)
+                    .unwrap_or_else(|e| panic!("{case}: {e}: {receipt}"));
+                assert_eq!(receipt["head"], HEAD, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn stalled_head_reports_do_not_take_the_later_fix_slot() {
+        let numbers = [470, 471, 472];
+        for (apply, action_first) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut baseline = None;
+            for policy in [
+                PollPolicy::default(),
+                PollPolicy::from_json(&json!({"stalledHeadReports": 1})).unwrap(),
+            ] {
+                let cap = policy.stalled_head_reports;
+                let mut fake = github();
+                fake.page(
+                    &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+                    None,
+                    None,
+                    numbers
+                        .iter()
+                        .map(|n| json!({"number": n, "user": {"login": BOT}}))
+                        .collect(),
+                );
+                for n in numbers {
+                    let comments = if n < 472 {
+                        json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(
+                            &json!({"rounds": FIX_ROUNDS, "sha": "1".repeat(40)}), "Fix round.") }])
+                    } else {
+                        json!([])
+                    };
+                    fake.page(
+                        &format!("repos/{REPO}/issues/{n}/comments?per_page=100"),
+                        None,
+                        None,
+                        comments,
+                    );
+                    fake.pulls.insert(
+                        n,
+                        pull(
+                            "pull-470",
+                            json!({
+                                "number": n, "contexts": {"ci": {"conclusion": "FAILURE"}}
+                            }),
+                        ),
+                    );
+                }
+                let mut cfg = config();
+                cfg.policy = policy;
+                cfg.policy.action_first = action_first;
+                let dispatcher = Fake::default();
+                let caps = caps::Caps::new(caps::Limits {
+                    dispatch: Some(1),
+                    ..Default::default()
+                });
+                let applying_now = || applying(&dispatcher).filter(|_| apply);
+                let follow = [REPO.into()];
+                let approved = action_first.then(|| {
+                    fake.page(
+                        &action_first::approved_path(&cfg),
+                        None,
+                        None,
+                        json!({
+                            "incomplete_results": false, "total_count": 1,
+                            "items": [{"repository_url": format!("{API_ROOT}repos/{REPO}"),
+                                "number": 470, "user": {"login": BOT}, "pull_request": {}}],
+                        }),
+                    );
+                    let prior = action_first::run_approved_capped(
+                        &fake,
+                        &fake,
+                        &cfg,
+                        &follow,
+                        applying_now(),
+                        &caps,
+                        now(),
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(prior.0.errors, 0, "{:?}", prior.0.lines);
+                    assert!(prior.0.steps.iter().any(|s| s.number == 470 && s.ran));
+                    prior
+                });
+                let outcome = run_capped_after_direction(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    (&[], &follow),
+                    applying_now(),
+                    Some(&caps),
+                    now(),
+                    approved,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                let taken: Vec<_> = outcome
+                    .steps
+                    .iter()
+                    .filter(|s| s.ran)
+                    .map(|s| (s.number, s.action))
+                    .collect();
+                assert_eq!(
+                    taken,
+                    [(470, "needs-human"), (471, "needs-human"), (472, "fix")]
+                );
+                let notes: Vec<_> = outcome
+                    .lines
+                    .iter()
+                    .filter_map(|line| line.split_once(STALLED_HEAD_SUFFIX).map(|(_, json)| json))
+                    .collect();
+                assert_eq!(notes.len(), cap);
+                if let [report] = notes.as_slice() {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(report).unwrap(),
+                        json!({
+                            "kind": "fix-round-limit", "repository": REPO, "pull": 470,
+                            "head": HEAD, "rounds_used": FIX_ROUNDS, "round_limit": FIX_ROUNDS,
+                            "recorded_run": null,
+                        })
+                    );
+                }
+                let starts = dispatcher.writes.into_inner();
+                assert_eq!(starts.len(), usize::from(apply));
+                if let [(_, start)] = starts.as_slice() {
+                    assert_eq!(start["inputs"]["kind"], "fix");
+                    assert_eq!(start["inputs"]["item"], "472");
+                }
+                let effects = (
+                    caps.summary(),
+                    fake.sent.into_inner(),
+                    fake.writes.into_inner(),
+                    starts,
+                );
+                if cap == 0 {
+                    baseline = Some(effects);
+                } else {
+                    assert_eq!(baseline.as_ref(), Some(&effects));
+                }
+            }
+        }
+    }
+
     /// A capped pass takes steps up to its caps and holds the rest whole,
     /// writing nothing of them; a preview plans as many as an apply takes.
     /// A fix round is a dispatch, a merge a write, each one step however
@@ -26263,6 +26584,7 @@ mod tests {
             cut: None,
             apply: None,
             dispatched: 0,
+            stalled_heads_reported: 0,
             merged: 0,
             preview_merges: 0,
             queues: BTreeMap::new(),
