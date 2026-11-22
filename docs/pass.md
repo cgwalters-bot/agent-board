@@ -164,7 +164,8 @@ opt-ins, not every optional key. The GitHub catalog consists of:
   Missing is unconfigured.
 - Nonempty collections: `mix`, `follow`, `pr.reviewPools`,
   `pr.reviewDispatchRepositories`, `pr.draftReviewRepositories`,
-  `pr.operatorPaths`. Explicit empty collections are disabled, not unconfigured.
+  `pr.operatorPaths`, `promote.botAuthorEmails`. Explicit empty collections
+  are disabled, not unconfigured.
 - Presence activators: `midstream`, `revisit`, `sweep`, `sessions`, `maintain`,
   `overlap`, `holds`, `holds.patExpiry`, `holds.proposals`, `holds.drafts`,
   `decisions`, `starts`, `direction`, `cost`, `requestShare`, `requestWindow`,
@@ -6345,6 +6346,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `promote.forks` | Legacy map of fork repository to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, readable for one release for pinned callers. Every entry needs `origin=fork`, `bot-midstream` and GitHub fork status; upstream must equal GitHub's parent, base overrides its default branch. Without entries, `midstream` discovery supplies candidates from metadata. A non-fork attempt or conflicting parent is a hard error. Publication remains off by default through `promote.publish`. |
 | `promote.publish` | Default `false`: allow standalone `promote --apply --max-writes N` to publish one upstream draft or update one same-head PR after fresh gates and operator current-head approval; three writes reserved; no pushes, ready changes or fork closure; the pass always remains read-only for promotion |
 | `promote.onApproval` | Default `false`: standalone `promote` also evaluates draft fork PRs and, on a draft without a `/promote` command, takes the operator's latest deciding review approving the current head, submitted after its push, as the trigger (never `--human-text`); publication still needs `promote.publish` |
+| `promote.botAuthorEmails` | Default `[]`: up to 16 exact former Git author emails allowed in promotion replay only when the author is explicitly unmapped and the committer login is the configured bot or `github-actions[bot]`. Does not relax approval or other promotion gates. |
 | `promote.signoff.name`, `promote.signoff.email` | Reserved operator sign-off identity; both non-empty; required with `promote.forks`, no default; no sign-off is performed in the preview |
 | `promote.policyRepository` | Repository whose default branch supplies upstream policy records, never written; required with `promote.forks`; read only after earlier candidate gates pass |
 | `promote.policyPath` | Directory of the records in it, one `OWNER/REPO.md` per upstream; absent, its top level |

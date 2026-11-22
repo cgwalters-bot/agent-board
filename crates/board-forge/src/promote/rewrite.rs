@@ -188,14 +188,37 @@ impl Commits {
     }
 }
 
+fn former_bot_author(config: &Config, promote: &pass::promote::Promote, commit: &Value) -> bool {
+    // An author email alone is self-asserted. Require the expected committer
+    // attribution too, without treating either field as proof of approval.
+    (commit.get("author").is_some_and(Value::is_null)
+        || commit.pointer("/author/login").is_some_and(Value::is_null))
+        && commit
+            .pointer("/committer/login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| {
+                login.eq_ignore_ascii_case(&config.bot)
+                    || login.eq_ignore_ascii_case("github-actions[bot]")
+            })
+        && commit
+            .pointer("/commit/author/email")
+            .and_then(Value::as_str)
+            .is_some_and(|email| {
+                promote
+                    .bot_author_emails
+                    .iter()
+                    .any(|allowed| allowed == email)
+            })
+}
+
 /// What a replay needs before any Git run: a linear chain from the merge base
 /// of commits by the bot or operator. A preview reads this; only a conflict is
 /// left to the replay itself.
 pub(super) fn replayable(config: &Config, commits: &Commits) -> Result<()> {
-    config
+    let promote = config
         .promote
         .as_ref()
-        .and_then(|p| p.signoff.as_ref())
+        .filter(|p| p.signoff.is_some())
         .context("missing sign-off identity")?;
     let mut parent = commits.parent();
     for c in commits.rows() {
@@ -213,7 +236,8 @@ pub(super) fn replayable(config: &Config, commits: &Commits) -> Result<()> {
             c["author"]["login"]
                 .as_str()
                 .is_some_and(|a| a.eq_ignore_ascii_case(&config.bot)
-                    || a.eq_ignore_ascii_case(&config.operator)),
+                    || a.eq_ignore_ascii_case(&config.operator))
+                || former_bot_author(config, promote, c),
             "promotion refuses another author's commit"
         );
         parent = sha;
@@ -554,7 +578,8 @@ mod tests {
 
     #[test]
     fn replay_preserves_authors_and_trailers_signs_every_commit_and_holds_conflicts() {
-        let config = config();
+        let mut config = config();
+        config.promote.as_mut().unwrap().bot_author_emails = vec!["author@example.invalid".into()];
         let mut git = Git::default();
         git.init().unwrap();
         let commit = |parent: Option<&str>, path: &str, content: &str, message: &str| {
@@ -568,6 +593,8 @@ mod tests {
             "First\n\nGenerated-by: preserved",
         );
         let second = commit(Some(&first), "topic", "second\n", "Second");
+        let approved = "refs/heads/approved";
+        git.run(&["update-ref", approved, &second], &[]).unwrap();
         let pull = json!({"head":{"sha":second}});
         for conflict in [false, true] {
             let base = commit(
@@ -581,11 +608,14 @@ mod tests {
                 parent: ancestor.clone(),
                 rows: vec![
                     json!({"sha":first,"parents":[{"sha":ancestor}],"author":{"login":config.bot},"commit":{"message":"First\n\nGenerated-by: preserved"}}),
-                    json!({"sha":second,"parents":[{"sha":first}],"author":{"login":config.bot},"commit":{"message":"Second"}}),
+                    json!({"sha":second,"parents":[{"sha":first}],"author":null,
+                        "committer":{"login":"github-actions[bot]"},
+                        "commit":{"message":"Second","author":{"email":"author@example.invalid"}}}),
                 ],
                 suffix: None,
             };
             let result = git.replay(&config, &pull, &commits, &base);
+            assert_eq!(git.run(&["rev-parse", approved], &[]).unwrap(), second);
             if conflict {
                 assert!(result.is_err());
                 continue;
