@@ -60,6 +60,35 @@ fn dependency_state_table() {
 }
 
 #[test]
+fn stacked_pull_request_dependency_release_holds_on_retarget() {
+    for (status, late) in [("ahead", false), ("diverged", false), ("ahead", true), ("diverged", true)] {
+        let (mut fake, mut cfg) = dependency_fixture();
+        cfg.policy.stack_recovery = true;
+        fake.pulls.get_mut(&470).unwrap()["isDraft"] = true.into();
+        dependency_record(&mut fake, json!({"update_head":"","released":false,"reason":"blocked"}));
+        fake.page("repos/other/repo/pulls/12", None, None, json!({"number":12,"state":"closed","merged":true}));
+        fake.page(&format!("repos/{REPO}/compare/main...{HEAD}"), None, None, json!({"status":status}));
+        let stack_change = json!({"nodes":[{"__typename":"AutomaticBaseChangeSucceededEvent",
+            "oldBase":"dispatch/469","createdAt":"2026-10-12T00:55:00Z"}],"pageInfo":{"hasPreviousPage":false}});
+        if late {
+            fake.late_pull_fields = Some(json!({"stackChange":stack_change}));
+        } else {
+            fake.pulls.get_mut(&470).unwrap()["stackChange"] = stack_change;
+        }
+        let out = dependency_pass(&fake, &cfg, true, None);
+        assert!(out.lines.iter().any(|line| line.contains("retargeted from stack branch dispatch/469")), "{status}, late={late}: {:?}", out.lines);
+        let writes = written(&fake.writes);
+        if late {
+            assert!(writes.is_empty(), "{status}: {writes:?}");
+        } else {
+            assert_eq!(out.errors, 0, "{:?}", out.lines);
+            assert_eq!(out.steps[0].action, "skip");
+            assert!(writes.is_empty(), "{status}: {writes:?}");
+        }
+    }
+}
+
+#[test]
 fn dependency_holds_are_opt_in_bounded_and_repeatable() {
     let (mut fake, mut cfg) = dependency_fixture();
     cfg.policy.hold_dependencies = false;
@@ -236,7 +265,7 @@ fn dependency_fix_plan_preflight_and_charge_share_admission() {
             .unwrap().unwrap().contains("blocked by other/repo#12"));
     }
     assert!(matches!(charge_planned_fix(&fake, &fake, &cfg,
-        (REPO, 470, HEAD, "claude"), now()).unwrap(), Err(why) if why.contains("blocked by other/repo#12")));
+        (REPO, 470, HEAD, "claude"), (REPO, 470), now()).unwrap(), Err(why) if why.contains("blocked by other/repo#12")));
     assert!(fake.writes.borrow().is_empty());
 }
 

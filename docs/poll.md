@@ -177,12 +177,14 @@ is not automatically retried and goes to `needs-supervisor`; a person can update
 the branch and remove that label. A released marker prevents the poll from
 promoting a later human-created draft again. Unfinished checkpoints, partial work
 and placeholder titles stay draft. A draft with no recorded dependency hold is
-not automatically promoted. Non-default bases currently require supervisor
-retargeting.
+not automatically promoted. [Stack follow-up](#stacked-pull-requests) normally
+retargets eligible bot PRs when their lower PR merges, without the supervisor.
+Dependency release takes precedence on a draft with a recorded dependency hold;
+that release still asks the supervisor to retarget a non-default base.
 
 Remaining #936 work: derived pin blockers and minimum-revision CI diagnostics,
-pin workflow starts, `depends_on` plan/dispatch plumbing, and automatic stacked
-retargeting. This is not the full dependency feature. For tracker deployment,
+pin workflow starts and `depends_on` plan/dispatch plumbing. This is not the
+full dependency feature. For tracker deployment,
 update the pin and set `cgwalters-forge/tracker` `.github/pass.json` key
 `pr.holdDependencies` to `true` (and `.github/poll/agent-board.json` key
 `holdDependencies` to `true` if standalone poll is still used). Verify these in a
@@ -686,7 +688,7 @@ configuration`, decides nothing there, and goes on.
 The file's top level also takes the keys of the pass's
 [`pr`](pass.md) that change what the poll decides, read by the same code with
 the same names, types, defaults, bounds and meaning, so one `pr` block gives one
-policy either way: `maintainers`, `checkReruns`, `unstall`, `directionFirst` (`operatorComments`
+policy either way: `maintainers`, `checkReruns`, `unstall`, `stackRecovery`, `directionFirst` (`operatorComments`
 and `notifications` read before the followed repositories rather than after
 them), `ownerBranches`, `ownSpaceOnly`,
 `foldRounds`, `reviewPools`, `reviewDispatchRepositories`,
@@ -1153,7 +1155,9 @@ to its author, unless the pass's [`pr.unstall`](pass.md#unstall) has it
 updated the same way. Only `BEHIND` is read: a head GitHub reports with another state,
 such as `BLOCKED`, is merged as before, and a refusal is an error.
 
-Stacked pull requests ([job plans](job-plans.md#stacking), agent-board#133):
+### Stacked pull requests
+
+For stacked pull requests ([job plans](job-plans.md#stacking), agent-board#133),
 the poll merges or queues a pull request only into its repository's default
 branch (`defaultBranchRef`; one not read waits), so an approved, green pull
 request stacked on another's branch waits rather than landing on an
@@ -1166,14 +1170,34 @@ request to the branch that one merged into, the default branch or a
 closed unmerged, none at all, or a merge into anything else, it labels it
 `needs-human`. A conflict with the new base is then a rebase round under
 `rebaseRounds`, or a fix round, as any conflict is. A head whose verdict
-predates its newest base change (`BaseRefChangedEvent`, also GitHub's own
-retargeting when a merged head branch is deleted), or whose review job run
+predates its newest recorded base change, or whose review job run
 started before it, is not merged on it: that review read the change against
 the branch below, with that branch's review workflow. Nothing asks the review
 job to run again, so the bot's pull request goes to `needs-human` for the
 operator to review the head against the new base; with the pass's
 [`reruns`](pass.md#reruns), a head behind its new base is rebased onto it
 instead, and its push asks for that review.
+
+`pr.stackRecovery: true` (`stackRecovery: true` in standalone poll) detects
+a former stack; it does not repair one. A current stack is handled as above.
+The poll reads up to 100 retargets, including GitHub's automatic retargets,
+which then also count for review freshness. Once the bot's pull request moved
+off any `dispatch/` branch other than the default, by the poll's own retarget,
+a person or GitHub, it may still carry the lower PR's obsolete commits, which
+a retarget event cannot identify. Until the operator reviews its head after
+that move, the poll puts it in the operator's `needs-human` list without
+labelling it or starting a review, update, or repair round. A push alone does
+not clear it, since a round started before the move can still push those
+commits. Incomplete history waits the same way, since it could hide such a
+move. A force-push of a lower branch under a current stack is not detected.
+
+Verify the inherited work, rebasing it away if needed, then review the head.
+The hold is computed from the PR, not a label. When auto-merge or a
+merge queue entry is active, the operator's wait asks them to cancel it on
+GitHub first; the poll does not cancel it. The option is off by default and
+grants no new permission.
+
+### Outage refunds
 
 `brokerOutage` (absent by default, which charges every failed run) keeps a
 broker outage from using a round (agent-board#108):

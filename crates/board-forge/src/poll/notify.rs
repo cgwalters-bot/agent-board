@@ -2731,9 +2731,10 @@ mod tests {
             "dispatch cap",
             "write cap",
             "fix bounds",
+            "stack moved before walk",
         ] {
             let repo = "upstream/app";
-            let fake = intake_github(repo, true, "comment", OPERATOR);
+            let mut fake = intake_github(repo, true, "comment", OPERATOR);
             let issue = format!("repos/{repo}/issues/2");
             fake.rest
                 .borrow_mut()
@@ -2789,6 +2790,17 @@ mod tests {
             fake.page(&path, pull);
             let mut config = search_intake(&fake, repo);
             config.policy.operator_review_fixes = true;
+            if case == "stack moved before walk" {
+                config.policy.direction_first = true;
+                config.policy.stack_recovery = true;
+                fake.stack_pull = Some(json!({
+                    "state": "OPEN", "author": {"login": BOT}, "headRefOid": "abcdef0123456789",
+                    "baseRefName": "main", "baseRepository": {"defaultBranchRef": {"name": "main"}},
+                    "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+                    "stackChange": {"nodes": [{"__typename": "AutomaticBaseChangeSucceededEvent",
+                        "oldBase": "dispatch/1", "createdAt": UPDATED}], "pageInfo": {"hasPreviousPage": false}}
+                }));
+            }
             if case == "fix bounds" {
                 config.policy.fix_bounds = super::super::bounds::FixBoundsSet::new(vec![
                         super::super::bounds::FixBounds::parse(
@@ -2818,6 +2830,16 @@ mod tests {
             )
             .unwrap();
             assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            if case == "stack moved before walk" {
+                assert!(
+                    outcome
+                        .lines
+                        .iter()
+                        .any(|line| line.contains("retargeted from stack branch dispatch/1")),
+                    "{:?}",
+                    outcome.lines
+                );
+            }
             if changed {
                 assert!(
                     outcome.lines.iter().any(|line| {

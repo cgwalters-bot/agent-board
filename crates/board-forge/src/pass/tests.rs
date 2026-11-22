@@ -18684,6 +18684,10 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         "headRepository": {"nameWithOwner": CONTROL},
         "labels": {"nodes": [{"name": "rebase"}], "pageInfo": {"hasNextPage": false}}});
     let labelled = |name: &str| json!({"labels": {"nodes": [{"name": "rebase"}, {"name": name}], "pageInfo": {"hasNextPage": false}}});
+    let stack_change = json!({"nodes": [{"__typename": "BaseRefChangedEvent",
+        "previousRefName": "dispatch/lower", "createdAt": "2026-10-22T00:00:00Z"}],
+        "pageInfo": {"hasPreviousPage": false}});
+    let stack_reason = "retargeted from stack branch dispatch/lower; verify the inherited work, then review the head";
     // The bot's comment `id` on the pull request: a poll marker, or a claim.
     let poll_comment = |id: u64, tag: &str, state: Value| {
         json!({"id": id, "node_id": format!("IC_{id}"), "user": {"login": "cgwalters-bot"},
@@ -18728,6 +18732,11 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         ("held", true, Some(UPSTREAM), &brief, edit(labelled("Hold")), (vec![], 0), held("it is labelled hold")),
         ("dependency held", true, Some(UPSTREAM), &brief,
             edit(json!({"body": "Depends on other/repo#12"})), (vec![], 0), held("blocked by other/repo#12")),
+        ("stack target", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), held(stack_reason)),
+        ("stack ledger at charge", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), held(stack_reason)),
+        ("stack target at charge", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), held(stack_reason)),
+        ("stack target held at charge", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("planned fix PR acquired a hold or its labels are unread")),
         ("needs-human", true, Some(UPSTREAM), &brief, edit(labelled("needs-human")), (vec![], 0), held("it is labelled needs-human")),
         // Admitted, then labelled before the start's first write.
         ("held at the recheck", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), held("it is labelled hold")),
@@ -18784,6 +18793,7 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         let mut config = config(json!({"wip": 5, "pr": {"headOwners": ["cgwalters-forge"]}}));
         config.fix_plans = on;
         config.pr.poll.hold_dependencies = name == "dependency held";
+        config.pr.poll.stack_recovery = name.starts_with("stack ");
         config.follow = vec![UPSTREAM.into(), CONTROL.into()];
         config.pr.poll.owner_branches = name == "ownerBranches missing";
         config.pr.poll.own_space_only = name.starts_with("ownSpaceOnly");
@@ -18849,6 +18859,24 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         if name == "frozen midstream ledger" {
             control_pull["labels"]["nodes"] = json!([{"name": "hold"}]);
         }
+        if config.pr.poll.stack_recovery {
+            for (repo, number, p) in [(UPSTREAM, 429, &pull), (CONTROL, 70, &control_pull)] {
+                let (owner, repo_name) = repo.split_once('/').unwrap();
+                let mut p = p.clone();
+                p["baseRefName"] = "main".into();
+                p["baseRepository"]["defaultBranchRef"]["name"] = "main".into();
+                p["stackChange"] = if name == "stack target" && repo == UPSTREAM {
+                    stack_change.clone()
+                } else {
+                    json!({"nodes": [], "pageInfo": {"hasPreviousPage": false}})
+                };
+                forge.replay.requests.push(json!({
+                    "request": graphql_key(poll::STACK_PULL_QUERY,
+                        &json!({"owner": owner, "name": repo_name, "number": number})),
+                    "answer": {"data": {"repository": {"pullRequest": p}}}
+                }));
+            }
+        }
         forge
             .replay
             .requests
@@ -18898,6 +18926,28 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
                     if reads.get() > 1 {
                         data["repository"]["pullRequest"]["labels"]["nodes"] =
                             json!([{"name": "hold"}]);
+                    }
+                }
+            }));
+        }
+        if name.starts_with("stack ") && name.ends_with(" at charge") {
+            let reads = Cell::new(0);
+            let stack_change = stack_change.clone();
+            let target = name != "stack ledger at charge";
+            let label = name == "stack target held at charge";
+            forge.racing = Some(Box::new(move |query, data| {
+                if query != poll::STACK_PULL_QUERY {
+                    return;
+                }
+                let p = &mut data["repository"]["pullRequest"];
+                if p["isCrossRepository"] == target {
+                    reads.set(reads.get() + 1);
+                    if reads.get() > 2 {
+                        if label {
+                            p["labels"]["nodes"] = json!([{"name": "hold"}]);
+                        } else {
+                            p["stackChange"] = stack_change.clone();
+                        }
                     }
                 }
             }));
@@ -18972,6 +19022,7 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
                     &leased.pass,
                     &config.poll(None),
                     (CONTROL, 70, HEAD, "claude"),
+                    (UPSTREAM, 429),
                     leased.pass.replay.now
                 )
                 .unwrap()
@@ -19060,10 +19111,10 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         );
         if !expected.starts_with("start ") {
             assert!(forge.dispatches().is_empty(), "{name}");
-            if name == "dependency held" {
+            if name == "dependency held" || config.pr.poll.stack_recovery {
                 assert!(
                     forge.comments_on(CONTROL, 70).is_empty(),
-                    "charged a held dependency"
+                    "charged a held PR: {name}"
                 );
             }
             assert!(

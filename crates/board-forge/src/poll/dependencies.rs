@@ -366,6 +366,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         && review_hold(self.config, &current).is_none(),
                     "dependency PR changed or held before write"
                 );
+                // A retarget away from and back to the default branch can
+                // leave the same base name while changing what the head carries.
+                if (ready || update)
+                    && let Some(why) = self.stack_admission(pull, &current)
+                {
+                    bail!("dependency release held: {why}");
+                }
                 let id = previous.as_ref().map(|(id, _)| *id);
                 // Persist the update reservation before the mutation. Ready is
                 // recorded afterwards: a retry sees a ready PR and only records it.

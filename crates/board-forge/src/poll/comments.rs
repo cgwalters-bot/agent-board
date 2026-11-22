@@ -1686,6 +1686,26 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if nodes(&pull, "/labels").iter().any(|l| l["name"] == LABEL) {
             return Ok((true, format!("left to a person: labelled {LABEL}")));
         }
+        let marker = find_marker(read, &self.config.bot);
+        if self.config.policy.stack_recovery {
+            // Intake can run before the PR walk has seen the stack.
+            let (owner, name) = repo.split_once('/').context("repository")?;
+            let current = self.read_pull(owner, name, number)?;
+            if current["state"] != "OPEN"
+                || text(&current, "/author/login") != self.config.bot
+                || text(&current, "/headRefOid") != head
+                || current.pointer("/labels/pageInfo/hasNextPage") != Some(&Value::Bool(false))
+                || is_held(&current)
+                || labelled(&current)
+            {
+                return Ok((false, "waiting: pull request changed or held".into()));
+            }
+            // Settled, as a label is: the walk keeps the wait in the
+            // operator's list, and retry slots are for conditions that clear.
+            if let Some(why) = self.stack_hold(&current) {
+                return Ok((true, format!("left to a person: {why}")));
+            }
+        }
         // A fix round on the bot's own pull request, as only it gets here,
         // is its own to start anywhere ([`super::AUTHORED_STEPS`]).
         if !self.config.writes_in(repo) {
@@ -1714,7 +1734,6 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Some(why) = self.handover_shared_head(repo, number) {
             return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
         }
-        let marker = find_marker(read, &self.config.bot);
         // A stop whose label is gone was reset, as decide reads it.
         let carried = if marker.stopped {
             marker.reset()
@@ -2479,6 +2498,7 @@ pub(super) mod tests {
     #[derive(Default)]
     pub(in crate::poll) struct Fake {
         pub(in crate::poll) rest: RefCell<BTreeMap<String, Value>>,
+        pub(in crate::poll) stack_pull: Option<Value>,
         searched: RefCell<Vec<String>>,
         pub(in crate::poll) writes: RefCell<Vec<(String, Value)>>,
         /// The status a dispatch gets, where not a success.
@@ -2833,7 +2853,13 @@ pub(super) mod tests {
     }
 
     impl Transport for Fake {
-        fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            if query == STACK_PULL_QUERY
+                && variables["number"] == 2
+                && let Some(pull) = &self.stack_pull
+            {
+                return Ok(json!({"repository": {"pullRequest": pull}}));
+            }
             bail!("no GraphQL expected")
         }
     }

@@ -380,7 +380,17 @@ macro_rules! check_fields {
 }
 
 macro_rules! pull_query {
-    ($($age:literal),+) => { concat!(
+    // A deleted lower branch can produce an automatic retarget instead of a
+    // BaseRefChangedEvent.
+    (stack, $run_age:literal, $status_age:literal) => { pull_query!(
+        $run_age, $status_age,
+        r#"      stackChange: timelineItems(last: 100, itemTypes: [BASE_REF_CHANGED_EVENT, AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT]) {
+        nodes { __typename ... on BaseRefChangedEvent { id createdAt previousRefName } ... on AutomaticBaseChangeSucceededEvent { id createdAt oldBase } }
+        pageInfo { hasPreviousPage }
+      }
+"#
+    ) };
+    ($run_age:literal, $status_age:literal, $stack:literal) => { concat!(
     r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -398,10 +408,11 @@ macro_rules! pull_query {
       files(first: 100) { nodes { path changeType } pageInfo { hasNextPage } }
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { id createdAt reason beforeCommit { oid } } } }
       baseChange: timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
-      reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
+"#, $stack,
+    r#"      reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
       series: commits(first: 100) { nodes { commit { oid messageHeadline } } pageInfo { hasNextPage } }
       commits(last: 1) { nodes { commit { oid committedDate message statusCheckRollup { state contexts(first: 100) { "#,
-    check_fields!($($age),+),
+    check_fields!($run_age, $status_age),
     r#" } } } } }
     }
   }
@@ -409,8 +420,11 @@ macro_rules! pull_query {
 ) };
 }
 
-pub(crate) const PULL_QUERY: &str = pull_query!("", "");
-const TIMED_PULL_QUERY: &str = pull_query!("startedAt ", "createdAt ");
+// Keep the existing query variants stable for callers replaying recordings.
+pub(crate) const PULL_QUERY: &str = pull_query!("", "", "");
+const TIMED_PULL_QUERY: &str = pull_query!("startedAt ", "createdAt ", "");
+pub(crate) const STACK_PULL_QUERY: &str = pull_query!(stack, "", "");
+const TIMED_STACK_PULL_QUERY: &str = pull_query!(stack, "startedAt ", "createdAt ");
 
 /// What one list query says of a repository's open pull requests labelled
 /// [`LABEL`], so that those the pass would only skip take no reads of their
@@ -488,6 +502,7 @@ const LOWER_QUERY: &str = r#"query($owner: String!, $name: String!, $branch: Str
     }
   }
 }"#;
+
 /// Pull requests read from one branch; the bot opens one per branch.
 const LOWER_READS: u64 = 10;
 
@@ -619,6 +634,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "agentRecovery",
     "holdMissingData",
     "stopReasons",
+    "stackRecovery",
     "fixRounds",
 ];
 
@@ -683,6 +699,8 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// Leave current and former stacks to the operator.
+    pub stack_recovery: bool,
     /// Exact base repositories left to their own maintainer (lowercase).
     pub maintainers: BTreeSet<String>,
     /// CLI-only selection, never authority to bypass the followed envelope.
@@ -1194,6 +1212,8 @@ pub struct PrOptions {
     #[serde(default)]
     pub agent_recovery: bool,
     #[serde(default)]
+    pub stack_recovery: bool,
+    #[serde(default)]
     pub queue_only_repository: Option<String>,
     #[serde(default)]
     pub hold_missing_data: bool,
@@ -1405,6 +1425,7 @@ impl PrOptions {
             queue_only_repository,
             hold_missing_data,
             stop_reasons,
+            stack_recovery,
             hold_dependencies,
             supervisor_holds,
             action_first,
@@ -1436,6 +1457,7 @@ impl PrOptions {
         policy.hold_dependencies = hold_dependencies;
         policy.hold_missing_data = hold_missing_data;
         policy.stop_reasons = stop_reasons;
+        policy.stack_recovery = stack_recovery;
         policy.action_first = action_first;
         policy.red_checks = red_checks;
         policy.review_turn = review_turn;
@@ -1618,6 +1640,7 @@ impl PollPolicy {
             unstall: false,
             hold_missing_data: false,
             stop_reasons: false,
+            stack_recovery: false,
             fix_caller_workflow: None,
             direction_first: false,
             owner_branches: false,
@@ -2876,10 +2899,10 @@ fn head_verdict<'a>(pull: &'a Value, config: &Config, review_run: Option<&Value>
 /// the old base's workflow, which could wait out the retarget to approve. A
 /// change whose time cannot be read is taken to be newer than any review.
 fn reviewed_on_base(pull: &Value, config: &Config, review_run: Option<&Value>) -> bool {
-    let Some(change) = nodes(pull, "/baseChange/nodes").last() else {
+    let Some(changed) = base_changed(pull) else {
         return true;
     };
-    let Some(changed) = timestamp(change["createdAt"].as_str()) else {
+    let Some(changed) = changed else {
         return false;
     };
     let after = |at: Option<&str>| timestamp(at).is_some_and(|at| at > changed);
@@ -2888,6 +2911,34 @@ fn reviewed_on_base(pull: &Value, config: &Config, review_run: Option<&Value>) -
         after(r["submittedAt"].as_str())
             && (operator || after(review_run.and_then(|run| run["run_started_at"].as_str())))
     })
+}
+
+/// Whether a base is, or was, a stack branch: any `dispatch/` branch other
+/// than the default. This reads GitHub's refs, so it is deliberately wider
+/// than [`crate::stack::validate_branch`], which bounds workflow inputs.
+fn stack_base(branch: &str, default: &str) -> bool {
+    branch != default && branch.starts_with(crate::stack::STACK_BRANCH_PREFIX)
+}
+
+/// When the pull request's base last changed: `None` if it never did, and
+/// `Some(None)` if a change's time cannot be read. With stack recovery the
+/// pull request also carries GitHub's automatic retargets, which
+/// `baseChange` leaves out; every freshness gate reads them here.
+fn base_changed(pull: &Value) -> Option<Option<OffsetDateTime>> {
+    let changes: Vec<&Value> = nodes(pull, "/baseChange/nodes")
+        .last()
+        .into_iter()
+        .chain(nodes(pull, "/stackChange/nodes"))
+        .collect();
+    if changes.is_empty() {
+        return None;
+    }
+    changes
+        .iter()
+        .map(|c| timestamp(c["createdAt"].as_str()))
+        .collect::<Option<Vec<_>>>()
+        .map(|times| times.into_iter().max())
+        .or(Some(None))
 }
 
 /// The run of the review job a pass reads to decide `pull`: the one its marker
@@ -7444,9 +7495,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             text(r, "/commit/oid") == head
                 && cited_run(text(r, "/body")).is_some_and(|(at, cited)| at == repo && cited == id)
         });
-        let since_base = match nodes(pull, "/baseChange/nodes").last() {
+        let since_base = match base_changed(pull) {
             None => true,
-            Some(change) => timestamp(change["createdAt"].as_str())
+            Some(changed) => changed
                 .zip(timestamp(run["created_at"].as_str()))
                 .is_some_and(|(changed, created)| created > changed),
         };
@@ -7845,9 +7896,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         let before = self.writes;
         let (repo, pull) = (review.repo.as_str(), &review.pull);
-        if ordinary_reviews(self.config, repo) || self.config.policy.hold_dependencies {
+        let stack_guard =
+            self.config.policy.stack_recovery && text(pull, "/author/login") == self.config.bot;
+        if stack_guard
+            || ordinary_reviews(self.config, repo)
+            || self.config.policy.hold_dependencies
+        {
             let (owner, name) = repo.split_once('/').context("review repository")?;
             let current = self.read_pull(owner, name, review.number)?;
+            if let Some(why) = self.stack_admission(pull, &current) {
+                return Ok((Some(format!("not started: {why}")), false));
+            }
             if current["state"] != "OPEN"
                 || (current["isDraft"] != false && !drafts::eligible(self.config, repo, &current))
                 || current["headRefOid"] != pull["headRefOid"]
@@ -7860,7 +7919,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     false,
                 ));
             }
-            if let Some(why) = self.dependency_work_hold(repo, &current)? {
+            if (ordinary_reviews(self.config, repo) || self.config.policy.hold_dependencies)
+                && let Some(why) = self.dependency_work_hold(repo, &current)?
+            {
                 return Ok((Some(format!("not started: {why}")), false));
             }
         }
@@ -8849,6 +8910,128 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         Ok(())
     }
 
+    /// A retarget event cannot prove which commits the upper PR inherited
+    /// from the branch it left. The opt-in policy leaves a PR moved off a
+    /// stack branch, or whose history is incomplete, to the operator until
+    /// they review its head after the move. A push does not clear it: a fix
+    /// round started before the move can still push the inherited commits.
+    /// A current stack follows [`Self::stacked`] as without the option.
+    fn stack_hold(&self, pull: &Value) -> Option<String> {
+        if !self.config.policy.stack_recovery || text(pull, "/author/login") != self.config.bot {
+            return None;
+        }
+        let default = text(pull, "/baseRepository/defaultBranchRef/name");
+        let from_lower = nodes(pull, "/stackChange/nodes")
+            .iter()
+            .rev()
+            .find_map(|event| {
+                let from = match text(event, "/__typename") {
+                    "AutomaticBaseChangeSucceededEvent" => text(event, "/oldBase"),
+                    "BaseRefChangedEvent" => text(event, "/previousRefName"),
+                    _ => return None,
+                };
+                stack_base(from, default).then_some((from, event))
+            });
+        let (reason, moved) = if let Some((from, event)) = from_lower {
+            (
+                format!(
+                    "retargeted from stack branch {from}; verify the inherited work, then review the head"
+                ),
+                timestamp(event["createdAt"].as_str()),
+            )
+        } else if pull.pointer("/stackChange/pageInfo/hasPreviousPage") != Some(&Value::Bool(false))
+            || !pull["stackChange"]["nodes"].is_array()
+        {
+            (
+                "base retarget history is incomplete; verify whether this pull request inherited stack work, then review the head".into(),
+                base_changed(pull).flatten(),
+            )
+        } else {
+            return None;
+        };
+        // A time that cannot be read is newer than any review.
+        let reviewed = verdicts(pull, self.config).0.is_some_and(|(_, r)| {
+            moved
+                .zip(timestamp(r["submittedAt"].as_str()))
+                .is_some_and(|(moved, at)| at > moved)
+        });
+        if reviewed {
+            return None;
+        }
+        Some(
+            if !pull["autoMergeRequest"].is_null() || !pull["mergeQueueEntry"].is_null() {
+                format!("cancel the pending merge on GitHub first; {reason}")
+            } else {
+                reason
+            },
+        )
+    }
+
+    /// Recheck stack evidence on the same fresh read as other admission
+    /// checks. A trip away and back can leave the base name unchanged.
+    fn stack_admission(&self, decided: &Value, current: &Value) -> Option<String> {
+        self.stack_hold(current).or_else(|| {
+            (self.config.policy.stack_recovery
+                && text(decided, "/author/login") == self.config.bot
+                && (current["baseRefName"] != decided["baseRefName"]
+                    || current["stackChange"] != decided["stackChange"]))
+                .then(|| "base retarget history changed after the decision".into())
+        })
+    }
+
+    fn planned_stack_hold(&self, pull: &Value, head: &str) -> Option<String> {
+        if !self.config.policy.stack_recovery {
+            return None;
+        }
+        if text(pull, "/headRefOid") != head || text(pull, "/author/login") != self.config.bot {
+            return Some("planned fix PR head or author changed".into());
+        }
+        if is_held(pull)
+            || labelled(pull)
+            || pull.pointer("/labels/pageInfo/hasNextPage") != Some(&Value::Bool(false))
+        {
+            return Some("planned fix PR acquired a hold or its labels are unread".into());
+        }
+        self.stack_hold(pull)
+    }
+
+    fn planned_target_hold(
+        &mut self,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) -> Result<Option<String>> {
+        if !self.config.policy.stack_recovery {
+            return Ok(None);
+        }
+        let (owner, name) = repo
+            .split_once('/')
+            .context("planned fix target repository")?;
+        let pull = self.read_pull(owner, name, number)?;
+        if pull["state"] != "OPEN" {
+            return Ok(Some("planned fix PR is no longer open".into()));
+        }
+        Ok(self.planned_stack_hold(&pull, head))
+    }
+
+    /// Planned fixes and the poll share the same round ledger and holds.
+    fn planned_ledger_hold(
+        &mut self,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) -> Result<Option<String>> {
+        if !self.config.policy.stack_recovery && !self.config.policy.hold_dependencies {
+            return Ok(None);
+        }
+        let (owner, name) = repo.split_once('/').context("round ledger repository")?;
+        let pull = self.read_pull(owner, name, number)?;
+        if let Some(why) = self.planned_stack_hold(&pull, head) {
+            return Ok(Some(why));
+        }
+        self.dependency_work_hold(repo, &pull)
+    }
+
     /// For the bot's pull request stacked on another's `dispatch/` branch
     /// ([`crate::stack`]): once the pull request below it merged, the step that
     /// retargets it to the branch that one merged into, and that branch, so its
@@ -8860,8 +9043,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let base = text(pull, "/baseRefName");
         let default = text(pull, "/baseRepository/defaultBranchRef/name");
         if default.is_empty()
-            || base == default
-            || !base.starts_with(crate::stack::STACK_BRANCH_PREFIX)
+            || !stack_base(base, default)
             || labelled(pull)
             || !is_harness(pull, self.config)
         {
@@ -8932,12 +9114,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// app, nor an app as the bot.
     fn read_pull(&mut self, owner: &str, name: &str, number: u64) -> Result<Value> {
         self.spend()?;
+        let query = match (
+            self.config.policy.stack_recovery,
+            self.config.policy.red_checks.is_some(),
+        ) {
+            (false, false) => PULL_QUERY,
+            (false, true) => TIMED_PULL_QUERY,
+            (true, false) => STACK_PULL_QUERY,
+            (true, true) => TIMED_STACK_PULL_QUERY,
+        };
         let data = self.graphql.graphql(
-            if self.config.policy.red_checks.is_some() {
-                TIMED_PULL_QUERY
-            } else {
-                PULL_QUERY
-            },
+            query,
             json!({"owner": owner, "name": name, "number": number}),
         )?;
         let mut pull = data
@@ -9377,6 +9564,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if review_only {
             self.review_turn_candidate(repo, number, &pull)?;
         }
+        if pull["state"] == "OPEN"
+            && let Some(why) = self.stack_hold(&pull)
+        {
+            return Ok(self.person_skip(repo, number, merge_only, &pull, &why));
+        }
         if self.config.policy.pull.is_some()
             && (is_held(&pull) || labelled(&pull) || review_hold(self.config, &pull).is_some())
         {
@@ -9456,6 +9648,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 None,
                 None,
             ));
+        }
+        if let Some(why) = self.stack_hold(&pull) {
+            return Ok(self.person_skip(repo, number, merge_only, &pull, &why));
         }
         // A search hit can be stale. Check the ledger before the
         // ordinary decision path does anything (including draft/review work).
@@ -10125,6 +10320,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 if is_held(&p) {
                     return Ok(Some(format!("labelled {HOLD_LABEL}")));
                 }
+                if let Some(why) = self.stack_admission(&pull, &p) {
+                    return Ok(Some(why));
+                }
                 if revalidate_stop
                     && (p["state"] != "OPEN"
                         || p["headRefOid"] != head
@@ -10677,7 +10875,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             self.count_reviews(repo, outcome);
         }
         let mut required = BTreeMap::new();
-        let left = self.left_labelled(repo, &open);
+        // The labelled listing has no stack history or pending merge data.
+        let left = if policy.stack_recovery {
+            BTreeMap::new()
+        } else {
+            self.left_labelled(repo, &open)
+        };
         let on_hold: BTreeSet<u64> = open
             .iter()
             .filter(|p| p["labels"].as_array().is_some_and(|l| holds(l)))
@@ -10704,9 +10907,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 continue;
             }
             // Decided from its listing, it costs no share.
-            let quiet = (priority.is_none() && !merge_only && !left.contains_key(&number))
-                .then(|| self.quiet_replay(repo, number, listings.get(&number).copied()))
-                .flatten();
+            let quiet = (priority.is_none()
+                && !config.policy.stack_recovery
+                && !merge_only
+                && !left.contains_key(&number))
+            .then(|| self.quiet_replay(repo, number, listings.get(&number).copied()))
+            .flatten();
             if let Some((turn, floor)) = priority
                 && self.remaining.saturating_sub(floor) < PULL_SHARE_MARGIN
             {
@@ -11566,6 +11772,12 @@ pub(crate) fn planned_fix_control<R: Rest, G: Transport>(
     pass.followed = follow.iter().map(|r| r.to_ascii_lowercase()).collect();
     let (owner, name) = repo.split_once('/').ok_or("its repository has no owner")?;
     if let Some(why) = pass
+        .planned_target_hold(repo, number, text(pull, "/headRefOid"))
+        .map_err(|e| format!("stack admission could not be read: {e:#}"))?
+    {
+        return Err(why);
+    }
+    if let Some(why) = pass
         .dependency_work_hold(repo, pull)
         .map_err(|e| format!("dependency admission could not be read: {e:#}"))?
     {
@@ -11691,12 +11903,8 @@ pub(crate) fn planned_fix_hold<R: Rest, G: Transport>(
     now: OffsetDateTime,
 ) -> Result<Option<String>> {
     let mut pass = Pass::new(rest, graphql, config, now);
-    if config.policy.hold_dependencies {
-        let (owner, name) = repo.split_once('/').context("repository")?;
-        let pull = pass.read_pull(owner, name, number)?;
-        if let Some(why) = pass.dependency_work_hold(repo, &pull)? {
-            return Ok(Some(why));
-        }
+    if let Some(why) = pass.planned_ledger_hold(repo, number, head)? {
+        return Ok(Some(why));
     }
     let read = pass.paged(
         &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
@@ -11718,16 +11926,10 @@ pub(crate) fn charge_planned_fix<R: Rest, G: Transport>(
     graphql: &G,
     config: &Config,
     (repo, number, head, pool): (&str, u64, &str, &str),
+    target: (&str, u64),
     now: OffsetDateTime,
 ) -> Result<std::result::Result<PlannedCharge, String>> {
     let mut pass = Pass::new(rest, graphql, config, now);
-    if config.policy.hold_dependencies {
-        let (owner, name) = repo.split_once('/').context("repository")?;
-        let pull = pass.read_pull(owner, name, number)?;
-        if let Some(why) = pass.dependency_work_hold(repo, &pull)? {
-            return Ok(Err(why));
-        }
-    }
     let user = pass.get("user")?;
     if text(&user, "/login") != config.bot {
         return Ok(Err(format!(
@@ -11742,6 +11944,14 @@ pub(crate) fn charge_planned_fix<R: Rest, G: Transport>(
         Ok(carried) => carried,
         Err(why) => return Ok(Err(why)),
     };
+    if let Some(why) = pass.planned_ledger_hold(repo, number, head)? {
+        return Ok(Err(why));
+    }
+    // The round ledger can be a different PR. Reading it cannot prove
+    // that the actual dispatch target is still on its admitted base.
+    if let Some(why) = pass.planned_target_hold(target.0, target.1, head)? {
+        return Ok(Err(why));
+    }
     let round = carried.rounds + 1;
     let of = format!(
         "Planned fix round {round} of {} for `{}`",
@@ -15361,7 +15571,13 @@ mod tests {
                     json!({"repository": {"visibility": self.report_visibility.get(&repo), "mergeQueue": queue}}),
                 );
             }
-            assert!(matches!(query, PULL_QUERY | TIMED_PULL_QUERY));
+            assert!(
+                matches!(
+                    query,
+                    PULL_QUERY | TIMED_PULL_QUERY | STACK_PULL_QUERY | TIMED_STACK_PULL_QUERY
+                ),
+                "{query}"
+            );
             let number = variables["number"].as_u64().unwrap();
             let mut pull = self.pulls[&number].clone();
             if *self.labelled.borrow() {
@@ -15387,6 +15603,11 @@ mod tests {
                 for (key, value) in fields {
                     pull[key] = value.clone();
                 }
+            }
+            if matches!(query, PULL_QUERY | TIMED_PULL_QUERY) {
+                pull.as_object_mut().unwrap().remove("stackChange");
+            } else if pull.get("stackChange").is_none() {
+                pull["stackChange"] = json!({"nodes": [], "pageInfo": {"hasPreviousPage": false}});
             }
             Ok(json!({"repository": {"pullRequest": pull}}))
         }
@@ -19174,6 +19395,198 @@ mod tests {
     const DISPATCHES: &str = "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches";
 
     #[test]
+    fn stacked_pull_request_recovery() {
+        const LOWER: &str = "dispatch/469";
+        const AT: &str = "2026-10-12T00:55:00Z";
+        let retarget = |from: &str| json!({"__typename": "BaseRefChangedEvent", "createdAt": AT, "previousRefName": from});
+        // A current stack is `stacked_pull_requests_are_retargeted_and_never_queued`'s.
+        // Only the operator's review after the move clears the hold; a push
+        // after it may come from a round started before it.
+        for (case, base, reason) in [
+            ("manual retarget", "main", "retargeted from stack branch"),
+            // Any `dispatch/` ref, not only one a workflow input may name.
+            (
+                "retarget from a wider ref",
+                "main",
+                "retargeted from stack branch dispatch/469+old",
+            ),
+            (
+                "pushed after retarget",
+                "main",
+                "retargeted from stack branch",
+            ),
+            ("reviewed after retarget", "main", " -> merged"),
+            ("automatic retarget", "main", "retargeted from stack branch"),
+            (
+                "pending auto-merge",
+                "main",
+                "cancel the pending merge on GitHub",
+            ),
+            (
+                "pending queue entry",
+                "main",
+                "cancel the pending merge on GitHub",
+            ),
+            (
+                "retarget after ordinary stop",
+                "main",
+                "retargeted from stack branch",
+            ),
+            ("ordinary retargets", "main", " -> merged"),
+            (
+                "unread retarget history",
+                "main",
+                "base retarget history is incomplete",
+            ),
+            (
+                "retarget during admission",
+                "main",
+                "not taken: retargeted from stack branch",
+            ),
+        ] {
+            let mut fake = github();
+            let moved = case == "retarget during admission";
+            if moved {
+                fake.late_pull_fields = Some(json!({"stackChange": {
+                    "nodes": [retarget("main"), retarget(LOWER)],
+                    "pageInfo": {"hasPreviousPage": false}
+                }}));
+            }
+            let changes = match case {
+                "automatic retarget"
+                | "pending auto-merge"
+                | "pending queue entry"
+                | "retarget after ordinary stop" => vec![
+                    json!({"__typename": "AutomaticBaseChangeSucceededEvent", "createdAt": AT, "oldBase": LOWER}),
+                ],
+                "ordinary retargets" | "unread retarget history" => {
+                    ["topic", "release", "other", "stable"]
+                        .map(retarget)
+                        .to_vec()
+                }
+                "manual retarget" | "pushed after retarget" | "reviewed after retarget" => {
+                    vec![retarget(LOWER)]
+                }
+                "retarget from a wider ref" => vec![retarget("dispatch/469+old")],
+                _ => vec![],
+            };
+            let mut change = json!({"baseRefName": base,
+                "stackChange": {"nodes": changes, "pageInfo": {"hasPreviousPage": case == "unread retarget history"}}});
+            let action_first = case == "pending auto-merge";
+            if action_first {
+                change["autoMergeRequest"] = json!({"enabledAt": AT});
+                change["mergeStateStatus"] = BEHIND.into();
+                fake.page(
+                    &action_first::approved_path(&config()),
+                    None,
+                    None,
+                    json!({"incomplete_results": false, "total_count": 1, "items": [
+                        {"repository_url": format!("{API_ROOT}repos/{REPO}"), "number": 470,
+                            "user": {"login": BOT}, "pull_request": {}}
+                    ]}),
+                );
+            }
+            if case == "pending queue entry" {
+                change["mergeQueueEntry"] = json!({"id": "entry"});
+            }
+            let mut marker = json!({});
+            if case == "retarget after ordinary stop" {
+                change["labels"] =
+                    json!({"nodes": [{"name": LABEL}], "pageInfo": {"hasNextPage": false}});
+                change["mergeable"] = CONFLICTING.into();
+                marker = json!({"rounds": 1, "stopped": true, "sha": HEAD, "at": "2026-10-11T00:00:00Z"});
+            }
+            if case == "pushed after retarget" {
+                let mut commits = fixture("pull-470")["commits"].clone();
+                commits["nodes"][0]["commit"]["committedDate"] = "2026-10-12T01:00:00Z".into();
+                change["commits"] = commits;
+            }
+            if matches!(case, "ordinary retargets" | "reviewed after retarget") || action_first {
+                let mut approval = review("APPROVED", user("cgwalters"), HEAD, "");
+                // Before the move, so it cannot clear the hold.
+                approval["submittedAt"] = if action_first {
+                    "2026-10-12T00:50:00Z"
+                } else {
+                    "2026-10-12T01:30:00Z"
+                }
+                .into();
+                change["reviews"] =
+                    json!({"nodes": [approval], "pageInfo": {"hasPreviousPage": false}});
+            }
+            let (outcome, fake, dispatcher) = applied_policy(
+                fake,
+                PollPolicy::from_json(&json!({"stackRecovery": true, "rebaseRounds": 2,
+                    "actionFirst": action_first,
+                    "staleDays": 1,
+                    "operatorAnswers": case == "retarget after ordinary stop"}))
+                .unwrap(),
+                change,
+                marker,
+            );
+            assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            let line = outcome
+                .lines
+                .iter()
+                .find(|line| line.contains("#470"))
+                .unwrap();
+            assert!(line.contains(reason), "{case}: {line}");
+            assert!(fake.lower_reads.borrow().is_empty(), "{case}");
+            if reason == " -> merged" {
+                assert!(!line.contains("stack"), "{case}: {line}");
+            } else {
+                assert!(dispatcher.writes.borrow().is_empty(), "{case}: {line}");
+                assert!(fake.writes.borrow().is_empty(), "{case}");
+                if !moved {
+                    assert!(
+                        outcome.waits.iter().any(|wait| wait.number == 470
+                            && wait.kind == "needs-human"
+                            && wait.reason.contains(reason)),
+                        "{case}: {:?}",
+                        outcome.lines
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stacked_pull_request_deferred_review_rechecks_retarget_history() {
+        for action in [REVIEW, REVIEW_RERUN] {
+            for apply in [false, true] {
+                let mut fake = github();
+                fake.late_pull_fields = Some(json!({"stackChange": {"nodes": [
+                    {"__typename": "BaseRefChangedEvent", "previousRefName": "main", "createdAt": "2026-10-12T00:55:00Z"},
+                    {"__typename": "BaseRefChangedEvent", "previousRefName": "dispatch/469", "createdAt": "2026-10-12T00:56:00Z"}
+                ], "pageInfo": {"hasPreviousPage": false}}}));
+                let mut cfg = config();
+                cfg.policy.stack_recovery = true;
+                let dispatcher = Fake::default();
+                let mut pass = Pass::new(&fake, &fake, &cfg, now());
+                pass.apply = if apply { applying(&dispatcher) } else { None };
+                let (owner, name) = REPO.split_once('/').unwrap();
+                let pull = pass.read_pull(owner, name, 470).unwrap();
+                let review = Deferred {
+                    rank: 0,
+                    repo: REPO.into(),
+                    number: 470,
+                    pull,
+                    marker: Marker::default(),
+                    comments: vec![],
+                    action,
+                    run: Some((7, None)),
+                    line: String::new(),
+                    at: (0, None),
+                };
+                let (done, ran) = pass.take_review(&review).unwrap();
+                assert!(!ran, "{action}, apply={apply}: {done:?}");
+                assert!(done.unwrap().contains("retargeted from stack branch"));
+                assert!(fake.writes.borrow().is_empty());
+                assert!(dispatcher.writes.borrow().is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn stacked_pull_requests_are_retargeted_and_never_queued() {
         let comment = format!("POST repos/{REPO}/issues/470/comments");
         let labelled = vec![
@@ -19218,7 +19631,11 @@ mod tests {
             ("someone else's merged", vec![lower("someone", "MERGED", "main")], broken.clone(), labelled.clone(), None),
             ("the fork's branch of that name merged", vec![forked], broken, labelled, None),
         ];
-        for (name, pulls, line, writes, onto) in cases {
+        // Stack recovery leaves a current stack to this path unchanged.
+        for ((name, pulls, line, writes, onto), recovery) in cases
+            .into_iter()
+            .flat_map(|case| [(case.clone(), false), (case, true)])
+        {
             let mut fake = github();
             fake.pulls.insert(
                 470,
@@ -19236,14 +19653,26 @@ mod tests {
                 format!("{API_ROOT}repos/{REPO}/labels"),
                 vec![(422, json!({}))],
             );
-            let outcome = applied(&fake, &Fake::default());
+            let mut cfg = config();
+            cfg.policy.stack_recovery = recovery;
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.to_owned()],
+                applying(&Fake::default()),
+                now(),
+            )
+            .unwrap();
             let got = outcome.lines.last().unwrap();
-            assert!(got.ends_with(&line), "{name}: {got}");
-            assert_eq!(written(&fake.writes), writes, "{name}");
+            assert!(got.ends_with(&line), "{name} {recovery}: {got}");
+            assert_eq!(written(&fake.writes), writes, "{name} {recovery}");
             assert_eq!(
                 *fake.lower_reads.borrow(),
                 [json!("dispatch/469")],
-                "{name}"
+                "{name} {recovery}"
             );
             let bases: Vec<Value> = (fake.writes.borrow().iter())
                 .filter(|(w, _)| w.contains("/pulls/470"))
@@ -19304,34 +19733,48 @@ mod tests {
                 stale,
             ),
         ] {
-            let mut fake = github();
-            let change = match reviews {
-                Some(mut reviews) => {
-                    reviews["nodes"][0]["submittedAt"] = "2026-10-12T01:30:00Z".into();
-                    json!({"reviews": reviews})
+            // GitHub may record a retarget only as an automatic base change,
+            // which stack recovery reads; it counts as any other change.
+            for automatic in [false, true] {
+                if automatic && changed.is_none() {
+                    continue;
                 }
-                None => json!({}),
-            };
-            let mut p = pull("pull-470", change);
-            p["baseRepository"]["defaultBranchRef"] = default;
-            if let Some(at) = changed {
-                p["baseChange"] = json!({"nodes": [{"createdAt": at}]});
+                let mut fake = github();
+                let change = match reviews.clone() {
+                    Some(mut reviews) => {
+                        reviews["nodes"][0]["submittedAt"] = "2026-10-12T01:30:00Z".into();
+                        json!({"reviews": reviews})
+                    }
+                    None => json!({}),
+                };
+                let mut p = pull("pull-470", change);
+                p["baseRepository"]["defaultBranchRef"] = default.clone();
+                if let Some(at) = changed {
+                    if automatic {
+                        p["stackChange"] = json!({"nodes": [{"__typename": "AutomaticBaseChangeSucceededEvent",
+                            "createdAt": at, "oldBase": "topic"}], "pageInfo": {"hasPreviousPage": false}});
+                    } else {
+                        p["baseChange"] = json!({"nodes": [{"createdAt": at}]});
+                    }
+                }
+                fake.pulls.insert(470, p);
+                let mut cfg = config();
+                cfg.policy.stack_recovery = automatic;
+                let outcome = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &[REPO.into()],
+                    None,
+                    now(),
+                )
+                .unwrap();
+                let got = outcome.lines.last().unwrap();
+                assert!(got.ends_with(line), "{automatic}: {got}");
+                assert!(fake.lower_reads.borrow().is_empty());
             }
-            fake.pulls.insert(470, p);
-            let outcome = run(
-                &fake,
-                &fake,
-                &config(),
-                State::default(),
-                &[],
-                &[REPO.into()],
-                None,
-                now(),
-            )
-            .unwrap();
-            let got = outcome.lines.last().unwrap();
-            assert!(got.ends_with(line), "{got}");
-            assert!(fake.lower_reads.borrow().is_empty());
         }
         // Retargeted onto main, which moved on with the merge below it: with
         // `reruns`, the head is rebased onto main, and its push asks the
@@ -26132,6 +26575,14 @@ mod tests {
                 ("closed", json!({"state":"CLOSED"})),
                 ("new head", json!({"headRefOid":"newer"})),
                 (
+                    "retargeted",
+                    json!({"stackChange": {
+                        "nodes": [{"__typename":"BaseRefChangedEvent",
+                            "previousRefName":"dispatch/lower", "createdAt":"2026-10-12T00:55:00Z"}],
+                        "pageInfo": {"hasPreviousPage":false}
+                    }}),
+                ),
+                (
                     "unread checks",
                     json!({"commits":pull("pull-470", json!({
                     "contexts":{"ci":overdue},"truncated":{"checks":true}
@@ -26142,6 +26593,7 @@ mod tests {
                 let dispatcher = Fake::default();
                 let mut cfg = config();
                 cfg.policy.red_checks = Some(RedChecks::default());
+                cfg.policy.stack_recovery = true;
                 fake.pulls.insert(470, initial.clone());
                 fake.late_pull_fields = Some(late);
                 let comments = if action == "fix" {
@@ -26166,6 +26618,12 @@ mod tests {
                     .unwrap();
                 let step = step.unwrap();
                 assert_eq!(step.action, action, "{case}: {line}");
+                if case == "retargeted" {
+                    assert!(
+                        line.contains("not taken: retargeted from stack branch"),
+                        "{line}"
+                    );
+                }
                 assert_eq!(step.ran, case == "unchanged", "{action} {case}: {line}");
                 assert_eq!(
                     fake.writes.borrow().is_empty(),

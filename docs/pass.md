@@ -6390,6 +6390,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.quietWaits` | Decide a bot pull request unchanged in its listing (head, `updated_at`) since a whole read that left it waiting on the operator alone (a promotion or withheld-approval wait) from that listing, without reading it again, for at most four hours; GitHub only; see [quiet pull request waits](#quiet-pull-request-waits-github); `true` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |
+| `pr.stackRecovery` | Leave a [former stack](poll.md#stacked-pull-requests) to the operator until they review its head after the move, instead of guessing what it inherited; `false` |
 | `pr.directionFirst` | Run the intake's search (a standalone poll's `operatorComments` and `notifications`) before the followed repositories' reads, so that they cannot spend stage 2's share first, at the walk's expense, see [the intake](#github-operator-direction-intake); `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |

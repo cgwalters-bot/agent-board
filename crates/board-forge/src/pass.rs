@@ -8097,7 +8097,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.caps.count_many(Kind::Write, CHARGE_WRITES);
         let at = (control.repository.as_str(), control.number, head, pool);
         let poll = self.config.poll(None);
-        match poll::charge_planned_fix(&self.client, &self.client, &poll, at, self.now) {
+        match poll::charge_planned_fix(
+            &self.client,
+            &self.client,
+            &poll,
+            at,
+            (&dest.repository, dest.number),
+            self.now,
+        ) {
             Ok(Ok(charge)) => Ok(charge),
             Ok(Err(why)) => Err(Step::Hold(Hold::new(
                 HoldKind::NeedsOperator,

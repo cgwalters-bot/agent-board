@@ -335,9 +335,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             cited_run(text(review, "/body")).context("unverified review provenance")?;
         ensure!(base == repo, "foreign review provenance");
         let run = self.get(&format!("repos/{repo}/actions/runs/{id}"))?;
-        if let Some(change) = nodes(pull, "/baseChange/nodes").last() {
+        if let Some(changed) = base_changed(pull) {
             ensure!(
-                timestamp(change["createdAt"].as_str())
+                changed
                     .zip(timestamp(run["run_started_at"].as_str()))
                     .is_some_and(|(changed, started)| started > changed),
                 "base changed since review"
@@ -546,6 +546,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 text(&raw, "/head/sha"),
                 "description or base changed; pending fresh review",
             );
+        }
+        if self.config.policy.stack_recovery {
+            let (owner, name) = repo.split_once('/').context("draft repository")?;
+            let current = self.read_pull(owner, name, number)?;
+            if let Some(why) = self.stack_admission(pull, &current) {
+                return Ok(self.person_skip(repo, number, false, &current, &why));
+            }
         }
         if !is_held(pull) {
             self.reconcile_bucket(repo, number, &raw, &assessment)?;

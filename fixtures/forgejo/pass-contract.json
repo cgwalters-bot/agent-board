@@ -286,6 +286,7 @@
     "changeSweepHours": {"verdict": "refused", "reason": "the changes diff reads GitHub repositories, and narrows PR follow-up (stage 2)"},
     "pr.reviewWorkflow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.checkReruns": {"verdict": "refused", "reason": "PR check retries (stage 2) require GitHub checks and Actions runs"},
+    "pr.stackRecovery": {"verdict": "refused", "reason": "PR stack recovery (stage 2) reads GitHub pull request timelines"},
     "pr.ownerBranches": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.unstall": {"verdict": "refused", "reason": "PR follow-up (stage 2) reruns GitHub Actions review runs"},
     "pr.directionFirst": {"verdict": "refused", "reason": "PR follow-up (stage 2) orders GitHub's operator-direction search"},

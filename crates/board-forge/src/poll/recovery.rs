@@ -276,6 +276,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let head = text(pull, "/headRefOid");
         let (owner, name) = repo.split_once('/').context("triage repository")?;
         let current = self.read_pull(owner, name, number)?;
+        if let Some(why) = self.stack_admission(pull, &current) {
+            return Ok(format!("not started: {why}"));
+        }
         if current["state"] != "OPEN"
             || current["headRefOid"] != pull["headRefOid"]
             || !truncated(&current).is_empty()
