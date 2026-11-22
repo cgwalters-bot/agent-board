@@ -108,7 +108,8 @@ write it would make as `would: ...`. Outside those changed steps the lines
 are the ones train.cjs printed, so the two can be diffed on the same state. `--apply` makes the writes with
 `GH_TOKEN`, which must be the bot's: it opens the PRs from the bot's forks,
 comments on and labels the tracking issue, and dispatches the release workflow.
-A pass makes at most 200 GitHub API requests. The optional image stage and its
+A pass makes at most `requestLimit` GitHub API requests, 200 unless configured
+(at most 2000). The optional image stage and its
 wrapper consumer each invoke at most two external commands (no retry), each
 limited by GNU `timeout` to 60 seconds plus 5 seconds to kill. They require
 `timeout`, `skopeo` and a `gh` supporting attestation verification on the caller's
@@ -117,8 +118,13 @@ train. Run one pass at a time, for example in a
 workflow `concurrency` group without `cancel-in-progress`: passes that overlap
 race on the same step, though only one of them dispatches a release.
 
-Discovery shares that fixed 200-request budget, including pagination and cache
-revalidation. Full inventory pages always require the next page. Organization
+Discovery shares that budget, including pagination and cache revalidation, and
+prints `discovery used N of LIMIT requests` once it completes. A pass that runs
+out during discovery fails naming the repository it had reached, or the
+inventory or bot forks; raise `requestLimit` past what that implies. The next
+pass discovers from the start again: completing coverage in one pass is what
+lets it decide callers or done, and the cache saves response bytes, not
+requests. Full inventory pages always require the next page. Organization
 inventories must match the owner's independently reported `public_repos` plus
 `owned_private_repos` counts, including archives and forks before filtering.
 Missing private-count visibility or a count mismatch refuses completion rather
@@ -150,7 +156,7 @@ identical reference in a `run` string is left untouched.
 ## Configuration
 
 The file comes from the caller's protected default branch; every key is
-required except `secureHost` and `callers`, and unknown keys are refused. `callers`
+required except `secureHost`, `callers` and `requestLimit`, and unknown keys are refused. `callers`
 may be omitted or empty. An example with an additive test fixture exception:
 
 ```json
@@ -170,8 +176,10 @@ may be omitted or empty. An example with an additive test fixture exception:
 
 The shape is train.cjs's `config.json` with `bot` (formerly read from the
 poll's `agent-board.json`) added and `pageSize`, `maxRequests` and
-`requestTimeoutSeconds` removed: inventory listings paginate in pages of 100, the request
-bound is fixed, and every request has the client's 30-second timeout.
+`requestTimeoutSeconds` removed: inventory listings paginate in pages of 100
+and every request has the client's 30-second timeout. `requestLimit`, a count
+from 1 to 2000, replaces `maxRequests`; the cap keeps a mistyped limit from
+spending the token's hourly allowance.
 
 ### Caller settings
 

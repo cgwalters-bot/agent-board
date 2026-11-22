@@ -857,6 +857,16 @@ fn config_refuses_what_it_cannot_use() {
     let mut omitted = valid();
     omitted.as_object_mut().unwrap().remove("callers");
     assert!(Config::from_json(&omitted).unwrap().callers.is_empty());
+    assert_eq!(
+        Config::from_json(&omitted).unwrap().request_limit,
+        REQUEST_LIMIT
+    );
+    let mut raised = valid();
+    raised["requestLimit"] = json!(MAX_REQUEST_LIMIT);
+    assert_eq!(
+        Config::from_json(&raised).unwrap().request_limit,
+        MAX_REQUEST_LIMIT
+    );
     // A pointer into the configuration, its value, then the error.
     for (pointer, value, expected) in [
         (
@@ -877,6 +887,15 @@ fn config_refuses_what_it_cannot_use() {
         ("/labels/stalled", json!(""), "labels needs stalled"),
         ("/labels/extra", json!("x"), "unknown labels key extra"),
         ("/intervalHours", json!(-1), "intervalHours"),
+        ("/requestLimit", json!(0), "requestLimit must be"),
+        (
+            "/requestLimit",
+            json!(MAX_REQUEST_LIMIT + 1),
+            "requestLimit must be",
+        ),
+        ("/requestLimit", json!(u64::MAX), "requestLimit must be"),
+        ("/requestLimit", json!("400"), "requestLimit must be"),
+        ("/requestLimit", Value::Null, "requestLimit must be"),
     ] {
         let mut config = valid();
         let (parent, key) = pointer.rsplit_once('/').unwrap();
@@ -1426,12 +1445,13 @@ fn inventories_paginate_and_never_accept_partial_coverage() {
         read_bytes: 0,
         callers: vec![],
         followed: None,
+        discovering: None,
     };
     assert!(
         pass.inventory("/orgs/example/repos?type=all")
             .unwrap_err()
             .to_string()
-            .contains("budget exhausted")
+            .contains(&format!("request budget of {REQUEST_LIMIT} exhausted"))
     );
     assert_eq!(api.0.get(), 1);
 }
@@ -1531,6 +1551,54 @@ fn partial_visibility_is_not_complete_coverage() {
         f["responses"]["/orgs/cgwalters-forge"] = metadata;
         let error = replay(&f, true).unwrap_err();
         assert!(error.contains("complete repository"), "{error}");
+    }
+}
+
+/// tracker#1861's run: more repositories than the default limit discovers.
+#[test]
+fn request_limit_bounds_discovery_and_names_where_it_stopped() {
+    const EXTRA: usize = 93;
+    let mut f = discovery_fixture(false);
+    let r = &mut f["responses"];
+    for i in 0..EXTRA {
+        let repo = format!("cgwalters-forge/extra-{i:02}");
+        r[OWNER_REPOS]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"full_name": repo,
+            "archived": false, "fork": false, "default_branch": "main"}));
+        r[format!("/repos/{repo}/commits/main")] = json!({"sha": CALLER_HEAD});
+        r[format!("/repos/{repo}/git/trees/{CALLER_HEAD}?recursive=1")] =
+            json!({"truncated": false, "tree": []});
+    }
+    r["/orgs/cgwalters-forge"]["public_repos"] = json!(6 + EXTRA);
+    for (limit, expected) in [
+        (
+            None,
+            Err("request budget of 200 exhausted during discovery at cgwalters-forge/extra-"),
+        ),
+        (Some(MAX_REQUEST_LIMIT), Ok("v0.6.4: callers\n")),
+    ] {
+        if let Some(limit) = limit {
+            f["config"]["requestLimit"] = json!(limit);
+        }
+        match (replay(&f, false), expected) {
+            (Err(error), Err(expected)) => {
+                assert!(error.contains(expected), "{error}");
+                assert!(error.ends_with("; raise requestLimit"), "{error}");
+            }
+            (Ok(out), Ok(expected)) => {
+                assert!(out.contains(expected), "{out}");
+                let used = out
+                    .lines()
+                    .find_map(|l| l.strip_prefix("discovery used "))
+                    .and_then(|l| l.strip_suffix(&format!(" of {MAX_REQUEST_LIMIT} requests")))
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .unwrap_or_else(|| panic!("no discovery count\n{out}"));
+                assert!(used > REQUEST_LIMIT, "{used}");
+            }
+            (result, _) => panic!("{limit:?}: {result:?}"),
+        }
     }
 }
 
