@@ -699,21 +699,42 @@ setting does not cancel existing runs or disable the pass's separate
 
 `maintainerReport` is absent by default: no report reads or writes. Set it to
 `{"repository": "OWNER/REPO", "issue": 1356}` in the trusted caller's
-`agent-board.json` to publish a machine-readable readout after each poll pass.
-The issue must be an issue, not a pull request, in a **private** repository:
-the followed set and reasons may disclose private repository activity, as the
-holds snapshot does. The setting does not change any pull request decision.
+`agent-board.json` to publish a machine-readable readout after each standalone
+`poll` pass. The hosted `pass` builds its poll policy from defaults and its `pr`
+keys, which have no `maintainerReport`.
+The target must be an issue, not a pull request. By default it must be private
+and gets the decision report described below, with any follow set. Set
+`"publicQueues": true` inside `maintainerReport` to publish a smaller snapshot
+to a **public** destination instead. The fence and `schema` are both
+`agent-board/public-merge-queues/v1`, and the only other fields are
+`generated_at` and `merge_queues`. The queue map uses the entry format below
+but covers the entire resolved follow set, even repositories the poll didn't
+decide this pass. The public snapshot includes no poll decisions, wait reasons,
+queue events, coverage or error counts. These can reflect private activity
+even when the affected pull requests are public.
+
+For public publication, each queue read must also confirm the repository is
+public. A non-public, unreadable or incomplete source refuses the entire
+publication with a poll error without changing any pull request decision.
+Watch-only repositories aren't sources. The configured mode determines the
+payload and never falls back to the full report. The poll checks destination
+visibility just before publication. This cannot prevent a visibility change
+between the final check and the write, nor remove an older comment. Never make
+a repository containing a private report public; editing a comment does not
+erase its history. Use a fresh public issue in a repository that does not
+contain private reports.
 
 The bot finds its comment by the leading marker
-`<!-- agent-board-maintainer-report -->`, creates it if absent, and otherwise
+`<!-- agent-board-maintainer-report -->` (private report) or
+`<!-- agent-board-public-merge-queues -->` (public queues), creates it if absent, and otherwise
 edits it only when the full body changes. It ignores another author's marker.
 Like the holds publisher this is an edited snapshot, not an event log; callers
 should serialize passes targeting the same issue to avoid racing creation.
 The generated time is part of the content, so a later pass normally updates it.
-Publication runs last within the poll's 500-request budget and, under `pass`,
-counts as one write under `--max-writes`. A refused read or write is reported
-as a poll error, not a reason to undo or reconsider PR steps. A body over
-60,000 bytes is refused rather than silently publishing a partial inventory.
+Publication runs last within the poll's 500-request budget. A refused read or
+write is reported as a poll error, not a reason to undo or reconsider PR steps.
+A body over 60,000 bytes is refused rather than silently publishing a partial
+inventory.
 
 In `--dry-run` the fenced block is printed verbatim to stdout, without the
 usual `[dry-run]` line prefix; no report destination is read or written. The

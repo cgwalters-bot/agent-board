@@ -3,7 +3,9 @@ use super::*;
 use serde::Serialize;
 
 pub const SCHEMA: &str = "agent-board/maintainer-report/v1";
+const PUBLIC_SCHEMA: &str = "agent-board/public-merge-queues/v1";
 pub const MARKER: &str = "<!-- agent-board-maintainer-report -->";
+const PUBLIC_MARKER: &str = "<!-- agent-board-public-merge-queues -->";
 // GitHub rejects oversized comments. Refuse rather than publish a partial inventory.
 const MAX_COMMENT_BYTES: usize = 60_000;
 
@@ -12,6 +14,7 @@ const MAX_COMMENT_BYTES: usize = 60_000;
 /// step (tracker#1356).
 pub(super) const QUEUE_QUERY: &str = r#"query($owner: String!, $name: String!, $entries: Int!) {
   repository(owner: $owner, name: $name) {
+    visibility
     mergeQueue { entries(first: $entries) {
       nodes { position state headCommit { oid } pullRequest { number } }
       pageInfo { hasNextPage }
@@ -21,20 +24,24 @@ pub(super) const QUEUE_QUERY: &str = r#"query($owner: String!, $name: String!, $
 /// Queue entries read per repository; a longer queue is reported unread
 /// rather than partial.
 const QUEUE_ENTRIES: u64 = 100;
-/// Requests queue reads leave for publishing: the destination repository,
-/// the issue, a page of its comments and the write.
-const PUBLISH_REQUESTS: usize = 4;
+/// The issue, its first page of comments, and fresh destination visibility.
+const PUBLISH_READS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct Destination {
     pub repository: String,
     pub issue: u64,
+    pub public_queues: bool,
 }
 
 impl Destination {
     pub(super) fn from_json(value: Option<&Value>) -> Result<Option<Self>> {
         let Some(value) = value else { return Ok(None) };
-        check_keys(&[&["repository", "issue"]], value, "maintainerReport")?;
+        check_keys(
+            &[&["repository", "issue", "publicQueues"]],
+            value,
+            "maintainerReport",
+        )?;
         let repository = value["repository"]
             .as_str()
             .context("maintainerReport.repository is not a string")?;
@@ -43,10 +50,25 @@ impl Destination {
             .as_u64()
             .filter(|n| *n > 0)
             .context("maintainerReport.issue is not a positive integer")?;
+        let public_queues = match value.get("publicQueues") {
+            None => false,
+            Some(setting) => setting
+                .as_bool()
+                .context("maintainerReport.publicQueues is not a boolean")?,
+        };
         Ok(Some(Self {
             repository: repository.into(),
             issue,
+            public_queues,
         }))
+    }
+
+    fn marker(&self) -> &'static str {
+        if self.public_queues {
+            PUBLIC_MARKER
+        } else {
+            MARKER
+        }
     }
 }
 
@@ -131,10 +153,14 @@ fn render(
     if !supervisor.is_empty() {
         snapshot["needs_supervisor"] = json!(supervisor);
     }
+    fenced(MARKER, SCHEMA, &snapshot)
+}
+
+fn fenced(marker: &str, schema: &str, snapshot: &Value) -> Result<String> {
     // Escape backticks in JSON strings so repository-controlled reasons cannot
     // close the protocol fence. JSON readers recover the original text.
-    let json = serde_json::to_string_pretty(&snapshot)?.replace('`', "\\u0060");
-    let body = format!("{MARKER}\n\n```{SCHEMA}\n{json}\n```\n");
+    let json = serde_json::to_string_pretty(snapshot)?.replace('`', "\\u0060");
+    let body = format!("{marker}\n\n```{schema}\n{json}\n```\n");
     ensure!(
         body.len() <= MAX_COMMENT_BYTES,
         "maintainer report exceeds {MAX_COMMENT_BYTES} bytes; not publishing a partial report"
@@ -147,6 +173,24 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let Some(at) = &self.config.policy.maintainer_report else {
             return;
         };
+        if let Err(error) = self.report(at, follow, outcome) {
+            outcome.error("maintainer report", &error);
+        }
+    }
+
+    fn report(
+        &mut self,
+        at: &Destination,
+        follow: &BTreeSet<&String>,
+        outcome: &mut Outcome,
+    ) -> Result<()> {
+        if self.apply.is_some() && at.public_queues {
+            // Do not pass Outcome or any of the poll's cached observations to
+            // the public renderer. Even action names, coverage and counts can
+            // expose facts about private repositories outside the follow set.
+            let body = self.public_report(follow)?;
+            return self.publish_report(at, &body, &mut outcome.lines);
+        }
         // Deferred review starts now have their final outcome; labelled skips
         // also use the poll's existing state rather than reclassifying anything.
         for step in &outcome.steps {
@@ -167,39 +211,61 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             if outcome.undecided.contains(&repo.to_ascii_lowercase()) {
                 continue;
             }
-            let entries = self.merge_queue(repo).unwrap_or_else(|error| {
+            let entries = self.merge_queue(repo, false).unwrap_or_else(|error| {
                 outcome.error(&format!("maintainer report: {repo} merge queue"), &error);
                 Value::Null
             });
             queues.insert(*repo, entries);
         }
-        let result = (|| -> Result<()> {
-            let body = render(
-                self.now,
-                self.apply.is_some(),
-                follow,
-                &self.report_pulls,
-                &queues,
-                outcome,
-            )?;
-            if self.apply.is_none() {
-                outcome.maintainer_report = Some(body);
-                return Ok(());
-            }
-            self.publish_report(at, &body, &mut outcome.lines)
-        })();
-        if let Err(error) = result {
-            outcome.error("maintainer report", &error);
+        let body = render(
+            self.now,
+            self.apply.is_some(),
+            follow,
+            &self.report_pulls,
+            &queues,
+            outcome,
+        )?;
+        if self.apply.is_none() {
+            outcome.maintainer_report = Some(body);
+            return Ok(());
         }
+        self.publish_report(at, &body, &mut outcome.lines)
+    }
+
+    fn public_report(&mut self, follow: &BTreeSet<&String>) -> Result<String> {
+        let mut queues = BTreeMap::new();
+        for repo in follow {
+            let queue = self
+                .merge_queue(repo, true)
+                .with_context(|| format!("{repo} public merge queue"))?;
+            queues.insert(*repo, queue);
+        }
+        fenced(
+            PUBLIC_MARKER,
+            PUBLIC_SCHEMA,
+            &json!({
+                "schema": PUBLIC_SCHEMA,
+                "generated_at": self.now.format(&Rfc3339)?,
+                "merge_queues": queues,
+            }),
+        )
     }
 
     /// `repo`'s default-branch queue entries in order, empty where it has no
     /// merge queue. A longer queue than is read, or a budget down to what
     /// publishing needs, is an error.
-    fn merge_queue(&mut self, repo: &str) -> Result<Value> {
+    fn merge_queue(&mut self, repo: &str, public_only: bool) -> Result<Value> {
         let (owner, name) = repo.split_once('/').context("repository")?;
+        // Standalone poll also reserves the write. The hosted pass already
+        // keeps a separate write reserve.
+        let reserve = PUBLISH_READS + 1;
+        let share_too_short = self.apply.is_some()
+            && self
+                .rest
+                .share_left()
+                .is_some_and(|left| left <= PUBLISH_READS);
         ensure!(
-            self.remaining > PUBLISH_REQUESTS,
+            self.remaining > reserve && !share_too_short,
             "request budget left for publishing the report"
         );
         self.spend()?;
@@ -207,13 +273,29 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             QUEUE_QUERY,
             json!({"owner": owner, "name": name, "entries": QUEUE_ENTRIES}),
         )?;
-        let queue = data
-            .pointer("/repository/mergeQueue")
+        let repository = &data["repository"];
+        ensure!(
+            !public_only || repository["visibility"] == "PUBLIC",
+            "repository is not confirmed public"
+        );
+        let queue = repository
+            .get("mergeQueue")
             .context("merge queue not given")?;
         ensure!(
             queue.is_null()
                 || queue.pointer("/entries/pageInfo/hasNextPage") == Some(&Value::Bool(false)),
             "more than {QUEUE_ENTRIES} entries queued"
+        );
+        ensure!(
+            !public_only
+                || queue.is_null()
+                || queue
+                    .pointer("/entries/nodes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|entries| entries
+                        .iter()
+                        .all(|entry| { entry["position"].is_u64() && entry["state"].is_string() })),
+            "merge queue entries not given"
         );
         let entries = nodes(queue, "/entries/nodes")
             .iter()
@@ -227,6 +309,26 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(Value::Array(entries))
     }
 
+    fn public_destination(&mut self, repo: &str) -> Result<bool> {
+        let destination = self
+            .get_url(&format!("{API_ROOT}repos/{repo}"), Value::clone, true)
+            .map(|(body, _)| body)
+            .with_context(|| format!("{repo}: could not read repository visibility"))?;
+        match (
+            destination["private"].as_bool(),
+            destination.get("visibility"),
+        ) {
+            (Some(true), None) => Ok(false), // Keep accepting the existing private flag.
+            (Some(true), Some(visibility))
+                if visibility == "private" || visibility == "internal" =>
+            {
+                Ok(false)
+            }
+            (Some(false), Some(visibility)) if visibility == "public" => Ok(true),
+            _ => bail!("{repo}: cannot confirm maintainer report destination visibility"),
+        }
+    }
+
     fn publish_report(
         &mut self,
         at: &Destination,
@@ -235,11 +337,6 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     ) -> Result<()> {
         let repo = &at.repository;
         let issue = at.issue;
-        let destination = self.get(&format!("repos/{repo}"))?;
-        ensure!(
-            destination["private"] == true,
-            "{repo} is not private; the maintainer report is not written there"
-        );
         let target = self.get(&format!("repos/{repo}/issues/{issue}"))?;
         ensure!(
             target["pull_request"].is_null(),
@@ -253,9 +350,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .iter()
             .filter(|c| {
                 text(c, "/user/login").eq_ignore_ascii_case(&self.config.bot)
-                    && text(c, "/body").starts_with(MARKER)
+                    && text(c, "/body").starts_with(at.marker())
             })
             .min_by_key(|c| c["id"].as_u64().unwrap_or(u64::MAX));
+        // Check after all potentially slow queue and comment reads.
+        // Repository visibility never chooses the payload.
+        let public = self.public_destination(repo)?;
+        ensure!(
+            public == at.public_queues,
+            "{repo}: maintainer report requires a {} destination",
+            if at.public_queues {
+                "public"
+            } else {
+                "private"
+            }
+        );
         if comment.is_some_and(|c| text(c, "/body") == body) {
             lines.push("maintainer report: unchanged".into());
             return Ok(());
