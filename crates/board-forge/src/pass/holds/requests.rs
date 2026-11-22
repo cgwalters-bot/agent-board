@@ -141,7 +141,22 @@ pub(crate) fn identity(ask: &Ask, host: &str) -> String {
         // must not collapse merely because they share an issue number.
         _ if ask.source == "pass" => "pass-alarm".to_owned(),
         _ => {
-            let question = ask.ask.split_whitespace().collect::<Vec<_>>().join(" ");
+            // The copy edit to stranded draft cards is not a new operator
+            // decision. Retain the question that keyed already published groups.
+            let legacy = ask
+                .group
+                .as_ref()
+                .filter(|g| g.reason == super::STRANDED_DRAFTS)
+                .map(|g| {
+                    let repo = action.repository.rsplit('/').next().unwrap_or_default();
+                    format!("{repo}: {} {}", g.numbers.len(), g.reason)
+                });
+            let question = legacy
+                .as_deref()
+                .unwrap_or(&ask.ask)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             format!("question/{:x}", Sha256::digest(question.as_bytes()))
         }
     };

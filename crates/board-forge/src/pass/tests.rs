@@ -20517,6 +20517,15 @@ fn config_table() {
             .draft_review_repositories,
         ["O/R"]
     );
+    assert!(!parsed.poll(None).policy.ready_first_party_drafts);
+    routed["pr"]["readyFirstPartyDrafts"] = true.into();
+    assert!(
+        Config::parse(&routed.to_string())
+            .unwrap()
+            .poll(None)
+            .policy
+            .ready_first_party_drafts
+    );
     for bad in [
         json!(["o/elsewhere"]),
         json!(["o/*"]),
@@ -25042,7 +25051,10 @@ fn labelled_drafts_publish_one_group_on_successive_passes() {
         let snapshot = holds::parse(&published).unwrap();
         let asks = snapshot["needs_you"]["items"].as_array().unwrap();
         let group = asks.iter().find(|a| a["source"] == "reviews").unwrap();
-        assert_eq!(group["ask"], "agentic-job: 2 drafts to inspect and promote");
+        assert_eq!(
+            group["ask"],
+            "agentic-job: inspect 2 drafts; mark ready only if complete"
+        );
         assert_eq!(group["group"]["numbers"], json!([9, 10]));
         if let Some(previous) = &previous {
             assert_eq!(group, previous);
@@ -25074,7 +25086,7 @@ fn labelled_drafts_publish_one_group_on_successive_passes() {
     let drafts = reviews.iter().find(|a| a["action"]["number"] == 9).unwrap();
     assert_eq!(
         drafts["ask"],
-        "agentic-job: 1 drafts to inspect and promote"
+        "agentic-job: inspect 1 draft; mark ready only if complete"
     );
     assert_eq!(drafts["group"]["numbers"], json!([9]));
     let ready = reviews

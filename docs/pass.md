@@ -330,6 +330,27 @@ grant more fix rounds. Explicit stage-4 `fixPlans` retain their existing policy.
 Stacked multi-issue runs remain deferred until the stacked-output dependencies
 in #750 and agentic-job#3438 are usable. This option does not synthesize stacks.
 
+## First-party bot drafts (GitHub)
+
+Ordinary review starts only once a pull request is ready. Set
+`pr.readyFirstPartyDrafts: true` to return unheld bot PRs opened as drafts with
+no checkpoint to normal review in the caller's own space, on heads from the
+bot's fork or `pr.headOwners`. The fix bounds and `ownerBranches` limit
+repairs, not readiness. A PR deliberately converted
+to draft stays draft, regardless of who converted it. The standalone poll reads
+`readyFirstPartyDrafts` at top level. The default is off.
+
+Checkpoint drafts keep their bounded continuation path. Unread checkpoint
+evidence, unfinished or unverified hand-backs, unsuccessful or unidentified
+rounds and holds cannot authorize readiness: such a draft gets `needs-human`,
+which publishes the operator's ask. A running round or unresolved claim is
+waited on. Midstream and `pr.noMerge` are
+unchanged. Readiness uses the existing write cap and rechecks the draft and
+its holds before writing. It does not remove holds, approve or merge the PR.
+
+Caller: after previewing the updated pass, set `pr.readyFirstPartyDrafts` to
+`true` in `cgwalters-forge/tracker`'s `.github/pass.json`.
+
 ## Quiet pull request waits (GitHub)
 
 The concrete failure `pr.quietWaits` stops is the PR walk spending the
@@ -6371,6 +6392,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |
 | `pr.reviewDispatchRepositories` | Exact followed base repositories using ordinary `dispatch.yml` reviews and separate all-author intake; `[]` by default; needs `pr.reviewPools`; at most 50; GitHub only |
 | `pr.draftReviewRepositories` | Review-only bot drafts and informational head-bound quick/deep buckets; `[]` by default; subset of `pr.reviewDispatchRepositories` and `pr.noMerge`; at most 50; GitHub only; see [draft buckets](#midstream-draft-buckets-opt-in-producer-slice-of-648) |
+| `pr.readyFirstPartyDrafts` | Return eligible unheld bot drafts without a checkpoint to normal review; `false` by default; [GitHub only](#first-party-bot-drafts-github) |
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
 | `pr.toilFixPool`, `pr.conflictFixPool` | Special fix pools; absent uses ordinary fix choice |
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |

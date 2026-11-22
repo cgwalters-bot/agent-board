@@ -183,7 +183,7 @@ pub(in crate::pass) fn revalidate(
             });
             if group.numbers.len() != before {
                 let repo = ask.action.repository.rsplit('/').next().unwrap_or_default();
-                ask.ask = format!("{repo}: {} {}", group.numbers.len(), group.reason);
+                ask.ask = holds::group_ask(repo, group.numbers.len(), &group.reason);
             }
             if let Some(first) = group.numbers.first() {
                 if ask.action.number != *first {
@@ -687,7 +687,10 @@ mod tests {
         assert_eq!(card.group.as_ref().unwrap().numbers, [2]);
         assert_eq!(card.action.number, 2);
         assert_eq!(card.head, None);
-        assert_eq!(card.ask, "work: 1 drafts to inspect and promote");
+        assert_eq!(
+            card.ask,
+            "work: inspect 1 draft; mark ready only if complete"
+        );
         assert_eq!(card.target, group_target);
         assert_eq!(list.requests.len(), 1);
         assert!(list.requests.iter().all(|r| r.target.number != 1));

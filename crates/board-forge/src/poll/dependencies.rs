@@ -7,7 +7,7 @@ const TAG: &str = "<!-- agent-board-dependencies: ";
 const BLOCKED: &str = "blocked";
 const SUPERVISOR: &str = "needs-supervisor";
 pub(super) const DRAFT: &str = "mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { clientMutationId } }";
-const READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }";
+pub(super) const READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }";
 type PullStep = (String, bool, Option<Wait>, Option<Stepped>);
 
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -47,6 +47,18 @@ fn marker(comments: &[Value], bot: &str) -> Result<Option<(u64, Held)>> {
         }
     }
     Ok(None)
+}
+
+pub(super) fn unreleased(comments: &[Value], bot: &str) -> Result<bool> {
+    Ok(marker(comments, bot)?.is_some_and(|(_, held)| !held.released))
+}
+
+pub(super) fn draft_hold_label(pull: &Value) -> bool {
+    nodes(pull, "/labels/nodes").iter().any(|label| {
+        [BLOCKED, SUPERVISOR, LABEL]
+            .iter()
+            .any(|name| text(label, "/name").eq_ignore_ascii_case(name))
+    })
 }
 
 /// A PR is satisfied only by merge, not closure. An abandoned issue is not a

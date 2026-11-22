@@ -2118,12 +2118,23 @@ fn earlier(a: &str, b: &str) -> bool {
     matches!((parse_time(a), parse_time(b)), (Some(a), Some(b)) if a < b)
 }
 
-/// The group reason of stranded drafts, whose target lists only drafts.
+/// The persisted group reason of stranded drafts, whose target lists only drafts.
 const STRANDED_DRAFTS: &str = "drafts to inspect and promote";
 
 /// The group reason of clean, green midstream drafts (`review-promote`),
 /// whose target lists only drafts too.
 const PROMOTE_DRAFTS: &str = "drafts waiting for promotion";
+
+/// Render a group the same way when it is published and after revalidation
+/// removes a member. Keep the persisted reason stable across that wording change.
+pub(super) fn group_ask(repo: &str, count: usize, reason: &str) -> String {
+    if reason == STRANDED_DRAFTS {
+        let drafts = if count == 1 { "draft" } else { "drafts" };
+        format!("{repo}: inspect {count} {drafts}; mark ready only if complete")
+    } else {
+        format!("{repo}: {count} {reason}")
+    }
+}
 
 /// A list URL made only from validated repository/PR identities. Older v2
 /// consumers ignore `group` and can still open the representative PR action.
@@ -2206,7 +2217,7 @@ fn group_stranded(items: Vec<Ask>) -> Vec<Ask> {
             .rsplit('/')
             .next()
             .unwrap_or_default();
-        representative.ask = format!("{repo}: {} {reason}", numbers.len());
+        representative.ask = group_ask(repo, numbers.len(), &reason);
         representative.group = Some(AskGroup {
             reason,
             numbers: numbers.into_iter().collect(),
@@ -5628,7 +5639,18 @@ mod tests {
         assert!(unfinished.group.is_none());
         assert!(promote.target.ends_with("draft%3Atrue"));
         let group = listed.items.iter().find(|a| a.key == "o/bootc#1").unwrap();
-        assert_eq!(group.ask, "bootc: 44 drafts to inspect and promote");
+        assert_eq!(
+            group.ask,
+            "bootc: inspect 44 drafts; mark ready only if complete"
+        );
+        // Hash the pre-change question verbatim, without the compatibility
+        // branch, and compare it with the identity in the new publication.
+        let mut legacy = group.clone();
+        legacy.group = None;
+        legacy.ask = "bootc: 44 drafts to inspect and promote".into();
+        assert!(listed.requests.iter().any(|r| {
+            r.question == group.ask && r.identity == requests::identity(&legacy, DEFAULT_HOST)
+        }));
         assert_eq!(
             group.group.as_ref().unwrap().numbers,
             (1..=44).collect::<Vec<_>>()

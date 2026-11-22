@@ -380,7 +380,7 @@ macro_rules! check_fields {
 }
 
 macro_rules! pull_query {
-    ($($age:literal),+) => { concat!(
+    ($extra:expr, $($age:literal),+) => { concat!(
     r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -395,7 +395,9 @@ macro_rules! pull_query {
       closingIssuesReferences(first: 10) { nodes { number repository { nameWithOwner } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } pageInfo { hasNextPage } }
       autoMergeRequest { enabledAt }
       mergeQueueEntry { state }
-      files(first: 100) { nodes { path changeType } pageInfo { hasNextPage } }
+      files(first: 100) { nodes { path changeType } pageInfo { hasNextPage } }"#,
+    $extra,
+    r#"
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { id createdAt reason beforeCommit { oid } } } }
       baseChange: timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
       reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
@@ -409,8 +411,17 @@ macro_rules! pull_query {
 ) };
 }
 
-pub(crate) const PULL_QUERY: &str = pull_query!("", "");
-const TIMED_PULL_QUERY: &str = pull_query!("startedAt ", "createdAt ");
+macro_rules! draft_origin_fields {
+    () => {
+        "\n      updatedAt redrafts: timelineItems(last: 1, itemTypes: [CONVERT_TO_DRAFT_EVENT]) { nodes { __typename } pageInfo { hasPreviousPage } }"
+    };
+}
+
+pub(crate) const PULL_QUERY: &str = pull_query!("", "", "");
+const TIMED_PULL_QUERY: &str = pull_query!("", "startedAt ", "createdAt ");
+const DRAFT_ORIGIN_QUERY: &str = pull_query!(draft_origin_fields!(), "", "");
+const TIMED_DRAFT_ORIGIN_QUERY: &str =
+    pull_query!(draft_origin_fields!(), "startedAt ", "createdAt ");
 
 /// What one list query says of a repository's open pull requests labelled
 /// [`LABEL`], so that those the pass would only skip take no reads of their
@@ -611,6 +622,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "reviewPools",
     "reviewDispatchRepositories",
     "draftReviewRepositories",
+    "readyFirstPartyDrafts",
     "headOwners",
     "noMerge",
     "operatorPaths",
@@ -897,6 +909,8 @@ pub struct PollPolicy {
     /// Explicit base-repository opt-in to ordinary dispatched review intake.
     pub review_dispatch_repositories: Vec<String>,
     pub draft_review_repositories: Vec<String>,
+    /// Return unheld first-party bot drafts without checkpoints to normal review.
+    pub ready_first_party_drafts: bool,
     /// Caller workflow already inventoried by pass, to avoid counting its reviews twice.
     pub review_caller_workflow: Option<String>,
     /// The pass's `wip` as its fix, rebase, continuation, answer, triage and
@@ -1237,6 +1251,8 @@ pub struct PrOptions {
     #[serde(default)]
     pub draft_review_repositories: Vec<String>,
     #[serde(default)]
+    pub ready_first_party_drafts: bool,
+    #[serde(default)]
     pub head_owners: Vec<String>,
     #[serde(default)]
     pub no_merge: Vec<String>,
@@ -1421,6 +1437,7 @@ impl PrOptions {
             review_pools,
             review_dispatch_repositories,
             draft_review_repositories,
+            ready_first_party_drafts,
             head_owners,
             no_merge,
             operator_paths,
@@ -1451,6 +1468,7 @@ impl PrOptions {
         policy.review_pools = review_pools;
         policy.review_dispatch_repositories = review_dispatch_repositories;
         policy.draft_review_repositories = draft_review_repositories;
+        policy.ready_first_party_drafts = ready_first_party_drafts;
         policy.head_owners = head_owners;
         policy.no_merge = no_merge;
         policy.operator_paths = operator_paths;
@@ -1633,6 +1651,7 @@ impl PollPolicy {
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
             draft_review_repositories: Vec::new(),
+            ready_first_party_drafts: false,
             assign_holds: get("assignHolds")?
                 .map(|a| a.as_bool().context("assignHolds is not a boolean"))
                 .transpose()?
@@ -3725,18 +3744,19 @@ fn placeholder_commits(pull: &Value) -> bool {
         .any(|n| is_placeholder(text(n, "/commit/messageHeadline")))
 }
 
+fn partial_handback(title: &str, body: &str) -> bool {
+    title.trim_start().starts_with(PARTIAL_TITLE_PREFIX)
+        || body.trim_start().starts_with(PARTIAL_BODY_PREFIX)
+}
+
 /// What is wrong with the title and description, which no fix run can change.
 fn undescribed(pull: &Value) -> Vec<&'static str> {
     let title = text(pull, "/title").trim();
-    let partial = title.starts_with(PARTIAL_TITLE_PREFIX)
-        || text(pull, "/body")
-            .trim_start()
-            .starts_with(PARTIAL_BODY_PREFIX);
     let mut out = Vec::new();
     if is_placeholder(title) {
         out.push("its title is the harness placeholder");
     }
-    if partial {
+    if partial_handback(title, text(pull, "/body")) {
         out.push("it is marked as partial work");
     }
     out
@@ -3842,8 +3862,7 @@ fn head_description(pull: &Value) -> Option<(String, String)> {
         && !body.is_empty()
         && body.chars().count() <= BODY_LIMIT;
     let harness = is_placeholder(subject)
-        || subject.starts_with(PARTIAL_TITLE_PREFIX)
-        || body.starts_with(PARTIAL_BODY_PREFIX)
+        || partial_handback(subject, &body)
         || !matches!(find_checkpoint(message), Ok(None));
     (fits && !harness).then(|| (subject.to_owned(), body.to_owned()))
 }
@@ -4779,8 +4798,8 @@ pub fn decide(
     }
     // A draft is a checkpoint now that agentic-job opens complete work ready
     // (agentic-job#691): it is continued before anything else, as its checks
-    // and review are of unfinished work. A draft without one is no longer
-    // marked ready on its checks; see below.
+    // and review are of unfinished work. Green checks are not evidence of
+    // completion and do not authorize taking a draft out of draft.
     let draft = pull["isDraft"].as_bool().unwrap_or(false);
     let midstream = harness && draft && no_merge(config, pull);
     if harness && draft {
@@ -4792,6 +4811,31 @@ pub fn decide(
                     "needs-human",
                     format!("a draft whose checkpoint is unreadable ({error})"),
                 );
+            }
+            Ok(None)
+                if first_party_draft(config, pull)
+                    && undescribed(pull).is_empty()
+                    && !placeholder_commits(pull) =>
+            {
+                if let Some(reason) = draft_readiness_hold(pull) {
+                    return draft_handoff(reason);
+                }
+                if marker.sha.as_deref() == Some(head) {
+                    if fix_run.is_none_or(|run| run["status"] != "completed") {
+                        return started(
+                            config,
+                            marker,
+                            (fix_run, outages),
+                            head,
+                            "draft round pending",
+                            now,
+                        );
+                    }
+                    if fix_run.is_some_and(|run| run["conclusion"] != "success") {
+                        return draft_handoff(UNSUCCESSFUL_DRAFT_ROUND);
+                    }
+                }
+                return step("ready", "first-party bot draft has no checkpoint").followed(None);
             }
             Ok(None) => {}
             Ok(Some(at)) => {
@@ -5633,6 +5677,78 @@ fn no_merge(config: &Config, pull: &Value) -> bool {
             .publication_forks
             .keys()
             .any(|r| r.eq_ignore_ascii_case(repository))
+}
+
+fn first_party_draft(config: &Config, pull: &Value) -> bool {
+    let repo = text(pull, "/baseRepository/nameWithOwner");
+    config.policy.ready_first_party_drafts
+        && pull["isDraft"] == true
+        && is_harness(pull, config)
+        && !config.policy.merge_authors.contains(&config.bot)
+        && config.ours(repo)
+        && !no_merge(config, pull)
+        && !config
+            .policy
+            .midstreams
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(repo))
+}
+
+const UNSUCCESSFUL_DRAFT_ROUND: &str =
+    "draft round did not complete successfully; verify its hand-back before marking ready";
+
+/// A first-party draft that readiness cannot release, short of a live round,
+/// goes to the operator as it would without `readyFirstPartyDrafts`: a plain
+/// wait would publish no ask for it.
+fn draft_handoff(why: &str) -> Decision {
+    step(
+        "needs-human",
+        format!("a draft with no checkpoint, not marked ready: {why}"),
+    )
+}
+
+/// Evidence needed on both the decision read and the final pre-write read.
+fn draft_readiness_hold(pull: &Value) -> Option<&'static str> {
+    // The rule recovers drafts opened as drafts, not PRs deliberately taken
+    // out of review. Even one conversion suffices; no actor attribution or
+    // full timeline traversal is needed. Missing history cannot authorize it.
+    if !pull["redrafts"]["nodes"]
+        .as_array()
+        .is_some_and(Vec::is_empty)
+        || pull.pointer("/redrafts/pageInfo/hasPreviousPage") != Some(&Value::Bool(false))
+    {
+        return Some("pull request was converted to draft or its draft origin is unreadable");
+    }
+    let head = text(pull, "/headRefOid");
+    let commit = &pull["commits"]["nodes"][0]["commit"];
+    if head.is_empty()
+        || commit["oid"] != head
+        || !commit["message"].is_string()
+        || !pull["title"].is_string()
+        || !pull["body"].is_string()
+    {
+        return Some("draft checkpoint evidence was not read whole");
+    }
+    let message = text(commit, "/message");
+    let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
+    if is_placeholder(subject.trim())
+        || partial_handback(subject, body)
+        || [text(pull, "/title"), text(pull, "/body"), message]
+            .iter()
+            .any(|text| says_untested(text).is_some())
+    {
+        return Some("draft hand-back says the work is unfinished or unverified");
+    }
+    if pull.pointer("/labels/pageInfo/hasNextPage") != Some(&Value::Bool(false))
+        || !pull["labels"]["nodes"].is_array()
+        || !pull.get("autoMergeRequest").is_some_and(Value::is_null)
+        || !pull.get("mergeQueueEntry").is_some_and(Value::is_null)
+        || is_held(pull)
+        || dependencies::draft_hold_label(pull)
+    {
+        return Some("draft is held or its hold evidence was not read whole");
+    }
+    None
 }
 
 fn queue_only(policy: &PollPolicy, repository: &str) -> bool {
@@ -6862,8 +6978,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let number = pull["number"]
             .as_u64()
             .context("pull request has no number")?;
-        if !matches!(decision.action, "skip" | "wait" | "refund" | "needs-human")
-            && let Some(why) = self.dependency_work_hold(repo, pull)?
+        // Readiness already made this admission before its final draft read.
+        if !matches!(
+            decision.action,
+            "skip" | "wait" | "refund" | "needs-human" | "ready"
+        ) && let Some(why) = self.dependency_work_hold(repo, pull)?
         {
             return Ok(Some(format!("not taken: {why}")));
         }
@@ -6887,6 +7006,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             None => marker,
         };
         match decision.action {
+            "ready" => {
+                self.mutate(dependencies::READY, json!({"id": id}))?;
+                Ok(Some("marked ready for review".into()))
+            }
             "merge" => {
                 let rules = self.get(&format!(
                     "repos/{repo}/rules/branches/{}",
@@ -8932,12 +9055,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// app, nor an app as the bot.
     fn read_pull(&mut self, owner: &str, name: &str, number: u64) -> Result<Value> {
         self.spend()?;
+        let draft_origin = self.config.policy.ready_first_party_drafts
+            && self.config.ours(&format!("{owner}/{name}"));
+        let query = match (draft_origin, self.config.policy.red_checks.is_some()) {
+            (false, false) => PULL_QUERY,
+            (false, true) => TIMED_PULL_QUERY,
+            (true, false) => DRAFT_ORIGIN_QUERY,
+            (true, true) => TIMED_DRAFT_ORIGIN_QUERY,
+        };
         let data = self.graphql.graphql(
-            if self.config.policy.red_checks.is_some() {
-                TIMED_PULL_QUERY
-            } else {
-                PULL_QUERY
-            },
+            query,
             json!({"owner": owner, "name": name, "number": number}),
         )?;
         let mut pull = data
@@ -9797,6 +9924,39 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
             _ => decision,
         };
+        if decision.action == "ready" {
+            if dependencies::unreleased(&comments, &self.config.bot)? {
+                // Only `holdDependencies` releases the hold by itself.
+                decision = if self.config.policy.hold_dependencies {
+                    step("wait", "draft has an unreleased dependency hold")
+                } else {
+                    draft_handoff("draft has an unreleased dependency hold")
+                };
+            } else if !marker.stopped && marker.sha.as_deref().is_some_and(|sha| sha != head) {
+                // A round may push its new head before it finishes applying
+                // its hand-back. Only a known successful run releases this
+                // gate; a dispatch without a run ID needs a person to check.
+                match marker.run {
+                    None => {
+                        decision = draft_handoff(
+                            "draft round on the previous head has no run ID; verify it before marking ready",
+                        );
+                    }
+                    Some(run) => {
+                        let run = self.get(&format!(
+                            "repos/{}/actions/runs/{run}",
+                            self.config.dispatch_repo
+                        ))?;
+                        if run["status"] != "completed" {
+                            decision = step("wait", "draft round pending on the previous head")
+                                .followed(None);
+                        } else if run["conclusion"] != "success" {
+                            decision = draft_handoff(UNSUCCESSFUL_DRAFT_ROUND);
+                        }
+                    }
+                }
+            }
+        }
         if decision.action == "merge" && queue_only(&self.config.policy, repo) && !queued {
             decision = step(
                 "wait",
@@ -10110,7 +10270,62 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // on since the read above stops it too. A quoted reason is the head's,
         // and so is a stop whose reason could not be read.
         let revalidate_stop = supervisor_empty_fix || quoted_stop;
-        let hold = if writing {
+        let hold = if writing && decision.action == "ready" {
+            // GitHub has no compare-and-set for readiness. Revalidate the
+            // identity, draft evidence and holds after dependency admission.
+            (|| {
+                if let Some(why) = self.dependency_work_hold(repo, &pull)? {
+                    return Ok(Some(why));
+                }
+                let mut p = self.read_pull(owner, name, number)?;
+                let comments = self.pull_comments(repo, number, &p)?;
+                if dependencies::unreleased(&comments, &self.config.bot)? {
+                    return Ok(Some("draft has an unreleased dependency hold".into()));
+                }
+                if find_marker(&comments, &self.config.bot) != marker {
+                    return Ok(Some("draft round marker changed".into()));
+                }
+                // A round's claim precedes its marker: one already posted may
+                // start a continuation of the checkpoint this read no longer sees.
+                if earliest_claim(&comments, &self.config.bot, &claim_from(&marker)).is_some() {
+                    return Ok(Some("draft has an unresolved round claim".into()));
+                }
+                // A paginated comment read may have taken several requests.
+                // Check the draft again, using its updated time to bind it to
+                // the preceding snapshot and comment read.
+                if p.pointer("/comments/pageInfo/hasPreviousPage") != Some(&Value::Bool(false)) {
+                    let fresh = self.read_pull(owner, name, number)?;
+                    if !p["updatedAt"].is_string()
+                        || fresh["updatedAt"] != p["updatedAt"]
+                        || fresh["comments"] != p["comments"]
+                    {
+                        return Ok(Some("draft changed during the comment read".into()));
+                    }
+                    p = fresh;
+                }
+                if !first_party_draft(self.config, &p)
+                    || !text(&p, "/baseRepository/nameWithOwner").eq_ignore_ascii_case(repo)
+                    || p["number"] != number
+                    || !p["id"].is_string()
+                    || p["id"] != pull["id"]
+                    || p["state"] != "OPEN"
+                    || p["headRefOid"] != head
+                    || p["title"] != pull["title"]
+                    || p["body"] != pull["body"]
+                    || p["baseRefName"] != pull["baseRefName"]
+                    || draft_readiness_hold(&p).is_some()
+                    || !matches!(checkpoint(&p), Ok(None))
+                {
+                    return Ok(Some(
+                        "draft changed, acquired a hold or could not be read whole".into(),
+                    ));
+                }
+                if let Some(hold) = review_hold(self.config, &p) {
+                    return Ok(Some(hold.reason(&p, &marker)));
+                }
+                Ok(None)
+            })()
+        } else if writing {
             self.read_pull(owner, name, number).and_then(|mut p| {
                 if let Some(review) = &priority_review {
                     self.review_turn_candidate(repo, number, &p)?;
@@ -15361,7 +15576,10 @@ mod tests {
                     json!({"repository": {"visibility": self.report_visibility.get(&repo), "mergeQueue": queue}}),
                 );
             }
-            assert!(matches!(query, PULL_QUERY | TIMED_PULL_QUERY));
+            assert!(matches!(
+                query,
+                PULL_QUERY | TIMED_PULL_QUERY | DRAFT_ORIGIN_QUERY | TIMED_DRAFT_ORIGIN_QUERY
+            ));
             let number = variables["number"].as_u64().unwrap();
             let mut pull = self.pulls[&number].clone();
             if *self.labelled.borrow() {
@@ -15387,6 +15605,9 @@ mod tests {
                 for (key, value) in fields {
                     pull[key] = value.clone();
                 }
+            }
+            if matches!(query, PULL_QUERY | TIMED_PULL_QUERY) {
+                pull.as_object_mut().unwrap().remove("redrafts");
             }
             Ok(json!({"repository": {"pullRequest": pull}}))
         }
@@ -17251,6 +17472,280 @@ mod tests {
                 assert!(labels);
             }
             assert!(dispatcher.writes.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn first_party_draft_ownership() {
+        for (case, expected, ready, dispatched) in [
+            ("ready", "marked ready for review", true, false),
+            (
+                "preview",
+                "first-party bot draft has no checkpoint",
+                false,
+                false,
+            ),
+            ("checkpoint", "its checkpoint says budget", false, true),
+            ("midstream", PROMOTE_WAIT, false, false),
+            ("off", "a draft with no checkpoint", false, false),
+            (
+                "capped",
+                "first-party bot draft has no checkpoint",
+                false,
+                false,
+            ),
+            ("late checkpoint", "draft changed", false, false),
+            ("late hold", "draft changed", false, false),
+            ("redrafted", "was converted to draft", false, false),
+            ("late redraft", "draft changed", false, false),
+            ("unread origin", "draft origin is unreadable", false, false),
+            ("placeholder", "finish the work", false, true),
+            ("incomplete description", "work is unfinished", false, false),
+            ("incomplete commit", "work is unfinished", false, false),
+            ("partial commit", "work is unfinished", false, false),
+            (
+                "unread message",
+                "checkpoint evidence was not read whole",
+                false,
+                false,
+            ),
+            (
+                "malformed checkpoint",
+                "checkpoint is unreadable",
+                false,
+                false,
+            ),
+            ("held", "draft is held", false, false),
+            (
+                "dependency marker",
+                "unreleased dependency hold",
+                false,
+                false,
+            ),
+            (
+                "running",
+                "draft round pending on the previous head",
+                false,
+                false,
+            ),
+            ("unnamed", "previous head has no run ID", false, false),
+            ("historical", "marked ready for review", true, false),
+            (
+                "failed previous round",
+                UNSUCCESSFUL_DRAFT_ROUND,
+                false,
+                false,
+            ),
+            (
+                "failed current round",
+                UNSUCCESSFUL_DRAFT_ROUND,
+                false,
+                false,
+            ),
+            (
+                "outside fix scope",
+                "not a pull request from the bot's fork",
+                false,
+                false,
+            ),
+            ("claimed", "unresolved round claim", false, false),
+        ] {
+            let handoff = matches!(
+                case,
+                "redrafted"
+                    | "unread origin"
+                    | "incomplete description"
+                    | "incomplete commit"
+                    | "partial commit"
+                    | "unread message"
+                    | "held"
+                    | "dependency marker"
+                    | "unnamed"
+                    | "failed previous round"
+                    | "failed current round"
+            );
+            let mut fake = github();
+            let mut fields = json!({"isDraft": true, "body": "Explain the review requirement.",
+                "autoMergeRequest": null, "mergeQueueEntry": null, "updatedAt": "2026-10-12T01:00:00Z"});
+            if case == "ready" {
+                fields["contexts"] = json!({"review": null, "ci": {"conclusion": "FAILURE"}});
+            }
+            let mut draft = pull("pull-470", fields);
+            let redraft = json!({"nodes": [{"__typename": "ConvertToDraftEvent"}],
+                "pageInfo": {"hasPreviousPage": false}});
+            draft["redrafts"] = match case {
+                "redrafted" => redraft.clone(),
+                "unread origin" => Value::Null,
+                _ => json!({"nodes": [], "pageInfo": {"hasPreviousPage": false}}),
+            };
+            let head = draft["headRefOid"].clone();
+            let commit = &mut draft["commits"]["nodes"][0]["commit"];
+            commit["oid"] = head;
+            commit["message"] = match case {
+                "checkpoint" => checkpointed("budget").into(),
+                "unread message" => Value::Null,
+                "incomplete commit" => "This work is incomplete.".into(),
+                "partial commit" => "[partial: budget] Implement the first half".into(),
+                _ => "Finish the first batch".into(),
+            };
+            match case {
+                "late checkpoint" => {
+                    fake.late_pull_fields = Some(json!({"body": checkpointed("budget")}));
+                }
+                "late hold" => {
+                    fake.late_pull_fields = Some(json!({"labels": {
+                        "nodes": [{"name": "blocked"}], "pageInfo": {"hasNextPage": false}
+                    }}));
+                }
+                "late redraft" => fake.late_pull_fields = Some(json!({"redrafts": redraft})),
+                "placeholder" => draft["title"] = "[partial: budget] draft".into(),
+                "incomplete description" => draft["body"] = "This work is incomplete.".into(),
+                "malformed checkpoint" => draft["body"] = CHECKPOINT_FENCE.into(),
+                "held" => draft["labels"]["nodes"] = json!([{"name": "blocked"}]),
+                "dependency marker" => dependency_record(
+                    &mut fake,
+                    json!({"update_head": "", "released": false, "reason": "blocked by other/repo#12"}),
+                ),
+                "outside fix scope" => draft["isCrossRepository"] = false.into(),
+                _ => {}
+            }
+            fake.pulls.insert(470, draft);
+            let mut cfg = config();
+            cfg.policy = PollPolicy::from_json(&if case == "off" {
+                json!({})
+            } else {
+                json!({"readyFirstPartyDrafts": true})
+            })
+            .unwrap();
+            if case == "late redraft" {
+                // Check that the fresh draft-origin read still runs when the
+                // poll also asks for check timestamps.
+                cfg.policy.red_checks = Some(RedChecks::default());
+                for qualifier in ["status:failure", "status:pending"] {
+                    fake.page(
+                        &priority_turn::search_path(&cfg, qualifier),
+                        None,
+                        None,
+                        json!({"items":[],"total_count":0,"incomplete_results":false}),
+                    );
+                }
+            }
+            if case == "midstream" {
+                cfg.policy.no_merge = vec![REPO.to_ascii_uppercase()];
+            }
+            cfg.policy.unstall = case == "placeholder";
+            if matches!(
+                case,
+                "running"
+                    | "historical"
+                    | "unnamed"
+                    | "failed previous round"
+                    | "failed current round"
+            ) {
+                let sha = if case == "failed current round" {
+                    HEAD
+                } else {
+                    "older"
+                };
+                let mut state = json!({"rounds": 1, "sha": sha, "at": "2026-10-12T01:00:00Z"});
+                if case != "unnamed" {
+                    state["run"] = 7.into();
+                }
+                fake.page(
+                    &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                    None,
+                    None,
+                    json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(&state, "Fix round.")}]),
+                );
+                fake.page(
+                    &format!("repos/{}/actions/runs/7", cfg.dispatch_repo),
+                    None,
+                    None,
+                    match case {
+                        "running" => json!({"status": "in_progress"}),
+                        "failed previous round" => {
+                            json!({"status": "completed", "conclusion": "failure"})
+                        }
+                        "failed current round" => {
+                            json!({"status": "completed", "conclusion": "cancelled"})
+                        }
+                        _ => json!({"status": "completed", "conclusion": "success"}),
+                    },
+                );
+            }
+            if case == "claimed" {
+                // A continuation's claim, posted before its marker.
+                let claim = json!({"from": "none", "round": 1, "sha": HEAD});
+                fake.page(
+                    &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                    None,
+                    None,
+                    json!([{"id": 5, "user": {"login": BOT},
+                        "body": format!("<!-- {CLAIM}: {claim} -->\nContinuation round 1: claimed.")}]),
+                );
+            }
+            let dispatcher = Fake::default();
+            dispatcher.answers.borrow_mut().insert(
+                DISPATCHES.into(),
+                vec![(200, json!({"workflow_run_id": 1234}))],
+            );
+            let caps = caps::Caps::new(caps::Limits {
+                dispatch: Some(1),
+                writes: Some(if case == "capped" { 0 } else { 10 }),
+                status_changes: None,
+            });
+            let outcome = run_capped(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                (&[], &[REPO.into()]),
+                if case == "preview" {
+                    None
+                } else {
+                    applying(&dispatcher)
+                },
+                Some(&caps),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            assert!(
+                outcome.lines.iter().any(|l| l.contains(expected)),
+                "{case}: {:?}",
+                outcome.lines
+            );
+            assert_eq!(outcome.dispatched, usize::from(dispatched), "{case}");
+            let writes = fake.writes.borrow();
+            if ready {
+                assert_eq!(
+                    writes.as_slice(),
+                    [(
+                        dependencies::READY.into(),
+                        json!({"id": fake.pulls[&470]["id"]})
+                    )]
+                );
+            } else {
+                assert!(
+                    writes.iter().all(|(query, _)| query != dependencies::READY),
+                    "{case}: {writes:?}"
+                );
+                if !matches!(
+                    case,
+                    "checkpoint" | "placeholder" | "off" | "malformed checkpoint"
+                ) && !handoff
+                {
+                    assert!(writes.is_empty(), "{case}: {writes:?}");
+                }
+            }
+            // What readiness refuses, short of a live round, is published as
+            // the operator's, as without the option.
+            let waits: Vec<_> = outcome.waits.iter().map(|w| w.kind).collect();
+            if handoff {
+                assert_eq!(waits, ["needs-human"], "{case}: {:?}", outcome.lines);
+            } else if matches!(case, "running" | "claimed") {
+                assert!(waits.is_empty(), "{case}: {waits:?}");
+            }
         }
     }
 

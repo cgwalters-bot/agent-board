@@ -690,7 +690,7 @@ policy either way: `maintainers`, `checkReruns`, `unstall`, `directionFirst` (`o
 and `notifications` read before the followed repositories rather than after
 them), `ownerBranches`, `ownSpaceOnly`,
 `foldRounds`, `reviewPools`, `reviewDispatchRepositories`,
-`draftReviewRepositories`, `headOwners`, `noMerge`, `operatorPaths`,
+`draftReviewRepositories`, `readyFirstPartyDrafts`, `headOwners`, `noMerge`, `operatorPaths`,
 `staleDays` and `fixRounds`, besides `mergeAuthors`, `toilFixPool`, `conflictFixPool`,
 `mergeQueue` and `rebaseRounds` above. As in the pass, `reviewPools` needs
 `reviewWorkflow`, and `reviewDispatchRepositories` names only followed
@@ -1454,7 +1454,7 @@ start, or a claim never recorded, adds a new stop, after which the operator
 answers again. Issues are not followed, so a `needs-human` issue is left as
 before.
 
-The poll never takes a pull request out of draft. Since agentic-job v0.5.1
+Since agentic-job v0.5.1
 (agentic-job#691) opens complete work ready and only a
 [checkpoint](https://github.com/cgwalters-forge/agentic-job/blob/v0.5.1/docs/safe-outputs.md#ready-or-draft)
 as a draft, a draft of the bot's pull requests from its fork whose head commit
@@ -1465,9 +1465,10 @@ checkpoint says REASON`. Continuation rounds are counted in the marker apart
 from fix rounds; `continuation.rounds` (0 to 5, default 2) caps them, past
 which, or for a malformed checkpoint, the pull request gets `needs-human`
 with the reason (the pass's [`pr.unstall`](pass.md#unstall) gives one fresh
-round on another pool first). A draft with no checkpoint also goes to `needs-human`
-instead of being marked ready on green checks, except on a base repository
-in the pass's `pr.noMerge`, where a draft is the finished state: its fix
+round on another pool first). By default a draft with no checkpoint goes to
+`needs-human`; [`readyFirstPartyDrafts`](pass.md#first-party-bot-drafts-github)
+instead returns eligible first-party bot drafts to normal review. With
+`pr.noMerge`, a draft is the finished state: its fix
 and rebase rounds run as for any other (a conflict is rebased without the
 approval the review job never gives a draft), and once clean and green it
 waits with `a midstream draft, waiting for promotion`, unlabelled.
