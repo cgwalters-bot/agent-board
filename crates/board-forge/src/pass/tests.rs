@@ -47,6 +47,195 @@ fn intake_fixture() -> Replay {
     replay
 }
 
+const AUDIT_MISSING: &str =
+    "project membership audit cgwalters-forge/tracker#459: absent from board snapshot";
+
+fn membership_audit_config() -> Config {
+    config(
+        json!({"projectMembershipAudit":true,"issueIntake":true,"state":"state.json","triage":{},
+        "follow":["cgwalters-forge/tracker"],"workRepositories":["cgwalters-forge/tracker"],"pr":{"fixPools":["claude"]}}),
+    )
+}
+
+fn membership_audit_fixture(cursor: Option<&str>, more: bool) -> Replay {
+    let mut fixture = intake_fixture();
+    for entry in &mut fixture.requests {
+        if let Some(Value::Array(nodes)) = entry["answer"].pointer_mut("/data/node/items/nodes") {
+            nodes.clear();
+        }
+        if entry["request"]["graphql"] == fnv(&intake::query(false)) {
+            let node = &mut entry["answer"]["data"]["repository"]["issues"]["nodes"][0];
+            node["createdAt"] = json!("2020-01-01T00:00:00Z");
+            node["labels"] = json!({"nodes":[{"name":"needs-human"},{"name":"P1"}],"totalCount":2});
+        }
+    }
+    fixture.requests.push(json!({
+        "request":graphql_key(&membership_audit::query(), &json!({"owner":"cgwalters-forge","name":"tracker","cursor":cursor})),
+        "answer":{"data":{"repository":{"nameWithOwner":"cgwalters-forge/tracker","issues":{
+            "nodes":[{"number":459,"state":"OPEN"}],"pageInfo":{"hasNextPage":more,"endCursor":"page-1"}
+        }}}}
+    }));
+    fixture
+}
+
+#[test]
+fn membership_audit_resumes_without_enrolling_or_initializing_an_old_issue() {
+    let cfg = membership_audit_config();
+    let first = membership_audit_fixture(None, true);
+    let report = preview(&cfg, &first);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(report.lines.iter().any(|line| line == AUDIT_MISSING));
+    assert!(report.membership_audit.is_none());
+    let off = Config {
+        project_membership_audit: false,
+        ..membership_audit_config()
+    };
+    let off_report = preview(&off, &first);
+    assert_eq!(off_report.spent.requests + 1, report.spent.requests);
+    assert!(!off_report.lines.iter().any(|line| line == AUDIT_MISSING));
+
+    let mut state = State::default();
+    for (fixture, remaining) in [
+        (first, Some("page-1")),
+        (membership_audit_fixture(Some("page-1"), false), None),
+    ] {
+        let mut inner = Forge::new(None, false);
+        inner.replay = fixture;
+        if let Some(since) = state.issue_intake.get("cgwalters-forge/tracker") {
+            for entry in &mut inner.replay.requests {
+                if entry["request"]["graphql"] == fnv(&intake::query(false)) {
+                    entry["request"]["variables"]["since"] = json!(since);
+                }
+            }
+        }
+        let fake = IntakeForge {
+            forge: inner,
+            enrollment: RefCell::default(),
+            fail_field: false,
+        };
+        let report = block(run(
+            &fake,
+            &fake,
+            &cfg,
+            state,
+            (
+                Mode::Local,
+                Limits {
+                    status_changes: Some(1),
+                    ..Limits::default()
+                },
+            ),
+            fake.forge.replay.now,
+        ))
+        .unwrap();
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert!(report.lines.iter().any(|line| line == AUDIT_MISSING));
+        assert!(fake.enrollment.borrow().is_empty(), "{:?}", report.lines);
+        assert!(fake.forge.dispatches().is_empty());
+        state = report.state.unwrap();
+        let saved = state.to_json();
+        assert_eq!(
+            saved["membership_audit"]["positions"]["cgwalters-forge/tracker"].as_str(),
+            remaining
+        );
+        assert_eq!(
+            State::from_json(&saved).unwrap().membership_audit,
+            state.membership_audit
+        );
+    }
+}
+
+#[test]
+fn membership_audit_uses_complete_project_membership_without_overriding_the_status_cap() {
+    for (partial, draft, count) in [
+        (false, false, 0),
+        (false, true, 0),
+        (false, false, 2),
+        (true, false, 2),
+    ] {
+        let mut fixture = membership_audit_fixture(None, false);
+        for entry in &mut fixture.requests {
+            let Some(items) = entry["answer"].pointer_mut("/data/node/items") else {
+                continue;
+            };
+            let unpaged = json!({"hasNextPage":false,"endCursor":null});
+            for number in 459..459 + count {
+                items["nodes"].as_array_mut().unwrap().push(json!({
+                    "id":format!("card-{number}"), "fieldValues":{"nodes":[],"pageInfo":unpaged},
+                    "content":{"__typename":"Issue","id":format!("issue-{number}"),"number":number,"title":"old",
+                        "state":"OPEN","stateReason":null,"repository":{"nameWithOwner":"cgwalters-forge/tracker"},
+                        "createdAt":"2020-01-01T00:00:00Z","updatedAt":"2020-01-01T00:00:00Z","closedAt":null,
+                        "labels":{"nodes":[{"name":"needs-human"}],"pageInfo":unpaged},
+                        "assignees":{"nodes":[],"pageInfo":unpaged}}
+                }));
+            }
+            if partial {
+                items["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":"redacted","content":null}));
+            }
+            if draft {
+                items["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":"draft","content":{"__typename":"DraftIssue"}}));
+            }
+        }
+        let report = block(run(
+            &fixture,
+            &fixture,
+            &membership_audit_config(),
+            State::default(),
+            (
+                Mode::Preview,
+                Limits {
+                    status_changes: Some(1),
+                    ..Limits::default()
+                },
+            ),
+            fixture.now,
+        ))
+        .unwrap();
+        let lines = &report.lines;
+        assert_eq!(report.failures, usize::from(count == 2), "{lines:?}");
+        assert_eq!(lines.iter().any(|line| line == AUDIT_MISSING), count == 0);
+        assert_eq!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("status: refused, 2 changes")),
+            count == 2,
+            "{lines:?}"
+        );
+        assert_eq!(lines.iter().any(|line| line == "project membership audit deferred: no complete board snapshot"), partial);
+        assert_eq!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("project membership audit cgwalters-forge/tracker:")),
+            !partial
+        );
+    }
+}
+
+#[test]
+fn membership_audit_rejects_malformed_pages_before_reporting_absence() {
+    for (pointer, bad) in [
+        ("/nameWithOwner", json!("other/repo")),
+        ("/issues/nodes/0/number", json!(0)),
+        ("/issues/nodes/0/state", json!("CLOSED")),
+        ("/issues/pageInfo/hasNextPage", Value::Null),
+        ("/issues/pageInfo/endCursor", json!("")),
+    ] {
+        let mut fixture = membership_audit_fixture(None, true);
+        *fixture.requests.last_mut().unwrap()["answer"]["data"]["repository"]
+            .pointer_mut(pointer)
+            .unwrap() = bad;
+        let report = preview(&membership_audit_config(), &fixture);
+        assert_eq!(report.failures, 1, "{pointer}: {:?}", report.lines);
+        assert!(!report.lines.iter().any(|line| line == AUDIT_MISSING));
+    }
+}
+
 #[test]
 fn issue_intake_enrolls_a_fresh_unlabelled_issue_and_triages_only_ours() {
     let cfg = config(json!({"issueIntake":true,"state":"state.json","triage":{},

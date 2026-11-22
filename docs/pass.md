@@ -827,6 +827,29 @@ Caller activation: in `cgwalters-forge/tracker`, `.github/pass.json`, set
 `issueIntake` to `true` after updating the agent-board revision. No deployed
 configuration is changed here.
 
+## Project membership audit (GitHub)
+
+`projectMembershipAudit: true` reports open issues in `workRepositories` that
+were absent from the pass's project item read. It does not create
+cards, set fields, or feed intake, Status, or scheduling decisions. It is off
+by default and requires `state` and a GitHub board. An empty issue-side
+membership list is not evidence of absence.
+
+After the normal pass stages, the audit spends at most one remaining request
+on up to 20 open issues, in creation order. It visits work repositories in
+round-robin order and saves page cursors in apply mode only. A failed page
+does not advance that repository's cursor; a refused cursor restarts that
+repository. Unreadable project content, partial item pagination or exhausted
+budget defers the audit. Known drafts and incomplete fields don't hide membership.
+A terminal page starts a new sweep on that repository's next turn. The board
+snapshot and issue listing are separate reads, so the report isn't an atomic
+inventory or a receipt authorizing edits.
+
+Caller settings: after updating the agent-board revision, preview
+`projectMembershipAudit: true` in `cgwalters-forge/tracker`'s `.github/pass.json`
+with the audit enabled. No deployed configuration is changed here. Membership
+writes and field projection remain part of [#1051](https://github.com/cgwalters-forge/agent-board/issues/1051).
+
 ## Action-first pull requests (GitHub)
 
 The concrete failure this prevents is spending the PR stage's share on upstream

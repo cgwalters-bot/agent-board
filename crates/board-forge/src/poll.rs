@@ -1979,6 +1979,8 @@ pub struct State {
     pub carried_holds: BTreeMap<String, crate::pass::lean::Carried>,
     /// Repository updated-issue watermarks; discovery only, never authority.
     pub issue_intake: BTreeMap<String, String>,
+    /// Discovery position only; never authorizes membership or field edits.
+    pub membership_audit: Option<crate::pass::MembershipAudit>,
     /// Optional holds descendant context left unread at the publication share.
     /// Reporting only; these item names never authorize work.
     pub holds_pending: Vec<String>,
@@ -2085,6 +2087,7 @@ impl State {
                     "scan_cursor",
                     "carried_holds",
                     "issue_intake",
+                    "membership_audit",
                     "holds_pending",
                     "holds_summary_cursor",
                     "notify_since",
@@ -2295,6 +2298,14 @@ impl State {
                     .context("poll state holds_summary_cursor is not an issue")
             })
             .transpose()?;
+        let membership_audit: Option<crate::pass::MembershipAudit> = object
+            .get("membership_audit")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("decode project membership audit position")?;
+        if let Some(position) = &membership_audit {
+            position.validate()?;
+        }
         let holds_pending: Vec<String> = object
             .get("holds_pending")
             .map(|v| serde_json::from_value(v.clone()))
@@ -2338,6 +2349,7 @@ impl State {
             scan_cursor,
             carried_holds,
             issue_intake,
+            membership_audit,
             holds_pending,
             holds_summary_cursor,
             notify_since,
@@ -2413,6 +2425,9 @@ impl State {
         }
         if !self.issue_intake.is_empty() {
             state["issue_intake"] = json!(self.issue_intake);
+        }
+        if let Some(position) = &self.membership_audit {
+            state["membership_audit"] = json!(position);
         }
         if !self.holds_pending.is_empty() {
             state["holds_pending"] = json!(self.holds_pending);
@@ -10821,6 +10836,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         scan_cursor: None,
         carried_holds: BTreeMap::new(),
         issue_intake: BTreeMap::new(),
+        membership_audit: None,
         holds_pending: Vec::new(),
         holds_summary_cursor: None,
         notify_since,

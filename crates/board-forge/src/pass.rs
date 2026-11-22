@@ -626,6 +626,9 @@ pub struct Config {
     /// Off by default: enroll updated issues from followed repositories.
     #[serde(default)]
     pub issue_intake: bool,
+    /// Off by default: report open work-repository issues missing from the board.
+    #[serde(default)]
+    pub project_membership_audit: bool,
     /// Off unless set: stage 2 also follows up to this many repositories a
     /// pass where the bot has an open pull request, besides those the live
     /// epics name, which it follows first, and never merges in those it
@@ -1577,6 +1580,14 @@ impl Config {
             ensure!(
                 self.state.is_some(),
                 "issueIntake needs state for incremental reads"
+            );
+        }
+        if self.project_membership_audit {
+            ensure!(
+                self.github_board().is_some()
+                    && self.state.is_some()
+                    && !self.work_repositories.is_empty(),
+                "projectMembershipAudit needs a GitHub board, state and workRepositories"
             );
         }
         if let Some(board) = self.forgejo_board() {
@@ -4295,6 +4306,7 @@ pub struct Report {
     /// This pass's bounded upstream issue reads, keyed by the fork issue.
     pub upstreams: RefCell<crate::upstream::Observations>,
     pub issue_intake: BTreeMap<String, String>,
+    membership_audit: Option<MembershipAudit>,
     /// Library projection of facts already read; never rendered by the CLI.
     observation: Option<decision::Observation>,
     /// The existing publication builder's unencoded projection, where reached.
@@ -4682,6 +4694,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         state.pass_responses = bounds.next_responses.take();
         state.scan_cursor = report.scan_cursor.clone();
         state.issue_intake = report.issue_intake.clone();
+        state.membership_audit = report.membership_audit.clone();
         state.holds_pending = bounds.publication_pending.take();
         state.holds_summary_cursor = bounds.publication_summary_cursor.take();
     }
@@ -4705,6 +4718,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         // Kept as it was by a pass whose stage 4 scans nothing.
         scan_cursor: state.scan_cursor.clone(),
         issue_intake: state.issue_intake.clone(),
+        membership_audit: state.membership_audit.clone(),
         ..Report::default()
     };
     if config.skip_active_work {
@@ -4751,6 +4765,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         swept: None,
         busy: None,
         board: None,
+        audit_membership: None,
         snapshot: None,
         other: None,
         epic_starts: Vec::new(),
@@ -4913,6 +4928,10 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         } else {
             cost::stage(unbudgeted, config, within, caps, scheduler.report);
         }
+    }
+    // Use only requests left after the rest of the pass.
+    if config.project_membership_audit {
+        scheduler.audit_membership();
     }
     if let Some(routing) = bounds.routing.borrow_mut().as_mut() {
         report.lines.append(&mut routing.lines);
@@ -5433,6 +5452,7 @@ struct Scheduler<'a, C> {
     busy: Option<Option<BTreeMap<String, String>>>,
     /// The open board issues, likewise.
     board: Option<Option<BoardRead>>,
+    audit_membership: Option<membership_audit::Membership>,
     /// The usage snapshot, read once a pass: `Some(None)` where there is
     /// none or it could not be read, which was reported.
     snapshot: Option<Option<Value>>,
@@ -10991,6 +11011,8 @@ pub mod holds;
 
 pub mod decision;
 mod intake;
+mod membership_audit;
+pub use membership_audit::MembershipAudit;
 pub mod lean;
 pub mod lease;
 mod living;
