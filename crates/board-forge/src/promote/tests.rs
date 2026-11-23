@@ -2571,6 +2571,8 @@ struct PublishingForge {
     fail: Option<usize>,
     writer: String,
     returned_number: bool,
+    /// Reviews answered from a point on, as if they changed then.
+    late_reviews: Option<(Value, Late)>,
     /// The head repository's `bot/promote/*` branch: absent until a fake
     /// rewrite pushes it, or a scenario plants it.
     promote_ref: Rc<RefCell<Option<String>>>,
@@ -2578,6 +2580,15 @@ struct PublishingForge {
     promoted: RefCell<Vec<Value>>,
     publication_checks: Value,
     checked_heads: RefCell<Vec<String>>,
+}
+
+/// When [`PublishingForge::late_reviews`] starts answering.
+#[derive(Clone, Copy, Debug)]
+enum Late {
+    /// Once preparation has read the receipt comments again.
+    Preparing,
+    /// Once the pending receipt is written.
+    Receipt,
 }
 
 /// A rewrite whose head is a function of the upstream base alone, so a base
@@ -2710,6 +2721,21 @@ impl Rest for PublishingForge {
             Some(compare)
         } else if url == format!("{API}repos/{REPO}/pulls/34") {
             Some(self.fresh.clone())
+        } else if let Some((reviews, _)) = self.late_reviews.as_ref().filter(|(_, late)| {
+            url.contains("/pulls/34/reviews?")
+                && match late {
+                    Late::Preparing => {
+                        self.reads
+                            .borrow()
+                            .iter()
+                            .filter(|url| url.contains("/issues/34/comments?"))
+                            .count()
+                            >= 3
+                    }
+                    Late::Receipt => !self.writes.borrow().is_empty(),
+                }
+        }) {
+            Some(reviews.clone())
         } else if url == format!("{API}repos/composefs/composefs-rs/pulls/70")
             && !self.promoted.borrow().is_empty()
         {
@@ -2881,6 +2907,7 @@ fn publication() -> (PublishingForge, Config) {
         fail: None,
         writer: "cgwalters-bot".into(),
         returned_number: false,
+        late_reviews: None,
         promote_ref: Rc::new(RefCell::new(None)),
         promoted: RefCell::new(vec![]),
         publication_checks: json!({"contexts":{"totalCount":1,"nodes":[{
@@ -3010,6 +3037,131 @@ fn approved_draft_is_published_without_spending_reads_on_waiting_drafts() {
                 .any(|url| url.contains(&format!("/issues/{number}/"))
                     || url.contains(&format!("/pulls/{number}/")))
         );
+    }
+}
+
+/// A draft published on the operator's approval, rebuilt onto a moved
+/// upstream base when `rewrite`.
+fn approved_draft(rewrite: bool) -> (PublishingForge, Config) {
+    let (mut forge, mut config) = publication();
+    config.promote.as_mut().unwrap().on_approval = true;
+    forge.fresh["draft"] = json!(true);
+    *pull(&mut forge.replay) = forge.fresh.clone();
+    *comments(&mut forge.replay) = json!([]);
+    sync_metadata(&mut forge.replay);
+    timeline(&mut forge.replay, json!([]));
+    if rewrite {
+        body(&mut forge.replay, "/compare/")["behind_by"] = json!(1);
+    }
+    (forge, config)
+}
+
+#[test]
+fn review_change_before_publication_holds_only_when_it_decides() {
+    let approved = json!({"id":5,"user":{"login":"cgwalters"},"state":"APPROVED",
+        "submitted_at":COMMAND,"commit_id":HEAD});
+    let mut dismissed = approved.clone();
+    dismissed["state"] = json!("DISMISSED");
+    let mut edited = approved.clone();
+    edited["body"] = json!("edited later");
+    let other = json!({"id":6,"user":{"login":"someone"},"state":"COMMENTED",
+        "submitted_at":COMMAND,"commit_id":HEAD,"body":"unrelated"});
+    let comment = json!({"id":7,"user":{"login":"cgwalters"},"state":"COMMENTED",
+        "submitted_at":COMMAND,"commit_id":HEAD,"body":"looks good"});
+    let mut changes = comment.clone();
+    changes["state"] = json!("CHANGES_REQUESTED");
+    for late in [Late::Preparing, Late::Receipt] {
+        for (reviews, promoted) in [
+            (json!([dismissed]), false),
+            (json!([approved, changes]), false),
+            (json!([edited, other, comment]), true),
+        ] {
+            for rewrite in [false, true] {
+                let case = format!("{late:?} {reviews} rewrite={rewrite}");
+                let (mut forge, config) = approved_draft(rewrite);
+                forge.late_reviews = Some((reviews.clone(), late));
+                let mut git = FakeRewrite::new(&forge);
+                let lines =
+                    publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+                if promoted {
+                    assert!(lines[0].starts_with("promoted"), "{case}: {lines:?}");
+                    continue;
+                }
+                assert!(
+                    lines[0].contains("review evidence changed before publication"),
+                    "{case}: {lines:?}"
+                );
+                // Neither the ref push nor the upstream PR follows a revoked
+                // approval; a receipt already written says to retry.
+                assert!(forge.promote_ref.borrow().is_none(), "{case}");
+                let writes = forge.writes.borrow();
+                assert!(
+                    writes.iter().all(|(_, url, _)| !url.contains("/pulls")),
+                    "{case}: {writes:?}"
+                );
+                match late {
+                    Late::Preparing => assert!(writes.is_empty(), "{case}"),
+                    Late::Receipt => {
+                        assert_eq!(writes.len(), 2, "{case}");
+                        let status = writes[1].2["body"].as_str().unwrap();
+                        assert!(status.contains("was not confirmed"), "{case}: {status}");
+                        assert!(publish::pending(status).unwrap(), "{case}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn review_recheck_is_charged_before_the_first_write() {
+    for rewrite in [false, true] {
+        let run = |limit: Option<usize>| {
+            let (mut forge, mut config) = approved_draft(rewrite);
+            if let Some(limit) = limit {
+                request_share(&mut forge.replay, &mut config, limit);
+            }
+            let mut git = FakeRewrite::new(&forge);
+            let lines =
+                publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+            let reviews = forge
+                .reads
+                .borrow()
+                .iter()
+                .filter(|url| url.contains("/pulls/34/reviews?"))
+                .count();
+            let writes = forge.writes.borrow().clone();
+            (lines, reviews, writes)
+        };
+        // Two evaluations and the recheck before the first write, then one
+        // at each upstream boundary: the push, if any, and the PR write.
+        let (lines, reviews, writes) = run(None);
+        assert!(lines[0].starts_with("promoted"), "{rewrite}: {lines:?}");
+        assert_eq!(
+            (reviews, !writes.is_empty()),
+            (4 + usize::from(rewrite), true),
+            "{rewrite}"
+        );
+        // The tightest share that defers the first recheck has written nothing.
+        let tight = (1..200).find(|&limit| run(Some(limit)).1 >= 3).unwrap();
+        let (lines, reviews, writes) = run(Some(tight - 1));
+        assert_eq!((reviews, writes.len()), (2, 0), "{rewrite}: {lines:?}");
+        assert!(
+            lines.last().unwrap().starts_with("promote deferred:"),
+            "{rewrite}: {lines:?}"
+        );
+        // A share spent at a later boundary leaves the receipt retryable.
+        for limit in tight..tight + 200 {
+            let (lines, _, writes) = run(Some(limit));
+            if lines.last().unwrap().starts_with("promoted") {
+                break;
+            }
+            let status = writes.last().unwrap().2["body"].as_str().unwrap();
+            assert!(
+                status.contains("was not confirmed") && publish::pending(status).unwrap(),
+                "{rewrite} {limit}: {lines:?}"
+            );
+        }
     }
 }
 

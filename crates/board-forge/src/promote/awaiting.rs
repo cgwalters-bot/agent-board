@@ -159,7 +159,7 @@ impl<'a> Awaiting<'a> {
         let metadata = get(client, &format!("repos/{repo}"))?;
         let target = super::target(&metadata, repo, legacy)?
             .context("repository lacks midstream metadata")?;
-        let command = evaluate(
+        let (command, _) = evaluate(
             client,
             self.config,
             (repo, number),

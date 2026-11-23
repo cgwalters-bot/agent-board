@@ -173,6 +173,8 @@ struct Prepared {
     fresh: Value,
     /// The head the operator approved; approval and the receipt name it.
     head: String,
+    /// The operator's deciding reviews that authorized `head`.
+    reviews: Vec<Decision>,
     /// When `head` was first pushed: the fork base must not move after it.
     introduced: OffsetDateTime,
     /// What the receipts record of the publication.
@@ -309,7 +311,10 @@ pub(super) fn apply_with<C: Rest + Transport>(
                         continue;
                     }
                 };
-                lines.push(publish(client, (repo, target), git, *prepared).with_context(pending)?);
+                lines.push(
+                    publish(client, config, (repo, target), git, *prepared)
+                        .with_context(pending)?,
+                );
                 return Ok(());
             }
         }
@@ -330,7 +335,8 @@ pub(super) fn apply_with<C: Rest + Transport>(
             ) {
                 Ok(Step::Publish(prepared)) => {
                     lines.push(
-                        publish(client, (repo, target), git, *prepared).with_context(context)?,
+                        publish(client, config, (repo, target), git, *prepared)
+                            .with_context(context)?,
                     );
                     return Ok(());
                 }
@@ -362,7 +368,7 @@ fn prepare<C: Rest + Transport>(
     git: &mut impl rewrite::Rewrite,
 ) -> Result<Step> {
     let number = pull["number"].as_u64().context("invalid pull number")?;
-    let (command, first) = validate(client, config, repo, target, pull, now, None)?;
+    let (command, first, _) = validate(client, config, repo, target, pull, now, None)?;
     // No mutation until the *entire* evidence chain has been read again,
     // including uncached policy and PR-specific provenance.
     let fresh = get(client, &format!("repos/{repo}/pulls/{number}"))?;
@@ -385,7 +391,7 @@ fn prepare<C: Rest + Transport>(
     }
     // Do not reread the fork range. Check the unchanged fork base and head,
     // then select the suffix against the fresh upstream comparison.
-    let (current, range) = validate(
+    let (current, range, reviews) = validate(
         client,
         config,
         repo,
@@ -697,9 +703,17 @@ fn prepare<C: Rest + Transport>(
     if max_writes < needed {
         return Ok(Step::Held(held(repo, number, needed)));
     }
+    // Keep the evaluated approval and cancellation evidence bound to the
+    // writes, across receipt handling and local Git preparation. Check it
+    // here, before the first write, so a spent request share defers the
+    // candidate before any receipt; `publish` checks again at its push and
+    // upstream PR boundaries.
+    let reviews = deciding(config, &reviews);
+    recheck_reviews(client, config, repo, number, &reviews)?;
     Ok(Step::Publish(Box::new(Prepared {
         fresh,
         head,
+        reviews,
         introduced: command.introduced,
         cut: range.commits.cut(&what.onto),
         publication,
@@ -707,6 +721,39 @@ fn prepare<C: Rest + Transport>(
         confirmed,
         receipt,
     })))
+}
+
+/// A review's identity, state, order and commit.
+type Decision = [Value; 4];
+
+/// Only the operator's non-`COMMENTED` reviews decide promotion; an edited
+/// body, a comment-only review or another author's review does not.
+fn deciding(config: &Config, reviews: &[Value]) -> Vec<Decision> {
+    reviews
+        .iter()
+        .filter(|r| {
+            r["user"]["login"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&config.operator))
+                && r["state"] != "COMMENTED"
+        })
+        .map(|r| ["id", "state", "submitted_at", "commit_id"].map(|key| r[key].clone()))
+        .collect()
+}
+
+fn recheck_reviews(
+    client: &impl Rest,
+    config: &Config,
+    repo: &str,
+    number: u64,
+    reviews: &[Decision],
+) -> Result<()> {
+    let current = pages(client, &format!("repos/{repo}/pulls/{number}/reviews"))?;
+    hold!(
+        deciding(config, &current) == reviews,
+        "review evidence changed before publication"
+    );
+    Ok(())
 }
 
 fn held(repo: &str, number: u64, needed: usize) -> String {
@@ -952,6 +999,7 @@ fn ref_head(client: &impl Rest, repo: &str, branch: &str) -> Result<Option<Strin
 /// so a failure here ends the invocation with the receipt saying why.
 fn publish<C: Rest + Transport>(
     client: &C,
+    config: &Config,
     (repo, target): (&str, &pass::promote::Fork),
     git: &mut impl rewrite::Rewrite,
     prepared: Prepared,
@@ -959,6 +1007,7 @@ fn publish<C: Rest + Transport>(
     let Prepared {
         fresh,
         head,
+        reviews,
         introduced,
         cut,
         publication,
@@ -1049,10 +1098,14 @@ fn publish<C: Rest + Transport>(
             }
             Ok(())
         };
+        // A revoked approval must not move or open an upstream PR. Failing
+        // here leaves the receipt retryable, like the other boundary reads.
+        let check_reviews = || recheck_reviews(client, config, repo, number, &reviews);
         check_fork()?;
         let push = what.rewrite.as_ref().is_some_and(|r| r.push);
         if push {
             check_upstream()?;
+            check_reviews()?;
             git.publish(
                 head_repo,
                 &what.branch,
@@ -1070,6 +1123,7 @@ fn publish<C: Rest + Transport>(
             "publication branch moved"
         );
         check_upstream()?;
+        check_reviews()?;
         let text = json!({"title":publication["title"], "body":publication["body"]});
         let published = if let Some(pr) = &what.existing {
             let n = pr["number"]
@@ -1192,7 +1246,7 @@ fn validate(
     pull: &Value,
     now: OffsetDateTime,
     prior: Option<rewrite::Commits>,
-) -> Result<(Command, Range)> {
+) -> Result<(Command, Range, Vec<Value>)> {
     let metadata = get(client, &format!("repos/{repo}"))?;
     let legacy = config.promote.as_ref().and_then(|settings| {
         settings
@@ -1208,7 +1262,7 @@ fn validate(
         "promotion target changed"
     );
     let number = pull["number"].as_u64().context("invalid pull number")?;
-    let command = evaluate(
+    let (command, reviews) = evaluate(
         client,
         config,
         (repo, number),
@@ -1218,7 +1272,6 @@ fn validate(
     )?;
     // An authenticated command alone must not ready a head the operator never
     // approved. A later COMMENTED review does not cancel a deciding review.
-    let reviews = pages(client, &format!("repos/{repo}/pulls/{number}/reviews"))?;
     reviews
         .iter()
         .rev()
@@ -1260,7 +1313,7 @@ fn validate(
         direct,
         base: tip.context("unpinned publication base")?,
     };
-    Ok((command, range))
+    Ok((command, range, reviews))
 }
 
 /// The upstream PR is open at the published head, from the fork's head

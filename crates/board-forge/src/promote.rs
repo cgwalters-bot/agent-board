@@ -488,7 +488,7 @@ pub fn preview<C: Rest + Transport>(
                     now,
                 );
                 match evidence {
-                    Ok(command) => {
+                    Ok((command, _)) => {
                         match assess(client, config, repo, &pull, target, &command, &mut policies) {
                             Ok((Gates::Promoted(result), _)) => {
                                 lines.push(format!("{result}; head={head} {command}; staging verification required for bot-fork head"));
@@ -1500,7 +1500,7 @@ fn evaluate(
     pull: &Value,
     (network, upstream): (bool, &str),
     now: OffsetDateTime,
-) -> Result<Command> {
+) -> Result<(Command, Vec<Value>)> {
     hold!(network, "fork-network mismatch");
     hold!(pull["state"] == "open", "pull is not open");
     repository(&pull["base"]["repo"], repo)?;
@@ -1724,7 +1724,7 @@ fn evaluate(
             .is_some_and(|s| s.eq_ignore_ascii_case("needs-human"))),
         "needs-human"
     );
-    Ok(selected)
+    Ok((selected, reviews))
 }
 
 /// With `promote.onApproval`, on a draft, the operator's latest deciding review,
