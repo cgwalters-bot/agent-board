@@ -281,7 +281,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             || !truncated(&current).is_empty()
             || labelled(&current)
             || is_held(&current)
-            || review_hold(self.config, &current).is_some()
+            || self
+                .recheck_review_hold(
+                    repo,
+                    number,
+                    &current,
+                    marker,
+                    review_hold(self.config, pull).is_some(),
+                )?
+                .is_some()
         {
             return Ok("not started: PR changed or held".into());
         }

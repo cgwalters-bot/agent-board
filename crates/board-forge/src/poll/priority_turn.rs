@@ -148,7 +148,6 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             || !pull.pointer("/labels/nodes").is_some_and(Value::is_array)
             || is_held(pull)
             || labelled(pull)
-            || review_hold(self.config, pull).is_some()
         {
             return Err(PrioritySkip("PR is held, draft, queued, or has unread holds").into());
         }
@@ -159,6 +158,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         {
             return Err(PrioritySkip("no fresh formal change request on this head").into());
         }
+        // The shared decision and pre-write paths check review requests with
+        // the stop ledger, so a stale request does not cost the priority turn.
         Ok(())
     }
 

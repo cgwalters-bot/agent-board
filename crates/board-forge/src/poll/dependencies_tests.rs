@@ -89,6 +89,93 @@ fn dependency_holds_are_opt_in_bounded_and_repeatable() {
 }
 
 #[test]
+fn dependency_draft_can_release_with_an_expired_review_hold() {
+    for (push, update, renewed) in [(false, false, false), (false, true, false), (true, false, false), (true, false, true)] {
+        let (mut fake, mut cfg) = dependency_fixture();
+        cfg.policy.assign_holds = true;
+        let operator = &cfg.operator;
+        let p = fake.pulls.get_mut(&470).unwrap();
+        p["reviews"]["nodes"] = json!([review("CHANGES_REQUESTED", job(), HEAD, "VERDICT: CHANGES")]);
+        p["reviewRequests"] = json!({"nodes": [{"requestedReviewer": user(operator)}], "pageInfo": {"hasNextPage": false}});
+        p["timelineItems"] = json!({"nodes": [{
+            "__typename": "ReviewRequestedEvent", "actor": user(BOT),
+            "requestedReviewer": user(operator), "createdAt": "2026-10-12T01:10:00Z"
+        }]});
+        let stop = json!({"rounds": FIX_ROUNDS, "stopped": true, "sha": "old"});
+        let body = marker_body(&stop, &format!(
+            "The poll stopped following this pull request: rounds exhausted. {}", review_stop_release(operator),
+        ));
+        let mut comments = vec![json!({"id": 5, "user": {"login": BOT}, "body": body, "created_at": "2026-10-12T01:10:01Z"})];
+        let path = format!("repos/{REPO}/issues/470/comments?per_page=100");
+        fake.page(&path, None, None, json!(comments));
+        let out = dependency_pass(&fake, &cfg, true, None);
+        assert_eq!(out.errors, 0, "{:?}", out.lines);
+        assert_eq!(out.steps[0].action, "blocked");
+        let resumed_stop = |url: &str, body: &Value| {
+            url.ends_with("/470/comments")
+                && parse_marker(MARKER, text(body, "/body"))
+                    .is_some_and(|m| m["queue_only"] == true && m["queue_reset_from"] == 5)
+        };
+        let (body, resumed) = {
+            let writes = fake.writes.borrow();
+            let drafted = writes.iter().position(|(url, _)| url.contains("convertPullRequestToDraft"));
+            let resumed = writes.iter().position(|(url, body)| resumed_stop(url, body));
+            assert!(resumed.is_some() && resumed < drafted, "{writes:?}");
+            let body = writes.iter().find(|(url, body)| url.ends_with("/comments") && !resumed_stop(url, body)).unwrap().1["body"].clone();
+            (body, writes[resumed.unwrap()].1["body"].clone())
+        };
+        comments.push(json!({"id": 77, "user": {"login": BOT}, "body": body}));
+        // An already-owned draft from before conversion recorded resumption
+        // must still acknowledge the stop before taking a branch update.
+        if !update {
+            comments.push(json!({"id": 78, "user": {"login": BOT}, "body": resumed}));
+        }
+        fake.page(&path, None, None, json!(comments));
+        fake.writes.borrow_mut().clear();
+        let p = fake.pulls.get_mut(&470).unwrap();
+        p["isDraft"] = true.into();
+        p["labels"]["nodes"] = json!([{"name":"blocked"}]);
+        if push {
+            p["headRefOid"] = "pushed".into();
+            p["reviews"]["nodes"] = json!([]);
+        }
+        if renewed {
+            p["timelineItems"]["nodes"].as_array_mut().unwrap().push(json!({
+                "__typename": "ReviewRequestedEvent", "actor": user(operator),
+                "requestedReviewer": user(operator), "createdAt": "2026-10-12T03:10:00Z"
+            }));
+        }
+        fake.page("repos/other/repo/pulls/12", None, None, json!({"number":12,"state":"closed","merged":true}));
+        let mut head = if push { "pushed" } else { HEAD };
+        if update {
+            // The update moves the head past the reviewed one, so only the
+            // recorded resumption lets the next pass past the stop.
+            fake.page(&format!("repos/{REPO}/compare/main...{HEAD}"), None, None, json!({"status":"diverged"}));
+            let out = dependency_pass(&fake, &cfg, true, None);
+            assert_eq!(out.errors, 0, "{:?}", out.lines);
+            assert_eq!(out.steps[0].action, "dependency-update");
+            let writes = fake.writes.take();
+            let resumed = writes.iter().position(|(url, body)| resumed_stop(url, body));
+            let updated = writes.iter().position(|(url, _)| url.contains("updatePullRequestBranch"));
+            assert!(resumed.is_some() && resumed < updated, "{writes:?}");
+            let held = writes.iter().find(|(url, _)| url.ends_with("/comments/77")).unwrap();
+            comments[1]["body"] = held.1["body"].clone();
+            comments.push(json!({"id": 78, "user": {"login": BOT}, "body": writes[resumed.unwrap()].1["body"]}));
+            fake.page(&path, None, None, json!(comments));
+            let p = fake.pulls.get_mut(&470).unwrap();
+            p["headRefOid"] = "updated".into();
+            p["reviews"]["nodes"] = json!([]);
+            head = "updated";
+        }
+        fake.page(&format!("repos/{REPO}/compare/main...{head}"), None, None, json!({"status":"ahead"}));
+        let out = dependency_pass(&fake, &cfg, true, None);
+        assert_eq!(out.errors, 0, "{update}: {:?}", out.lines);
+        assert_eq!(out.steps[0].action, if renewed { "skip" } else { "dependency-ready" }, "{update}: {:?}", out.lines);
+        assert_eq!(fake.writes.borrow().iter().any(|(url, _)| url.contains("markPullRequestReadyForReview")), !renewed);
+    }
+}
+
+#[test]
 fn dependency_release_is_once_and_updates_are_not_retried() {
     for released in [false, true] {
         let (mut fake, cfg) = dependency_fixture();
@@ -255,7 +342,7 @@ fn dependency_work_path(action: &'static str) {
         let why = match action {
             "continue" | "rebase" => pass.start_fix(REPO, pull, &checks,
                 (&marker, &[]), 1, action, None).unwrap(),
-            "update" => pass.update(REPO, pull, "not rebased: ").unwrap(),
+            "update" => pass.update(REPO, pull, "not rebased: ", None).unwrap(),
             "merge" => pass.take(REPO, pull, &checks, (&marker, &[]),
                 &step("merge", "approved and green"), None).unwrap().unwrap(),
             _ => unreachable!(),
@@ -299,7 +386,7 @@ fn dependency_deferred_review_uses_fresh_body() {
             marker: Marker::default(), comments: vec![], action,
             run: Some((7, None)), line: String::new(), at: (0, None),
         };
-        let (done, ran) = pass.take_review(&review).unwrap();
+        let (done, ran, _) = pass.take_review(&review).unwrap();
         assert!(!ran);
         assert!(done.unwrap().contains("blocked by other/repo#12"));
         assert!(fake.writes.borrow().is_empty());

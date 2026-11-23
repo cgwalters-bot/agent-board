@@ -436,25 +436,28 @@ A pass with `assignHolds: true` (off by default) requests the operator's PR
 review instead of adding `needs-human` when it stops on a ready PR. GitHub
 rejects review requests on drafts, so draft stops keep their existing label
 hold; the poll never marks unfinished work ready to request review. The request precedes the
-stop marker, so an interrupted write still holds the PR. While that review is
-requested, no poll work runs on the PR; a missing or truncated reviewer list
-also holds it. Submitting a review or removing the request releases the stop
-and permits fresh rounds. Comments alone do not release a review-request hold;
+stop marker, so an interrupted write still holds the PR. A pending request
+holds the PR unless it is released; a missing or truncated reviewer list also
+holds it. Submitting a review as the requested reviewer or removing the request
+releases the stop and permits fresh rounds. Comments alone do not release a review-request hold;
 `operatorAnswers` and `staleDays` still apply only to labelled stops. Existing
 labels remain holds and are not automatically migrated. A standalone poll
 takes the same top-level `assignHolds` in its `agent-board.json`, so a pass and
 a standalone poll of the same PR hold it alike.
 
-The hold diagnostic says `operator review pending; requester unknown`: the
-requested reviewer is not evidence of who asked. Bot-created requests still
-hold. When the existing authenticated bot marker records a stop, the diagnostic
-also names that recorded pass stop, links its comment where available, and
-distinguishes the current head from an older head (or an unknown recorded head).
-This is stop evidence, not attribution of the review request. A request written
-before an interrupted stop-marker write still holds without recorded-stop
-evidence. Missing or truncated reviewer reads retain their incomplete-read hold.
-No timeline reads or additional settings are used; labels, release/reset rules,
-and typed operator-wait/status routing are unchanged.
+If the bot's stop names an older head and the new head has a verdict that
+counts (the operator's, or the review job's from its own run; anyone else's
+review does not), the poll checks a bounded tail of review-request events. If
+the pending request is the bot's own, the poll resumes normal follow-up with
+fresh fix rounds. Once a pass has written a round, rerun or queue marker after
+the stop, later passes keep following the PR whatever that step did to the
+head or marker, except on the stopped head itself, which a branch reset can
+bring back. A branch update the poll takes past the stop, its own or a
+dependency hold's, first writes a queue marker naming the stop, so its new
+head is followed on before it has a verdict. The poll does not remove the request on GitHub: removal is by
+reviewer and could erase a concurrent human request. A request from a person
+or of unknown origin, a current-head stop, and label holds still hold. The stop
+marker alone is not evidence of who requested the review.
 
 A stop is added after its label or review request, and
 `--apply` reads the comments before the label and without the response cache,

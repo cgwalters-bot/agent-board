@@ -49,6 +49,11 @@ fn marker(comments: &[Value], bot: &str) -> Result<Option<(u64, Held)>> {
     Ok(None)
 }
 
+pub(super) fn owns_draft(comments: &[Value], bot: &str) -> bool {
+    marker(comments, bot)
+        .is_ok_and(|entry| entry.is_some_and(|(_, held)| held.owns_draft && !held.released))
+}
+
 /// A PR is satisfied only by merge, not closure. An abandoned issue is not a
 /// completed prerequisite either. Missing facts cannot authorize readiness.
 fn satisfied(value: &Value, pull: bool) -> Result<Option<bool>> {
@@ -349,6 +354,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 self.rest.start_kind(action);
                 let (owner, name) = repo.split_once('/').context("repository")?;
                 let current = self.read_pull(owner, name, number)?;
+                let marker = find_marker(comments, &self.config.bot);
+                let expired = review_hold(self.config, pull).is_some();
                 ensure!(
                     current["state"] == "OPEN"
                         && current["headRefOid"] == pull["headRefOid"]
@@ -363,7 +370,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         && is_harness(&current, self.config)
                         && !is_held(&current)
                         && !labelled(&current)
-                        && review_hold(self.config, &current).is_none(),
+                        && if expired {
+                            self.recheck_review_hold(repo, number, &current, &marker, true)?
+                                .is_none()
+                        } else {
+                            review_hold(self.config, &current).is_none()
+                        },
                     "dependency PR changed or held before write"
                 );
                 let id = previous.as_ref().map(|(id, _)| *id);
@@ -372,7 +384,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 if changed && !ready {
                     self.dependency_marker(repo, number, id, &held)?;
                 }
-                if !ready && current["isDraft"] == false {
+                let drafting = !ready && current["isDraft"] == false;
+                // The next pass may see an unreviewed head, whether we update
+                // it now or someone pushes while our dependency draft waits.
+                if expired && (drafting || update) {
+                    self.resume_from_stop(repo, number, &marker)?;
+                }
+                if drafting {
                     self.mutate(DRAFT, json!({"id": current["id"]}))?;
                 }
                 let rest = self.rest;

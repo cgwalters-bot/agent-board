@@ -79,6 +79,15 @@ pub(crate) const MARKER: &str = "tracker-poll";
 pub(crate) use tests::conflict_stop_fixture;
 /// This poll's own: the claim a pass posts before it starts a fix round.
 const CLAIM: &str = "agent-board-fix-claim";
+
+/// How the text of the poll's own stop comment begins, after its marker.
+const STOP_TEXT: &str = "The poll stopped following this pull request: ";
+
+/// What a stop quotes after its reason and release ([`review_stops`]).
+const STOP_QUOTES: [&str; 2] = [
+    "\n\nThe run reported (unverified): ",
+    "\n\nThe failure as this head left it:",
+];
 /// On a pull request or an issue it closes: the review job's approval alone
 /// does not merge it, the operator's of the head does (agent-board#293).
 pub(crate) const OPERATOR_APPROVAL_LABEL: &str = "needs-operator-approval";
@@ -414,6 +423,25 @@ macro_rules! pull_query {
 
 pub(crate) const PULL_QUERY: &str = pull_query!("", "");
 const TIMED_PULL_QUERY: &str = pull_query!("startedAt ", "createdAt ");
+
+// Read only for a possible stale stop. The latest event for the operator must
+// be visible in this bounded tail; missing evidence leaves the request alone.
+const REVIEW_HOLD_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id state isDraft headRefOid
+      labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
+      reviewRequests(first: 100) { nodes { requestedReviewer { ... on User { login } } } pageInfo { hasNextPage } }
+      timelineItems(last: 20, itemTypes: [REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT]) {
+        nodes {
+          __typename
+          ... on ReviewRequestedEvent { createdAt actor { __typename login } requestedReviewer { __typename ... on User { login } } }
+          ... on ReviewRequestRemovedEvent { requestedReviewer { __typename ... on User { login } } }
+        }
+      }
+    }
+  }
+}"#;
 
 /// What one list query says of a repository's open pull requests labelled
 /// [`LABEL`], so that those the pass would only skip take no reads of their
@@ -3276,6 +3304,10 @@ pub struct Marker {
     pub review_head: Option<String>,
 
     pub review_at: Option<String>,
+
+    /// Whether this stop requested the operator's review ([`review_stops`]).
+    /// Written, never read into the marker, so only the stop carries it.
+    pub review_request: bool,
 }
 
 /// The merge queue as the marker records it: every removal the poll acted on
@@ -3442,6 +3474,9 @@ impl Marker {
         if let Some(head) = &self.review_head {
             state["review_head"] = plain(head).into();
             state["review_at"] = json!(self.review_at);
+        }
+        if self.review_request {
+            state["review_request"] = true.into();
         }
         state
     }
@@ -3621,6 +3656,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
             pending: Vec::new(),
             review_head: None,
             review_at: None,
+            review_request: false,
         };
         if latest.id.is_none() || marker.id > latest.id {
             latest = marker;
@@ -3690,9 +3726,14 @@ fn earliest_claim(comments: &[Value], bot: &str, from: &str) -> Option<(u64, Opt
 }
 
 fn labelled(pull: &Value) -> bool {
-    nodes(pull, "/labels/nodes")
+    needs_human(nodes(pull, "/labels/nodes"))
+}
+
+/// GitHub's label names are case-insensitive, in both REST and GraphQL.
+fn needs_human(labels: &[Value]) -> bool {
+    labels
         .iter()
-        .any(|l| l["name"] == LABEL)
+        .any(|l| text(l, "/name").eq_ignore_ascii_case(LABEL))
 }
 
 /// Whether `labels`, GraphQL's nodes or the REST list, carry [`HOLD_LABEL`].
@@ -4794,8 +4835,28 @@ pub fn decide(
     pull: &Value,
     checks: &Checks,
     marker: &Marker,
-    (fix_run, review_run): (Option<&Value>, Option<&Value>),
+    runs: (Option<&Value>, Option<&Value>),
     outages: &Outages,
+    now: OffsetDateTime,
+) -> Decision {
+    decide_with_hold(
+        config,
+        pull,
+        checks,
+        marker,
+        runs,
+        (outages, review_hold(config, pull)),
+        now,
+    )
+}
+
+fn decide_with_hold(
+    config: &Config,
+    pull: &Value,
+    checks: &Checks,
+    marker: &Marker,
+    (fix_run, review_run): (Option<&Value>, Option<&Value>),
+    (outages, hold): (&Outages, Option<ReviewHold>),
     now: OffsetDateTime,
 ) -> Decision {
     let head = text(pull, "/headRefOid");
@@ -4827,7 +4888,7 @@ pub fn decide(
             ),
         );
     }
-    if let Some(hold) = review_hold(config, pull) {
+    if let Some(hold) = hold {
         return step("skip", hold.reason(pull, marker));
     }
     // `stopped` is what needs-human wrote next to the label, so with the label
@@ -5624,7 +5685,11 @@ fn rest_comment(node: &Value) -> Result<Value> {
 /// What, if anything, `decision` for `pull` leaves waiting on the operator.
 /// What the pass resolves by itself is not: a run, check, review or rerun
 /// it waits for, a queue, or an answer it already acts on.
-fn operator_wait(config: &Config, pull: &Value, decision: &Decision) -> Option<&'static str> {
+fn operator_wait(
+    pull: &Value,
+    decision: &Decision,
+    hold: Option<ReviewHold>,
+) -> Option<&'static str> {
     let approval = format!("labelled {OPERATOR_APPROVAL_LABEL} ");
     match decision.action {
         "needs-human" => Some("needs-human"),
@@ -5632,7 +5697,7 @@ fn operator_wait(config: &Config, pull: &Value, decision: &Decision) -> Option<&
             if labelled(pull)
                 || decision.reason.starts_with(LEFT_TO_OPERATOR)
                 || (decision.waiting == WaitReason::Person
-                    && review_hold(config, pull) == Some(ReviewHold::Pending)) =>
+                    && hold == Some(ReviewHold::Pending)) =>
         {
             Some("needs-human")
         }
@@ -5649,7 +5714,7 @@ fn operator_wait(config: &Config, pull: &Value, decision: &Decision) -> Option<&
     }
 }
 
-/// A review request holds all poll paths, including queue and stack recovery.
+/// An active review request holds all poll paths, including queue and stack recovery.
 /// Missing or partial reads cannot release it and reset the fix budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReviewHold {
@@ -5700,6 +5765,124 @@ fn review_hold(config: &Config, pull: &Value) -> Option<ReviewHold> {
             text(request, "/requestedReviewer/login").eq_ignore_ascii_case(&config.operator)
         })
         .then_some(ReviewHold::Pending)
+}
+
+fn can_expire_review_hold(pull: &Value) -> bool {
+    pull["state"] == "OPEN"
+        && pull.pointer("/labels/pageInfo/hasNextPage") == Some(&Value::Bool(false))
+        && pull.pointer("/labels/nodes").is_some_and(Value::is_array)
+        && !labelled(pull)
+        && !is_held(pull)
+}
+
+fn review_stop_release(operator: &str) -> String {
+    format!(
+        "{operator}'s review is requested; submit a review or remove the request to have the poll start again on it, with fresh fix rounds."
+    )
+}
+
+/// A recognized review-request stop: when it was written and its own marker.
+type ReviewStop = (OffsetDateTime, Value);
+
+/// Recognize existing review-request stops, not label or supervisor stops.
+/// A new stop says so in its marker. An older one has the release ending a
+/// paragraph of its reason, which can span lines; what the stop quotes after
+/// it, a run's report or CI output, is not read.
+fn review_stops(config: &Config, comments: &[Value]) -> BTreeMap<u64, ReviewStop> {
+    let release = format!(". {}", review_stop_release(&config.operator));
+    comments
+        .iter()
+        .filter_map(|comment| {
+            let body = text(comment, "/body");
+            let (_, section) = body.split_once('\n')?;
+            let section = STOP_QUOTES
+                .iter()
+                .filter_map(|quote| section.find(quote))
+                .min()
+                .map_or(section, |end| &section[..end]);
+            if text(comment, "/user/login") != config.bot || !section.starts_with(STOP_TEXT) {
+                return None;
+            }
+            let state = parse_marker(MARKER, body)?;
+            if state["review_request"] != true
+                && !section
+                    .split("\n\n")
+                    .any(|paragraph| paragraph.ends_with(&release))
+            {
+                return None;
+            }
+            if state["stopped"] != true || state["rounds"].as_u64().is_none_or(|r| r >= 1 << 53) {
+                return None;
+            }
+            Some((
+                comment["id"].as_u64()?,
+                (timestamp(comment["created_at"].as_str())?, state),
+            ))
+        })
+        .collect()
+}
+
+/// The poll's markers after comment `after`, each with whether it is a stop,
+/// recognized as a review stop ([`review_stops`]) or not.
+fn markers_after<'a>(
+    comments: &'a [Value],
+    bot: &'a str,
+    after: u64,
+) -> impl Iterator<Item = (bool, Value)> + 'a {
+    comments.iter().filter_map(move |comment| {
+        let body = text(comment, "/body");
+        if text(comment, "/user/login") != bot
+            || comment["id"].as_u64().is_none_or(|id| id <= after)
+        {
+            return None;
+        }
+        let state = parse_marker(MARKER, body)?;
+        state["rounds"].as_u64().filter(|r| *r < 1 << 53)?;
+        let stop = body.lines().nth(1).is_some_and(|line| {
+            line.starts_with(STOP_TEXT) || line.starts_with(crate::stop::SUPERVISOR_PREFIX)
+        });
+        Some((stop, state))
+    })
+}
+
+/// Whether the poll wrote a marker other than a stop after the stop `after`:
+/// a round, rerun or queue write. It writes none while the stop holds, so one
+/// means a pass already resumed from it, whatever that write did to the
+/// marker's identity (a rerun keeps `stopped`, a queue write the stop's id).
+/// A queue write counts only where it names the stop it resumed from: one
+/// decided before the stop can land after it.
+fn resumed_after(comments: &[Value], bot: &str, after: u64) -> bool {
+    markers_after(comments, bot, after).any(|(stop, state)| {
+        !stop && (state["queue_only"] != true || state["queue_reset_from"].as_u64() == Some(after))
+    })
+}
+
+/// The request immediately preceding the stop's comment must still be the
+/// latest event for the operator. A human re-request must not be removed.
+fn bot_review_request_at(config: &Config, pull: &Value) -> Option<OffsetDateTime> {
+    for event in nodes(pull, "/timelineItems/nodes").iter().rev() {
+        match text(event, "/requestedReviewer/__typename") {
+            "Team" | "Mannequin" | "Bot" => continue,
+            "User" => {
+                let login = text(event, "/requestedReviewer/login");
+                if login.is_empty() {
+                    return None;
+                }
+                if !login.eq_ignore_ascii_case(&config.operator) {
+                    continue;
+                }
+            }
+            _ => return None,
+        }
+        if event["__typename"] == "ReviewRequestedEvent"
+            && matches!(text(event, "/actor/__typename"), "User" | "Bot")
+            && author_login(&event["actor"]).eq_ignore_ascii_case(&config.bot)
+        {
+            return timestamp(event["createdAt"].as_str());
+        }
+        return None;
+    }
+    None
 }
 
 fn approval_only(pull: &Value, checks: &Checks, run: Option<&Value>, config: &Config) -> bool {
@@ -6270,6 +6453,24 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         Ok(())
     }
 
+    /// Record resumption before updating a branch or taking ownership of a
+    /// dependency draft. The head can change before the next pass, which must
+    /// still be able to follow it without a verdict ([`resumed_after`]). A
+    /// later stop or request is not covered.
+    fn resume_from_stop(&mut self, repo: &str, number: u64, marker: &Marker) -> Result<()> {
+        if !marker.stopped {
+            return Ok(());
+        }
+        let mut next = marker.reset();
+        self.post_marker(
+            repo,
+            number,
+            &mut next,
+            "Resumed from the review stop above.",
+            Some(marker),
+        )
+    }
+
     /// A round's marker, written over the claim `claim` this pass won, so
     /// that the round is one comment on the pull request, not a claim and a
     /// marker (agent-board#223). Its id is the claim's, newer than every
@@ -6463,13 +6664,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 seen: q.seen.clone(),
                 ..QueueState::default()
             }),
+            review_request: request_review,
             ..Marker::default()
         };
         let release = if request_review {
-            format!(
-                "{}'s review is requested; submit a review or remove the request to have the poll start again on it, with fresh fix rounds.",
-                self.config.operator
-            )
+            review_stop_release(&self.config.operator)
         } else {
             format!(
                 "It is labelled `{LABEL}`; remove the label to have the poll start again on it, with fresh fix rounds."
@@ -6497,10 +6696,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             // Below the release instructions, so that the run's text cannot
             // stand in for or run into them.
             (None, Some(run_reason)) => format!(
-                "The poll stopped following this pull request: {reason}. {release}\n\nThe run reported (unverified): {run_reason}"
+                "{STOP_TEXT}{reason}. {release}{}{run_reason}",
+                STOP_QUOTES[0]
             ),
             (None, None) => {
-                format!("The poll stopped following this pull request: {reason}. {release}")
+                format!("{STOP_TEXT}{reason}. {release}")
             }
         };
         // CI output, fenced so that nothing in it renders, mentions or links;
@@ -6508,7 +6708,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // without `<!--`, it cannot carry a marker or claim of the bot's.
         if let Some(excerpt) = excerpt.filter(|_| !supervisor) {
             text.push_str(&format!(
-                "\n\nThe failure as this head left it:\n\n```text\n{}\n```",
+                "{}\n\n```text\n{}\n```",
+                STOP_QUOTES[1],
                 excerpt.replace('`', "'").replace("<!--", "<!- -")
             ));
         }
@@ -6894,6 +7095,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             checks_from: marker.checks_from.clone(),
             review_head: None,
             review_at: None,
+            review_request: false,
         };
         self.mark_claim(
             repo,
@@ -6989,6 +7191,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // An enqueue whose state the marker already has, as one GitHub refused
         // last pass, is not recorded again.
         let new_queue = marker.stopped || decision.queue != marker.queue;
+        // The bot's own pull request reaches a step with its operator's
+        // review pending only once that hold expired.
+        let resumed = (review_hold(self.config, pull) == Some(ReviewHold::Pending)
+            && text(pull, "/author/login") == self.config.bot)
+            .then_some(marker);
         let recorded;
         let marker = match &decision.queue {
             Some(queue) => {
@@ -7052,7 +7259,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     // The bot's own, or with `unstall` a `mergeAuthors` one,
                     // which is a skip before it gets here otherwise. The
                     // approval was of the old head and does not carry over.
-                    self.update(repo, pull, "not merged: ").map(Some)
+                    self.update(repo, pull, "not merged: ", resumed).map(Some)
                 } else {
                     let repo_settings = self.get(&format!("repos/{repo}"))?;
                     let method = [
@@ -7114,7 +7321,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 )?;
                 Ok(Some("round given back".into()))
             }
-            "update" => self.update(repo, pull, "not rebased: ").map(Some),
+            "update" => self.update(repo, pull, "not rebased: ", resumed).map(Some),
             "needs-human" => {
                 let excerpt = checks.diagnosis.as_deref();
                 self.stop(
@@ -7145,7 +7352,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     || !truncated(&current).is_empty()
                     || labelled(&current)
                     || is_held(&current)
-                    || review_hold(self.config, &current).is_some()
+                    || self
+                        .recheck_review_hold(
+                            repo,
+                            number,
+                            &current,
+                            marker,
+                            review_hold(self.config, pull).is_some(),
+                        )?
+                        .is_some()
                 {
                     return Ok(Some("not granted: head changed or held".into()));
                 }
@@ -7207,8 +7422,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// Rebases `pull`, the bot's or with [`PollPolicy::unstall`] a
     /// `mergeAuthors` one, onto its base, pinned to the head read, once
     /// a pass for each base; the new head waits for its review. `not` starts
-    /// the line of one that waits for another pass.
-    fn update(&mut self, repo: &str, pull: &Value, not: &str) -> Result<String> {
+    /// the line of one that waits for another pass. `resumed` is the stop an
+    /// expired review hold let the pass past ([`Self::resume_from_stop`]).
+    fn update(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+        not: &str,
+        resumed: Option<&Marker>,
+    ) -> Result<String> {
         if let Some(why) =
             self.handover_shared_head(repo, pull["number"].as_u64().unwrap_or_default())
         {
@@ -7231,6 +7453,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             ));
         }
         self.updated.insert((repo.to_owned(), base.to_owned()));
+        if let Some(marker) = resumed {
+            let number = pull["number"]
+                .as_u64()
+                .context("pull request has no number")?;
+            self.resume_from_stop(repo, number, marker)?;
+        }
         if !pull["autoMergeRequest"].is_null() {
             let settings = self.get(&format!("repos/{repo}"))?;
             if settings["allow_rebase_merge"] == true {
@@ -7913,7 +8141,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         for review in deferred {
             let (line, stepped) = review.at;
             match self.take_review(&review) {
-                Ok((done, ran)) => {
+                // As a hold found when it was decided ([`Self::person_skip`]).
+                Ok((_, _, Some(reason))) => {
+                    let (skip, _, wait, step) =
+                        self.person_skip(&review.repo, review.number, false, &review.pull, &reason);
+                    outcome.lines[line] = skip;
+                    outcome.waits.extend(wait);
+                    if let (Some(stepped), Some(step)) = (stepped, step) {
+                        outcome.steps[stepped] = step;
+                    }
+                }
+                Ok((done, ran, None)) => {
                     let done = done.map(|d| format!(" -> {d}")).unwrap_or_default();
                     outcome.lines[line] = format!("{}{done}", review.line);
                     if let Some(stepped) = stepped {
@@ -7940,14 +8178,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
 
     /// One deferred review start or rerun, a dispatch step within the caps,
     /// admitted ([`Self::admits`]) before anything is written: what came of
-    /// it, and whether it was taken, or in a preview would be.
-    fn take_review(&mut self, review: &Deferred) -> Result<(Option<String>, bool)> {
+    /// it, whether it was taken, or in a preview would be, and the reason of a
+    /// review hold found again on it, which leaves it to the operator.
+    fn take_review(&mut self, review: &Deferred) -> Result<(Option<String>, bool, Option<String>)> {
         self.rest.start_kind(review.action);
         if let Some(apply) = &self.apply {
             apply.dispatcher.start_kind(review.action);
         }
         if let Some(held) = self.caps.and_then(|caps| caps.check(Kind::Dispatch)) {
-            return Ok((Some(held), false));
+            return Ok((Some(held), false, None));
         }
         if let Err(why) = self.admits() {
             let verb = if review.action == REVIEW {
@@ -7955,11 +8194,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             } else {
                 "re-run"
             };
-            return Ok((Some(format!("not {verb}: {why}")), false));
+            return Ok((Some(format!("not {verb}: {why}")), false, None));
         }
         let before = self.writes;
         let (repo, pull) = (review.repo.as_str(), &review.pull);
-        if ordinary_reviews(self.config, repo) || self.config.policy.hold_dependencies {
+        let expired = review_hold(self.config, pull) == Some(ReviewHold::Pending)
+            && text(pull, "/author/login") == self.config.bot;
+        if expired || ordinary_reviews(self.config, repo) || self.config.policy.hold_dependencies {
             let (owner, name) = repo.split_once('/').context("review repository")?;
             let current = self.read_pull(owner, name, review.number)?;
             if current["state"] != "OPEN"
@@ -7972,10 +8213,18 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 return Ok((
                     Some("not started: pull request changed or is held".into()),
                     false,
+                    None,
                 ));
             }
+            if expired
+                && let Some(hold) =
+                    self.recheck_review_hold(repo, review.number, &current, &review.marker, true)?
+            {
+                let reason = hold.reason(&current, &review.marker);
+                return Ok((Some(format!("not started: {reason}")), false, Some(reason)));
+            }
             if let Some(why) = self.dependency_work_hold(repo, &current)? {
-                return Ok((Some(format!("not started: {why}")), false));
+                return Ok((Some(format!("not started: {why}")), false, None));
             }
         }
         let done = match &self.apply {
@@ -8010,7 +8259,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         let done = done?;
         let ran = done.as_ref().is_none_or(|d| !d.starts_with("not "));
-        Ok((done, ran))
+        Ok((done, ran, None))
     }
 
     /// Starts the review job of `pull`'s head as the bot, from the base
@@ -9092,11 +9341,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// change request, so one with either is read whole. A query that fails,
     /// or a pull request past its page, is read whole too.
     fn left_labelled(&mut self, repo: &str, open: &[Value]) -> BTreeMap<u64, Value> {
-        let listed = open.iter().any(|p| {
-            p["labels"]
-                .as_array()
-                .is_some_and(|labels| labels.iter().any(|l| l["name"] == LABEL))
-        });
+        let listed = open.iter().any(|p| needs_human(nodes(p, "/labels")));
         if !listed || self.config.policy.operator_answers {
             return BTreeMap::new();
         }
@@ -9220,6 +9465,135 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         });
         let line = format!("{repo}#{number} {} skip: {reason}", short(head));
         (line, false, Some(wait), stepped)
+    }
+
+    /// Ignore a superseded stop only in the poll. GitHub removes requests by
+    /// reviewer, so deleting one could erase a concurrent human re-request.
+    /// Whether the stop is superseded is read from the stop's own comment and
+    /// what came after it, not from the newest marker, which the first
+    /// resumed step may change in any way.
+    fn review_hold_with_stop(
+        &mut self,
+        repo: &str,
+        number: u64,
+        pull: &Value,
+        comments: &[Value],
+    ) -> Result<Option<ReviewHold>> {
+        let hold = review_hold(self.config, pull);
+        if hold != Some(ReviewHold::Pending)
+            || !can_expire_review_hold(pull)
+            || (pull["isDraft"] != false
+                && !(pull["isDraft"] == true
+                    && self.config.policy.hold_dependencies
+                    && dependencies::owns_draft(comments, &self.config.bot)))
+            || text(pull, "/author/login") != self.config.bot
+            || self.config.held_in(repo).is_some()
+        {
+            return Ok(hold);
+        }
+        let head = text(pull, "/headRefOid");
+        let stops = review_stops(self.config, comments);
+        let Some((&last_stop, (_, stop))) = stops.last_key_value() else {
+            return Ok(hold);
+        };
+        // A later stop, even one not recognized as a review stop, is newer
+        // than anything this one says.
+        if markers_after(comments, &self.config.bot, last_stop).any(|(stop, _)| stop) {
+            return Ok(hold);
+        }
+        // The stop must name a known head other than this one: the head it
+        // handed to the operator stays held, even one a branch reset brings
+        // back after a pass resumed. A pass already resumed from the stop: a
+        // push from its round need not be reviewed before we can follow it
+        // again. Otherwise this head must have a verdict that counts: the
+        // operator's, or the review job's from its own run. That review may
+        // predate the stop comment.
+        let stopped_head = text(stop, "/sha");
+        let rule = !stopped_head.is_empty()
+            && stopped_head != head
+            && (resumed_after(comments, &self.config.bot, last_stop) || {
+                stop["missing_data_run"]
+                    .as_u64()
+                    .filter(|id| *id > 0)
+                    .is_none()
+                    && self.counted_verdict(repo, pull)?
+            });
+        if !rule || head.is_empty() || text(pull, "/id").is_empty() {
+            return Ok(hold);
+        }
+        let (owner, name) = repo.split_once('/').context("repository")?;
+        self.spend()?;
+        let data = self.graphql.graphql(
+            REVIEW_HOLD_QUERY,
+            json!({"owner": owner, "name": name, "number": number}),
+        )?;
+        let fresh = &data["repository"]["pullRequest"];
+        if fresh["id"] != pull["id"]
+            || fresh["headRefOid"] != head
+            || fresh["isDraft"] != pull["isDraft"]
+            || !can_expire_review_hold(fresh)
+        {
+            return Ok(hold);
+        }
+        let fresh_hold = review_hold(self.config, fresh);
+        if fresh_hold != Some(ReviewHold::Pending) {
+            return Ok(fresh_hold);
+        }
+        // A later stop may reuse the outstanding request. Find the first
+        // matching stop, and keep every stopped head from there through the
+        // latest stop protected until the operator releases that request.
+        let ours = bot_review_request_at(self.config, fresh).is_some_and(|request| {
+            let origin = stops.iter().find(|&(_, (stop, _))| {
+                request <= *stop && *stop - request <= time::Duration::seconds(STOP_WRITES_SECONDS)
+            });
+            origin.is_some_and(|(&id, _)| {
+                stops.range(id..).all(|(_, (_, stop))| {
+                    let stopped_head = text(stop, "/sha");
+                    !stopped_head.is_empty() && stopped_head != head
+                })
+            })
+        });
+        Ok((!ours).then_some(ReviewHold::Pending))
+    }
+
+    /// Whether the head has a verdict that counts ([`head_verdict`]), with
+    /// the review job's run read as the decision reads it. Anyone else's
+    /// review, a visitor's included, does not supersede a stop.
+    fn counted_verdict(&mut self, repo: &str, pull: &Value) -> Result<bool> {
+        let run = match review_run_id(pull, self.config) {
+            Some(run) => Some(
+                self.get_url(
+                    &format!("{API_ROOT}repos/{repo}/actions/runs/{run}"),
+                    slim_run,
+                    false,
+                )?
+                .0,
+            ),
+            None => None,
+        };
+        Ok(head_verdict(pull, self.config, run.as_ref()).is_some())
+    }
+
+    /// A replacement stop or review request can arrive while deciding. Only
+    /// revisit an expiration that the decision actually used.
+    fn recheck_review_hold(
+        &mut self,
+        repo: &str,
+        number: u64,
+        pull: &Value,
+        marker: &Marker,
+        expired: bool,
+    ) -> Result<Option<ReviewHold>> {
+        let hold = review_hold(self.config, pull);
+        if !expired || hold != Some(ReviewHold::Pending) {
+            return Ok(hold);
+        }
+        let comments = self.pull_comments(repo, number, pull)?;
+        let fresh = find_marker(&comments, &self.config.bot);
+        if fresh.id != marker.id {
+            return Ok(hold);
+        }
+        self.review_hold_with_stop(repo, number, pull, &comments)
     }
 
     /// Why agentic-job's apply would refuse to push a round's commit to a
@@ -9634,8 +10008,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 self.review_intake.pulls += 1;
             }
         }
+        let raw_hold = review_hold(self.config, &pull);
+        let hold = if merge_only {
+            raw_hold
+        } else {
+            self.review_hold_with_stop(repo, number, &pull, &comments)?
+        };
+        let expired_hold = raw_hold.is_some() && hold.is_none();
         if text(&pull, "/author/login") == self.config.bot
-            && let Some(hold) = review_hold(self.config, &pull)
+            && let Some(hold) = hold
         {
             return Ok(self.person_skip(
                 repo,
@@ -9876,13 +10257,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         } else if let Some(decision) = stale_decision {
             decision
         } else if answer.is_empty() {
-            decide(
+            decide_with_hold(
                 self.config,
                 &pull,
                 &checks,
                 &marker,
                 (fix_run.as_ref(), review_run.as_ref()),
-                &outages,
+                (&outages, hold),
                 self.now,
             )
         } else {
@@ -10056,7 +10437,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             && is_harness(&pull, self.config)
             && !labelled(&pull)
             && !is_held(&pull)
-            && review_hold(self.config, &pull).is_none()
+            && hold.is_none()
         {
             decision = self.recovery_step(repo, &pull, &marker, &comments, decision)?;
         }
@@ -10230,7 +10611,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // and so is a stop whose reason could not be read.
         let revalidate_stop = supervisor_empty_fix || quoted_stop;
         let mut receipt_reread = !writing;
-        let hold = if writing {
+        let mut renewed_hold = None;
+        let fresh_hold = if writing {
             self.read_pull(owner, name, number).and_then(|mut p| {
                 receipt_reread = p["state"] == "OPEN"
                     && p["headRefOid"] == head
@@ -10249,6 +10631,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 if is_held(&p) {
                     return Ok(Some(format!("labelled {HOLD_LABEL}")));
                 }
+                if expired_hold
+                    && (p["headRefOid"] != head
+                        || p["isDraft"] != pull["isDraft"]
+                        || !can_expire_review_hold(&p))
+                {
+                    return Ok(Some("pull request changed or acquired a hold".into()));
+                }
                 if revalidate_stop
                     && (p["state"] != "OPEN"
                         || p["headRefOid"] != head
@@ -10260,8 +10649,14 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                             .into(),
                     ));
                 }
-                if let Some(hold) = review_hold(self.config, &p) {
-                    return Ok(Some(hold.reason(&p, &marker)));
+                if let Some(hold) =
+                    self.recheck_review_hold(repo, number, &p, &marker, expired_hold)?
+                {
+                    let reason = hold.reason(&p, &marker);
+                    if expired_hold {
+                        renewed_hold = Some(reason.clone());
+                    }
+                    return Ok(Some(reason));
                 }
                 // A failing or overdue check can recover without a push.
                 // Don't claim a round or stop on evidence the fresh read no
@@ -10298,10 +10693,13 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         } else {
             Ok(None)
         };
+        if let Some(reason) = renewed_hold {
+            return Ok(self.person_skip(repo, number, merge_only, &pull, &reason));
+        }
         let done = match (&self.apply, &retarget, &stale) {
             _ if capped || deferred => Ok(held),
-            _ if !matches!(hold, Ok(None)) => {
-                hold.map(|reason| reason.map(|reason| format!("not taken: {reason}")))
+            _ if !matches!(fresh_hold, Ok(None)) => {
+                fresh_hold.map(|reason| reason.map(|reason| format!("not taken: {reason}")))
             }
             (Some(_), _, _) if !answer.is_empty() => self
                 .answer_round(repo, &pull, (&marker, &comments), (&answer, &labelled_by))
@@ -10534,7 +10932,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 review_run.as_ref().or(display_run.as_ref()),
                 self.config,
             );
-        let wait = operator_wait(self.config, &pull, &decision)
+        let wait = operator_wait(&pull, &decision, hold)
             .or_else(|| approval_only.then_some("approve"))
             .map(|kind| Wait {
                 review_bucket: None,
@@ -10730,18 +11128,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             return false;
         };
         let labels = nodes(pull, "/labels");
-        if holds(labels)
-            || labels
-                .iter()
-                .any(|l| text(l, "/name").eq_ignore_ascii_case(LABEL))
-        {
+        if holds(labels) || needs_human(labels) {
             return true;
         }
         let requested = self.config.policy.assign_holds
             && nodes(pull, "/requested_reviewers")
                 .iter()
                 .any(|r| text(r, "/login").eq_ignore_ascii_case(&self.config.operator));
-        if !requested && pull["draft"].as_bool() != Some(true) {
+        let draft = pull["draft"] == true;
+        if !requested && !draft {
             return false;
         }
         let key = (repo.to_ascii_lowercase(), number);
@@ -10751,7 +11146,24 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
                     false,
                 )
-                .is_ok_and(|comments| find_marker(&comments, &self.config.bot).stopped);
+                .is_ok_and(|comments| {
+                    let marker = find_marker(&comments, &self.config.bot);
+                    if !marker.stopped || draft {
+                        return marker.stopped;
+                    }
+                    if review_stops(self.config, &comments).is_empty() {
+                        return true;
+                    }
+                    // The REST listing shows a pending operator request. A
+                    // partial GraphQL list cannot disprove that hold; only a
+                    // complete release puts this stopped PR back in order.
+                    repo.split_once('/').is_some_and(|(owner, name)| {
+                        let hold = self.read_pull(owner, name, number).and_then(|current| {
+                            self.review_hold_with_stop(repo, number, &current, &comments)
+                        });
+                        matches!(hold, Ok(Some(_)))
+                    })
+                });
             self.pressure.stopped.insert(key.clone(), stopped);
         }
         self.pressure.stopped[&key]
@@ -15328,6 +15740,8 @@ mod tests {
         /// Fields that change on a second read of the fixture PR at #470.
         late_pull_fields: Option<Value>,
         pull_reads: RefCell<usize>,
+        late_review_hold_timeline: Option<Value>,
+        review_hold_reads: RefCell<usize>,
         /// The `mergeQueue` the report's query gives, null for a read that
         /// fails; none gives a repository without a merge queue.
         report_queue: Option<Value>,
@@ -15539,7 +15953,10 @@ mod tests {
                     json!({"repository": {"visibility": self.report_visibility.get(&repo), "mergeQueue": queue}}),
                 );
             }
-            assert!(matches!(query, PULL_QUERY | TIMED_PULL_QUERY));
+            assert!(matches!(
+                query,
+                PULL_QUERY | TIMED_PULL_QUERY | REVIEW_HOLD_QUERY
+            ));
             let number = variables["number"].as_u64().unwrap();
             let mut pull = self.pulls[&number].clone();
             if *self.labelled.borrow() {
@@ -15564,6 +15981,14 @@ mod tests {
             {
                 for (key, value) in fields {
                     pull[key] = value.clone();
+                }
+            }
+            if query == REVIEW_HOLD_QUERY {
+                *self.review_hold_reads.borrow_mut() += 1;
+                if *self.review_hold_reads.borrow() > 1
+                    && let Some(timeline) = &self.late_review_hold_timeline
+                {
+                    pull["timelineItems"] = timeline.clone();
                 }
             }
             Ok(json!({"repository": {"pullRequest": pull}}))
@@ -23073,6 +23498,564 @@ mod tests {
         }
     }
 
+    #[test]
+    fn review_stops_are_read_from_the_marker_or_the_reason_alone() {
+        let cfg = config();
+        let release = review_stop_release(&cfg.operator);
+        let label = format!("It is labelled `{LABEL}`; remove the label.");
+        let legacy = json!({"rounds": 0, "stopped": true, "sha": "old"});
+        let mut structured = legacy.clone();
+        structured["review_request"] = true.into();
+        for (state, text, author, expected) in [
+            (&legacy, format!("{STOP_TEXT}stuck. {release}"), BOT, true),
+            // A multiline API message pushes the release past the second line.
+            (
+                &legacy,
+                format!("{STOP_TEXT}dispatch refused:\nline two\n\nline three. {release}"),
+                BOT,
+                true,
+            ),
+            (
+                &legacy,
+                format!("{STOP_TEXT}stuck. {release}{}it said so", STOP_QUOTES[0]),
+                BOT,
+                true,
+            ),
+            (
+                &structured,
+                format!("{STOP_TEXT}dispatch refused:\nGitHub said no. {release}"),
+                BOT,
+                true,
+            ),
+            (&legacy, format!("{STOP_TEXT}stuck. {label}"), BOT, false),
+            // Quoted run or CI output is no evidence.
+            (
+                &legacy,
+                format!("{STOP_TEXT}stuck. {label}{}x. {release}", STOP_QUOTES[0]),
+                BOT,
+                false,
+            ),
+            (
+                &legacy,
+                format!(
+                    "{STOP_TEXT}stuck. {label}{}\n\n```text\nx. {release}\n```",
+                    STOP_QUOTES[1]
+                ),
+                BOT,
+                false,
+            ),
+            (
+                &structured,
+                format!("Re-ran the checks. {release}"),
+                BOT,
+                false,
+            ),
+            (
+                &structured,
+                format!("{STOP_TEXT}stuck. {release}"),
+                "visitor",
+                false,
+            ),
+        ] {
+            let comment = json!({
+                "id": 5, "user": {"login": author}, "body": marker_body(state, &text),
+                "created_at": "2026-10-12T01:10:01Z"
+            });
+            assert_eq!(
+                review_stops(&cfg, &[comment]).contains_key(&5),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deferred_review_start_waits_on_the_operator_when_review_is_requested_again() {
+        let mut cfg = config();
+        cfg.policy.assign_holds = true;
+        cfg.policy.review_pools = vec!["claude".into()];
+        let operator = cfg.operator.clone();
+        let timeline = |actor: &str| {
+            json!({"nodes": [{
+                "__typename": "ReviewRequestedEvent", "actor": user(actor),
+                "requestedReviewer": user(&operator), "createdAt": "2026-10-12T01:10:00Z"
+            }]})
+        };
+        // The operator asks again between the decision and the start.
+        let mut fake = Fake {
+            late_review_hold_timeline: Some(timeline(&operator)),
+            ..github()
+        };
+        let stop = marker_body(
+            &json!({"rounds": FIX_ROUNDS, "stopped": true, "sha": "old", "review_request": true}),
+            &format!(
+                "{STOP_TEXT}rounds exhausted. {}",
+                review_stop_release(&operator)
+            ),
+        );
+        let round = marker_body(&json!({"rounds": 1, "sha": "pushed"}), "Round 1.");
+        fake.rest
+            .get_mut(&format!(
+                "{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100"
+            ))
+            .unwrap()
+            .3 = json!([
+            {"id": 5, "user": {"login": BOT}, "body": stop, "created_at": "2026-10-12T01:10:01Z"},
+            {"id": 6, "user": {"login": BOT}, "body": round}
+        ]);
+        fake.pulls.insert(470, pull("pull-470", json!({
+            "reviews": {"nodes": []},
+            "reviewRequests": {"nodes": [{"requestedReviewer": user(&operator)}], "pageInfo": {"hasNextPage": false}},
+            "timelineItems": timeline(BOT)
+        })));
+        fake.page(
+            &format!(
+                "repos/{REPO}/actions/workflows/review.yml/runs?event=workflow_dispatch&created=%3E%3D2026-10-11&per_page={REVIEW_DISPATCH_READS}"
+            ),
+            None,
+            None,
+            json!({"workflow_runs": []}),
+        );
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &[REPO.to_owned()],
+            None,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        let line = outcome.lines.last().unwrap();
+        assert!(line.contains("skip: operator review pending"), "{line}");
+        assert_eq!(*fake.review_hold_reads.borrow(), 2);
+        assert_eq!(outcome.waits.len(), 1, "{:?}", outcome.waits);
+        assert_eq!(outcome.waits[0].kind, "needs-human");
+        let step = outcome.steps.last().unwrap();
+        assert_eq!((step.action, step.waiting), ("skip", WaitReason::Person));
+        assert!(fake.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn expired_review_hold_respects_labels_and_incomplete_pressure_reads() {
+        let mut cfg = config();
+        cfg.policy.assign_holds = true;
+        for (incomplete, label, late) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut fake = github();
+            let labels =
+                json!({"nodes": [{"name": "Needs-Human"}], "pageInfo": {"hasNextPage": false}});
+            let mut pull = pull(
+                "pull-470",
+                json!({
+                    "reviews": {"nodes": [review("CHANGES_REQUESTED", user(&cfg.operator), HEAD, "fix this")]},
+                    "reviewRequests": {"nodes": [{"requestedReviewer": user(&cfg.operator)}], "pageInfo": {"hasNextPage": incomplete}},
+                    "timelineItems": {"nodes": [{
+                        "__typename": "ReviewRequestedEvent", "actor": user(BOT),
+                        "requestedReviewer": user(&cfg.operator), "createdAt": "2026-10-12T01:10:00Z"
+                    }]}
+                }),
+            );
+            if label {
+                pull["labels"] = labels.clone();
+            }
+            if late {
+                fake.late_pull_fields = Some(json!({"labels": labels}));
+            }
+            fake.pulls.insert(470, pull);
+            let stop = json!({"rounds": FIX_ROUNDS, "stopped": true, "sha": "old", "review_request": true});
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None,
+                None,
+                json!([{"id": 5, "user": {"login": BOT}, "created_at": "2026-10-12T01:10:01Z",
+                    "body": marker_body(&stop, &format!("{STOP_TEXT}rounds exhausted."))}]),
+            );
+            if !late {
+                let mut pass = Pass::new(&fake, &fake, &cfg, now());
+                let open =
+                    [json!({"number": 470, "requested_reviewers": [{"login": cfg.operator}]})];
+                assert_eq!(pass.pressure_parked(REPO, &open, 470), incomplete || label);
+                *fake.pull_reads.borrow_mut() = 0;
+            }
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            if incomplete || label || late {
+                assert!(dispatcher.writes.borrow().is_empty(), "{:?}", outcome.lines);
+                assert!(fake.writes.borrow().is_empty(), "{:?}", outcome.lines);
+            } else {
+                assert_eq!(outcome.dispatched, 1, "{:?}", outcome.lines);
+            }
+        }
+    }
+
+    #[test]
+    fn an_older_review_stop_lapses_only_for_its_own_request_on_a_reviewed_head() {
+        let mut cfg = config();
+        cfg.policy.assign_holds = true;
+        let operator = &cfg.operator;
+        let timeline = |actor| {
+            json!({"nodes": [{
+                "__typename": "ReviewRequestedEvent", "actor": user(actor),
+                "requestedReviewer": user(operator), "createdAt": "2026-10-12T01:10:00Z"
+            }]})
+        };
+        let mut fake = github();
+        let dispatcher = Fake::default();
+        let run_poll = |fake: &Fake, dispatcher: &Fake, limit| {
+            let caps = caps::Caps::new(caps::Limits {
+                dispatch: Some(limit),
+                ..Default::default()
+            });
+            run_capped(
+                fake,
+                fake,
+                &cfg,
+                State::default(),
+                (&[], &[REPO.into()]),
+                applying(dispatcher),
+                Some(&caps),
+                now(),
+            )
+            .unwrap()
+        };
+        let comment_path = &format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+        let job_review = |head| review("CHANGES_REQUESTED", job(), head, "VERDICT: CHANGES");
+        // Anyone can comment on a public pull request; that is no verdict.
+        let visitor = review("COMMENTED", user("visitor"), HEAD, "Looks wrong.");
+        let stopped = |sha| json!({"rounds": FIX_ROUNDS, "stopped": true, "sha": sha});
+        // The first step a pass takes on resuming need not change the head or
+        // clear `stopped`: a rerun keeps the stop's state under a new id, a
+        // queue write the stop's id. Either way the next pass follows it on,
+        // here to wait for a verdict the visitor's review does not give.
+        let resumed = "wait: no approving review of the head yet";
+        let mut rerun = stopped("old");
+        rerun["checks_rerun"] = HEAD.into();
+        let mut queued = stopped("old");
+        queued["queue_only"] = true.into();
+        queued["queue_reset_from"] = 5.into();
+        let mut stale_queue = queued.clone();
+        stale_queue["queue_reset_from"] = Value::Null;
+        // A resumed round's push need not be reviewed to be followed, but a
+        // later stop holds, even one whose reason spans lines.
+        let round = json!({"rounds": 1, "sha": "pushed"});
+        let later_stop = format!("{STOP_TEXT}dispatch failed:\nGitHub said no.");
+        let reused_stop =
+            json!({"rounds": FIX_ROUNDS, "stopped": true, "sha": "pushed", "review_request": true});
+        let held = "operator review pending; requester unknown";
+        for (stopped_head, reviewed, after, actor, late, limit, expected) in [
+            (
+                "old",
+                job_review(HEAD),
+                &[] as &[(&Value, &str)],
+                BOT,
+                false,
+                1,
+                "fix: review requested changes",
+            ),
+            (
+                "old",
+                job_review(HEAD),
+                &[],
+                BOT,
+                false,
+                0,
+                "held by --max-dispatch",
+            ),
+            (
+                HEAD,
+                job_review(HEAD),
+                &[],
+                BOT,
+                false,
+                1,
+                "pass stop recorded for current head",
+            ),
+            ("old", job_review("old"), &[], BOT, false, 1, held),
+            ("old", visitor.clone(), &[], BOT, false, 1, held),
+            (
+                "old",
+                job_review(HEAD),
+                &[],
+                operator.as_str(),
+                false,
+                1,
+                held,
+            ),
+            (
+                "old",
+                job_review(HEAD),
+                &[],
+                BOT,
+                true,
+                1,
+                "skip: operator review pending; requester unknown",
+            ),
+            (
+                "old",
+                visitor.clone(),
+                &[(&rerun, "Resumed.")],
+                BOT,
+                false,
+                1,
+                resumed,
+            ),
+            (
+                "old",
+                visitor.clone(),
+                &[(&queued, "Resumed.")],
+                BOT,
+                false,
+                1,
+                resumed,
+            ),
+            (
+                "old",
+                visitor.clone(),
+                &[(&stale_queue, "Resumed.")],
+                BOT,
+                false,
+                1,
+                held,
+            ),
+            (
+                "old",
+                visitor.clone(),
+                &[(&round, "Round 1.")],
+                BOT,
+                false,
+                1,
+                resumed,
+            ),
+            (
+                "old",
+                visitor.clone(),
+                &[(&round, "Round 1."), (&stopped(HEAD), &later_stop)],
+                BOT,
+                false,
+                1,
+                held,
+            ),
+            // A branch reset back to the stopped head after a pass resumed
+            // on another: the head handed to the operator stays held.
+            (
+                HEAD,
+                job_review(HEAD),
+                &[(&round, "Round 1.")],
+                BOT,
+                false,
+                1,
+                held,
+            ),
+            (
+                HEAD,
+                job_review(HEAD),
+                &[(&round, "Round 1."), (&reused_stop, &later_stop)],
+                BOT,
+                false,
+                1,
+                held,
+            ),
+            (
+                HEAD,
+                job_review(HEAD),
+                &[(&rerun, "Resumed.")],
+                BOT,
+                false,
+                1,
+                held,
+            ),
+        ] {
+            fake.writes.borrow_mut().clear();
+            dispatcher.writes.borrow_mut().clear();
+            *fake.review_hold_reads.borrow_mut() = 0;
+            fake.late_review_hold_timeline = late.then(|| timeline(operator));
+            dispatcher.answers.borrow_mut().insert(
+                DISPATCHES.into(),
+                vec![(200, json!({"workflow_run_id": 1234}))],
+            );
+            let body = marker_body(
+                &stopped(stopped_head),
+                &format!(
+                    "{STOP_TEXT}rounds exhausted. {}",
+                    review_stop_release(operator)
+                ),
+            );
+            let mut comments = vec![
+                json!({"id": 5, "user": {"login": BOT}, "body": body, "created_at": "2026-10-12T01:10:01Z"}),
+            ];
+            for (id, (state, text)) in (6..).zip(after.iter()) {
+                comments.push(
+                    json!({"id": id, "user": {"login": BOT}, "body": marker_body(state, text), "created_at": "2026-10-12T02:10:01Z"}),
+                );
+            }
+            fake.rest.get_mut(comment_path).unwrap().3 = comments.into();
+            // The new head's review can arrive before the old stop comment.
+            fake.pulls.insert(470, pull("pull-470", json!({
+                "reviews": {"nodes": [reviewed]},
+                "reviewRequests": {"nodes": [{"requestedReviewer": user(operator)}], "pageInfo": {"hasNextPage": false}},
+                "timelineItems": timeline(actor)
+            })));
+            let outcome = run_poll(&fake, &dispatcher, limit);
+            assert_eq!(outcome.errors, 0, "{expected}: {:?}", outcome.lines);
+            assert!(
+                outcome.lines.last().unwrap().contains(expected),
+                "{expected}: {:?}",
+                outcome.lines
+            );
+            if !expected.starts_with("fix:") {
+                assert!(fake.writes.borrow().is_empty());
+                assert!(dispatcher.writes.borrow().is_empty());
+                if late {
+                    assert_eq!(outcome.waits[0].kind, "needs-human");
+                    assert!(outcome.waits[0].reason.contains("operator review pending"));
+                }
+                continue;
+            }
+            let writes = fake.writes.borrow();
+            assert!(
+                writes
+                    .iter()
+                    .all(|(url, _)| !url.ends_with("/requested_reviewers"))
+            );
+            assert_eq!(dispatcher.writes.borrow().len(), 1);
+            let round = text(&writes.last().unwrap().1, "/body");
+            assert_eq!(parse_marker(MARKER, round).unwrap()["rounds"], 1);
+            let round = json!({"id": 99, "user": {"login": BOT}, "body": round});
+            drop(writes);
+            fake.rest
+                .get_mut(comment_path)
+                .unwrap()
+                .3
+                .as_array_mut()
+                .unwrap()
+                .push(round);
+            fake.page(
+                "repos/cgwalters-forge/tracker/actions/runs/1234",
+                None,
+                None,
+                json!({"status": "in_progress"}),
+            );
+            let outcome = run_poll(&fake, &dispatcher, 1);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert!(
+                outcome
+                    .lines
+                    .last()
+                    .unwrap()
+                    .contains("wait: fix round 1 is running"),
+                "{:?}",
+                outcome.lines
+            );
+            assert_eq!(dispatcher.writes.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_branch_update_past_an_expired_review_stop_is_followed_on() {
+        let mut cfg = config();
+        cfg.policy.assign_holds = true;
+        let operator = cfg.operator.clone();
+        let mut fake = github();
+        let dispatcher = Fake::default();
+        let run_poll = |fake: &Fake| {
+            run_capped(
+                fake,
+                fake,
+                &cfg,
+                State::default(),
+                (&[], &[REPO.into()]),
+                applying(&dispatcher),
+                None,
+                now(),
+            )
+            .unwrap()
+        };
+        let comment_path = &format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+        let stop = marker_body(
+            &json!({"rounds": FIX_ROUNDS, "stopped": true, "sha": "old"}),
+            &format!(
+                "{STOP_TEXT}rounds exhausted. {}",
+                review_stop_release(&operator)
+            ),
+        );
+        fake.rest.get_mut(comment_path).unwrap().3 = json!([
+            {"id": 5, "user": {"login": BOT}, "body": stop, "created_at": "2026-10-12T01:10:01Z"}
+        ]);
+        let requested = json!({
+            "mergeStateStatus": BEHIND,
+            "reviewRequests": {"nodes": [{"requestedReviewer": user(&operator)}], "pageInfo": {"hasNextPage": false}},
+            "timelineItems": {"nodes": [{
+                "__typename": "ReviewRequestedEvent", "actor": user(BOT),
+                "requestedReviewer": user(&operator), "createdAt": "2026-10-12T01:10:00Z"
+            }]}
+        });
+        fake.pulls.insert(470, pull("pull-470", requested.clone()));
+        let outcome = run_poll(&fake);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        let got = outcome.lines.last().unwrap();
+        assert!(
+            got.ends_with("-> brought up to date with main; waits for the review of the new head"),
+            "{got}"
+        );
+        let writes = fake.writes.take();
+        let resumed = writes.iter().position(|(url, body)| {
+            url.ends_with("/470/comments")
+                && parse_marker(MARKER, text(body, "/body"))
+                    .is_some_and(|m| m["queue_only"] == true && m["queue_reset_from"] == 5)
+        });
+        let updated = writes
+            .iter()
+            .position(|(url, _)| url.contains("updatePullRequestBranch"));
+        assert!(resumed.is_some() && resumed < updated, "{writes:?}");
+        // The new head has no verdict yet, and the stop's request is still
+        // pending: only the recorded resumption lets the pass follow it on
+        // to wait for its review.
+        let mut p = pull("pull-470", requested);
+        p["headRefOid"] = "updated".into();
+        p["commits"]["nodes"][0]["commit"]["oid"] = "updated".into();
+        p["mergeStateStatus"] = "CLEAN".into();
+        fake.pulls.insert(470, p);
+        for (resumed, expected) in [
+            (None, "skip: operator review pending"),
+            (
+                Some(&writes[resumed.unwrap()].1["body"]),
+                "wait: no approving review of the head yet",
+            ),
+        ] {
+            if let Some(body) = resumed {
+                fake.rest
+                    .get_mut(comment_path)
+                    .unwrap()
+                    .3
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id": 6, "user": {"login": BOT}, "body": body}));
+            }
+            let outcome = run_poll(&fake);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let got = outcome.lines.last().unwrap();
+            assert!(got.contains(expected), "{got}");
+        }
+    }
+
     fn assign_holds_request_and_release(policy: PollPolicy) {
         let state = json!({"rounds": FIX_ROUNDS, "sha": "older"});
         let failed = json!({"contexts": {"ci": {"conclusion": "FAILURE"}}});
@@ -23100,6 +24083,7 @@ mod tests {
         );
         let stopped = parse_marker(MARKER, stop).unwrap();
         assert_eq!(stopped["stopped"], true);
+        assert_eq!(stopped["review_request"], true);
         assert!(!stop.contains("It is labelled"), "{stop}");
         drop(writes);
 
@@ -23171,7 +24155,7 @@ mod tests {
                         assert_eq!(decision.action, "skip");
                         assert_eq!(decision.waiting, WaitReason::Person);
                         assert_eq!(
-                            operator_wait(&cfg, &p, &decision),
+                            operator_wait(&p, &decision, review_hold(&cfg, &p)),
                             (!incomplete).then_some("needs-human")
                         );
                     }
@@ -27573,6 +28557,8 @@ mod tests {
         for (case, skip) in [
             ("off", ""),
             ("fresh", ""),
+            ("expired stop", ""),
+            ("renewed stop", "operator review pending"),
             ("combined", ""),
             ("operator before job", ""),
             ("unproven job approval", ""),
@@ -27647,6 +28633,21 @@ mod tests {
                 );
             }
             let mut candidate = pull("pull-470", fields);
+            let review_stop = matches!(case, "expired stop" | "renewed stop");
+            if review_stop {
+                cfg.policy.assign_holds = true;
+                candidate["reviewRequests"] = json!({"nodes": [{"requestedReviewer": user(&cfg.operator)}], "pageInfo": {"hasNextPage": false}});
+                let request = |actor| {
+                    json!({"nodes": [{
+                        "__typename": "ReviewRequestedEvent", "actor": user(actor),
+                        "requestedReviewer": user(&cfg.operator), "createdAt": "2026-10-12T01:10:00Z"
+                    }]})
+                };
+                candidate["timelineItems"] = request(BOT);
+                if case == "renewed stop" {
+                    candidate["timelineItems"] = request(&cfg.operator);
+                }
+            }
             if case == "held" {
                 candidate["labels"]["nodes"] = json!([{"name": HOLD_LABEL}]);
             }
@@ -27694,11 +28695,18 @@ mod tests {
                 "exhausted" => Some(json!({"sha":"older","rounds":cfg.policy.fix_rounds()})),
                 _ => None,
             };
+            let comments = if review_stop {
+                let stop = json!({"sha": "older", "rounds": FIX_ROUNDS, "stopped": true, "review_request": true});
+                json!([{"id": 10, "user": {"login": BOT}, "created_at": "2026-10-12T01:10:01Z",
+                    "body": marker_body(&stop, &format!("{STOP_TEXT}rounds exhausted."))}])
+            } else {
+                json!(marker.into_iter().map(|marker| json!({"id":10,"user":{"login":BOT},"body":marker_body(&marker, "a round")})).collect::<Vec<_>>())
+            };
             fake.page(
                 &format!("repos/{REPO}/issues/470/comments?per_page=100"),
                 None,
                 None,
-                json!(marker.into_iter().map(|marker| json!({"id":10,"user":{"login":BOT},"body":marker_body(&marker, "a round")})).collect::<Vec<_>>()),
+                comments,
             );
             fake.page(
                 &format!("repos/{}/actions/runs/8", cfg.dispatch_repo),
@@ -27772,7 +28780,11 @@ mod tests {
                 );
             } else if matches!(
                 case,
-                "fresh" | "job fresh" | "operator before job" | "unproven job approval"
+                "fresh"
+                    | "expired stop"
+                    | "job fresh"
+                    | "operator before job"
+                    | "unproven job approval"
             ) {
                 assert_eq!(
                     (first.repository.as_str(), first.number, first.action),
