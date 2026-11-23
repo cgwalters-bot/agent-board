@@ -54,6 +54,28 @@ Anything else, including `null` for a field, is refused: the caller has no input
 for the base branch, budget or allowed outputs yet, so a plan must not appear to
 set them. One plan per comment; a comment with two is refused.
 
+### CI repair plans
+
+If stacked or sibling repairs would each leave CI red on causes another repair
+fixes, use one plan for the verified causes of the same incident. Callers can
+put this policy in the file selected by the GitHub pass's
+[`guidance` mapping](pass.md#repository-guidance) for the repository holding
+the tracking issue or epic. For example:
+
+> For a CI incident in the work repository that the current issue or epic
+> covers, verify the failures and group only causes shown to belong to that
+> incident into one implement plan. List each cause and its evidence in the
+> brief and ask the implement job to document each separately in its PR.
+> Do not disable checks. If the evidence links a new cause to a repair already
+> in progress for the same incident, report it for operator follow-up instead
+> of proposing a sibling repair. An open PR or a body marker alone is not proof
+> of a shared incident.
+
+This is planner guidance, not a lock or a routing rule. It does not prevent
+concurrent or rerun jobs from opening sibling repairs, send later causes to a
+repair PR, or change ordinary fix rounds. The operator starts any follow-up.
+Initial publication still carries one patch as one commit.
+
 ### Issues staged outside the work repository
 
 The concrete threat is checking the tracking repository's bounds while changing

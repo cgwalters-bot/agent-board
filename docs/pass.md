@@ -4070,6 +4070,9 @@ their own guidance file and configure its mapping; without one, the brief
 has only the neutral planning task and protocol. This reuses the existing
 off-by-default mapping and its validation bounds, with no new reads or authority.
 
+For example, callers can use it to guide planners on grouping
+[CI repairs](job-plans.md#ci-repair-plans) without changing dispatch or fix rounds.
+
 ```json
 "guidance": {
   "cgwalters-forge/agent-board": {"path": "AGENTS.md"},
