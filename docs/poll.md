@@ -179,8 +179,11 @@ of the [decision seam](architecture.md#proposed-read-only-persistent-consumer)
 gets the same index back in memory and carries it itself; the state it carries
 goes through the same decode as a file before the next pass.
 
-The index holds at most 1,024 responses, 8 MiB of serialized response data,
-and 256 KiB per entry. Deterministic eviction drops responses only. Newly
+The index holds at most 1,024 responses, 24 MiB of serialized response data,
+and 256 KiB per entry. When a bound is reached, the pass evicts least-recently
+used responses first. Older unstamped entries come first, with URL order as a
+stable tie breaker. Saving leaves room for the other state fields within the
+32 MiB file limit. Eviction drops responses only. Newly
 written entries include a SHA-256 corruption checksum; this is **not** writer
 authentication. Invalid responses are discarded with diagnostics. An incompatible
 response scope also starts cold; the log says whether the scope was absent or
@@ -195,12 +198,12 @@ retained-data bounds, not an input file allocation bound.
 Full shared REST reads revalidate their own ETags on every access. A 304 replaces
 the body with the validated representation; a present Link replaces pagination
 metadata, while an absent Link retains it. There is no TTL or issue-`updatedAt`
-shortcut for comments, timelines, reviews, checks or relationships. Existing
-GraphQL reads remain fresh. The existing `Kept` hold-only read deduplication is
+shortcut for comments, timelines, reviews, checks or relationships. GraphQL
+item reuse is [opt-in](pass.md#graphql-item-reuse-github). The existing `Kept` hold-only read deduplication is
 retained; it does not authorize starts. Explicit live poll reads bypass the
 shared cache, as do shared reads during start/recovery admission. Writes,
-including ambiguous failures and GraphQL mutations, keep the disposable shared
-index: a cached body is served only after a conditional read, so a resource a
+including ambiguous failures and GraphQL mutations, keep REST validators: a
+cached REST body is served only after a conditional read, so a resource a
 write changed answers 200 with its new body. Poll writes still discard their
 local response index; a pass that wrote does not carry old slim responses into
 its next state. All pagination,

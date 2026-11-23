@@ -72,6 +72,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
         "assignHolds",
         "readFreeHolds",
         "leanReads",
+        "reuseGraphqlItems",
         "bodyPlans",
         "leases",
         "reruns",
@@ -212,6 +213,7 @@ mod tests {
         }
         let github = classify(&json!({})).unwrap();
         assert!(github.unconfigured.contains("openPrCap"));
+        assert!(github.unconfigured.contains("reuseGraphqlItems"));
         assert!(github.unconfigured.contains("pr.agentRecovery"));
         assert!(github.unconfigured.contains("promote.botAuthorEmails"));
         for (emails, disabled) in [

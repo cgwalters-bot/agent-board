@@ -19962,6 +19962,105 @@ fn body_plans_refuse_a_plan_changed_while_read() {
     }
 }
 
+/// With `reuseGraphqlItems`, a body reused from an unchanged listing that
+/// shows no plan is read again live: a plan a writer added after the
+/// listing starts the issue rather than being outranked by triage's plan
+/// comment.
+#[test]
+fn body_plans_read_a_reused_body_without_a_plan_live() {
+    let listed = "2026-10-22T00:00:00Z";
+    let observed =
+        board_query(true, false).replacen("createdAt updatedAt", "createdAt id updatedAt", 1);
+    let versioned = cache::ItemQuery::Body.versioned();
+    let triage = "start triage cgwalters-forge/tracker#446 pool=claude record=";
+    let implement = "start implement cgwalters-forge/tracker#446 plan=body pool=claude record=";
+    for (name, added, expected) in [
+        ("unchanged", false, triage),
+        ("a plan added", true, implement),
+    ] {
+        let mut forge = body_plan_forge(
+            "P0",
+            "Write the staging design down.",
+            "cgwalters-bot",
+            None,
+        );
+        on_446(&mut forge, |node| {
+            node["content"]["id"] = json!("I_446");
+            node["content"]["updatedAt"] = json!(listed);
+        });
+        // The listing that observes versions, and the versioned body read.
+        let mut copies = Vec::new();
+        for entry in &forge.replay.requests {
+            let mut entry = entry.clone();
+            if entry["answer"]
+                .pointer("/data/repositoryOwner/projectV2")
+                .is_some()
+            {
+                entry["request"]["graphql"] = fnv(&observed).into();
+            } else if entry["request"]["graphql"] == fnv(BODY_QUERY) {
+                entry["request"]["graphql"] = fnv(&versioned).into();
+                let issue = &mut entry["answer"]["data"]["repository"]["issue"];
+                issue["id"] = json!("I_446");
+                issue["updatedAt"] = json!(listed);
+            } else {
+                continue;
+            }
+            copies.push(entry);
+        }
+        forge.replay.requests.extend(copies);
+        rest_comment_pages(&mut forge.replay);
+        if added {
+            // Only a live read of the original query sees the new plan.
+            let block = body_plan_block();
+            forge.racing = Some(Box::new(move |request, data| {
+                if request.contains(BODY_QUERY) {
+                    data["repository"]["issue"]["body"] = block.clone().into();
+                }
+            }));
+        }
+        let now = forge.replay.now;
+        let forge = ConditionalRecording {
+            replay: forge,
+            reads: RefCell::default(),
+            traffic: RefCell::default(),
+            contextless: Cell::default(),
+        };
+        let cfg = config(
+            json!({"bodyPlans": true, "reuseGraphqlItems": true, "state": "pass-state.json"}),
+        );
+        let own = own();
+        let pass = |state, mode| {
+            let report = block(run(
+                &forge,
+                &forge,
+                &cfg,
+                state,
+                (mode, Limits::default()),
+                now,
+            ));
+            let report = report.unwrap();
+            assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+            report
+        };
+        let cold = pass(State::default(), Mode::Preview);
+        let warm = pass(next_state(&cold), Mode::Actions(&own));
+        assert!(
+            warm.lines.iter().any(|l| l.contains("GraphQL reuses 1,")),
+            "{name}: {:#?}",
+            warm.lines
+        );
+        let line = warm.lines.iter().find(|l| l.contains("tracker#446"));
+        assert!(
+            line.is_some_and(|l| l.starts_with(expected)),
+            "{name}: no line {expected:?} in {:#?}",
+            warm.lines
+        );
+        let comments = forge.replay.comments_on("cgwalters-forge/tracker", 446);
+        assert_eq!(comments.len(), 2, "{name}: {comments:#?}");
+        assert_eq!(comments[0].starts_with(BODY_PLAN), added, "{name}");
+    }
+}
+
 // ---- Pure logic ----
 
 /// The keys a `revisit` section needs beside it: triage, on pool `a`.

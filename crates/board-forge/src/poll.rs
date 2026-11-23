@@ -1740,6 +1740,9 @@ pub trait Rest {
     fn preview_pool_start(&self, _pool: &str) {}
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse>;
+    /// A listing body the poll just revalidated with its own validator.
+    fn revalidated_listing(&self, _url: &str, _body: &Value) {}
+
     /// Bypass every conditional cache, including a pass-wide wrapper. Claims
     /// need current pagination even when the first page's body is unchanged.
     fn get_fresh(&self, url: &str) -> Result<RestResponse> {
@@ -2119,7 +2122,14 @@ impl State {
                 Some((url.clone(), entry.clone()))
             })
             .collect::<BTreeMap<_, _>>();
-        let evicted = !crate::pass::cache::bound(&mut responses).evicted.is_empty();
+        let response_limit = if signed {
+            crate::pass::cache::MAX_BYTES
+        } else {
+            crate::pass::cache::LEGACY_MAX_BYTES
+        };
+        let evicted = !crate::pass::cache::bound(&mut responses, response_limit)
+            .evicted
+            .is_empty();
         if evicted || !object.get("responses").is_some_and(Value::is_object) {
             eprintln!("cache: missing, oversized or evicted disposable responses; cold reads");
         }
@@ -7874,6 +7884,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             // The ETag covers the body only: a list that grew past this page
             // answers 304 with a new `Link`. Without one, the cached pages stand.
             (304, Some(mut cached)) => {
+                self.rest.revalidated_listing(url, &cached["body"]);
                 if let Some(link) = response.link {
                     cached["next"] = next_link(&link).into();
                 }
@@ -7889,7 +7900,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         };
         let entry = crate::pass::cache::seal(entry);
         self.used.insert(url.to_owned(), entry.clone());
-        self.evicted += crate::pass::cache::bound(&mut self.used).evicted.len();
+        self.evicted +=
+            crate::pass::cache::bound(&mut self.used, crate::pass::cache::LEGACY_MAX_BYTES)
+                .evicted
+                .len();
         Ok((
             entry["body"].clone(),
             entry["next"].as_str().map(str::to_owned),

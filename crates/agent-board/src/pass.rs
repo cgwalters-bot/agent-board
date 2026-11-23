@@ -451,8 +451,13 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                     if let (true, Some(path), Some(state)) =
                         (args.apply, &config.state, &report.state)
                     {
-                        std::fs::write(path, serde_json::to_vec(&state.to_json())?)
-                            .with_context(|| format!("write {path}"))?;
+                        let bytes = serde_json::to_vec(&state.to_json())?;
+                        ensure!(
+                            bytes.len() as u64 <= pass::STATE_BYTES,
+                            "pass state exceeds {} bytes",
+                            pass::STATE_BYTES
+                        );
+                        std::fs::write(path, bytes).with_context(|| format!("write {path}"))?;
                     }
                     if let (true, Some(path)) = (args.apply, &config.store) {
                         save_store(path, &report, now);
