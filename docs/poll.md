@@ -110,6 +110,37 @@ Regression replays use the apply annotations from tracker runs `43244188959` and
 live dispatch test. Deployment requires tracker `.github/pass.json` key
 `pr.holdMissingData` set to `true`; no caller configuration is changed here.
 
+### Stop reasons (#1119)
+
+The concrete failure prevented is a fix round's stop that does not say why
+(tracker#1781). `pr.stopReasons: true` in the pass (`stopReasons: true` in
+standalone poll) enables it; it is off by default. It changes no fix round: it
+spends, saves and reruns none.
+
+A stop because a completed fix or continuation run left the head unchanged
+quotes that run's checked `noop` or `missing_data` reason as a bounded,
+unverified excerpt, as [infrastructure stops](pass.md#infrastructure-stops) do,
+whoever directed the round; a stop for another cause on that head, such as a
+broken stack, keeps its own reason alone. A plain stop puts the excerpt on its
+own line after the release instructions, and bidirectional formatting
+characters are dropped from it so that it cannot reorder the bot's text. It is
+read the same way, only where the stop is posted: one artifact of the first
+attempt of a public caller's run, quoted only if a fresh read of the run after
+it still shows that attempt completed and unchanged. A plain stop's excerpt has
+its own bound, not what the stop's reason leaves of a supervisor hold's. Like a
+supervisor hold, such a stop is posted only on an open pull request still at
+that head, with no hold and all its labels read, whether or not its reason
+could be read. The reason starts, routes or releases nothing. Stopping rounds
+whose fix is out of the pull request's reach needs a reason code the run's
+checked report does not carry yet; the reason's prose is no basis for it. A
+failure of the review job's own run still takes a fix round: a failed check's
+link names the run it shows, not one the check belongs to, so it cannot pick a
+review run to re-run with the pass's Actions write access.
+
+Deployment requires tracker `.github/pass.json` key `pr.stopReasons` set to
+`true`; no caller configuration is changed here. There is no `pr.blockedRounds`
+key: the pass rejects its configuration with it.
+
 ### Declared PR dependencies (first slice of #936)
 
 The concrete failure prevented is spending review and recovery rounds on a head
