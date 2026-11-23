@@ -2964,6 +2964,10 @@ prolong a secondary limit: the refused operation fails as usual, the
 requests not sent are left out, and one `rate-limited: …` line says why,
 before the summary, which includes `, rate-limited` before its final effect
 counts. The next pass carries on.
+An explicit primary GraphQL point refusal is not retried. During Status, on
+any of its reads or edits, it discards the snapshot or defers the remaining
+edits with one `status deferred: …` line. The breaker still prevents further
+requests. A recording keeps the refusal typed, so its replay defers alike.
 `--record FILE` previews live and saves every read as a new fixture. Add
 `--replay SEED` to answer reads the token cannot make, such as a private usage
 snapshot or the broker's `/usage`. A preview counts only the PR runs that stage 2 actually starts, so it
@@ -3646,13 +3650,14 @@ estimates (one point per query, five per mutation), which can undercount.
 Transport retries and concurrent token users can consume additional allowance.
 The 90% maximum therefore targets headroom for other users, not a guaranteed
 tenth left for the standalone poll, supervisor or people's `gh`.
-A token with nothing left gets a limit of 0 and spends nothing, every
-operation refused with `the pass's request budget (0) is spent` until the
-reset the line names; the pass does not wait for it. Where the read fails,
-including a replay that did not record it, the fixed 650 holds and the pass
-says so (`warning: requestShare: the budget was not sized from the token's
-rate limit, so the fixed 650 holds: …`), without a failure. Each pass reads the
-headroom again; the poll's own request budget is not changed.
+A token with nothing left gets a limit of 0. The pass logs a deferral and
+returns without discovering repositories or running any stage; it does not
+wait for the reset. If the point budget runs out during Status edits, the
+remaining edits wait for the next pass, with one line and no failure. Where
+the read fails, including a replay that did not record it, the fixed 650
+holds and the pass says so (`warning: requestShare: the budget was not sized
+from the token's rate limit, so the fixed 650 holds: …`), without a failure.
+Each pass reads the headroom again; the poll's own request budget is not changed.
 
 Caller settings in `cgwalters-forge/tracker`: `.github/pass.json` is to set
 `requestShare` to `25`, targeting more than a sixth of the initial allowance
@@ -3676,8 +3681,8 @@ one), raises it to `floor` and caps it at `requestShare`'s percentage. Where
 that percentage is under `floor`, the pass is held: its limit is 0, it
 spends nothing and says so (`budget: requestWindow holds the pass until
 2026-11-16T15:00:00Z: 50% of the 1400 the token has left, 700, is under the
-floor of 1200, so it spends nothing (…)`), its operations refused as with a
-token that has nothing left. `pass next` still starts the next pass at its
+floor of 1200, so it spends nothing (…)`), deferring as with a token that has
+nothing left. `pass next` still starts the next pass at its
 interval, which reads the headroom again; after the reset it runs. The
 window also stops GraphQL at that many points, since the GraphQL pool counts
 points, not calls; the summary already reports a pass's points

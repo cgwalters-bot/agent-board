@@ -304,6 +304,19 @@ pub struct Preview {
     pub network_sends: Option<usize>,
 }
 
+/// No decision snapshot was read because the pass had no request budget.
+/// Keep the input state and retry on the next pass.
+#[derive(Debug)]
+pub struct PreviewDeferred;
+
+impl std::fmt::Display for PreviewDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("decision preview deferred: zero request budget")
+    }
+}
+
+impl std::error::Error for PreviewDeferred {}
+
 /// Explicit opt-in library invocation; no CLI option, local state write or
 /// persistent service is enabled. Config, state, transports and clock belong to
 /// the caller. Existing pass request/time bounds and caps still apply.
@@ -353,6 +366,9 @@ pub async fn preview<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // is not a partial observation: discard the entire result and its state.
     guarded.check_credential()?;
     let mut report = report?;
+    if report.zero_request_budget {
+        return Err(PreviewDeferred.into());
+    }
     let state = match unchanged {
         Some(state) => state,
         None => {
