@@ -404,7 +404,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         )?;
         file_veto(repo, &raw, &files, next.is_some())?;
         let (owner, name) = repo.split_once('/').context("draft repository")?;
-        self.more_checks(owner, name, number, pull)?;
+        self.more_checks(owner, name, number, pull, false)?;
         let contexts = pull
             .pointer("/commits/nodes/0/commit/statusCheckRollup/contexts")
             .context("CI not read")?;

@@ -192,8 +192,27 @@ impl std::fmt::Display for RateLimited {
 
 impl std::error::Error for RateLimited {}
 
+/// Strip both request identity and upstream text before exposing an error,
+/// retaining the signal that stops a rate-limited pass and a bare 404.
+pub(crate) fn sensitive_read_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<RateLimited>() {
+        RateLimited("GitHub rate-limited a sensitive read".into()).into()
+    } else if error.is::<NotFound>() {
+        NotFound.into()
+    } else if crate::pass::budget_spent(&error) {
+        error
+    } else {
+        anyhow::anyhow!("GitHub sensitive read failed")
+    }
+}
+
 pub trait Transport {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value>;
+
+    /// Fresh evidence with potentially private identity or contents.
+    fn graphql_sensitive(&self, query: &str, variables: Value) -> Result<Value> {
+        self.graphql(query, variables).map_err(sensitive_read_error)
+    }
 }
 
 /// The async [`Transport`], which the snapshot reads through. Its futures

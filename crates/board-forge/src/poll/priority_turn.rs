@@ -94,10 +94,61 @@ impl std::fmt::Display for PrioritySkip {
 
 impl std::error::Error for PrioritySkip {}
 
+/// A search-derived read provided no public evidence. Do not report its PR.
+#[derive(Debug)]
+pub(super) struct RedHidden;
+
+impl std::fmt::Display for RedHidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("red-check PR visibility unconfirmed")
+    }
+}
+
+impl std::error::Error for RedHidden {}
+
+pub(super) fn require_public(pull: &Value, owner: &str, name: &str) -> Result<()> {
+    let repository = &pull["baseRepository"];
+    ensure!(
+        repository["visibility"] == "PUBLIC"
+            && text(repository, "/nameWithOwner").eq_ignore_ascii_case(&format!("{owner}/{name}")),
+        RedHidden
+    );
+    Ok(())
+}
+
+fn red_turn_stopped(error: &anyhow::Error) -> bool {
+    error.is::<crate::github::RateLimited>() || crate::pass::budget_spent(error)
+}
+
+pub(super) fn red_evidence_error(error: anyhow::Error) -> anyhow::Error {
+    if red_turn_stopped(&error) {
+        error
+    } else {
+        RedHidden.into()
+    }
+}
+
+fn report_red_stop(outcome: &mut Outcome, error: &anyhow::Error) {
+    let reason = if error.is::<crate::github::RateLimited>() {
+        outcome.errors += 1;
+        "GitHub rate limited"
+    } else {
+        "request budget spent"
+    };
+    outcome
+        .lines
+        .push(format!("pull requests: red-check turn stopped; {reason}"));
+}
+
 pub(super) fn search_path(config: &Config, qualifier: &str) -> String {
     let owner = config.dispatch_repo.split('/').next().unwrap_or_default();
+    let public = if qualifier.starts_with("status:") {
+        " is:public"
+    } else {
+        ""
+    };
     let query = format!(
-        "author:{bot} user:{owner} user:{bot} is:pr is:open {qualifier} archived:false",
+        "author:{bot} user:{owner} user:{bot} is:pr is:open {qualifier} archived:false{public}",
         bot = config.bot
     );
     let query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
@@ -201,6 +252,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if !follow.iter().any(|r| self.config.ours(r)) {
             return;
         }
+        if turn == PriorityTurn::RedCheck && !self.rest.allows_sensitive_reads() {
+            outcome
+                .lines
+                .push("pull requests: red-check turn skipped in record/replay".into());
+            return;
+        }
         // Leave the ordinary walk room for both discovery and decisions. The
         // turn can use at most half the remaining share, with a local ceiling.
         let share = self
@@ -237,7 +294,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         for &qualifier in turn.searches() {
             // Keep the red-check diagnostics stable.
             let search = qualifier.strip_prefix("status:").unwrap_or(qualifier);
-            let listed = match self.priority_search(kind, qualifier) {
+            let listed = match self.priority_search(turn, qualifier) {
                 Ok((listed, partial)) => {
                     if partial {
                         outcome.lines.push(format!(
@@ -245,6 +302,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         ));
                     }
                     listed
+                }
+                Err(error) if turn == PriorityTurn::RedCheck && red_turn_stopped(&error) => {
+                    report_red_stop(outcome, &error);
+                    return;
                 }
                 Err(error) => {
                     outcome.error(&format!("pull requests: {kind} {search} search"), &error);
@@ -269,9 +330,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     None
                 };
                 if let Some(why) = skip {
-                    outcome
-                        .lines
-                        .push(format!("{repo}#{number} {kind} skip: {why}"));
+                    if turn != PriorityTurn::RedCheck {
+                        outcome
+                            .lines
+                            .push(format!("{repo}#{number} {kind} skip: {why}"));
+                    }
                 } else if let Some(repo) = followed {
                     admitted.push((repo.as_str(), number));
                 }
@@ -295,6 +358,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 })
                 .collect();
             if let Err(error) = self.follow_candidates(repo, open, Some((turn, floor)), outcome) {
+                if turn == PriorityTurn::RedCheck {
+                    report_red_stop(outcome, &error);
+                    break;
+                }
                 outcome.error(repo, &error);
             }
         }
@@ -302,10 +369,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 
     fn priority_search(
         &mut self,
-        kind: &str,
+        turn: PriorityTurn,
         qualifier: &str,
     ) -> Result<(Vec<(String, u64)>, bool)> {
-        let response = self.get(&search_path(self.config, qualifier))?;
+        let kind = turn.name();
+        let path = search_path(self.config, qualifier);
+        let response = if turn == PriorityTurn::RedCheck {
+            self.spend()?;
+            self.rest.get_sensitive(&format!("{API_ROOT}{path}"))?.body
+        } else {
+            self.get(&path)?
+        };
         let items = response["items"]
             .as_array()
             .with_context(|| format!("{kind} search has no items"))?;
@@ -326,7 +400,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     .as_str()
                     .and_then(|s| s.strip_prefix(&format!("{API_ROOT}repos/")))
                     .with_context(|| format!("{kind} search has an invalid repository URL"))?;
-                validate_repository(repo)?;
+                if turn == PriorityTurn::RedCheck {
+                    ensure!(
+                        validate_repository(repo).is_ok(),
+                        "{kind} search has an invalid repository name"
+                    );
+                } else {
+                    validate_repository(repo)?;
+                }
                 let number = item["number"]
                     .as_u64()
                     .filter(|&n| n > 0 && n <= i32::MAX as u64 && item["pull_request"].is_object())

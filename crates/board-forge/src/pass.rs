@@ -4023,6 +4023,18 @@ impl<C: Rest> Rest for Budget<'_, C> {
         self.observe(self.inner.get_live(url))
     }
 
+    fn get_sensitive(&self, url: &str) -> Result<RestResponse> {
+        let class = endpoint_class(url);
+        self.spend(false, &class)?;
+        self.root_read(&class, url, false, false);
+        // The breaker must see the rate limit, but never the unredacted error.
+        self.observe(self.inner.get_sensitive(url))
+    }
+
+    fn allows_sensitive_reads(&self) -> bool {
+        self.inner.allows_sensitive_reads()
+    }
+
     /// The poll's claim, or its count of review runs, is under way: as a
     /// start's, its reads are not refused by the share, and finish past the
     /// time bound.
@@ -4236,6 +4248,18 @@ fn comments_match(rest: &Value, data: &Value) -> bool {
 }
 
 impl<C: Rest + Transport> Transport for Budget<'_, C> {
+    fn graphql_sensitive(&self, query: &str, variables: Value) -> Result<Value> {
+        ensure!(!is_mutation(query), "sensitive evidence requires a read");
+        let operation = graphql_operation(query);
+        self.spend_graphql(false, query, &operation)?;
+        self.graphql_spent(
+            false,
+            &operation,
+            0,
+            self.inner.graphql_sensitive(query, variables),
+        )
+    }
+
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         self.graphql_counted(query, variables, &graphql_operation(query), 0)
     }
@@ -4363,6 +4387,14 @@ impl<C: Rest> Rest for Kept<'_, C> {
         self.inner.get_live(url)
     }
 
+    fn get_sensitive(&self, url: &str) -> Result<RestResponse> {
+        self.inner.get_sensitive(url)
+    }
+
+    fn allows_sensitive_reads(&self) -> bool {
+        self.inner.allows_sensitive_reads()
+    }
+
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         let key = json!({"get": url, "validator": validator});
         let read = || Ok(KeptRead::Rest(self.inner.get(url, validator)?));
@@ -4380,6 +4412,14 @@ impl<C: Rest> Rest for Kept<'_, C> {
 }
 
 impl<C: Rest + Transport> Transport for Kept<'_, C> {
+    fn graphql_sensitive(&self, query: &str, variables: Value) -> Result<Value> {
+        ensure!(
+            !is_mutation(query),
+            "kept reads decide a hold, and write nothing"
+        );
+        self.inner.graphql_sensitive(query, variables)
+    }
+
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         ensure!(
             !is_mutation(query),
@@ -10843,6 +10883,14 @@ fn fixture_text(head: &Value, entries: &[Value]) -> String {
 }
 
 impl<C: Rest> Rest for Recorder<'_, C> {
+    fn allows_sensitive_reads(&self) -> bool {
+        false
+    }
+
+    fn get_sensitive(&self, _: &str) -> Result<RestResponse> {
+        bail!("sensitive reads are not recorded")
+    }
+
     fn token_expiration(&self) -> Option<OffsetDateTime> {
         let expiry = self.inner.token_expiration();
         self.keep(
@@ -10914,6 +10962,10 @@ impl<C> Recorder<'_, C> {
 }
 
 impl<C: Transport> Transport for Recorder<'_, C> {
+    fn graphql_sensitive(&self, _: &str, _: Value) -> Result<Value> {
+        bail!("sensitive reads are not recorded")
+    }
+
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let request = graphql_key(query, &variables);
         self.keep_graphql(request, self.inner.graphql(query, variables))
@@ -11031,6 +11083,10 @@ impl<C: crate::github::GraphQl> crate::github::GraphQl for Seeded<'_, C> {
 }
 
 impl Rest for Replay {
+    fn allows_sensitive_reads(&self) -> bool {
+        false
+    }
+
     fn token_expiration(&self) -> Option<OffsetDateTime> {
         self.answer(&json!({"credential": "expiration"}))
             .ok()

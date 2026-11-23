@@ -93,6 +93,15 @@ impl<C: Rest> Rest for ReadOnly<'_, C> {
         self.inner.get(url, validator)
     }
 
+    fn allows_sensitive_reads(&self) -> bool {
+        self.inner.allows_sensitive_reads()
+    }
+
+    fn get_sensitive(&self, url: &str) -> Result<RestResponse> {
+        self.check_credential()?;
+        self.inner.get_sensitive(url)
+    }
+
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         // Preserve status-returning GETs: unlike get(), these let readers
         // interpret a missing resource (404/410) themselves.
@@ -115,6 +124,12 @@ impl<C: Transport> Transport for ReadOnly<'_, C> {
         query_only(query)?;
         self.check_credential()?;
         self.inner.graphql(query, variables)
+    }
+
+    fn graphql_sensitive(&self, query: &str, variables: Value) -> Result<Value> {
+        query_only(query)?;
+        self.check_credential()?;
+        self.inner.graphql_sensitive(query, variables)
     }
 }
 

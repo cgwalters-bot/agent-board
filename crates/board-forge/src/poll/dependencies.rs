@@ -91,6 +91,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(())
     }
 
+    /// Whether `pull` has dependency state for [`Self::dependency_admission`]
+    /// to reconcile, without naming any of its targets.
+    pub(super) fn has_dependency_state(
+        &mut self,
+        repo: &str,
+        number: u64,
+        pull: &Value,
+        comments: &[Value],
+    ) -> Result<bool> {
+        Ok(self
+            .dependency_admission(repo, number, pull, comments)?
+            .is_some())
+    }
+
     /// The single admission predicate for every path that can spend work on a
     /// PR. An unreleased marker holds even after prerequisites land: only the
     /// poll's release protocol may finish the branch update and draft release.

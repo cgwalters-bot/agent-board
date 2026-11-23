@@ -924,11 +924,22 @@ a turn before the walk. It searches the configured bot's open PRs for
 It rotates the returned candidates by clock and stops admitting decisions within
 half the remaining request share (up to 192 requests). A decision's reads stop
 at that floor; once it writes, such as posting a claim, it finishes under the
-normal pass bounds. It logs skips and
-incomplete search coverage. It considers only followed,
-admitted own-space PRs; fresh checks and round markers decide whether a hit
-needs attention. It does not override holds, fix-round limits, dispatch caps,
-or request and time bounds, so a hit is not a guarantee of a dispatch.
+normal pass bounds. It logs incomplete search coverage and drops hits outside
+followed, admitted own-space repositories without logging them. It asks search
+for public PRs and requires public visibility in the fresh PR response and any
+later check pages, rather than relying on a separate visibility probe. It does
+not cache those reads. Drafts, review-intake repositories, publication forks,
+stacks, PRs with dependency state, and decisions other than a fix stay with the
+ordinary walk. The open-PR cap, agent recovery and merge queue run their usual
+checks, so they defer a fix only where they would hold that PR. A round claim needs room
+in the public PR's comment page; a full or truncated ledger also goes to the
+walk under its existing rules. If a comment fills the page after the claim is
+posted, the turn reads the remaining comment pages to finish the round. Terminal
+throttling or exhausted budget stops the turn without naming a candidate.
+Record and replay skip the turn rather than keep search responses in fixtures.
+Fresh checks and round markers still decide whether a hit needs attention; the
+turn does not override holds, fix-round limits, dispatch caps, or request and
+time bounds.
 
 With the option enabled, a pending check with a recorded start, or a pending
 commit status with a recorded creation time, is treated as failed once it is
@@ -938,9 +949,11 @@ has not reported at all still waits; the age of the PR alone does not prove the
 check is stuck. A fix can push a new head before its run ends, so neither the
 turn nor such a timeout starts another fix while the marker's run is still in
 flight, or, for a dispatch without a run id, within the fix-run timeout of the
-marker's time. Before acting on failed or overdue checks, the poll re-reads the
-PR and its checks; if the head or failure evidence has changed, it leaves the
-decision to a later pass.
+marker's time. A run that answers 404 may be deleted or hidden from the poll
+credential, so it is held like a dispatch without a run id: until the fix-run
+timeout of the marker's time. Before acting on failed or overdue
+checks, the poll re-reads the PR and its checks; if the head or failure evidence
+has changed, it leaves the decision to a later pass.
 
 ### Changes-requested review turn (GitHub)
 

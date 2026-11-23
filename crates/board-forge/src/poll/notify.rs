@@ -4116,6 +4116,7 @@ mod tests {
                 deferred: Vec::new(),
                 deferring: None,
                 turn_floor: None,
+                red_reading: false,
                 planned: 0,
                 folds: Vec::new(),
                 report_pulls: BTreeMap::new(),

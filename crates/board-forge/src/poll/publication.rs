@@ -115,7 +115,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .split_once('/')
             .context("invalid upstream repository")?;
         let mut evidence = self.read_pull(owner, name, n)?;
-        self.more_checks(owner, name, n, &mut evidence)?;
+        self.more_checks(owner, name, n, &mut evidence, false)?;
         ensure!(
             evidence["headRefOid"] == upstream["head"]["sha"] && evidence["state"] == "OPEN",
             "upstream changed while reading publication CI"

@@ -22269,7 +22269,7 @@ impl Broker for Throttled {
 
 impl Rest for Throttled {
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
-        self.send()?;
+        self.send().with_context(|| format!("GET {url}"))?;
         self.forge.get(url, validator)
     }
 
@@ -22281,7 +22281,8 @@ impl Rest for Throttled {
 
 impl Transport for Throttled {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        self.send()?;
+        self.send()
+            .with_context(|| format!("GraphQL {variables}"))?;
         Transport::graphql(&self.forge, query, variables)
     }
 }
@@ -22342,6 +22343,50 @@ fn apply_stops_at_the_first_rate_limit() {
         let line = report.summary_line();
         assert!(line.starts_with(&report.summary), "{line}");
         assert!(line.contains(", rate-limited, starts "), "{line}");
+    }
+}
+
+#[test]
+fn sensitive_rate_limit_stops_the_pass_without_reporting_the_url() {
+    for graphql in [false, true] {
+        let forge = Throttled {
+            forge: Forge::new(None, false),
+            after: 0,
+            sent: Cell::new(0),
+        };
+        let bounds = Bounds::new(
+            PASS_REQUEST_LIMIT,
+            Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
+        );
+        bounds.stage.set(Stage::PullRequests);
+        let budget = Budget {
+            inner: &forge,
+            bounds: &bounds,
+        };
+        let repo = "cgwalters-forge/unconfirmed";
+        let url = format!("{API_ROOT}repos/{repo}");
+        let read = if graphql {
+            budget
+                .graphql_sensitive("query { viewer { login } }", json!({"repo": repo}))
+                .map(drop)
+        } else {
+            budget.get_sensitive(&url).map(drop)
+        };
+        assert!(read.is_err_and(|e| e.is::<RateLimited>()));
+        assert!(budget.get_live(&url).is_err_and(|e| e.is::<RateLimited>()));
+        assert_eq!(forge.sent.get(), 1);
+
+        let mut report = Report::default();
+        bounds.collapse(&mut report);
+        assert_eq!(report.failures, 1);
+        assert!(bounds.spent().rate_limited);
+        assert_eq!(bounds.spent().requests, 1);
+        for lines in [&report.lines, &report.failed_operations] {
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].starts_with("rate-limited: GitHub rate-limited a sensitive read"));
+            assert!(!lines[0].contains(repo), "{lines:?}");
+            assert!(!lines[0].contains("gave up after 3 retries"), "{lines:?}");
+        }
     }
 }
 
