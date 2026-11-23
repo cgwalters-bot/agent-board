@@ -207,10 +207,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         &mut self,
         follow: &BTreeSet<&String>,
         state: &State,
+        clock_start: Option<&str>,
         missing: &BTreeSet<String>,
         outcome: &mut Outcome,
     ) -> (Option<String>, Option<String>, BTreeMap<String, u64>) {
-        let cursor = state.share_cursor.as_deref();
+        let cursor = state.share_cursor.as_deref().or(clock_start);
         let discovery_cursor = state.action_first_cursor.as_deref();
         let mut positions = state.action_first_positions.clone();
         positions.retain(|repo, _| follow.iter().any(|r| r.eq_ignore_ascii_case(repo)));

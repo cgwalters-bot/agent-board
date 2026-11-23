@@ -866,6 +866,11 @@ candidates still run, and unlisted repositories resume on a later applying pass.
 The saved `action_first_cursor` rotates discovery independently of the
 `share_cursor` decision cut, so neither deferred listings nor priority
 candidates can reset the other's progress. Preview advances neither cursor.
+If neither cursor is carried and there is more than one repository, both walks
+start at a repository chosen by the pass clock. The walk and the red-check turn
+spread their ten-minute slots across the available starts without relying on
+consecutive slots. A saved cursor takes precedence for the walk and resumes
+from the actual cut. The pass logs the clock-selected repository.
 
 Approved, non-draft, mergeable candidates run first across those repositories,
 rotating from the saved share cursor within this class. Already queued/auto-merge
@@ -893,6 +898,33 @@ For more capacity for the remaining ordinary walk, in `cgwalters-forge/tracker`,
 stages share the derived budget without the default stage shares;
 `reserveScheduling` keeps its shares of it.
 No deployed config is changed here.
+
+### Red-check turn (GitHub)
+
+A bot PR with failed CI can repeatedly miss the ordinary walk when earlier
+repositories spend its request share. Set `pr.redChecks` to `{}` to opt in to
+a turn before the walk. It searches the configured bot's open PRs for
+`status:failure`, then `status:pending` (one page of at most 100 results each).
+It rotates the returned candidates by clock and stops admitting decisions within
+half the remaining request share (up to 192 requests). A decision's reads stop
+at that floor; once it writes, such as posting a claim, it finishes under the
+normal pass bounds. It logs skips and
+incomplete search coverage. It considers only followed,
+admitted own-space PRs; fresh checks and round markers decide whether a hit
+needs attention. It does not override holds, fix-round limits, dispatch caps,
+or request and time bounds, so a hit is not a guarantee of a dispatch.
+
+With the option enabled, a pending check with a recorded start, or a pending
+commit status with a recorded creation time, is treated as failed once it is
+older than six hours. Use `pr.redChecks: {"pendingHours": 12}` to change the
+threshold (1–168 hours). A check with no timestamp or a required context that
+has not reported at all still waits; the age of the PR alone does not prove the
+check is stuck. A fix can push a new head before its run ends, so neither the
+turn nor such a timeout starts another fix while the marker's run is still in
+flight, or, for a dispatch without a run id, within the fix-run timeout of the
+marker's time. Before acting on failed or overdue checks, the poll re-reads the
+PR and its checks; if the head or failure evidence has changed, it leaves the
+decision to a later pass.
 
 The hosted client gives the PR walk the pass's remaining read share, after the approved
 turn, intake and discovery, rather than the standalone poll's 500-request ceiling.
