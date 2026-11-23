@@ -111,6 +111,19 @@ Then come the findings, most important first. In an approving review, list
 important findings and nits under a "Follow-ups" heading, each with its file
 and line, for later pull requests. When there is a blocker, the fix may take
 important findings and nits along.
+When the only blocker is that the pull request's title or body claims what
+the diff does not deliver, so no change to the branch alone can resolve it,
+end your comment with a single unindented `PR text blocker: ` line after a
+blank line, outside any code fence, list, or quote. After the prefix, copy a
+distinctive contiguous excerpt of the claim verbatim from one line of the
+title or body (8–500 UTF-8 bytes, excluding surrounding whitespace); use a
+shorter excerpt if the line is too long. Close all code fences before the
+declaration, including the decision diff, and do not start narrative lines
+with raw HTML or `<` outside fences. The publisher adds its own footer after
+your comment. For a declaration, return only the verdict comment: do not
+submit inline comments or use the reserved `### Inline findings` heading.
+Put any follow-ups above the declaration. Give no declaration with any other
+blocker.
 Do not include a `Verification:` paragraph.
 Skip praise and style nits a linter would catch.
 This verdict is only text, never a GitHub approval or merge authorization; an

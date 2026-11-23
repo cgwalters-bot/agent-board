@@ -1075,6 +1075,31 @@ request, for one, starts none. Exhausted, the pull request goes
 to [agent recovery](#agent-recovery-instead-of-operator-parking-992) where
 `agentRecovery` is on, else to `needs-human`. In pass it is `pr.fixRounds`.
 
+`holdRecurringBlockers` (pass: `pr.holdRecurringBlockers`, off by default)
+pauses automatic fixes on a public bot-fork PR in our own space when the
+last fix round's head and the current head received consecutive trusted
+change requests whose sole blocker is the same PR text. Each verdict declares
+it in a final, standalone `PR text blocker: PHRASE` line before the publisher
+footer, quoting a short, verbatim excerpt of the title or body
+([review task](../workflow/review.md)); review prose or quoted examples never
+match. At the fix cap the same wait takes the place of a stop, recovery triage,
+or a grant of further rounds, without changing the existing CI or queue gates.
+The verdict producer is the review task in the target repository's base
+branch. This change updates agent-board's task only. Before expecting the
+Tracker setting to work for another repository, roll out the same declaration
+protocol there as part of [#1139](https://github.com/cgwalters-forge/agent-board/issues/1139).
+Enabling the poll setting alone cannot make existing verdicts match.
+Failed CI, a conflict or a placeholder commit, incomplete verdict history,
+a phrase the two verdicts quote differently, and historical review jobs that
+cannot be verified or started before the last base change leave the ordinary
+decision unchanged. It reports the wait to the operator but does not spend a
+round, write a hold, or launch a diagnosis. Editing the title or body alone
+does not start a review, so the wait clears when the PR text no longer
+contains the quoted phrase, or when the operator submits a verdict on the
+current head.
+A diagnosis run and automatic application need a PR-pinned checked output
+contract from tracker; the ordinary research profile is not that contract.
+
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
 once its fix rounds are used) gives a pull request that still fails one more
 round, the diagnostic round, on that pool, before `needs-human`
