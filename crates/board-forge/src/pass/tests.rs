@@ -2377,6 +2377,10 @@ pub(super) fn without_epics(mut replay: Replay) -> Replay {
 }
 
 pub(super) fn config(edit: Value) -> Config {
+    Config::parse(&config_text(edit)).unwrap()
+}
+
+fn config_text(edit: Value) -> String {
     let mut value: Value = serde_json::from_str(CONFIG).unwrap();
     value
         .as_object_mut()
@@ -2385,7 +2389,7 @@ pub(super) fn config(edit: Value) -> Config {
     // Preserve these fixtures' pre-preserve_order pool order. Production Pools
     // deliberately reads the order in the caller's text, not Value iteration.
     value.sort_all_objects();
-    Config::parse(&value.to_string()).unwrap()
+    value.to_string()
 }
 
 /// `config` with tracker out of the harness, by `pr.noMerge`, so that its
@@ -22043,7 +22047,13 @@ fn request_share_sizes_the_budget_from_the_headroom() {
         if let Some((core, graphql)) = recorded {
             replay.requests.push(rate_limit(core, graphql));
         }
-        let config = config(json!({"requestShare": share}));
+        let mut settings = json!({"requestShare": share});
+        if limit == 0 {
+            settings["follow"] = json!([{"org":"cgwalters-forge","forks":false}]);
+            settings["state"] = json!("state.json");
+        }
+        let config = Config::parse_sources(&config_text(settings)).unwrap();
+        assert_eq!(config.has_repository_sources(), limit == 0);
         let report = preview_within(&config, &replay, PASS_REQUEST_LIMIT);
         let said = match recorded {
             Some((core, graphql)) => format!(
@@ -22066,14 +22076,31 @@ fn request_share_sizes_the_budget_from_the_headroom() {
             "{name}: {} within {limit}",
             report.spent
         );
-        // A derived limit is the pass's: its shares and its refusals name it.
-        let names_limit = report
-            .lines
-            .iter()
-            .any(|line| line.contains(&format!("the pass's request budget ({limit}) is spent")));
-        assert_eq!(names_limit, limit == 0, "{name}: {:#?}", report.lines);
-        if limit > 0 {
-            assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        if limit == 0 {
+            assert_eq!(
+                report.lines[1..],
+                ["pass deferred: zero request budget; work waits for the next pass"]
+            );
+            assert!(
+                report.state.is_none(),
+                "a deferred pass must not advance state"
+            );
+            let deferred = block(decision::preview(
+                &replay,
+                &replay,
+                &config,
+                State::default(),
+                Limits::default(),
+                replay.now,
+            ))
+            .err()
+            .unwrap();
+            assert!(deferred.is::<decision::PreviewDeferred>());
+            assert_eq!(
+                deferred.to_string(),
+                "decision preview deferred: zero request budget"
+            );
         }
     }
     // A refused read holds the fixed limit as an unrecorded one does.
@@ -22252,15 +22279,20 @@ fn request_share_covers_the_due_cost_stage_even_with_no_read_capacity() {
         let report = preview_within(&config, &replay, PASS_REQUEST_LIMIT);
         let limit = remaining * 90 / 100;
         assert!(report.spent.requests <= limit, "{}", report.spent);
-        assert!(
-            report
-                .lines
-                .iter()
-                .any(|line| line.starts_with("cost error:")
-                    && line.contains(&format!("the pass's request budget ({limit}) is spent"))),
-            "{:?}",
-            report.lines
-        );
+        if limit == 0 {
+            assert_eq!(report.lines.len(), 2, "{:?}", report.lines);
+            assert_eq!(report.failures, 0);
+        } else {
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|line| line.starts_with("cost error:")
+                        && line.contains(&format!("the pass's request budget ({limit}) is spent"))),
+                "{:?}",
+                report.lines
+            );
+        }
     }
 }
 

@@ -184,6 +184,18 @@ impl std::error::Error for NotFound {}
 #[derive(Debug)]
 pub struct RateLimited(pub String);
 
+/// A GraphQL request with no data and only primary point-limit errors.
+#[derive(Debug)]
+pub(crate) struct GraphQlPointsExhausted;
+
+impl std::fmt::Display for GraphQlPointsExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GitHub's GraphQL points are exhausted")
+    }
+}
+
+impl std::error::Error for GraphQlPointsExhausted {}
+
 impl std::fmt::Display for RateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -980,6 +992,13 @@ fn rate_limit_error(error: &Value) -> bool {
         || error["code"] == "graphql_rate_limit"
 }
 
+fn primary_graphql_exhausted(body: &Value) -> bool {
+    body["data"].is_null()
+        && body["errors"].as_array().is_some_and(|errors| {
+            !errors.is_empty() && errors.iter().all(|e| e["type"] == "RATE_LIMITED")
+        })
+}
+
 /// Whether a refusal's REST message names a rate limit, as GitHub's for a
 /// primary and a secondary one do, where a permission refusal does not.
 fn rate_limit_message(body: &Value) -> bool {
@@ -988,13 +1007,18 @@ fn rate_limit_message(body: &Value) -> bool {
         .is_some_and(|m| m.to_ascii_lowercase().contains("rate limit"))
 }
 
-/// Whether GitHub refused a response under a rate limit, and how long it
-/// asks to wait if so: a 429; a 403 that asks to wait, has no requests
+/// Whether GitHub refused a response under a retryable rate limit, and how long
+/// it asks to wait if so: a 429; a 403 that asks to wait, has no requests
 /// left or names a rate limit; or GraphQL rate-limit errors without data,
 /// as GitHub answers a secondary limit with HTTP 200. A GraphQL response
 /// with data was answered, and a 403 that is none of these is a refusal:
-/// neither is retried.
+/// neither is retried. A confirmed primary GraphQL point refusal is returned
+/// immediately so work can defer to a later pass.
 fn rate_limited(status: u16, limits: &Limits, body: &Value, now: SystemTime) -> Option<Wait> {
+    // Return a confirmed point-limit refusal to the caller immediately.
+    if primary_graphql_exhausted(body) {
+        return None;
+    }
     let seconds = |value: &Option<String>| value.as_deref()?.trim().parse::<u64>().ok();
     let after = seconds(&limits.retry_after);
     let exhausted = seconds(&limits.remaining) == Some(0);
@@ -1146,7 +1170,7 @@ fn transport_error(error: ureq::Error) -> anyhow::Error {
     }
 }
 
-fn response_data(response: Value) -> Result<Value> {
+pub(crate) fn response_data(response: Value) -> Result<Value> {
     let details = response["errors"]
         .as_array()
         .map(|errors| {
@@ -1176,6 +1200,9 @@ fn response_data(response: Value) -> Result<Value> {
         .is_some_and(|errors| errors.iter().any(rate_limit_error))
     {
         let why = format!("GitHub GraphQL: {details}; response may be partial");
+        if primary_graphql_exhausted(&response) {
+            return Err(anyhow::Error::from(GraphQlPointsExhausted).context(RateLimited(why)));
+        }
         return Err(RateLimited(why).into());
     }
     ensure!(
@@ -2615,6 +2642,7 @@ mod tests {
     const SECONDARY: &str = r#"{"message":"You have exceeded a secondary rate limit"}"#;
     const PERMISSION: &str = r#"{"message":"Resource not accessible by integration"}"#;
     const GRAPHQL_LIMIT: &str = r#"{"errors":[{"type":"RATE_LIMIT","code":"graphql_rate_limit","message":"API rate limit already exceeded for user ID 1."}]}"#;
+    const GRAPHQL_POINTS_EXHAUSTED: &str = r#"{"errors":[{"type":"RATE_LIMITED"}]}"#;
 
     /// A response with `Retry-After`, the rate-limit headers and `body`.
     fn reply(status: u16, retry_after: Option<&str>, remaining: Option<&str>, body: &str) -> Reply {
@@ -2648,8 +2676,8 @@ mod tests {
             (reply(200, None, Some("4350"), GRAPHQL_LIMIT), unsaid, true),
             (reply(200, None, Some("0"), GRAPHQL_LIMIT), asked(90), true),
             (
-                reply(200, None, None, r#"{"errors":[{"type":"RATE_LIMITED"}]}"#),
-                unsaid,
+                reply(200, Some("10"), Some("0"), GRAPHQL_POINTS_EXHAUSTED),
+                None,
                 true,
             ),
             // Answered with data: not retried, as a mutation may have applied.
@@ -2853,6 +2881,13 @@ mod tests {
             // A refusal that asks no wait waits a minute, then two.
             (vec![reply(403, None, None, SECONDARY)], None, 2, 60, "ok"),
             (vec![graphql(); 2], None, 3, 180, "ok"),
+            (
+                vec![reply(200, Some("10"), Some("0"), GRAPHQL_POINTS_EXHAUSTED)],
+                None,
+                1,
+                0,
+                "GitHub GraphQL: RATE_LIMITED",
+            ),
             // The retry bound: the last refusal is not waited out.
             (
                 vec![limited("1"); RATE_LIMIT_RETRIES as usize + 1],
@@ -2936,9 +2971,17 @@ mod tests {
                     .is_err_and(|e| e.is::<AuthenticationRequired>()),
                 expected == "authentication"
             );
+            let primary = expected == "GitHub GraphQL: RATE_LIMITED";
+            assert_eq!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.is::<GraphQlPointsExhausted>()),
+                primary,
+                "{expected}"
+            );
             assert_eq!(
                 result.is_err_and(|e| e.is::<RateLimited>()),
-                outcome.contains("gave up"),
+                primary || outcome.contains("gave up"),
                 "{expected}"
             );
             assert_eq!(api.http.posts.get(), posts, "{expected}");

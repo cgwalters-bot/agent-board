@@ -3049,6 +3049,8 @@ struct Bounds {
     /// The breaker: why a refusal under a rate limit outlasted its wait,
     /// after which nothing more is sent, and how many requests were not.
     rate_limited: RefCell<Option<String>>,
+    /// Status deferred after a confirmed refusal for exhausted GraphQL points.
+    rate_limit_deferred: Cell<bool>,
     not_sent: Cell<usize>,
     /// What the stage under way leaves to the stages after it
     /// ([`AFTER_PULL_REQUESTS`], [`AFTER_EPICS`]), or none, and how many of
@@ -3103,6 +3105,7 @@ impl Bounds {
             estimated: Cell::new(false),
             graphql_limit: Cell::new(None),
             rate_limited: RefCell::new(None),
+            rate_limit_deferred: Cell::new(false),
             not_sent: Cell::new(0),
             kept: Cell::new(0),
             cut: Cell::new(0),
@@ -3308,7 +3311,11 @@ impl Bounds {
             .failed_operations
             .retain(|line| !line.contains(NOT_SENT));
         let dropped = before - report.failed_operations.len();
-        report.failures = report.failures.saturating_sub(dropped).max(1);
+        report.failures = report.failures.saturating_sub(dropped);
+        if self.rate_limit_deferred.get() {
+            return; // Status already logs the refusal and what waits.
+        }
+        report.failures = report.failures.max(1);
         if report.failed_operations.is_empty() {
             report
                 .failed_operations
@@ -4479,6 +4486,7 @@ impl<C: Broker> Broker for Budget<'_, C> {
 /// stages 3 and 4's holds as data, whose lines are among `lines`.
 #[derive(Default)]
 pub struct Report {
+    zero_request_budget: bool,
     /// Complete repository PR counts, or a failed read; absent when disabled.
     pub open_pr_counts: RefCell<BTreeMap<String, Option<usize>>>,
     pub open_pr_cap: Option<usize>,
@@ -4810,6 +4818,21 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // The budget first, before any request is spent of it: the read of the
     // headroom is free, so it goes around the bounds.
     size_request_share(client, config, bounds, Some(now), &mut lines);
+    // A zero allowance (including a window hold) cannot even resolve the
+    // repository sources. Leave the incoming state untouched for the next pass.
+    if bounds.limit.get() == 0 {
+        lines.push("pass deferred: zero request budget; work waits for the next pass".into());
+        return Ok(Report {
+            zero_request_budget: true,
+            lines,
+            summary: caps.summary(),
+            spent: bounds.spent(),
+            network_sends: network()
+                .zip(network_before)
+                .map(|(after, before)| after.saturating_sub(before)),
+            ..Report::default()
+        });
+    }
     let resolved = config.resolve(
         &Budget {
             inner: client,
@@ -10905,6 +10928,10 @@ fn broker_key(path: &str) -> Value {
 /// A recorded GET answer's flag for the live client's typed not-found error.
 const ABSENT: &str = "absent";
 
+/// A recorded GraphQL answer's flag for the live client's typed refusal of
+/// exhausted points ([`crate::github::GraphQlPointsExhausted`]).
+const POINTS_EXHAUSTED: &str = "pointsExhausted";
+
 /// A download, such as a job's log, in a recording.
 fn download_key(url: &str) -> Value {
     json!({"download": url})
@@ -11014,9 +11041,17 @@ impl<C> Recorder<'_, C> {
 }
 
 impl<C> Recorder<'_, C> {
+    /// Keeps a typed point refusal as [`POINTS_EXHAUSTED`] with its
+    /// rate-limit message, so a replay defers as the live pass did.
     fn keep_graphql(&self, request: Value, read: Result<Value>) -> Result<Value> {
         let answer = match &read {
             Ok(data) => json!({"data": data}),
+            Err(error) if error.is::<crate::github::GraphQlPointsExhausted>() => {
+                let why = error
+                    .downcast_ref::<crate::github::RateLimited>()
+                    .map_or_else(|| error.to_string(), |limited| limited.0.clone());
+                json!({POINTS_EXHAUSTED: true, "error": why})
+            }
             Err(error) => json!({"error": format!("{error:#}")}),
         };
         self.keep(request, answer);
@@ -11203,9 +11238,15 @@ impl Replay {
 }
 
 impl Replay {
-    /// The recorded answer to a GraphQL request.
+    /// The recorded answer to a GraphQL request; a recorded
+    /// [`POINTS_EXHAUSTED`] answer is the live client's typed refusal again.
     fn data(&self, query: &str, variables: Value) -> Result<Value> {
         let answer = self.answer(&graphql_key(query, &variables))?;
+        if answer[POINTS_EXHAUSTED] == true {
+            let why = answer["error"].as_str().unwrap_or("recorded refusal");
+            return Err(anyhow::Error::from(crate::github::GraphQlPointsExhausted)
+                .context(crate::github::RateLimited(why.to_owned())));
+        }
         match answer.get("error") {
             Some(error) => bail!("{}", error.as_str().unwrap_or("recorded error")),
             None => Ok(answer["data"].clone()),

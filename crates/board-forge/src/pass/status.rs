@@ -195,10 +195,7 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
         // anything. Forge/decoding errors remain errors, not budget deferrals.
         let snapshot = match github.snapshot().await {
             Ok(snapshot) => snapshot,
-            Err(error) if error.is::<BudgetSpent>() => {
-                self.line("status deferred: budget".into());
-                return Ok(());
-            }
+            Err(error) if self.read_deferred(&error) => return Ok(()),
             Err(error) => return Err(error.context("reading the whole board")),
         };
         // What scheduling read is reused, and what it failed to read, which
@@ -210,9 +207,8 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
                 let listed = self.runs(&config.target(git_ref));
                 if listed
                     .as_ref()
-                    .is_err_and(|error| error.is::<BudgetSpent>())
+                    .is_err_and(|error| self.read_deferred(error))
                 {
-                    self.line("status deferred: budget".into());
                     return Ok(());
                 }
                 self.unread(listed.map(|(_, busy)| busy), runs)
@@ -226,8 +222,7 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
             Some(read) => read,
             None => {
                 let read = self.board();
-                if read.as_ref().is_err_and(|error| error.is::<BudgetSpent>()) {
-                    self.line("status deferred: budget".into());
+                if read.as_ref().is_err_and(|error| self.read_deferred(error)) {
                     return Ok(());
                 }
                 self.unread(read, pulls)
@@ -321,11 +316,45 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
                     item.identity.display()
                 )),
                 Err(error) => {
+                    if let Some(reason) = self.deferral(&error) {
+                        self.line(format!(
+                            "status deferred: {reason}; {} change(s) wait for the next pass",
+                            changes.len() - n
+                        ));
+                        break;
+                    }
                     self.report.error(&said, &error);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Why `error` defers Status's remaining work to the next pass rather
+    /// than failing it, if it does: the pass's own budget is spent, or GitHub
+    /// confirmed its GraphQL points are, after which the breaker leaves the
+    /// failure to this stage's line. Every Status read and edit checks this.
+    fn deferral(&self, error: &anyhow::Error) -> Option<String> {
+        if let Some(spent) = error.downcast_ref::<BudgetSpent>() {
+            return Some(spent.to_string());
+        }
+        let points = error.downcast_ref::<crate::github::GraphQlPointsExhausted>()?;
+        self.client.bounds.rate_limit_deferred.set(true);
+        Some(points.to_string())
+    }
+
+    /// Whether a read's `error` defers Status, which then writes nothing and
+    /// says so.
+    fn read_deferred(&mut self, error: &anyhow::Error) -> bool {
+        let Some(reason) = self.deferral(error) else {
+            return false;
+        };
+        self.line(if error.is::<BudgetSpent>() {
+            "status deferred: budget".into()
+        } else {
+            format!("status deferred: {reason}; board snapshot discarded")
+        });
+        true
     }
 
     /// `read`'s value, or none where it failed, which is reported as `what`.
@@ -368,8 +397,14 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
         }
         let project = text(node, "/project/id");
         ensure!(!project.is_empty(), "{}'s board has no id", issue.display());
-        self.caps.count(Kind::Write);
-        github.set_field(project, id, write)?;
+        let result = github.set_field(project, id, write);
+        if !result
+            .as_ref()
+            .is_err_and(|error| error.is::<BudgetSpent>())
+        {
+            self.caps.count(Kind::Write);
+        }
+        result?;
         Ok(Wrote::Done)
     }
 }
@@ -1357,7 +1392,10 @@ mod tests {
         replay: Replay,
         since: BTreeMap<&'static str, &'static str>,
         writes: RefCell<Vec<Value>>,
+        refuse_second_mutation: Option<&'static str>,
     }
+
+    const REFUSED_PAGE: &str = "point-budget-exhausted";
 
     impl Board {
         /// The recorded board items.
@@ -1417,7 +1455,15 @@ mod tests {
 
     impl Transport for Board {
         fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            if variables["cursor"] == REFUSED_PAGE {
+                return crate::github::response_data(json!({"errors": [{"type": "RATE_LIMITED"}]}));
+            }
             if query.starts_with("mutation") {
+                if let Some(kind) = self.refuse_second_mutation
+                    && self.writes.borrow().len() == 1
+                {
+                    return crate::github::response_data(json!({"errors": [{"type": kind}]}));
+                }
                 self.writes.borrow_mut().push(variables.clone());
                 let option = &variables["value"]["singleSelectOptionId"];
                 return Ok(json!({"updateProjectV2ItemFieldValue": {"projectV2Item": {
@@ -1465,6 +1511,7 @@ mod tests {
             replay: replay(),
             since: BTreeMap::from([("bootc-dev/bootc#1030", "Todo")]),
             writes: RefCell::new(vec![]),
+            refuse_second_mutation: None,
         };
         let limits = Limits {
             dispatch: Some(0),
@@ -1522,6 +1569,7 @@ mod tests {
             replay: replay(),
             since: BTreeMap::new(),
             writes: RefCell::new(vec![]),
+            refuse_second_mutation: None,
         };
         let limits = Limits {
             dispatch: Some(0),
@@ -1576,6 +1624,7 @@ mod tests {
             replay: replay(),
             since: BTreeMap::new(),
             writes: RefCell::new(vec![]),
+            refuse_second_mutation: None,
         };
         // The recording's 16 reads and stage 3's one, then two changes'
         // read and write each.
@@ -1604,6 +1653,158 @@ mod tests {
     }
 
     #[test]
+    fn status_writes_defer_when_graphql_points_run_out() {
+        let board = Board {
+            replay: replay(),
+            since: BTreeMap::new(),
+            writes: RefCell::new(vec![]),
+            refuse_second_mutation: None,
+        };
+        let run = |bounds: &Bounds, writes| {
+            block(run_within(
+                &board,
+                &board,
+                &config(),
+                (
+                    State::default(),
+                    Mode::Local,
+                    Limits {
+                        writes,
+                        ..Limits::default()
+                    },
+                    board.replay.now,
+                ),
+                bounds,
+            ))
+            .unwrap()
+        };
+        let bounds = || Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        let before_edits = run(&bounds(), Some(0)).spent.points;
+        // Spend enough for one edit, then stop either before the next
+        // item's re-read or after it but before its mutation.
+        for extra in [0, QUERY_POINTS] {
+            board.writes.borrow_mut().clear();
+            let bounds = bounds();
+            let limit = before_edits + QUERY_POINTS + MUTATION_POINTS + extra;
+            bounds.graphql_limit.set(Some(limit));
+            let report = run(&bounds, None);
+            let deferred = format!(
+                "status deferred: the pass's estimated GraphQL point budget ({limit}) is spent; 35 change(s) wait for the next pass"
+            );
+            assert_eq!(stage(&report)[1..], [CHANGES[0], deferred.as_str(),]);
+            assert_eq!(board.writes.borrow().len(), 1);
+            assert_eq!(report.spent.points, limit);
+            assert_eq!(report.summary, "summary: dispatched 0, writes 1, held 0");
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        }
+    }
+
+    #[test]
+    fn status_defers_only_a_primary_graphql_refusal() {
+        for (kind, deferred) in [("RATE_LIMITED", true), ("RATE_LIMIT", false)] {
+            let board = Board {
+                replay: replay(),
+                since: BTreeMap::new(),
+                writes: RefCell::new(vec![]),
+                refuse_second_mutation: Some(kind),
+            };
+            let report = block(run(
+                &board,
+                &board,
+                &config(),
+                State::default(),
+                (Mode::Local, Limits::default()),
+                board.replay.now,
+            ))
+            .unwrap();
+            assert_eq!(board.writes.borrow().len(), 1);
+            assert!(report.spent.rate_limited);
+            if deferred {
+                assert_eq!(report.failures, 0);
+                assert_eq!(
+                    stage(&report)[1..],
+                    [
+                        CHANGES[0],
+                        "status deferred: GitHub's GraphQL points are exhausted; 35 change(s) wait for the next pass"
+                    ]
+                );
+            } else {
+                assert_eq!(report.failures, 1);
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|line| line.starts_with("rate-limited:"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn status_discards_a_partial_snapshot_on_primary_graphql_refusal() {
+        // The snapshot's own pages, then, after a whole snapshot, the open
+        // issues' read that scheduling left to Status under wip 0.
+        for read in ["/data/node/items", "/data/repositoryOwner/projectV2/items"] {
+            let mut replay = replay();
+            let first_page = replay
+                .requests
+                .iter_mut()
+                .find_map(|entry| entry["answer"].pointer_mut(read))
+                .unwrap();
+            assert!(!first_page["nodes"].as_array().unwrap().is_empty());
+            first_page["pageInfo"] = json!({"hasNextPage": true, "endCursor": REFUSED_PAGE});
+            let board = Board {
+                replay,
+                since: BTreeMap::new(),
+                writes: RefCell::new(vec![]),
+                refuse_second_mutation: None,
+            };
+            let now = board.replay.now;
+            let pass = |client: &dyn Fn() -> Report| {
+                let report = client();
+                assert_eq!(
+                    stage(&report),
+                    [
+                        "status deferred: GitHub's GraphQL points are exhausted; board snapshot discarded"
+                    ],
+                    "{read}"
+                );
+                assert!(board.writes.borrow().is_empty(), "{read}");
+                assert!(report.spent.rate_limited, "{read}");
+                assert_eq!(report.failures, 0, "{read}: {:#?}", report.lines);
+            };
+            let mode = (Mode::Local, Limits::default());
+            pass(&|| block(run(&board, &board, &config(), State::default(), mode, now)).unwrap());
+            // A recording keeps the typed refusal, so its replay defers too.
+            let recorder = crate::pass::Recorder::new(&board);
+            let live = || {
+                block(run(
+                    &recorder,
+                    &recorder,
+                    &config(),
+                    State::default(),
+                    mode,
+                    now,
+                ))
+            };
+            pass(&|| live().unwrap());
+            let fixture = serde_json::from_str(&recorder.fixture(now).unwrap()).unwrap();
+            let replay = Replay::from_json(&fixture).unwrap();
+            pass(&|| {
+                block(run(
+                    &replay,
+                    &replay,
+                    &config(),
+                    State::default(),
+                    mode,
+                    now,
+                ))
+                .unwrap()
+            });
+        }
+    }
+
+    #[test]
     fn status_read_defers_without_writes_at_each_budget_boundary() {
         // Cover refusal before the first request and partway through the
         // snapshot; there must be no derivation from a partial board.
@@ -1612,6 +1813,7 @@ mod tests {
                 replay: replay(),
                 since: BTreeMap::new(),
                 writes: RefCell::new(vec![]),
+                refuse_second_mutation: None,
             };
             let bounds = Bounds::new(limit, Instant::now() + Duration::from_secs(60));
             let report = block(run_within(
