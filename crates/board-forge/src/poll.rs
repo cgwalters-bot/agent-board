@@ -708,6 +708,8 @@ impl IntakeRoute {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// Pass-local ordering only; never supplied by the standalone poll config.
+    pub shuffle_seed: Option<u64>,
     /// Exact base repositories left to their own maintainer (lowercase).
     pub maintainers: BTreeSet<String>,
     /// CLI-only selection, never authority to bypass the followed envelope.
@@ -1668,6 +1670,7 @@ impl PollPolicy {
             review_caller_workflow: None,
             wip: None,
             review_ranks: BTreeMap::new(),
+            shuffle_seed: None,
             bot_only: Vec::new(),
             review_census: Vec::new(),
         };
@@ -1906,7 +1909,11 @@ impl std::str::FromStr for PullSelector {
 /// pull request on, then the repositories after it and those before it,
 /// and last that repository's pull requests before it. Each pass's walk
 /// takes up where the last one's stopped, however large one repository is.
-fn walk<'r>(follow: &BTreeSet<&'r String>, cursor: Option<&str>) -> Vec<(&'r String, Turn)> {
+fn walk<'r>(
+    follow: &BTreeSet<&'r String>,
+    cursor: Option<&str>,
+    seed: Option<u64>,
+) -> Vec<(&'r String, Turn)> {
     let cursor = cursor.map(str::to_ascii_lowercase);
     let (at, number) = match cursor.as_deref().map(|c| c.split_once('#')) {
         Some(Some((repo, n))) => (Some(repo.to_owned()), n.parse().ok()),
@@ -1929,6 +1936,13 @@ fn walk<'r>(follow: &BTreeSet<&'r String>, cursor: Option<&str>) -> Vec<(&'r Str
             _ => turns.push((repo, Turn::All)),
         }
     }
+    if let Some(seed) = seed {
+        let pinned =
+            usize::from(turns.first().is_some_and(|(repo, _)| {
+                at.as_ref().is_some_and(|at| repo.eq_ignore_ascii_case(at))
+            }));
+        turns[pinned..].sort_by_cached_key(|(repo, _)| crate::pass::shuffle_key(seed, repo, None));
+    }
     turns.extend(last);
     turns
 }
@@ -1946,7 +1960,8 @@ fn clock_start_index(now: OffsetDateTime, count: usize) -> usize {
 }
 
 /// A cache-only caller loses both cursors. Vary the first repository by
-/// clock until the caller can carry the actual cut forward.
+/// clock until the caller can carry the actual cut forward. A seeded walk
+/// (`shuffleWalk`) varies its order instead.
 fn clock_walk_start(
     follow: &BTreeSet<&String>,
     state: &State,
@@ -2084,6 +2099,8 @@ pub struct State {
     /// scan resumes after it, so that the stops of a few passes cover the
     /// board. None scans in order. Losing it only starts the scan over.
     pub scan_cursor: Option<String>,
+    /// Seed of the unfinished scheduling scan, absent for a clock-ordered scan.
+    pub scan_seed: Option<u64>,
     /// The pass's `leanReads` ([`crate::pass::lean`]): stage 4's holds held
     /// again while the board shows their candidates unchanged, by issue key,
     /// at most [`crate::pass::lean::CARRY_LIMIT`]. They hold and never
@@ -2196,6 +2213,7 @@ impl State {
                     "action_first_cursor",
                     "action_first_positions",
                     "scan_cursor",
+                    "scan_seed",
                     "carried_holds",
                     "issue_intake",
                     "holds_pending",
@@ -2383,6 +2401,14 @@ impl State {
                     .context("poll state scan_cursor is not an issue")
             })
             .transpose()?;
+        let scan_seed = object
+            .get("scan_seed")
+            .map(|seed| seed.as_u64().context("poll state scan_seed is not a u64"))
+            .transpose()?;
+        ensure!(
+            scan_seed.is_none() || scan_cursor.is_some(),
+            "poll state scan_seed requires scan_cursor"
+        );
         let carried_holds = crate::pass::lean::from_json(object.get("carried_holds"))?;
         let authored_cursor = cursor("authored_cursor")?;
         let issue_intake: BTreeMap<String, String> = object
@@ -2449,6 +2475,7 @@ impl State {
             action_first_cursor,
             action_first_positions,
             scan_cursor,
+            scan_seed,
             carried_holds,
             issue_intake,
             holds_pending,
@@ -2520,6 +2547,9 @@ impl State {
         }
         if let Some(cursor) = &self.scan_cursor {
             state["scan_cursor"] = cursor.as_str().into();
+            if let Some(seed) = self.scan_seed {
+                state["scan_seed"] = seed.into();
+            }
         }
         if !self.carried_holds.is_empty() {
             state["carried_holds"] = json!(self.carried_holds);
@@ -11162,7 +11192,11 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     let mut upstream_cursor = None;
     let mut action_first_cursor = None;
     let mut action_first_positions = BTreeMap::new();
-    let clock_start = clock_walk_start(&pr_follow, &state, now);
+    let clock_start = policy
+        .shuffle_seed
+        .is_none()
+        .then(|| clock_walk_start(&pr_follow, &state, now))
+        .flatten();
     if let Some(repo) = &clock_start {
         outcome.lines.push(format!(
             "pull requests: clock rotation start point is {repo}"
@@ -11185,6 +11219,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     for (repo, turn) in walk(
         &pr_follow,
         state.share_cursor.as_deref().or(clock_start.as_deref()),
+        policy.shuffle_seed,
     )
     .into_iter()
     .filter(|_| !config.policy.action_first)
@@ -11370,6 +11405,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         action_first_positions,
         // The pass's, kept by the pass ([`crate::pass::run`]).
         scan_cursor: None,
+        scan_seed: None,
         carried_holds: BTreeMap::new(),
         issue_intake: BTreeMap::new(),
         holds_pending: Vec::new(),
@@ -14966,6 +15002,13 @@ mod tests {
         assert_eq!(state.authored_cursor.as_deref(), Some("u/r"));
         assert_eq!(state.scan_cursor.as_deref(), Some("o/r#12"));
         assert_eq!(state.to_json(), with_cursor);
+        let mut seeded = with_cursor.clone();
+        seeded["scan_seed"] = json!(0);
+        let state = State::from_json(&seeded).unwrap();
+        assert_eq!(state.scan_seed, Some(0));
+        assert_eq!(state.to_json(), seeded);
+        seeded["scan_seed"] = json!("0");
+        assert!(State::from_json(&seeded).is_err());
         // An older cache's `authored_priority` is accepted and dropped.
         let mut older = with_cursor.clone();
         older["authored_priority"] = json!(["u/p", "u/r"]);
@@ -15006,6 +15049,7 @@ mod tests {
             ("authored_cursor", json!("not a repository")),
             ("scan_cursor", json!("o/r")),
             ("scan_cursor", json!("o/r#0")),
+            ("scan_seed", json!(0)),
             ("carried_holds", json!([])),
             (
                 "carried_holds",
@@ -26096,7 +26140,7 @@ mod tests {
             ),
         ];
         for (cursor, expected) in cases {
-            assert_eq!(walk(&follow, cursor), expected, "{cursor:?}");
+            assert_eq!(walk(&follow, cursor, None), expected, "{cursor:?}");
         }
         assert!([6, 7, 8].iter().all(|n| Turn::All.takes(*n)));
         assert!(!Turn::From(7).takes(6) && Turn::From(7).takes(7));
@@ -26123,7 +26167,7 @@ mod tests {
             for turn in 0..32 {
                 let now = now() + time::Duration::minutes(SLOT_MINUTES * cadence * turn);
                 let start = clock_walk_start(&follow, &state, now).unwrap();
-                let turns = walk(&follow, Some(&start));
+                let turns = walk(&follow, Some(&start), None);
                 assert_eq!(turns[0].0.to_ascii_lowercase(), start);
                 assert_eq!(turns.len(), names.len());
                 starts.insert(start);
@@ -26141,6 +26185,35 @@ mod tests {
             },
         ] {
             assert_eq!(clock_walk_start(&follow, &state, now()), None);
+        }
+    }
+
+    #[test]
+    fn the_seeded_walk_keeps_a_carried_cursor_and_shuffles_the_rest() {
+        let names = ["O/C", "o/a", "o/b", "o/d"].map(str::to_owned);
+        let follow = names.iter().collect();
+        for cursor in [None, Some("o/c"), Some("o/c#12")] {
+            let mut orders = BTreeSet::new();
+            for seed in 0..16 {
+                let turns = walk(&follow, cursor, Some(seed));
+                assert_eq!(turns, walk(&follow, cursor, Some(seed)));
+                if cursor.is_none() {
+                    assert_eq!(turns, walk(&follow, Some("o/missing#42"), Some(seed)));
+                }
+                if cursor.is_some() {
+                    assert_eq!(turns[0].0, &names[0]);
+                }
+                if cursor == Some("o/c#12") {
+                    assert_eq!(turns.first(), Some(&(&names[0], Turn::From(12))));
+                    assert_eq!(turns.last(), Some(&(&names[0], Turn::Before(12))));
+                }
+                assert_eq!(
+                    turns.iter().map(|(r, _)| *r).collect::<BTreeSet<_>>(),
+                    follow
+                );
+                orders.insert(turns.into_iter().map(|(r, _)| r).collect::<Vec<_>>());
+            }
+            assert!(orders.len() > 1, "{cursor:?}");
         }
     }
 

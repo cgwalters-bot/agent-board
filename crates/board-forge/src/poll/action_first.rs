@@ -70,7 +70,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             items.len(),
             listed.values().map(Vec::len).sum::<usize>()
         ));
-        for (repo, turn) in walk(follow, cursor) {
+        for (repo, turn) in walk(follow, cursor, self.config.policy.shuffle_seed) {
             if let Some(open) = listed.get(repo) {
                 self.follow_open(
                     repo,
@@ -211,6 +211,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         missing: &BTreeSet<String>,
         outcome: &mut Outcome,
     ) -> (Option<String>, Option<String>, BTreeMap<String, u64>) {
+        let seed = self.config.policy.shuffle_seed;
         let cursor = state.share_cursor.as_deref().or(clock_start);
         let discovery_cursor = state.action_first_cursor.as_deref();
         let mut positions = state.action_first_positions.clone();
@@ -219,7 +220,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut next = None;
         // Discovery must leave a full decision's margin. Resume unlisted
         // repositories next pass without cutting off already discovered work.
-        for (repo, turn) in walk(follow, discovery_cursor.or(cursor)) {
+        for (repo, turn) in walk(follow, discovery_cursor.or(cursor), seed) {
             if !self.config.ours(repo) || matches!(turn, Turn::Before(_)) {
                 continue;
             }
@@ -262,7 +263,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // cannot monopolize the priority share. Neither phase lists again.
         let mut turns = Vec::new();
         let mut before = Vec::new();
-        for (repo, turn) in walk(follow, cursor) {
+        for (repo, turn) in walk(follow, cursor, seed) {
             if matches!(turn, Turn::Before(_)) {
                 continue;
             }
@@ -331,7 +332,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut upstream = 0;
         let mut read = 0;
         let mut upstream_next = None;
-        for (repo, turn) in walk(follow, cursor) {
+        for (repo, turn) in walk(follow, cursor, seed) {
             if self.config.ours(repo) || matches!(turn, Turn::Before(_)) {
                 continue;
             }

@@ -8,17 +8,10 @@
 //!
 //! The setting is how many repositories one pass adds at most, as each
 //! followed pull request spends the poll's one request budget, which those
-//! in `follow` need too. They take turns ([`Rotation`]). The hosted pass
-//! keeps no state, so by default the turn is the pass's clock: the sorted
-//! list is cut into windows of the setting, and each [`SLOT_MINUTES`] the
-//! next window's turn comes, so any `ceil(N / setting)` consecutive slots
-//! sweep every repository with nothing kept: as many passes where the pass
-//! interval is the slot. A pass that comes late skips a window for a round;
-//! an interval of a multiple of the slot could skip some for good, so the
-//! slot is the hosted pass's interval. With `state`, a
-//! [`board_core::admission`] envelope whose cursor the pass keeps there
-//! takes its place. One out of its turn is undecided, so what the last pass
-//! held there is kept, not dropped.
+//! in `follow` need too. With `state`, the pass carries its cursor. With
+//! `shuffleWalk`, each pass shuffles the candidates after any carried cursor.
+//! Without either, the legacy clock rotation chooses the turn.
+//! A repository outside its turn remains undecided, so previous holds stay.
 //!
 //! It is stage 2's only round: the pass takes no `repositoriesPerPass`, whose
 //! envelope, given the followed set with these in it, could leave the same
@@ -49,19 +42,13 @@ pub const AUTHORED_LIMIT: usize = 10;
 /// addition to its turn ([`turn`]); any more take their turn with the rest.
 pub const PRIORITY_LIMIT: usize = AUTHORED_LIMIT;
 
-/// The length of one turn of the clock rotation ([`Rotation::Clock`]): the
-/// pass interval of tracker's poll.yml, whose `pass next` starts each pass
-/// ten minutes after the last one started, so consecutive passes take
-/// consecutive windows.
+/// Legacy hosted pass interval, in minutes.
 pub const SLOT_MINUTES: i64 = 10;
 
-/// How the repositories the search added take turns.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Rotation<'a> {
-    /// With `state`: from the cursor the last applying pass kept.
+pub(super) enum Order<'a> {
     Cursor(Option<&'a str>),
-    /// Without it: by the pass's start time, nothing kept.
     Clock(OffsetDateTime),
+    Shuffle { seed: u64, cursor: Option<&'a str> },
 }
 
 /// One pass's share of the repositories the search added.
@@ -115,7 +102,7 @@ pub(super) fn named(live: &[super::epics::EpicFacts]) -> Vec<String> {
 /// not followed: first those `priority` names (lower case), up to
 /// [`PRIORITY_LIMIT`] within `room`, the repositories the poll may still
 /// follow; then up to `per_pass` of the rest, within what room is left, by
-/// `rotation`. The priority repositories take none of the rotation's
+/// `cursor` and optionally shuffled by `seed`. The priority repositories take none of the turn's
 /// `per_pass`, so it moves on at its usual pace however many there are, and
 /// one that stops being named simply rejoins it. With no room left for the
 /// rotation, its cursor stays.
@@ -123,21 +110,38 @@ pub(super) fn turn(
     new: &[String],
     priority: &BTreeSet<String>,
     (per_pass, room): (usize, usize),
-    rotation: Rotation<'_>,
+    order: Order<'_>,
 ) -> Result<Turn> {
-    let prioritized: Vec<String> = (new.iter())
+    let mut prioritized: Vec<String> = (new.iter())
         .filter(|repo| priority.contains(&repo.to_ascii_lowercase()))
-        .take(PRIORITY_LIMIT.min(room))
         .cloned()
         .collect();
+    if let Order::Shuffle { seed, .. } = order {
+        prioritized.sort_by_cached_key(|repo| shuffle_key(seed, repo, None));
+    }
+    prioritized.truncate(PRIORITY_LIMIT.min(room));
     let rest = (new.iter())
         .filter(|repo| !prioritized.contains(repo))
         .map(String::as_str);
     let room = per_pass.min(room - prioritized.len());
-    let cursor = match rotation {
-        Rotation::Cursor(cursor) => cursor,
-        Rotation::Clock(now) => {
-            let admitted = clock_window(rest, room, now);
+    let cursor = match order {
+        Order::Cursor(cursor) | Order::Shuffle { cursor, .. } => cursor,
+        Order::Clock(now) => {
+            let names: Vec<_> = rest.collect::<BTreeSet<_>>().into_iter().collect();
+            let take = room.min(names.len());
+            let admitted = if take == 0 {
+                Vec::new()
+            } else {
+                let slot = now.unix_timestamp().div_euclid(SLOT_MINUTES * 60);
+                let start = (slot.rem_euclid(names.len() as i64) as usize * take) % names.len();
+                names
+                    .into_iter()
+                    .cycle()
+                    .skip(start)
+                    .take(take)
+                    .map(str::to_owned)
+                    .collect()
+            };
             return Ok(Turn {
                 prioritized,
                 admitted,
@@ -153,37 +157,27 @@ pub(super) fn turn(
             next,
         });
     }
+    if let Order::Shuffle { seed, .. } = order {
+        let mut names: Vec<_> = rest.collect();
+        let pinned =
+            cursor.and_then(|cursor| names.iter().position(|r| r.eq_ignore_ascii_case(cursor)));
+        if let Some(at) = pinned {
+            names.swap(0, at);
+        }
+        names[usize::from(pinned.is_some())..]
+            .sort_by_cached_key(|repo| shuffle_key(seed, repo, None));
+        return Ok(Turn {
+            prioritized,
+            admitted: names.iter().take(room).map(|r| (*r).to_owned()).collect(),
+            next: names.get(room).map(|r| (*r).to_owned()),
+        });
+    }
     let envelope = admission::admit(rest, room, cursor)?;
     Ok(Turn {
         prioritized,
         admitted: envelope.admitted,
         next: envelope.next,
     })
-}
-
-/// The `room` of the sorted, deduplicated `inventory` whose turn it is at
-/// `now`: the window starting `slot * room` names in, wrapping around, where
-/// `slot` counts the [`SLOT_MINUTES`] since the epoch. Any `ceil(N / room)`
-/// consecutive slots' windows cover all N names, without a cursor.
-fn clock_window<'a>(
-    inventory: impl IntoIterator<Item = &'a str>,
-    room: usize,
-    now: OffsetDateTime,
-) -> Vec<String> {
-    let names: Vec<&str> = (inventory.into_iter())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let take = room.min(names.len());
-    if take == 0 {
-        return Vec::new();
-    }
-    // Reduced mod N first: the product stays within N * room.
-    let slot = (now.unix_timestamp().div_euclid(SLOT_MINUTES * 60)).rem_euclid(names.len() as i64);
-    let start = (slot as usize * take) % names.len();
-    (names.iter().cycle().skip(start).take(take))
-        .map(|name| (*name).to_owned())
-        .collect()
 }
 
 /// The repositories, lower case, that `text` names as the place of an issue
@@ -288,8 +282,13 @@ mod tests {
         let priority = BTreeSet::from(["o/g".to_owned()]);
         let cursors = std::iter::once(None).chain(new.iter().map(|r| Some(r.as_str())));
         for cursor in cursors {
-            let rotation = Rotation::Cursor(cursor);
-            let turn = turn(&new, &priority, (3, POLL_REPOSITORY_LIMIT), rotation).unwrap();
+            let turn = turn(
+                &new,
+                &priority,
+                (3, POLL_REPOSITORY_LIMIT),
+                Order::Cursor(cursor),
+            )
+            .unwrap();
             assert_eq!(turn.prioritized, ["o/g"], "{cursor:?}");
             // Fewer at the end of the round, as the envelope stops there.
             assert!(
@@ -300,8 +299,13 @@ mod tests {
         }
         let (mut cursor, mut seen) = (None, BTreeSet::new());
         for _ in 0..4 {
-            let rotation = Rotation::Cursor(cursor.as_deref());
-            let turn = turn(&new, &priority, (3, POLL_REPOSITORY_LIMIT), rotation).unwrap();
+            let turn = turn(
+                &new,
+                &priority,
+                (3, POLL_REPOSITORY_LIMIT),
+                Order::Cursor(cursor.as_deref()),
+            )
+            .unwrap();
             seen.extend(turn.admitted);
             cursor = turn.next;
         }
@@ -309,75 +313,43 @@ mod tests {
         assert_eq!(cursor, None);
     }
 
-    /// Without `state`, consecutive passes a slot apart, each starting from
-    /// nothing kept, sweep every repository not prioritized within
-    /// `ceil(N / turn)` passes from wherever the clock is, while the
-    /// prioritized one comes first every pass and takes none of the turn.
-    /// tracker's case is 13 not followed, 3 a pass, one named by an epic.
     #[test]
-    fn clock_sweeps_everything_within_a_round_without_state() {
-        let start = OffsetDateTime::from_unix_timestamp(1_793_000_000).unwrap();
-        let slot = time::Duration::minutes(SLOT_MINUTES);
-        for (count, per_pass, room) in [
-            (13usize, 3usize, 50usize),
-            (12, 3, 50),
-            (2, 1, 50),
-            (7, 10, 50),
-            (13, 3, 3),
-        ] {
-            let new: Vec<String> = (0..count).map(|n| format!("o/r{n:02}")).collect();
-            let named = new[count / 2].clone();
-            let priority = BTreeSet::from([named.clone()]);
-            let rest = count - 1;
-            let take = per_pass.min(room - 1);
-            let passes = rest.div_ceil(take);
-            // From every place in a round, and mid-slot.
-            for offset in 0..(2 * passes as i32) {
-                let first = start + slot * offset + time::Duration::seconds(37);
-                let mut seen = BTreeSet::new();
-                for pass in 0..passes as i32 {
-                    let now = first + slot * pass;
-                    let turn =
-                        turn(&new, &priority, (per_pass, room), Rotation::Clock(now)).unwrap();
-                    let case = format!("{count}/{per_pass}/{room} at {offset}+{pass}");
-                    assert_eq!(turn.prioritized, std::slice::from_ref(&named), "{case}");
-                    assert_eq!(turn.admitted.len(), take.min(rest), "{case}: {turn:?}");
-                    assert!(!turn.admitted.contains(&named), "{case}");
-                    assert_eq!(turn.next, None, "{case}");
-                    // The same slot, the same turn: a rerun repeats it.
-                    let again = turn_at(
-                        &new,
-                        &priority,
-                        (per_pass, room),
-                        now + time::Duration::seconds(1),
-                    );
-                    assert_eq!(again, turn.admitted, "{case}");
-                    seen.extend(turn.admitted);
+    fn seeded_turn_keeps_priority_room_and_cursor() {
+        let new = ["o/a", "o/b", "o/c", "o/d", "o/e"].map(str::to_owned);
+        let reversed: Vec<_> = new.iter().rev().cloned().collect();
+        let priority = BTreeSet::from(["o/e".into()]);
+        for cursor in [None, Some("O/A")] {
+            let mut orders = BTreeSet::new();
+            for seed in 0..16 {
+                let run = |repos: &[String]| {
+                    turn(repos, &priority, (3, 3), Order::Shuffle { seed, cursor }).unwrap()
+                };
+                let actual = run(&new);
+                assert_eq!(actual, run(&reversed));
+                assert_eq!(actual.prioritized, ["o/e"]);
+                assert_eq!(actual.admitted.len(), 2);
+                assert!(!actual.admitted.contains(actual.next.as_ref().unwrap()));
+                if cursor.is_some() {
+                    assert_eq!(actual.admitted[0], "o/a");
                 }
-                assert_eq!(
-                    seen.len(),
-                    rest,
-                    "{count}/{per_pass}/{room} at {offset}: {seen:?}"
-                );
+                orders.insert(actual.admitted);
             }
+            assert!(orders.len() > 1);
         }
-        // Nothing to take, and no room, take nothing.
-        let none = turn(&[], &BTreeSet::new(), (3, 50), Rotation::Clock(start)).unwrap();
-        assert!(none.admitted.is_empty() && none.prioritized.is_empty());
-        let new = vec!["o/a".to_owned(), "o/b".to_owned()];
-        let full = turn(&new, &BTreeSet::new(), (3, 0), Rotation::Clock(start)).unwrap();
-        assert!(full.admitted.is_empty());
     }
 
-    fn turn_at(
-        new: &[String],
-        priority: &BTreeSet<String>,
-        bounds: (usize, usize),
-        now: OffsetDateTime,
-    ) -> Vec<String> {
-        turn(new, priority, bounds, Rotation::Clock(now))
-            .unwrap()
-            .admitted
+    #[test]
+    fn stateless_unshuffled_turns_still_rotate_by_clock() {
+        let new: Vec<_> = (0..12).map(|n| format!("o/r{n:02}")).collect();
+        let seen: BTreeSet<_> = (0..4)
+            .flat_map(|slot| {
+                let now = OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(slot * SLOT_MINUTES);
+                turn(&new, &BTreeSet::new(), (3, 50), Order::Clock(now))
+                    .unwrap()
+                    .admitted
+            })
+            .collect();
+        assert_eq!(seen, new.into_iter().collect());
     }
 
     /// The bounds on a turn: the priority repositories within
@@ -444,14 +416,14 @@ mod tests {
                 Some("o/r05"),
             ),
         ] {
-            let turn = turn(&new, priority, (per_pass, room), Rotation::Cursor(cursor)).unwrap();
+            let turn = turn(&new, priority, (per_pass, room), Order::Cursor(cursor)).unwrap();
             assert_eq!(turn.prioritized.len(), prioritized, "{case}: {turn:?}");
             assert_eq!(turn.admitted, admitted, "{case}");
             assert_eq!(turn.next.as_deref(), next, "{case}");
         }
         // A repository found in another case is still the one named.
         let mixed: Vec<String> = new.iter().map(|r| r.replace("r03", "R03")).collect();
-        let turn = turn(&mixed, &upper, (1, 50), Rotation::Cursor(Some("o/r02"))).unwrap();
+        let turn = turn(&mixed, &upper, (1, 50), Order::Cursor(Some("o/r02"))).unwrap();
         assert_eq!(
             (turn.prioritized, turn.admitted),
             (vec!["o/R03".to_owned()], vec!["o/r02".to_owned()])

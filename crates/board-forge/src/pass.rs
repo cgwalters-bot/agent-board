@@ -639,6 +639,9 @@ pub struct Config {
     /// epics name, which it follows first, and never merges in those it
     /// adds ([`authored`]).
     pub authored: Option<usize>,
+    /// Off by default: shuffle the GitHub pass walk within priority tiers.
+    #[serde(default)]
+    pub shuffle_walk: bool,
     /// Off unless set: hold new implements at this many open bot PRs in
     /// their destination repository, and land overlapping PRs oldest first.
     pub open_pr_cap: Option<usize>,
@@ -2898,6 +2901,37 @@ fn candidates_line(
 /// is last.
 pub type Rank = (usize, usize, OffsetDateTime, String, u64);
 
+/// A reproducible permutation by identity, independent of listing order or
+/// earlier stages' reads. This only orders already bounded candidates.
+pub(crate) fn shuffle_key(seed: u64, repository: &str, number: Option<u64>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(seed.to_le_bytes());
+    hash.update(repository.to_ascii_lowercase());
+    if let Some(number) = number {
+        hash.update([0]);
+        hash.update(number.to_le_bytes());
+    }
+    hash.finalize().into()
+}
+
+/// Keep top-down epic grouping, then item priority, within each epic priority.
+fn schedule_tier(
+    rank: &Rank,
+    facts: &Facts,
+    board: &BoardRead,
+    top_down: bool,
+) -> (usize, bool, Option<(OffsetDateTime, String)>, usize) {
+    let group = facts.parent.as_ref().filter(|_| top_down).map(|p| {
+        let parent = key(&p.issue);
+        let created = board
+            .items
+            .get(&parent)
+            .map_or(OffsetDateTime::UNIX_EPOCH, |e| e.created);
+        (created, parent)
+    });
+    (rank.0, top_down && group.is_none(), group, rank.1)
+}
+
 /// What decides, just before a start, whether an issue is held: [`hold`],
 /// or for a revisit [`revisit::revisit_hold`].
 type HoldRule = fn(&Facts, &BTreeMap<String, String>, &[&str]) -> Option<Hold>;
@@ -2990,6 +3024,7 @@ type ByStage = [usize; Stage::ALL.len()];
 /// What a pass may still spend, in requests and in time, both stages
 /// together, and what it spent.
 struct Bounds {
+    shuffle_seed: Cell<Option<u64>>,
     /// Per-item handoff notices, deduplicated across board reads and rechecks.
     handoff_notices: RefCell<BTreeSet<String>>,
     pull_link_candidates: RefCell<BTreeMap<String, Facts>>,
@@ -3066,6 +3101,7 @@ struct Bounds {
 impl Bounds {
     fn new(limit: usize, admit_by: Instant) -> Self {
         Self {
+            shuffle_seed: Cell::new(None),
             handoff_notices: RefCell::default(),
             pull_link_candidates: RefCell::default(),
             publication_reads: RefCell::default(),
@@ -4437,15 +4473,17 @@ pub struct Report {
     pub planned_starts: BTreeMap<String, u64>,
     pub lines: Vec<String>,
     pub summary: String,
+    pub shuffle_seed: Option<u64>,
     pub spent: Spent,
     /// Stage 4's candidates it screened out or read and did not start, by
     /// their hold kind's name, or [`NOT_READY_ERROR`] where their
     /// consideration failed: why nothing was startable (agent-board#864).
     pub not_ready: BTreeMap<String, usize>,
-    /// The last candidate stage 4 visited before a budget stop, kept in
-    /// `state` for the next pass to resume after; none at the walk's end,
-    /// and the last pass's where this one scanned nothing.
+    /// The budget cut stage 4 keeps in `state`: the last candidate attempted.
+    /// None at the walk's end; unchanged if the walk could not advance.
     pub scan_cursor: Option<String>,
+    /// The scheduling seed at that cut, not necessarily this pass's seed.
+    scan_seed: Option<u64>,
     /// `leanReads`' holds for the next pass to carry ([`lean`]), where stage
     /// 4 walked its candidates; none keeps the last pass's.
     pub carried_holds: Option<BTreeMap<String, lean::Carried>>,
@@ -4611,7 +4649,7 @@ pub async fn run<C: Rest + Transport + crate::github::GraphQl + Broker>(
         state,
         (mode, limits),
         now,
-        false,
+        (false, None),
     )
     .await
 }
@@ -4623,7 +4661,9 @@ pub async fn run_replay(
     config: &Config,
     limits: Limits,
     attribute_root: bool,
+    seed: Option<u64>,
 ) -> Result<Report> {
+    let seed = seed.or_else(|| config.shuffle_walk.then_some(0));
     run_pass(
         replay,
         replay,
@@ -4631,7 +4671,7 @@ pub async fn run_replay(
         State::default(),
         (Mode::Preview, limits),
         replay.now,
-        attribute_root,
+        (attribute_root, seed),
     )
     .await
 }
@@ -4643,7 +4683,7 @@ async fn run_pass<C: Rest + Transport + crate::github::GraphQl + Broker>(
     state: State,
     (mode, limits): (Mode<'_>, Limits),
     now: OffsetDateTime,
-    attribute_root: bool,
+    (attribute_root, seed): (bool, Option<u64>),
 ) -> Result<Report> {
     ensure!(
         config.forgejo_board().is_none(),
@@ -4651,6 +4691,7 @@ async fn run_pass<C: Rest + Transport + crate::github::GraphQl + Broker>(
     );
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, admit_by);
+    bounds.shuffle_seed.set(seed);
     if attribute_root {
         *bounds.root_reads.borrow_mut() = Some(RootReads::default());
     }
@@ -4677,6 +4718,11 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds: &Bounds,
 ) -> Result<Report> {
     config.check_pace(now)?;
+    if config.shuffle_walk && bounds.shuffle_seed.get().is_none() {
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("pass shuffle seed: {e}"))?;
+        bounds.shuffle_seed.set(Some(u64::from_le_bytes(bytes)));
+    }
     ensure!(
         !config.cleanup_history || config.living_status.is_some(),
         "cleanupHistory requires livingStatus"
@@ -4785,6 +4831,10 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     }
     bounds.collapse(&mut report);
     report.summary = caps.summary();
+    report.shuffle_seed = bounds.shuffle_seed.get();
+    if let Some(seed) = report.shuffle_seed {
+        report.summary.push_str(&format!(", seed {seed}"));
+    }
     report.spent = bounds.spent();
     if let Some(root) = bounds.root_reads.borrow().as_ref() {
         report.lines.push(root.line());
@@ -4810,6 +4860,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         }
         state.pass_responses = bounds.next_responses.take();
         state.scan_cursor = report.scan_cursor.clone();
+        state.scan_seed = report.scan_seed;
         state.issue_intake = report.issue_intake.clone();
         state.holds_pending = bounds.publication_pending.take();
         state.holds_summary_cursor = bounds.publication_summary_cursor.take();
@@ -4830,9 +4881,11 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         Mode::Actions(own) => (true, Some(own), "actions"),
         Mode::Local => (true, None, "local"),
     };
+    let same_scan_mode = state.scan_seed.is_some() == bounds.shuffle_seed.get().is_some();
     let mut report = Report {
-        // Kept as it was by a pass whose stage 4 scans nothing.
-        scan_cursor: state.scan_cursor.clone(),
+        // A pass that scans nothing keeps a same-mode continuation.
+        scan_cursor: state.scan_cursor.clone().filter(|_| same_scan_mode),
+        scan_seed: state.scan_seed.filter(|_| same_scan_mode),
         issue_intake: state.issue_intake.clone(),
         ..Report::default()
     };
@@ -4893,7 +4946,6 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         unconsidered: 0,
         unread: 0,
         budget_stop: None,
-        scan_cursor: state.scan_cursor.clone(),
         lean: RefCell::new(lean::Lean::new(state.carried_holds.clone(), now)),
         ended: RefCell::new(BTreeMap::new()),
         kept: RefCell::default(),
@@ -5603,9 +5655,6 @@ struct Scheduler<'a, C> {
     /// ([`epics::Scheduler::replan_held`]), whose start spends what the stop
     /// kept for one.
     budget_stop: Option<BudgetStop>,
-    /// Where the last pass's scan stopped ([`poll::State::scan_cursor`]):
-    /// this pass's scan resumes after it ([`Self::start`]).
-    scan_cursor: Option<String>,
     /// `leanReads`' carried holds ([`lean`]).
     lean: RefCell<lean::Lean>,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
@@ -6272,6 +6321,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
         let mut poll = config.poll(fresh.as_ref());
+        let seed = bounds.shuffle_seed.get();
+        poll.policy.shuffle_seed = seed;
         if let Some(line) = poll.policy.handover_line() {
             self.line(line);
         }
@@ -6469,7 +6520,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // gone, and what was held there dropped.
         let (mut swept, mut waiting) = (Vec::new(), Vec::new());
         // Without the option there is no round to keep a place in, and
-        // without `state` none is kept: the clock takes turns instead.
+        // without `state` none is kept.
         let kept = config.state.is_some();
         let mut cursor = (config.authored.filter(|_| kept)).and(state.authored_cursor.clone());
         if let Some(per_pass) = config.authored {
@@ -6508,11 +6559,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let forks = routes.as_ref().map(|r| &r.forks);
             let priority = authored::priority(&named, threads, forks);
             let room = POLL_REPOSITORY_LIMIT.saturating_sub(self.follows.len());
-            let rotation = match kept {
-                true => authored::Rotation::Cursor(cursor.as_deref()),
-                false => authored::Rotation::Clock(self.now),
+            let order = match (seed, kept) {
+                (Some(seed), _) => authored::Order::Shuffle {
+                    seed,
+                    cursor: cursor.as_deref(),
+                },
+                (None, true) => authored::Order::Cursor(cursor.as_deref()),
+                (None, false) => authored::Order::Clock(self.now),
             };
-            let turn = match authored::turn(&new, &priority, (per_pass, room), rotation) {
+            let turn = match authored::turn(&new, &priority, (per_pass, room), order) {
                 Ok(turn) => turn,
                 Err(error) => {
                     self.report.error("follow authored turn", &error);
@@ -6521,7 +6576,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             };
             // As with `repositoriesPerPass`, only a pass that applies moves
             // the cursor, so that a preview hides nothing.
-            if self.apply {
+            if self.apply && kept {
                 cursor = turn.next;
             }
             let prioritized = turn.prioritized.len();
@@ -7073,8 +7128,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // A completed walk clears the cursor; a pass that visits nothing
         // preserves it. No candidate-count or per-candidate request cap.
         let children = self.focus.children;
-        let resume = self.scan_cursor.take().and_then(|cursor| {
-            let at = (candidates.iter()).position(|(_, f)| f.issue.display() == cursor)?;
+        let resume = self.report.scan_cursor.as_ref().and_then(|cursor| {
+            let at = candidates
+                .iter()
+                .position(|(_, f)| f.issue.display() == *cursor)?;
             Some((cursor, at + 1))
         });
         let order: Vec<usize> = match &resume {
@@ -7093,7 +7150,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let mut last: Option<String> = None;
         let mut budget_stopped = false;
-        for (visited, n) in order.into_iter().enumerate() {
+        for (visited, &n) in order.iter().enumerate() {
             let (_, facts) = &candidates[n];
             let left = candidates.len() - visited;
             if free == 0 {
@@ -7260,8 +7317,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         if !budget_stopped {
             self.report.scan_cursor = None;
+            self.report.scan_seed = None;
         } else if let Some(last) = last {
             self.report.scan_cursor = Some(last);
+            self.report.scan_seed = self
+                .report
+                .scan_seed
+                .or(self.client.bounds.shuffle_seed.get());
         }
         self.lean_report();
         if taken == 0
@@ -7870,28 +7932,28 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             );
             self.candidates_deferred(deferred.len());
         }
-        ranked.sort_by(|a, b| a.0.cmp(&b.0));
-        if config.top_down {
-            // Finish one epic before opening another at the same Priority.
-            // Unparented items follow the epics at their own Priority.
-            let group = |facts: &Facts| {
-                facts.parent.as_ref().map(|p| {
-                    let epic = board.items.get(&key(&p.issue));
-                    (
-                        epic.map(|e| e.created)
-                            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
-                        key(&p.issue),
-                    )
-                })
-            };
-            ranked.sort_by(|a, b| {
-                a.0.0
-                    .cmp(&b.0.0)
-                    .then_with(|| a.1.parent.is_none().cmp(&b.1.parent.is_none()))
-                    .then_with(|| group(a.1).cmp(&group(b.1)))
-                    .then_with(|| a.0.cmp(&b.0))
-            });
+        // Keep the same peer order until the scan completes. Re-shuffling
+        // behind a saved cut can move unread peers back into the tried prefix.
+        // A cursor deferred by partial discovery is not stale: keep it.
+        if self.report.scan_cursor.as_ref().is_some_and(|cursor| {
+            let mut issues = (ranked.iter().map(|(_, facts)| &facts.issue))
+                .chain(deferred.iter().map(|facts| &facts.issue));
+            !issues.any(|issue| issue.display() == *cursor)
+        }) {
+            self.report.scan_cursor = None;
+            self.report.scan_seed = None;
         }
+        let seed = self
+            .report
+            .scan_seed
+            .or(self.client.bounds.shuffle_seed.get());
+        ranked.sort_by_cached_key(|(rank, facts)| {
+            (
+                schedule_tier(rank, facts, board, config.top_down),
+                seed.map(|seed| shuffle_key(seed, &rank.3, Some(rank.4))),
+                rank.clone(),
+            )
+        });
         self.report.tally.1.candidates = Some(ranked.len());
         let line = candidates_line(config, ranked.len(), (visitors, outside.len(), unparented));
         self.line(line);
@@ -10825,7 +10887,14 @@ impl<'a, C> Recorder<'a, C> {
     /// The fixture: the clock and every request with its answer, one
     /// request to a line, so that a re-recording diffs by request.
     pub fn fixture(&self, now: OffsetDateTime) -> Result<String> {
-        let head = json!({"schema": REPLAY_SCHEMA, "now": now.format(&Rfc3339)?});
+        self.fixture_with_seed(now, None)
+    }
+
+    pub fn fixture_with_seed(&self, now: OffsetDateTime, seed: Option<u64>) -> Result<String> {
+        let mut head = json!({"schema": REPLAY_SCHEMA, "now": now.format(&Rfc3339)?});
+        if let Some(seed) = seed {
+            head["shuffleSeed"] = json!(seed);
+        }
         Ok(fixture_text(&head, &self.entries.borrow()))
     }
 }
@@ -10938,6 +11007,10 @@ pub struct Replay {
 
 impl Replay {
     pub fn from_json(value: &Value) -> Result<Self> {
+        Self::from_json_with_seed(value).map(|(replay, _)| replay)
+    }
+
+    pub fn from_json_with_seed(value: &Value) -> Result<(Self, Option<u64>)> {
         ensure!(
             value["schema"] == REPLAY_SCHEMA,
             "not a pass replay (expected {REPLAY_SCHEMA})"
@@ -10952,7 +11025,11 @@ impl Replay {
             .as_array()
             .context("replay has no requests")?
             .clone();
-        Ok(Self { now, requests })
+        let shuffle_seed = value
+            .get("shuffleSeed")
+            .map(|seed| seed.as_u64().context("replay shuffleSeed is not a u64"))
+            .transpose()?;
+        Ok((Self { now, requests }, shuffle_seed))
     }
 
     fn answer(&self, request: &Value) -> Result<&Value> {

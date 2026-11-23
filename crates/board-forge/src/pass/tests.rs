@@ -625,6 +625,42 @@ fn top_down_fills_slots_before_reading_unrelated_parents() {
     }
 }
 
+#[test]
+fn seeded_schedule_shuffles_peers_without_crossing_priority_or_epic_groups() {
+    let replay = top_down_fixture();
+    let cfg = config(json!({"topDown": true, "wip": 4}));
+    let preview = |seed| {
+        block(run_replay(
+            &replay,
+            &cfg,
+            Limits::default(),
+            false,
+            Some(seed),
+        ))
+        .unwrap()
+    };
+    let mut orders = BTreeSet::new();
+    for seed in 0..8 {
+        let report = preview(seed);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        let starts: Vec<_> = report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("start "))
+            .cloned()
+            .collect();
+        assert_eq!(starts.len(), 2, "{:?}", report.lines);
+        assert!(
+            starts
+                .iter()
+                .all(|l| l.contains("tracker#446 ") || l.contains("tracker#459 "))
+        );
+        assert_eq!(report.lines, preview(seed).lines, "seed {seed}");
+        orders.insert(starts);
+    }
+    assert_eq!(orders.len(), 2);
+}
+
 /// A recorded REST fixture with live conditional semantics. Every validator
 /// is checked; 304s contain no body or pagination headers.
 struct ConditionalFixture(Replay);
@@ -761,6 +797,16 @@ fn next_state(report: &Report) -> State {
     State::from_json(&report.state.as_ref().unwrap().to_json()).unwrap()
 }
 
+/// Continue the scan without replaying any cached responses.
+fn scan_only(report: &Report) -> State {
+    let state = next_state(report);
+    State {
+        scan_cursor: state.scan_cursor,
+        scan_seed: state.scan_seed,
+        ..State::default()
+    }
+}
+
 fn starts(report: &Report) -> Vec<String> {
     (report.lines.iter().filter(|l| l.starts_with("start ")))
         .cloned()
@@ -780,6 +826,60 @@ fn a_stopped_scan_resumes_after_its_last_read_in_the_next_pass() {
             "graphql":{"remaining":remaining,"reset":1700000000}}}}})
     };
     fixture.0.requests.push(headroom(300));
+    let seeded = |seed, state| {
+        let bounds = Bounds::new(
+            PASS_REQUEST_LIMIT,
+            Instant::now() + std::time::Duration::from_secs(60),
+        );
+        bounds.shuffle_seed.set(Some(seed));
+        block(run_within(
+            &fixture,
+            &fixture,
+            &cfg,
+            (state, Mode::Preview, Limits::default(), fixture.0.now),
+            &bounds,
+        ))
+        .unwrap()
+    };
+    let seeded_first = seeded(0, State::default());
+    assert!(starts(&seeded_first).is_empty());
+    let saved = scan_only(&seeded_first);
+    assert_eq!(saved.scan_seed, Some(0));
+    let cursor = saved
+        .scan_cursor
+        .as_deref()
+        .expect("seeded scan reaches its cut");
+    let mut peers: Vec<_> = (6000..6080).collect();
+    peers.sort_by_key(|&n| shuffle_key(0, TRACKER, Some(n)));
+    let last = peers
+        .iter()
+        .position(|n| cursor == format!("{TRACKER}#{n}"))
+        .unwrap();
+    let deferred = format!("{TRACKER}#{}", peers[last + 1]);
+    let seeded_second = seeded(1, saved);
+    assert_eq!(seeded_second.failures, 0);
+    let first_hold = seeded_second
+        .lines
+        .iter()
+        .find(|l| l.starts_with("hold cgwalters-forge/tracker#60"));
+    assert!(
+        first_hold.is_some_and(|l| l.starts_with(&format!("hold {deferred}:"))),
+        "{deferred}: {first_hold:?}"
+    );
+    let mut pass = seeded_second;
+    for seed in 2..10 {
+        if !starts(&pass).is_empty() {
+            break;
+        }
+        pass = seeded(seed, scan_only(&pass));
+        assert_eq!(pass.failures, 0, "{:#?}", pass.lines);
+    }
+    assert!(
+        starts(&pass)
+            .iter()
+            .any(|line| line.contains("tracker#446 ") || line.contains("tracker#459 ")),
+        "unchanged low headroom starved later ready work"
+    );
     let stale = State {
         scan_cursor: Some("cgwalters-forge/tracker#999".into()),
         ..State::default()
@@ -916,41 +1016,65 @@ fn an_unattempted_candidate_does_not_advance_the_scan_cursor() {
         // Eleven reads precede consideration (two more validate a focus); the
         // held plan takes two more, leaving exactly the start/write reserves.
         let remaining = 2 * (11 + usize::from(focus) * 2 + 2 + WRITE_RESERVE + START_RESERVE);
-        fixture
-            .0
-            .requests
-            .push(json!({"request":{"get":format!("{API_ROOT}rate_limit")},
-        "answer":{"status":200,"body":{"resources":{
-            "core":{"remaining":remaining,"reset":1700000000},
-            "graphql":{"remaining":remaining,"reset":1700000000}}}}}));
-        let cfg = config(settings);
-        let first = pass_from(&fixture, &cfg, State::default());
-        assert!(starts(&first).is_empty());
-        assert_eq!(
-            first.scan_cursor.as_deref(),
-            Some("cgwalters-forge/tracker#6000")
-        );
-        assert_eq!(first.spent.by_cause["cgwalters-forge/tracker#6000"], 2);
-        assert!(
-            !first
-                .spent
-                .by_cause
-                .contains_key("cgwalters-forge/tracker#446")
-        );
-        // Drop response caches, not the cursor: changing responses cannot refund
-        // reads, and unchanged headroom must still let the ready candidate start.
-        let second = pass_from(
-            &fixture,
-            &cfg,
-            State {
-                scan_cursor: next_state(&first).scan_cursor,
-                ..State::default()
-            },
-        );
-        assert_eq!(
-            starts(&second),
-            ["start triage cgwalters-forge/tracker#446 pool=claude"]
-        );
+        let headroom = |remaining| {
+            json!({"request":{"get":format!("{API_ROOT}rate_limit")},
+            "answer":{"status":200,"body":{"resources":{
+                "core":{"remaining":remaining,"reset":1700000000},
+                "graphql":{"remaining":remaining,"reset":1700000000}}}}})
+        };
+        for shuffled in [false, true] {
+            fixture.0.requests.push(headroom(remaining));
+            settings["shuffleWalk"] = json!(shuffled);
+            let cfg = config(settings.clone());
+            let first = pass_from(&fixture, &cfg, State::default());
+            assert!(starts(&first).is_empty());
+            assert_eq!(
+                first.scan_cursor.as_deref(),
+                Some("cgwalters-forge/tracker#6000")
+            );
+            assert_eq!(first.spent.by_cause["cgwalters-forge/tracker#6000"], 2);
+            assert!(
+                !first
+                    .spent
+                    .by_cause
+                    .contains_key("cgwalters-forge/tracker#446")
+            );
+            assert_eq!(first.scan_seed.is_some(), shuffled);
+
+            // Changing responses cannot refund reads. Under the same headroom,
+            // the scan must resume across tiers and reach the ready candidate.
+            let second = pass_from(&fixture, &cfg, scan_only(&first));
+            assert_eq!(
+                starts(&second),
+                ["start triage cgwalters-forge/tracker#446 pool=claude"]
+            );
+
+            settings["shuffleWalk"] = json!(!shuffled);
+            let switched = pass_from(&fixture, &config(settings.clone()), scan_only(&first));
+            assert!(
+                starts(&switched).is_empty(),
+                "a mode change should start with P0 again"
+            );
+            assert_eq!(switched.scan_seed.is_some(), !shuffled);
+
+            // Take away the two reads that were available for consideration.
+            // The walk finds its cut but cannot advance it.
+            fixture.0.requests.pop();
+            fixture.0.requests.push(headroom(remaining - 4));
+            let stopped = pass_from(&fixture, &cfg, scan_only(&first));
+            assert!(
+                stopped
+                    .lines
+                    .iter()
+                    .any(|line| line.contains("scan resumed")),
+                "{:?}",
+                stopped.lines
+            );
+            assert!(starts(&stopped).is_empty());
+            assert_eq!(stopped.scan_cursor, first.scan_cursor);
+            assert_eq!(stopped.scan_seed, first.scan_seed);
+            fixture.0.requests.pop();
+        }
     }
 }
 
@@ -9651,12 +9775,12 @@ fn action_first_merges_two_approved_prs_in_repository_25_before_drafts_and_upstr
     let mut upstream_forge = Forge::new(None, false);
     upstream_forge.replay.requests = forge.replay.requests.clone();
     let upstream_report = apply(&upstream_forge, &upstream_cfg);
+    let upstream = &repositories[..10];
     let clock_start = upstream_report
         .lines
         .iter()
         .find_map(|l| l.strip_prefix("pull requests: clock rotation start point is "))
-        .expect("cache-only walk should log its start");
-    let upstream = &repositories[..10];
+        .unwrap();
     let start = upstream
         .iter()
         .position(|repo| repo == clock_start)
@@ -23565,23 +23689,16 @@ fn authored_repositories_take_turns() {
     }
 }
 
-/// Without `state`, as the hosted pass runs, nothing carries from one pass
-/// to the next: each consecutive applying pass, ten minutes apart and each
-/// from an empty state, still takes the next turn of the clock, so the three
-/// repositories in rotation are all swept within three passes, one a pass,
-/// and the one a live epic names (here by its fork's upstream would do too)
-/// comes first in every one of them.
 #[test]
-fn stateless_passes_sweep_every_authored_repository_and_priority_every_pass() {
+fn stateless_passes_shuffle_authored_admission_without_losing_priority() {
     const NAMED: &str = AUTHORED_NEXT;
     let rotating = [AUTHORED_REPO, "cgwalters-forge/xxx", "cgwalters-forge/yyy"];
-    let cfg = config(json!({"wip": 0, "pr": {"fixPools": ["claude"]}, "authored": 1}));
+    let cfg = config(
+        json!({"wip": 0, "pr": {"fixPools": ["claude"]}, "authored": 1, "shuffleWalk": true}),
+    );
     let own = own();
     let mut swept = BTreeSet::new();
-    let passes = rotating.len();
-    // Mid-slot, as a hosted pass starts some seconds after its slot.
-    let start = replay().now + time::Duration::seconds(17);
-    for pass in 0..passes as i32 {
+    for pass in 0..16 {
         let mut forge = authored_forge();
         let found: Vec<(&str, u64)> = (rotating.iter().map(|r| (*r, 9)))
             .chain([(NAMED, 1)])
@@ -23602,16 +23719,25 @@ fn stateless_passes_sweep_every_authored_repository_and_priority_every_pass() {
         forge.on_get = Some(Box::new(move |url, _| {
             reads.borrow_mut().push(url.to_owned())
         }));
-        let now = start + time::Duration::minutes(authored::SLOT_MINUTES * i64::from(pass));
-        let report = block(run(
+        let bounds = Bounds::new(
+            PASS_REQUEST_LIMIT,
+            Instant::now() + std::time::Duration::from_secs(60),
+        );
+        bounds.shuffle_seed.set(Some(pass));
+        let report = block(run_within(
             &forge,
             &forge,
             &cfg,
-            State::default(),
-            (Mode::Actions(&own), Limits::default()),
-            now,
+            (
+                State::default(),
+                Mode::Actions(&own),
+                Limits::default(),
+                forge.replay.now,
+            ),
+            &bounds,
         ))
         .unwrap();
+        assert!(report.summary_line().contains(&format!(", seed {pass},")));
         let lines = &report.lines;
         // As in [`authored_repositories_take_turns`]: tracker#596's question.
         assert_eq!(report.failures, 1, "pass {pass}: {lines:?}");

@@ -38,6 +38,10 @@ const LEASE_BRANCH: &str = "agent-board-leases";
 /// decoding can discard their presence or hide the capability diagnostic.
 pub(super) fn check_options(value: &Value) -> Result<()> {
     ensure!(
+        value.get("shuffleWalk").is_none(),
+        "unsupported_capability: shuffleWalk: GitHub pass ordering only"
+    );
+    ensure!(
         value.get("poolHeadroom").is_none(),
         "unsupported_capability: poolHeadroom: GitHub routing only"
     );

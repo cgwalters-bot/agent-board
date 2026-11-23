@@ -57,6 +57,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
     for name in [
         "notifications",
         "issueIntake",
+        "shuffleWalk",
         "reserveScheduling",
         "poolHeadroom",
         "skipActiveWork",

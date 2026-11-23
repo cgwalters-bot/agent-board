@@ -3389,10 +3389,42 @@ fn pass_replay_previews_without_credentials() {
         trace.ends_with(&format!("\nsummary: dispatched 6, writes 3, held 0, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":6}}")),
         "{text}"
     );
+    let seeded = || {
+        command()
+            .args([
+                "pass",
+                "--config",
+                "fixtures/pass/org-config.json",
+                "--replay",
+                "fixtures/pass/org-repositories.json",
+                "--seed",
+                "18446744073709551615",
+            ])
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env("PATH", "")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let seeded_output = seeded();
+    assert_eq!(seeded_output, seeded());
+    assert!(
+        String::from_utf8(seeded_output)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .contains(", seed 18446744073709551615,")
+    );
     for refused in [
         vec!["--apply"],
         vec!["--owner", "example"],
         vec!["--json", "lines"],
+        vec!["--seed", "18446744073709551616"],
     ] {
         command()
             .args(replay)

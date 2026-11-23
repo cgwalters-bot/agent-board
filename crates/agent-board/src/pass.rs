@@ -38,6 +38,9 @@ pub struct Pass {
     /// Preview a recorded pass (a replay fixture) at its clock instead of reading the forge; needs no token. A Forgejo fixture replays only on the instance it was recorded on. On GitHub, with --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage.
     #[arg(long, value_name = "FILE", conflicts_with = "apply")]
     pub replay: Option<PathBuf>,
+    /// Replay the GitHub pass shuffle with this unsigned 64-bit seed, overriding the recording's seed.
+    #[arg(long, value_name = "N", requires = "replay", conflicts_with = "record")]
+    pub seed: Option<u64>,
     /// During GitHub replay, count charged REST root reads by normalized path and repeated successful decision metadata reads.
     #[arg(long, requires = "replay", conflicts_with = "record")]
     pub attribute_rest_root: bool,
@@ -177,7 +180,7 @@ fn record_pass<C: Rest + Transport + GraphQl + pass::Broker>(
     let preview = (Mode::Preview, limits);
     let pass = pass::run(&recorder, &recorder, config, State::default(), preview, now);
     let report = runtime.block_on(pass)?;
-    std::fs::write(path, recorder.fixture(now)?)
+    std::fs::write(path, recorder.fixture_with_seed(now, report.shuffle_seed)?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(report)
 }
@@ -304,6 +307,11 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                 "--attribute-rest-root",
                 "REST root attribution is GitHub-only",
             ),
+            (
+                args.seed.is_some(),
+                "--seed",
+                "the pass shuffle is GitHub-only",
+            ),
         ] {
             ensure!(!supplied, "unsupported_capability: {option}: {reason}");
         }
@@ -398,16 +406,17 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         Some(path) => {
             let value = serde_json::from_str(&read(path)?)
                 .with_context(|| format!("decode {}", path.display()))?;
-            Some(Replay::from_json(&value)?)
+            Some(Replay::from_json_with_seed(&value)?)
         }
         None => None,
     };
     let report = match (&replay, &args.record) {
-        (Some(replay), None) => runtime.block_on(pass::run_replay(
+        (Some((replay, seed)), None) => runtime.block_on(pass::run_replay(
             replay,
             &config,
             limits,
             args.attribute_rest_root,
+            args.seed.or(seed.filter(|_| config.shuffle_walk)),
         ))?,
         (seed, record) => {
             let now = time::OffsetDateTime::now_utc();
@@ -416,7 +425,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(pass::PASS_SECONDS_LIMIT);
             let client = pass_client()?.retry_within(deadline);
             match (seed, record) {
-                (Some(seed), Some(path)) => {
+                (Some((seed, _)), Some(path)) => {
                     let seeded = Seeded {
                         seed,
                         live: &client,

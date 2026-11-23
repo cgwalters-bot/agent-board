@@ -882,11 +882,23 @@ candidates still run, and unlisted repositories resume on a later applying pass.
 The saved `action_first_cursor` rotates discovery independently of the
 `share_cursor` decision cut, so neither deferred listings nor priority
 candidates can reset the other's progress. Preview advances neither cursor.
-If neither cursor is carried and there is more than one repository, both walks
-start at a repository chosen by the pass clock. The walk and the red-check turn
-spread their ten-minute slots across the available starts without relying on
-consecutive slots. A saved cursor takes precedence for the walk and resumes
-from the actual cut. The pass logs the clock-selected repository.
+With `shuffleWalk: true` (GitHub, off by default), the pass draws one seed and
+shuffles repositories and scheduling candidates within their existing priority
+tiers. This prevents the same early candidates from always spending the share
+before their peers get a turn. PRs within a repository keep numeric order, so a
+saved PR walk cursor still resumes at the cut without skipping unread PRs.
+Approved and red PRs and operator intake keep their dedicated turns, with their
+clock rotation; scheduling continues in its [saved order](#scan-bounds).
+There is no change to admission, request or action caps, and no guarantee of
+coverage in a fixed number of passes.
+When `shuffleWalk` is off, the existing clock rotation still applies.
+
+The `summary:` line includes `seed N` when shuffling. A GitHub `--record`
+keeps it for `--replay`; `--replay FILE --seed N` explicitly selects a seed,
+even if the config leaves the shuffle off. A legacy recording without a seed
+uses seed 0 if the setting is on. A different seed may ask for reads the
+recording did not capture. Replay starts without the live pass's saved cursors;
+the seed reproduces the shuffle for the same inputs, not a stateful live walk.
 
 Approved, non-draft, mergeable candidates run first across those repositories,
 rotating from the saved share cursor within this class. Already queued/auto-merge
@@ -3150,16 +3162,11 @@ A pass captures one clock and performs these stages in order:
     as those in `follow`. Each pass searches `author:BOT is:pr is:open`, up
     to 3 pages of 100, leaving out archived repositories. N bounds what they
     spend of the poll's one request budget, which `follow` needs too: the
-    repositories not already followed take turns, N a pass, in sorted order.
-    Without `state`, as the hosted pass runs, the turn is the pass's clock:
-    each 10-minute slot the next N, wrapping around, so any ceil(M/N)
-    consecutive slots sweep all M, with nothing kept: as many passes at the
-    hosted interval of 10 minutes (`pass next --wait-minutes 10`). A late
-    pass skips a window for one round; a longer interval that is a multiple
-    of the slot could skip some for good, so keep the two equal. The
-    rotating set changes as pull requests open and close and as the
-    priority set moves. With `state`, it is a cursor (`authored_cursor`) that only
-    an applying pass moves, as with `repositoriesPerPass`. One out of its turn counts as undecided, so
+    repositories not already followed take turns, N a pass. With `state`, an
+    applying pass carries the next candidate in `authored_cursor`. With
+    `shuffleWalk`, it shuffles the rest (or all if there is no cursor); with
+    neither it takes the legacy clock's next window each ten-minute slot. One out of
+    its turn counts as undecided, so
     what the last pass held there is kept. Ahead of that rotation, and in
     addition to its N, each pass first follows the repositories that matter
     now, at most 10: those the live epics name, in an epic's body as
@@ -3617,14 +3624,17 @@ pace, WIP, runner availability and optional `--max-*` overrides still apply.
 No new option, read, write permission or dispatch authority is added.
 
 When the request/time budget stops the walk, `state.scan_cursor` keeps the last
-visited candidate. The next pass resumes after it, with focus children still
-first and earlier candidates last. An interrupted candidate rotates to the
-end and is retried when the walk wraps: one candidate too expensive for the
-current headroom must not indefinitely block cheaper ready work. A completed
-walk or capacity stop clears the cursor so the
-next pass reconsiders priority order; a pass that visits
-nothing preserves it. A stale cursor starts in order. Without `state`, every
-pass starts in order. The cursor affects ordering only, never admission.
+candidate whose consideration began. The next pass rotates after it, across
+priority tiers if needed, but still considers focus children before other work.
+An interrupted candidate waits for the walk to wrap rather than blocking cheaper
+ready work. With `shuffleWalk`, `state.scan_seed` keeps the original scheduling
+order across the cut; each fresh scan shuffles peers within priority tiers.
+
+A completed walk or capacity stop within the walk clears the continuation. A
+pass that does not reach the walk, or runs out of budget before attempting a
+candidate, keeps a valid continuation. A stale cursor or a change of shuffle
+mode starts a fresh scan. Without `state`, every pass starts fresh. The cursor
+affects ordering only, never admission.
 
 Caller migration: in `cgwalters-forge/tracker`, `.github/pass.json`, delete
 the `scan` key, retaining the existing `requestShare` and `state` settings.
