@@ -578,7 +578,22 @@ fn setup_credential_free_rehearsal() {
             assert!(!text.contains("REST root reads:"), "{text}");
             assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 1);
             assert!(text.contains("held by --max-dispatch: start "), "{text}");
-            assert!(text.ends_with(&format!("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":1}}\n")), "{text}");
+            let (trace, operations) = text.trim_end().rsplit_once(", stage operations ").unwrap();
+            assert!(trace.ends_with(&format!("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":1}}")), "{text}");
+            let operations: Value = serde_json::from_str(operations).unwrap();
+            assert_eq!(
+                operations["epics/PlanComments"],
+                serde_json::json!([3, 0, 0, 0, 0, 3, 3])
+            );
+            assert_eq!(
+                operations["schedule/PlanComments"],
+                serde_json::json!([9, 0, 0, 0, 0, 9, 9])
+            );
+            // REST requests are charged to their endpoint class.
+            assert_eq!(
+                operations["schedule/actions workflows runs"],
+                serde_json::json!([7, 0, 0, 0, 0, 0, 0])
+            );
             let expected = board_forge::pass::Config::parse(include_str!(
                 "../../../fixtures/pass/config.json"
             ))
@@ -3322,7 +3337,7 @@ fn pass_replay_previews_a_daily_session() {
         "{text}"
     );
     assert!(
-        text.ends_with(", planned starts {\"session\":1,\"triage\":5}\n"),
+        text.contains(", planned starts {\"session\":1,\"triage\":5}, stage operations "),
         "{text}"
     );
 }
@@ -3369,8 +3384,9 @@ fn pass_replay_previews_without_credentials() {
     // jobs read; none are recorded, so it keeps its slot. tracker#596's
     // sub-issues are all closed: it is asked about, three writes, not planned.
     assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 6);
+    let (trace, _) = text.trim_end().rsplit_once(", stage operations ").unwrap();
     assert!(
-        text.ends_with(&format!("\nsummary: dispatched 6, writes 3, held 0, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":6}}\n")),
+        trace.ends_with(&format!("\nsummary: dispatched 6, writes 3, held 0, {REPLAY_SPENT}, starts {{}}, comments created 0, edited 0, {REPLAY_NOT_READY}, planned starts {{\"triage\":6}}")),
         "{text}"
     );
     for refused in [

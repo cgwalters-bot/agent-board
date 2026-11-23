@@ -3615,6 +3615,19 @@ No tracker configuration is changed here.
 
 ### The request budget from the rate limit
 
+The pass summary's `stage operations` map keys are `stage/operation`. Each
+row contains, in order: requests charged, alias slots sent, aliases returned,
+reused read projections, HTTP 304s, GraphQL points, and GraphQL calls with
+estimated points. A REST request's operation is its endpoint class; a GraphQL
+query's is its projection name, or its class where it has none. Requests are
+counted where the pass budget charges them (reads, live reads, writes and
+downloads), not HTTP retries, and a refunded 304 is taken off it again, so
+each stage's charged counts add up to its `requests` count. A 304 is still
+listed as a send; it is not the same as reusing a read without sending it.
+The alias columns cover only Holds ancestry reads, not other aliased queries
+such as the change sweep's item and timeline reads. Alias return counts are
+transport coverage, not proof that each item decoded completely.
+
 The concrete failure `requestShare` stops is a pass starved by a fixed
 request count that matches nothing real: the 650 (646 for reads) stopped
 stages at their shares with slots free and ready work waiting, while the

@@ -227,7 +227,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 ));
             }
             query.push('}');
-            match self.client.graphql(&query, json!({})) {
+            match self
+                .client
+                .graphql_counted(&query, json!({}), "HoldsChains", batch.len())
+            {
                 Ok(data) => {
                     for (n, issue) in batch.iter().enumerate() {
                         let value = &data[format!("r{n}")]["issueOrPullRequest"];

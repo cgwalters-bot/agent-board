@@ -2855,6 +2855,7 @@ fn spent_names_each_stage_that_spent() {
             revalidated: 0,
             by_class: by_class.clone(),
             by_cause: by_cause.clone(),
+            by_operation: BTreeMap::new(),
         };
         assert_eq!(spent.to_string(), *expected);
     }
@@ -6417,9 +6418,28 @@ fn apply(forge: &Forge, config: &Config) -> Report {
     apply_limited(forge, config, Limits::default())
 }
 
+/// Each stage's charged operation counts add up to its requests: REST and
+/// GraphQL, reads, writes and downloads, less refunded 304s.
+fn assert_operations_reconcile(spent: &Spent) {
+    for (stage, requests) in Stage::ALL.iter().zip(spent.by_stage) {
+        let prefix = format!("{}/", stage.name());
+        let charged: usize = (spent.by_operation.iter())
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, row)| row.0)
+            .sum();
+        assert_eq!(
+            charged,
+            requests,
+            "{}: {:?}",
+            stage.name(),
+            spent.by_operation
+        );
+    }
+}
+
 /// [`apply`] within `limits`.
 pub(super) fn apply_limited(forge: &Forge, config: &Config, limits: Limits) -> Report {
-    block(run(
+    let report = block(run(
         forge,
         forge,
         config,
@@ -6427,7 +6447,9 @@ pub(super) fn apply_limited(forge: &Forge, config: &Config, limits: Limits) -> R
         (Mode::Actions(&own()), limits),
         forge.replay.now,
     ))
-    .unwrap()
+    .unwrap();
+    assert_operations_reconcile(&report.spent);
+    report
 }
 
 /// [`apply`] within a budget of `limit` requests.
@@ -6435,14 +6457,16 @@ pub(super) fn apply_within(forge: &Forge, config: &Config, limit: usize) -> Repo
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
     let state = (State::default(), Mode::Actions(&own()), Limits::default());
     let within = (state.0, state.1, state.2, forge.replay.now);
-    block(run_within(
+    let report = block(run_within(
         forge,
         forge,
         config,
         within,
         &Bounds::new(limit, admit_by),
     ))
-    .unwrap()
+    .unwrap();
+    assert_operations_reconcile(&report.spent);
+    report
 }
 
 /// Replay the pass against the atomic ref forge, with a foreign workflow
@@ -7202,6 +7226,11 @@ fn publication_share_bounds_reads_writes_and_refunds() {
         // Unspent pass capacity remains available to work, not earmarked for reports.
         bounds.enter(Stage::Schedule);
         assert!(client.spend(false, "work").is_ok());
+        // A refund takes its request off the charged count again.
+        let spent = bounds.spent();
+        assert_eq!(spent.by_operation["holds/conditional"].0, 0);
+        assert_eq!(spent.by_operation["holds/write"].0, WRITE_RESERVE);
+        assert_operations_reconcile(&spent);
     }
 }
 
@@ -7845,6 +7874,31 @@ fn apply_publishes_what_needs_you() {
         .collect();
     assert_eq!(reads.len(), reads.iter().collect::<BTreeSet<_>>().len());
     assert!(reads.contains(&"cgwalters-forge/agent-board#999".to_owned()));
+    // A successful ancestry batch can return a null item without losing the
+    // request or the alias sent for that item.
+    let mut missing_item = with_context(forge_with(None));
+    let request = graphql_key(
+        needs::epics::CONTEXT_QUERY,
+        &json!({"owner":"cgwalters-forge", "name":"tracker", "number":527}),
+    );
+    let response = missing_item
+        .replay
+        .requests
+        .iter_mut()
+        .find(|entry| entry["request"] == request)
+        .unwrap();
+    response["answer"]["data"]["repository"]["issueOrPullRequest"] = Value::Null;
+    let missing_item_report = apply(&missing_item, &config);
+    assert_eq!(
+        *missing_item.chain_reads.borrow(),
+        *context_forge.chain_reads.borrow()
+    );
+    let full = &context_report.spent.by_operation["holds/HoldsChains"];
+    let partial = &missing_item_report.spent.by_operation["holds/HoldsChains"];
+    assert_eq!(
+        (partial.0, partial.1, partial.2 + 1),
+        (full.0, reads.len(), full.2)
+    );
     let identities = context_list["identities"].as_array().unwrap();
     assert!(
         identities.iter().filter(|i| i["epic"] == "unknown").count() * 100 < identities.len() * 5,
@@ -29460,6 +29514,27 @@ fn focus_epic_goes_first_and_the_rest_spill_over() {
             );
         }
         assert_eq!(report.failures, failures, "{name}: {:#?}", report.lines);
+    }
+}
+
+#[test]
+fn issue_fact_reads_have_distinct_operations() {
+    let mut forge = Forge::new(None, false);
+    sub_issue(&mut forge.replay, "cgwalters-forge/review", "cgwalters");
+    focus_read(&mut forge.replay, "OPEN");
+    let config = config(
+        json!({"epics": {"repository": TRACKER, "inWorkRepositories": true,
+        "focus": "cgwalters-forge/review#135"}}),
+    );
+
+    let report = apply(&forge, &config);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let operations = &report.spent.by_operation;
+    for key in ["epics/IssueFacts", "schedule/FreshIssueFacts"] {
+        let row = operations
+            .get(key)
+            .unwrap_or_else(|| panic!("missing {key}: {operations:?}"));
+        assert_eq!((row.0, row.5), (1, 1), "{key}");
     }
 }
 
