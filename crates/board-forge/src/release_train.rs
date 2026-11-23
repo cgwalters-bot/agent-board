@@ -1364,7 +1364,7 @@ pub fn pass_with_cache(
     out: &mut dyn Write,
     cache: &mut crate::prune::Cache,
 ) -> Result<()> {
-    crate::pass::cache::bound(&mut cache.0).warn();
+    crate::pass::cache::bound(&mut cache.0, crate::pass::cache::LEGACY_MAX_BYTES).warn();
     let result = Pass {
         api,
         config,
@@ -1380,7 +1380,7 @@ pub fn pass_with_cache(
         discovering: None,
     }
     .run();
-    crate::pass::cache::bound(&mut cache.0).warn();
+    crate::pass::cache::bound(&mut cache.0, crate::pass::cache::LEGACY_MAX_BYTES).warn();
     result
 }
 
@@ -1408,7 +1408,7 @@ impl Pass<'_> {
         let body = entry["body"].clone();
         self.read_bytes += entry.to_string().len();
         ensure!(
-            self.read_bytes <= crate::pass::cache::MAX_BYTES,
+            self.read_bytes <= crate::pass::cache::LEGACY_MAX_BYTES,
             "discovery response byte budget exhausted"
         );
         self.reads

@@ -1,23 +1,134 @@
-//! Disposable full REST representations in the poll State's response map.
-//! The map is the rebuildable URL/representation index, not action state.
+//! Disposable REST and version-checked GraphQL representations in poll state.
+//! The map is a rebuildable representation index, not action state.
 use super::*;
 
 pub(super) const REPRESENTATION: &str = "#agent-board-rest-v1";
+const GRAPHQL_REPRESENTATION: &str = "#agent-board-graphql-item-v1-";
 pub(crate) const MAX_ENTRIES: usize = 1024;
-pub(crate) const MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_BYTES: usize = 24 * 1024 * 1024;
+pub(crate) const LEGACY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 256 * 1024;
+const MAX_OBSERVATIONS: usize = BOARD_PAGES * 100;
+
+/// How long before a kept GraphQL item read its version must be for an equal
+/// listing version to prove nothing changed since: `updatedAt` has whole
+/// seconds, so an edit in the read's own second keeps it, and the pass clock
+/// may run up to this far ahead of the forge's.
+const READ_SKEW: time::Duration = time::Duration::minutes(5);
+
+pub(super) fn shared_key(key: &str) -> bool {
+    key.ends_with(REPRESENTATION)
+        || key.split_once('#').is_some_and(|(_, fragment)| {
+            fragment.starts_with(GRAPHQL_REPRESENTATION.trim_start_matches('#'))
+        })
+}
 
 #[derive(Default)]
 pub(super) struct Responses {
     pub enabled: bool,
     pub context: Option<String>,
     pub entries: BTreeMap<String, Value>,
+    index: Index,
+    stamp: u64,
     pub hits: usize,
     pub misses: usize,
     pub modified: usize,
+    pub graphql_reused: usize,
+    pub graphql_enabled: bool,
+    /// The pass's clock, recorded on each GraphQL item read kept: no later
+    /// than the read itself.
+    pub now: Option<OffsetDateTime>,
+    observations: BTreeMap<String, (usize, Version)>,
     /// Keys this pass evicted and has not kept again, and the misses on them.
     pub evicted: BTreeSet<String>,
     pub evicted_misses: usize,
+}
+
+#[derive(Debug, PartialEq)]
+struct Version {
+    id: String,
+    updated: OffsetDateTime,
+    head: Option<String>,
+}
+
+impl Version {
+    fn read(id: &Value, updated: &Value, head: Option<&Value>) -> Option<Self> {
+        let id = id.as_str().filter(|id| !id.is_empty() && id.len() <= 128)?;
+        let updated = OffsetDateTime::parse(updated.as_str()?, &Rfc3339).ok()?;
+        let head = match head {
+            Some(head) => Some(
+                head.as_str()
+                    .filter(|oid| oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()))?
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        Some(Self {
+            id: id.to_owned(),
+            updated,
+            head,
+        })
+    }
+}
+
+/// Explicitly opt in discovery reads whose results are item-local. Checks,
+/// relationships, review state and live pre-write queries do not opt in.
+#[derive(Clone, Copy)]
+pub(super) enum ItemQuery {
+    Body,
+    Kind,
+}
+
+impl ItemQuery {
+    pub fn original(self) -> &'static str {
+        match self {
+            Self::Body => BODY_QUERY,
+            Self::Kind => KIND_QUERY,
+        }
+    }
+
+    pub fn versioned(self) -> String {
+        match self {
+            Self::Body => BODY_QUERY.replacen("url title", "id updatedAt url title", 1),
+            Self::Kind => KIND_QUERY.replacen(
+                "__typename",
+                "__typename ... on Issue { id updatedAt } ... on PullRequest { id updatedAt headRefOid }",
+                1,
+            ),
+        }
+    }
+
+    fn version(self, data: &Value) -> Option<Version> {
+        let (node, pull) = match self {
+            Self::Body => (data.pointer("/repository/issue")?, false),
+            Self::Kind => {
+                let item = data.pointer("/repository/issueOrPullRequest")?;
+                (
+                    item,
+                    match item["__typename"].as_str()? {
+                        "Issue" => false,
+                        "PullRequest" => true,
+                        _ => return None,
+                    },
+                )
+            }
+        };
+        Version::read(
+            &node["id"],
+            &node["updatedAt"],
+            pull.then_some(&node["headRefOid"]),
+        )
+    }
+}
+
+pub(super) fn item_path(repo: &str, number: u64) -> Option<String> {
+    validate_repository(repo).ok()?;
+    (number > 0).then(|| {
+        format!(
+            "{API_ROOT}repos/{}/issues/{number}",
+            repo.to_ascii_lowercase()
+        )
+    })
 }
 
 pub(crate) fn seal(mut entry: Value) -> Value {
@@ -67,32 +178,218 @@ impl Bounded {
     }
 }
 
-/// Eviction affects responses only, never pending asks, receipts or accounting.
-/// It keeps entries in URL order.
-pub(crate) fn bound(entries: &mut BTreeMap<String, Value>) -> Bounded {
-    let mut bounded = Bounded::default();
-    entries.retain(|url, entry| {
-        let size = url.len() + entry.to_string().len();
-        let keep = size <= MAX_ENTRY_BYTES
-            && bounded.entries < MAX_ENTRIES
-            && bounded.bytes + size <= MAX_BYTES;
-        if keep {
-            bounded.bytes += size;
-            bounded.entries += 1;
-        } else {
-            bounded.evicted.insert(url.clone());
+/// An unstamped (old-format or standalone poll) entry is oldest. Reverse URL
+/// order breaks ties on eviction, retaining the old order for unstamped maps.
+fn last_used(entry: &Value) -> u64 {
+    entry["last_used"].as_u64().unwrap_or_default()
+}
+
+#[derive(Default)]
+struct Index {
+    sizes: BTreeMap<(u64, std::cmp::Reverse<String>), usize>,
+    bytes: usize,
+}
+
+impl Index {
+    fn insert(&mut self, url: &str, entry: &Value) {
+        // Count the serialized key (including escaping), colon and comma too.
+        let size = json!(url).to_string().len() + entry.to_string().len() + 2;
+        self.sizes
+            .insert((last_used(entry), std::cmp::Reverse(url.to_owned())), size);
+        self.bytes += size;
+    }
+
+    fn remove(&mut self, url: &str, entry: &Value) {
+        if let Some(size) = self
+            .sizes
+            .remove(&(last_used(entry), std::cmp::Reverse(url.to_owned())))
+        {
+            self.bytes -= size;
         }
-        keep
-    });
+    }
+
+    fn bound(&mut self, entries: &mut BTreeMap<String, Value>, limit: usize) -> Bounded {
+        let mut evicted = BTreeSet::new();
+        self.sizes.retain(|(_, url), size| {
+            if *size <= MAX_ENTRY_BYTES {
+                return true;
+            }
+            self.bytes -= *size;
+            entries.remove(&url.0);
+            evicted.insert(url.0.clone());
+            false
+        });
+        while self.bytes > limit || self.sizes.len() > MAX_ENTRIES {
+            let Some(((_, url), size)) = self.sizes.pop_first() else {
+                break;
+            };
+            self.bytes -= size;
+            entries.remove(&url.0);
+            evicted.insert(url.0);
+        }
+        Bounded {
+            evicted,
+            entries: entries.len(),
+            bytes: self.bytes,
+        }
+    }
+}
+
+/// Eviction affects responses only, never pending asks, receipts or accounting.
+pub(crate) fn bound(entries: &mut BTreeMap<String, Value>, limit: usize) -> Bounded {
+    let mut index = Index::default();
+    for (url, entry) in entries.iter() {
+        index.insert(url, entry);
+    }
+    index.bound(entries, limit)
+}
+
+/// Reserve room for the rest of the saved state before keeping responses.
+pub(super) fn bound_state(state: &mut State) -> Bounded {
+    let mut entries = std::mem::take(&mut state.responses);
+    let other_bytes = state.to_json().to_string().len();
+    let limit = (STATE_BYTES as usize)
+        .saturating_sub(other_bytes)
+        .min(MAX_BYTES);
+    let bounded = bound(&mut entries, limit);
+    state.responses = entries;
     bounded
 }
 
 impl Responses {
+    fn observe_item(
+        &mut self,
+        repo: &str,
+        number: &Value,
+        version: Option<Version>,
+        writes: usize,
+    ) {
+        let Some(at) = number.as_u64().and_then(|n| item_path(repo, n)) else {
+            return;
+        };
+        if let Some(version) = version {
+            if self.observations.len() < MAX_OBSERVATIONS || self.observations.contains_key(&at) {
+                self.observations.insert(at, (writes, version));
+            }
+        } else {
+            self.observations.remove(&at);
+        }
+    }
+
+    pub fn observe_board(&mut self, content: &Value, writes: usize) {
+        self.observe_item(
+            text(content, "/repository/nameWithOwner"),
+            &content["number"],
+            Version::read(&content["id"], &content["updatedAt"], None),
+            writes,
+        );
+    }
+
+    pub fn observe_rest(&mut self, url: &str, body: &Value, writes: usize) {
+        let Some((path, _)) = url
+            .strip_prefix(API_ROOT)
+            .filter(|url| !url.contains('#'))
+            .and_then(|url| url.split_once('?'))
+        else {
+            return;
+        };
+        let Some((repo, collection)) = path
+            .strip_prefix("repos/")
+            .and_then(|path| path.rsplit_once('/'))
+        else {
+            return;
+        };
+        if !matches!(collection, "issues" | "pulls") {
+            return;
+        }
+        for node in body.as_array().into_iter().flatten() {
+            // The issues endpoint shows PRs too, but cannot attest to their heads.
+            let version = (!(collection == "issues" && node.get("pull_request").is_some()))
+                .then(|| {
+                    Version::read(
+                        &node["node_id"],
+                        &node["updated_at"],
+                        (collection == "pulls").then_some(&node["head"]["sha"]),
+                    )
+                })
+                .flatten();
+            self.observe_item(repo, &node["number"], version, writes);
+        }
+    }
+
+    pub fn graphql_hit(
+        &mut self,
+        at: &str,
+        query: ItemQuery,
+        key: &str,
+        writes: usize,
+    ) -> Option<Value> {
+        let (observed_writes, version) = self.observations.get(at)?;
+        let entry = self.entries.get(key)?;
+        let body = &entry["body"];
+        let read_at = entry["read_at"]
+            .as_str()
+            .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())?;
+        if *observed_writes != writes
+            || query.version(body).as_ref() != Some(version)
+            || version.updated + READ_SKEW >= read_at
+        {
+            return None;
+        }
+        let body = body.clone();
+        self.keep_entry(key.to_owned(), entry.clone());
+        self.graphql_reused += 1;
+        Some(body)
+    }
+
+    pub fn keep_graphql(&mut self, key: String, query: ItemQuery, body: &Value) {
+        let Some(read_at) = self.now.and_then(|now| now.format(&Rfc3339).ok()) else {
+            return;
+        };
+        if query.version(body).is_some() {
+            self.keep_entry(key, json!({"body": body, "read_at": read_at}));
+        }
+    }
+
+    pub fn graphql_key(at: &str, versioned: &str) -> String {
+        format!(
+            "{at}{GRAPHQL_REPRESENTATION}{:x}",
+            Sha256::digest(versioned)
+        )
+    }
+
+    pub fn seed(&mut self, entries: BTreeMap<String, Value>) {
+        self.index = Index::default();
+        for (key, entry) in &entries {
+            self.stamp = self.stamp.max(last_used(entry));
+            self.index.insert(key, entry);
+        }
+        self.entries = entries;
+        self.index.bound(&mut self.entries, MAX_BYTES);
+    }
+
+    fn keep_entry(&mut self, key: String, mut entry: Value) {
+        if let Some(old) = self.entries.get(&key) {
+            self.index.remove(&key, old);
+        }
+        // Resume after all the saved uses, including after a restart. Order
+        // uses within the pass too, so a just-read late URL never loses a tie.
+        self.stamp = self.stamp.saturating_add(1);
+        entry["last_used"] = self.stamp.into();
+        let entry = seal(entry);
+        self.index.insert(&key, &entry);
+        self.evicted.remove(&key);
+        self.entries.insert(key, entry);
+        self.evicted
+            .append(&mut self.index.bound(&mut self.entries, MAX_BYTES).evicted);
+    }
+
     pub fn get(&mut self, url: &str) -> Option<Value> {
         let key = format!("{url}{REPRESENTATION}");
         let entry = self.entries.get(&key).cloned();
-        if entry.is_some() {
+        if let Some(entry) = &entry {
             self.hits += 1;
+            self.keep_entry(key, entry.clone());
         } else {
             self.misses += 1;
             self.evicted_misses += usize::from(self.evicted.contains(&key));
@@ -105,14 +402,12 @@ impl Responses {
             return;
         }
         let key = format!("{url}{REPRESENTATION}");
-        self.evicted.remove(&key);
-        self.entries.insert(
+        self.keep_entry(
             key,
-            seal(json!({
-                "etag": response.etag, "link": response.link, "body": response.body
-            })),
+            json!({
+                    "etag": response.etag, "link": response.link, "body": response.body
+            }),
         );
-        self.evicted.append(&mut bound(&mut self.entries).evicted);
     }
 
     /// The pass's one eviction line, with `last` the bound of the state it
@@ -150,6 +445,9 @@ mod tests {
         reads: Cell<usize>,
         conditional: Cell<usize>,
         link: RefCell<Option<String>>,
+        listing: RefCell<Option<Value>>,
+        item: RefCell<Value>,
+        graphql_reads: Cell<usize>,
     }
 
     impl Rest for Forge {
@@ -171,7 +469,10 @@ mod tests {
                 body: if matched {
                     Value::Null
                 } else {
-                    json!([self.version.get()])
+                    self.listing
+                        .borrow()
+                        .clone()
+                        .unwrap_or_else(|| json!([self.version.get()]))
                 },
             })
         }
@@ -179,6 +480,13 @@ mod tests {
         fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
             self.version.set(self.version.get() + 1);
             bail!("ambiguous write reply")
+        }
+    }
+
+    impl Transport for Forge {
+        fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+            self.graphql_reads.set(self.graphql_reads.get() + 1);
+            Ok(self.item.borrow().clone())
         }
     }
 
@@ -238,7 +546,7 @@ mod tests {
             (bounds.spent().requests, bounds.spent().revalidated),
             (1, 1)
         );
-        bounds.shared_responses.borrow_mut().entries.clear();
+        bounds.shared_responses.borrow_mut().seed(BTreeMap::new());
         assert_eq!(client.get(&url, None).unwrap().body, json!([0]));
         forge.version.set(1); // A concurrent edit is never hidden by the cache.
         assert_eq!(client.get(&url, None).unwrap().body, json!([1]));
@@ -352,11 +660,11 @@ mod tests {
         let mut entries = (0..MAX_ENTRIES + 1)
             .map(|n| (format!("{url}/{n}"), json!({"body": []})))
             .collect();
-        let bounded = bound(&mut entries);
+        let bounded = bound(&mut entries, MAX_BYTES);
         assert_eq!(entries.len(), MAX_ENTRIES);
         assert_eq!((bounded.evicted.len(), bounded.entries), (1, MAX_ENTRIES));
         entries.insert("large".into(), json!({"body": "x".repeat(MAX_ENTRY_BYTES)}));
-        let bounded = bound(&mut entries);
+        let bounded = bound(&mut entries, MAX_BYTES);
         assert!(!entries.contains_key("large"));
         assert_eq!(bounded.evicted, BTreeSet::from(["large".to_owned()]));
     }
@@ -394,13 +702,19 @@ mod tests {
             link: None,
             body: json!([]),
         };
-        // URL order: the cap evicts the last URL, so keep "b..." beyond the cap.
+        // Refresh the first entry before inserting a late-sorting fresh URL.
         for n in 0..MAX_ENTRIES {
             responses.keep(&format!("{API_ROOT}a/{n:04}"), &ok("1"));
         }
-        let evicted = format!("{API_ROOT}b");
-        responses.keep(&evicted, &ok("1"));
-        assert!(responses.get(&evicted).is_none());
+        assert!(responses.get(&format!("{API_ROOT}a/0000")).is_some());
+        let mut restarted = Responses::default();
+        restarted.seed(responses.entries.clone());
+        restarted.keep(&format!("{API_ROOT}b"), &ok("1"));
+        assert!(restarted.get(&format!("{API_ROOT}b")).is_some());
+        assert!(restarted.get(&format!("{API_ROOT}a/0000")).is_some());
+        assert!(restarted.get(&format!("{API_ROOT}a/0001")).is_none());
+        responses.keep(&format!("{API_ROOT}b"), &ok("1"));
+        assert!(responses.get(&format!("{API_ROOT}a/0001")).is_none());
         assert!(responses.get(&format!("{API_ROOT}c")).is_none());
         assert!(responses.get(&format!("{API_ROOT}a/0000")).is_some());
         assert_eq!(
@@ -409,7 +723,7 @@ mod tests {
         );
         let mut state = responses.entries.clone();
         state.insert(format!("{API_ROOT}0"), json!({"body": []}));
-        let last = bound(&mut state);
+        let last = bound(&mut state, MAX_BYTES);
         let line = responses.evictions(&last);
         assert_eq!(
             line,
@@ -419,5 +733,236 @@ mod tests {
             )
         );
         assert!(!line.contains(API_ROOT));
+    }
+
+    #[test]
+    fn saved_state_leaves_room_for_other_fields() {
+        let mut state = State {
+            interval_seconds: poll::MIN_INTERVAL_SECONDS,
+            ..State::default()
+        };
+        state.bind_responses("scope");
+        state
+            .intake_waiting
+            .insert("o/r#1".into(), "2026-11-08T00:00:00Z".into());
+        let entry = seal(json!({"body": "x".repeat(192 * 1024)}));
+        for n in 0..192 {
+            let url = format!("{API_ROOT}repos/o/r/issues/{n}");
+            state
+                .responses
+                .insert(format!("{url}{REPRESENTATION}"), entry.clone());
+        }
+        let kept = bound_state(&mut state);
+        assert!(kept.bytes > 23 * 1024 * 1024 && kept.bytes <= MAX_BYTES);
+        // The older separate pass response map can itself use up to 16 MiB.
+        for n in 0..80 {
+            state
+                .pass_responses
+                .insert(format!("{API_ROOT}other/{n}"), entry.clone());
+        }
+        let kept = bound_state(&mut state);
+        assert!(!kept.evicted.is_empty());
+        let saved = serde_json::to_vec(&state.to_json()).unwrap();
+        assert!(saved.len() as u64 <= STATE_BYTES);
+        let decoded = State::from_json(&serde_json::from_slice(&saved).unwrap()).unwrap();
+        assert_eq!(decoded.responses.len(), kept.entries);
+        assert_eq!(decoded.intake_waiting, state.intake_waiting);
+        assert_eq!(decoded.pass_responses.len(), 80);
+    }
+
+    #[test]
+    fn graphql_items_reuse_only_matching_current_listings() {
+        const UPDATED: &str = "2026-11-08T00:00:00Z";
+        const CHANGED: &str = "2026-11-09T00:00:00Z";
+        let head = "a".repeat(40);
+        let forge = Forge::default();
+        let item = |id, at, head: &str| {
+            json!({"repository": {"issueOrPullRequest": {
+                "__typename": "PullRequest", "id": id, "updatedAt": at, "headRefOid": head,
+            }}})
+        };
+        let old = item("item-1", UPDATED, &head);
+        *forge.item.borrow_mut() = old.clone();
+        const READ: &str = "2026-11-08T00:10:00Z";
+        let cold = bounds();
+        cold.shared_responses.borrow_mut().graphql_enabled = true;
+        cold.shared_responses.borrow_mut().now =
+            Some(OffsetDateTime::parse(READ, &Rfc3339).unwrap());
+        let client = Budget {
+            inner: &forge,
+            bounds: &cold,
+        };
+        let query = ItemQuery::Kind;
+        assert_eq!(
+            client.graphql_item(query, "o/r", 1).unwrap(),
+            (old.clone(), false)
+        );
+        assert_eq!(forge.graphql_reads.get(), 1);
+        let mut state = State {
+            interval_seconds: poll::MIN_INTERVAL_SECONDS,
+            ..State::default()
+        };
+        state.bind_responses("scope");
+        state.responses = cold.shared_responses.borrow().entries.clone();
+        let saved = State::from_json(&state.to_json()).unwrap().responses;
+        assert!(saved.keys().all(|k| shared_key(k)));
+
+        for (enabled, id, at, listed_head, writes, starting, same_context, reuse, settled) in [
+            (
+                true,
+                "item-1",
+                UPDATED,
+                Some(&head),
+                false,
+                false,
+                true,
+                true,
+                true,
+            ),
+            (
+                true, "item-1", UPDATED, None, false, false, true, false, true,
+            ),
+            (
+                true,
+                "item-2",
+                UPDATED,
+                Some(&head),
+                false,
+                false,
+                true,
+                false,
+                true,
+            ),
+            (
+                true,
+                "item-1",
+                CHANGED,
+                Some(&head),
+                false,
+                false,
+                true,
+                false,
+                true,
+            ),
+            (
+                true,
+                "item-1",
+                UPDATED,
+                Some(&"b".repeat(40)),
+                false,
+                false,
+                true,
+                false,
+                true,
+            ),
+            (
+                true,
+                "item-1",
+                UPDATED,
+                Some(&head),
+                true,
+                false,
+                true,
+                false,
+                true,
+            ),
+            (
+                true,
+                "item-1",
+                UPDATED,
+                Some(&head),
+                false,
+                true,
+                true,
+                false,
+                true,
+            ),
+            (
+                true,
+                "item-1",
+                UPDATED,
+                Some(&head),
+                false,
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                false,
+                "item-1",
+                UPDATED,
+                Some(&head),
+                false,
+                false,
+                true,
+                false,
+                true,
+            ),
+            (
+                true,
+                "item-1",
+                UPDATED,
+                Some(&head),
+                false,
+                false,
+                true,
+                false,
+                false,
+            ),
+        ] {
+            forge.identity.set(0);
+            forge.graphql_reads.set(0);
+            let warm = bounds();
+            warm.shared_responses.borrow_mut().graphql_enabled = enabled;
+            let mut saved = saved.clone();
+            if !settled {
+                // Read in the listed version's own second, which a later
+                // edit in that second keeps.
+                for entry in saved.values_mut() {
+                    entry["read_at"] = UPDATED.into();
+                }
+            }
+            warm.shared_responses.borrow_mut().seed(saved);
+            let client = Budget {
+                inner: &forge,
+                bounds: &warm,
+            };
+            *forge.listing.borrow_mut() = Some(json!([{"number": 1, "node_id": id,
+                "updated_at": at, "head": {"sha": listed_head}}]));
+            let url = format!("{API_ROOT}repos/o/r/pulls?state=open");
+            if reuse {
+                // The poll supplies its own validator and hands back the body
+                // it just revalidated, not an unrevalidated saved listing.
+                forge.version.set(0);
+                assert_eq!(
+                    client
+                        .get(&url, Some(("If-None-Match", "0")))
+                        .unwrap()
+                        .status,
+                    304
+                );
+                client.revalidated_listing(&url, forge.listing.borrow().as_ref().unwrap());
+            } else {
+                let validator = Some(("If-None-Match", "wrong"));
+                assert_eq!(client.get(&url, validator).unwrap().status, 200);
+            }
+            if writes {
+                assert!(client.send("PATCH", API_ROOT, &json!({})).is_err());
+            }
+            warm.starting.set(starting);
+            forge.identity.set(u64::from(!same_context));
+            let current = item("item-2", CHANGED, &head);
+            *forge.item.borrow_mut() = current.clone();
+            let prior_requests = warm.spent().requests;
+            let read = client.graphql_item(query, "O/R", 1).unwrap();
+            assert_eq!(read, (if reuse { old.clone() } else { current }, reuse));
+            assert_eq!(forge.graphql_reads.get(), usize::from(!reuse));
+            assert_eq!(warm.spent().requests - prior_requests, usize::from(!reuse));
+            assert_eq!(
+                warm.shared_responses.borrow().graphql_reused,
+                usize::from(reuse)
+            );
+        }
     }
 }

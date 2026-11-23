@@ -419,6 +419,31 @@ after any new configuration field. A caller that
 publishes a filtered copy of its state, as tracker does, carries them only once
 that copy keeps `carried_holds` for its public repositories (agent-board#1048).
 
+## GraphQL item reuse (GitHub)
+
+Repeated item reads can exhaust the request budget before scheduling reaches
+ready work. `reuseGraphqlItems` saves selected discovery reads (issue body
+plans and item kind checks) when a listing read in this
+pass reports the same node ID and `updatedAt`, plus the same head OID for a
+PR, and that `updatedAt` is over five minutes older than the pass clock when
+the saved read was made: `updatedAt` has whole seconds, so an edit in the
+read's own second would not change it, and the runner's clock may be up to
+that far ahead of GitHub's. It is off by default and needs `state`
+and an authenticated cache scope.
+Missing or different evidence means a live read. A write attempt makes older
+listing observations unusable, even when the write fails. Start/recovery and
+pre-write rechecks stay live; PR eligibility, reviews, mergeability and
+checks aren't reused. A change not yet reflected by a listing can still
+affect discovery until a later read sees it, but a reused body showing no
+plan is read again live, so a body plan added since is not outranked by a
+triage plan comment.
+
+The responses share the [existing state bounds](poll.md#disposable-rest-responses-partial-794).
+The pass's `cache:` summary line reports `GraphQL reuses` separately from REST
+validator hits and 304s.
+The first pass after upgrading starts with a cold cache because the response
+scope includes the configuration shape.
+
 ## Local GitHub credentials
 
 `pass --config FILE` uses the first nonempty token from `GH_TOKEN`, then
@@ -6341,6 +6366,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `readFreeHolds` | GitHub only: apply board-proven holds before assignment reads, leaving request budget for ready candidates; no cached holds or new eligibility; `false` |
 | `leanReads` | GitHub only: hold an unchanged candidate's triage cooldown or open-pr-cap again without reading it while the board shows it unchanged, see [lean reads](#lean-reads-github); `false` |
+| `reuseGraphqlItems` | GitHub only: reuse selected GraphQL discovery reads from unchanged current-pass listing evidence, see [GraphQL item reuse](#graphql-item-reuse-github); `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `existingChildPlans` | GitHub only: let an epic plan post a dispatchable job plan on an existing open child via `post_job_plan`; existing repository, claim and write bounds remain; `false`. See [epic plans](epic-plans.md). |
 | `reserveOperator` | GitHub only: every triage brief states the `operatorAsk` bar for `needs-operator`, a `needs-design` verdict is planned rather than asked, and with `assignHolds` a verdict whose assignment the bot took off is triaged again rather than assigned again, see [reserving the operator](#reserving-the-operator); needs `triageFollowUpDays` and `operatorAsk`; `false` |

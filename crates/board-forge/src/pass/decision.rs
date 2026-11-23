@@ -368,6 +368,7 @@ pub async fn preview<C: Rest + Transport + crate::github::GraphQl + Broker>(
                 for entry in state.pass_responses.values_mut() {
                     *entry = cache::seal(std::mem::take(entry));
                 }
+                cache::bound_state(&mut state);
             }
             state
         }

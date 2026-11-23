@@ -747,6 +747,10 @@ pub struct Config {
     /// ([`lean`]).
     #[serde(default)]
     pub lean_reads: bool,
+    /// Off by default: reuse selected item reads when a current listing
+    /// confirms their version. Requires scoped response state.
+    #[serde(default)]
+    pub reuse_graphql_items: bool,
     /// Off at 0: else an issue still open after its implement plan's run
     /// ended is triaged again this many days after the plan's dispatch
     /// record ([`Scheduler::replan`]).
@@ -4013,7 +4017,21 @@ impl<C: Rest> Rest for Budget<'_, C> {
                 .borrow_mut()
                 .keep(url, &response);
         }
+        if current_scope && response.status == 200 {
+            self.revalidated_listing(url, &response.body);
+        }
         Ok(response)
+    }
+
+    fn revalidated_listing(&self, url: &str, body: &Value) {
+        let mut shared = self.bounds.shared_responses.borrow_mut();
+        if shared.graphql_enabled
+            && !self.bounds.starting.get()
+            && !self.bounds.finishing.get()
+            && self.inner.cache_context().as_ref() == shared.context.as_ref()
+        {
+            shared.observe_rest(url, body, self.bounds.writes.get());
+        }
     }
 
     fn get_live(&self, url: &str) -> Result<RestResponse> {
@@ -4233,6 +4251,54 @@ fn comments_match(rest: &Value, data: &Value) -> bool {
             .into_iter()
             .all(|(a, b)| a.is_string() && a == b)
         })
+}
+
+impl<C: Rest + Transport> Budget<'_, C> {
+    fn can_reuse_items(&self) -> bool {
+        let bounds = self.bounds;
+        let shared = bounds.shared_responses.borrow();
+        shared.graphql_enabled
+            && !bounds.starting.get()
+            && !bounds.finishing.get()
+            && bounds.rate_limited.borrow().is_none()
+            && Instant::now() <= bounds.admit_by
+            && self
+                .inner
+                .cache_context()
+                .is_some_and(|context| shared.context.as_ref() == Some(&context))
+    }
+
+    /// `query`'s answer for `repo#number`, and whether it was reused from
+    /// this pass's listing evidence rather than read live: a reused answer
+    /// shows the item only as of that listing.
+    fn graphql_item(
+        &self,
+        query: cache::ItemQuery,
+        repo: &str,
+        number: u64,
+    ) -> Result<(Value, bool)> {
+        let (owner, name) = repo.split_once('/').context("repository has no owner")?;
+        let vars = json!({"owner": owner, "name": name, "number": number});
+        let Some(at) = cache::item_path(repo, number).filter(|_| self.can_reuse_items()) else {
+            return Ok((self.graphql(query.original(), vars)?, false));
+        };
+        let versioned = query.versioned();
+        let key = cache::Responses::graphql_key(&at, &versioned);
+        let writes = self.bounds.writes.get();
+        let mut shared = self.bounds.shared_responses.borrow_mut();
+        if let Some(body) = shared.graphql_hit(&at, query, &key, writes) {
+            return Ok((body, true));
+        }
+        drop(shared);
+        let body = self.graphql(&versioned, vars)?;
+        if self.can_reuse_items() {
+            self.bounds
+                .shared_responses
+                .borrow_mut()
+                .keep_graphql(key, query, &body);
+        }
+        Ok((body, false))
+    }
 }
 
 impl<C: Rest + Transport> Transport for Budget<'_, C> {
@@ -4708,13 +4774,17 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         }
         let mut responses = bounds.shared_responses.borrow_mut();
         responses.enabled = true;
+        responses.graphql_enabled = config.reuse_graphql_items;
+        responses.now = Some(now);
         responses.context = context;
-        responses.entries = state
-            .responses
-            .iter()
-            .filter(|(key, _)| key.ends_with(cache::REPRESENTATION))
-            .map(|(key, entry)| (key.clone(), entry.clone()))
-            .collect();
+        responses.seed(
+            state
+                .responses
+                .iter()
+                .filter(|(key, _)| cache::shared_key(key))
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect(),
+        );
     } else {
         // Responses bound to a context this transport cannot confirm are
         // neither reused nor carried on under their old scope.
@@ -4771,14 +4841,12 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
             state.response_scope = Some(scope);
             state
                 .responses
-                .retain(|key, _| bounds.writes.get() == 0 && !key.ends_with(cache::REPRESENTATION));
+                .retain(|key, _| bounds.writes.get() == 0 && !cache::shared_key(key));
             state.responses.extend(responses.entries.clone());
-            let last = cache::bound(&mut state.responses);
-            report.lines.push(responses.evictions(&last));
         }
         report.lines.push(format!(
-            "cache: hits {}, {}, 304s {}, network sends {} (including retries), charged requests {}, GraphQL points {}",
-            responses.hits, responses.misses(), responses.modified,
+            "cache: hits {}, {}, 304s {}, GraphQL reuses {}, network sends {} (including retries), charged requests {}, GraphQL points {}",
+            responses.hits, responses.misses(), responses.modified, responses.graphql_reused,
             report.network_sends.map(|sends| sends.to_string()).unwrap_or_else(|| "unavailable".into()),
             bounds.limit.get().saturating_sub(bounds.left.get()), bounds.points.get()
         ));
@@ -4813,6 +4881,12 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         state.issue_intake = report.issue_intake.clone();
         state.holds_pending = bounds.publication_pending.take();
         state.holds_summary_cursor = bounds.publication_summary_cursor.take();
+        if state.response_scope.is_some() {
+            let last = cache::bound_state(state);
+            report
+                .lines
+                .push(bounds.shared_responses.borrow().evictions(&last));
+        }
     }
     Ok(report)
 }
@@ -7683,7 +7757,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let board = self.config.github_board().context("no GitHub board")?;
         let config = self.config;
         let revisit = config.revisit.is_some() || config.sweep.is_some() || config.lean_reads;
-        let query = board_query(revisit, config.assign_holds);
+        let observe = self.client.can_reuse_items();
+        let mut query = board_query(revisit || observe, config.assign_holds);
+        if observe {
+            query = query.replacen("createdAt updatedAt", "createdAt id updatedAt", 1);
+        }
         let mut cursor = Value::Null;
         let mut options = None;
         let mut items = BTreeMap::new();
@@ -7724,6 +7802,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     None => bail!("a board item could not be read; the board is incomplete"),
                 }
                 let mut facts = Facts::from_node(content)?;
+                if observe && self.client.can_reuse_items() {
+                    self.client
+                        .bounds
+                        .shared_responses
+                        .borrow_mut()
+                        .observe_board(content, self.client.bounds.writes.get());
+                }
+                if !revisit {
+                    facts.updated = None;
+                }
                 facts.priority = node["priority"]["name"].as_str().map(str::to_owned);
                 facts.status = node["status"]["name"].as_str().map(str::to_owned);
                 facts.why = node["why"]["text"].as_str().map(str::to_owned);
@@ -8040,13 +8128,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Whether `item` reads as a pull request; not where it reads as
     /// anything else or not at all.
     fn pull_request(&self, item: &ItemRef) -> bool {
-        let Some((owner, name)) = item.repository.split_once('/') else {
-            return false;
-        };
-        let variables = json!({"owner": owner, "name": name, "number": item.number});
-        (self.client.graphql(KIND_QUERY, variables)).is_ok_and(|data| {
-            data.pointer("/repository/issueOrPullRequest/__typename") == Some(&json!("PullRequest"))
-        })
+        self.client
+            .graphql_item(cache::ItemQuery::Kind, &item.repository, item.number)
+            .is_ok_and(|(data, _)| {
+                data.pointer("/repository/issueOrPullRequest/__typename")
+                    == Some(&json!("PullRequest"))
+            })
     }
 
     /// The head of `dest`, for plan `id`, an accepted `fix` plan
@@ -10684,7 +10771,31 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if !self.config.body_plans || !top_priority(&board.options, facts) {
             return Ok(None);
         }
-        let body = [self.body(&facts.issue)?];
+        let issue = &facts.issue;
+        let item = cache::ItemQuery::Body;
+        let (mut data, reused) =
+            (self.client).graphql_item(item, &issue.repository, issue.number)?;
+        let node = data
+            .pointer_mut("/repository/issue")
+            .filter(|n| n.is_object())
+            .map(Value::take)
+            .with_context(|| format!("{} is not an issue", issue.display()))?;
+        let found = self.plan_in_body(plan::comment(&node)?)?;
+        // A reused body shows no plan only as of this pass's listing. Every
+        // no-plan path may post a triage plan comment, which would outrank
+        // a body plan added since, so that answer is only taken live.
+        if reused && found.is_none() {
+            return self.plan_in_body(self.body(issue)?);
+        }
+        Ok(found)
+    }
+
+    /// [`Self::body_plan`]'s weighing of the body as read.
+    fn plan_in_body(
+        &self,
+        read: plan::Comment,
+    ) -> Result<Option<std::result::Result<BodyPlan, String>>> {
+        let body = [read];
         let writers = self.writers();
         if !plan::has_fence(&body[0].body, PLAN_FENCE) || plan::no_plan(&body, &writers) {
             return Ok(None);
