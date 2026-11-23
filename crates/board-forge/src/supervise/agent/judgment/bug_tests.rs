@@ -107,14 +107,14 @@ fn three_failed_passes_file_one_owner_bug_and_request_only_one_fix() {
             attempt: 1,
             now,
         };
-        bug[0].apply(&api, &p, &run).unwrap();
+        bug[0].apply(&api, &p, &run, None).unwrap();
         let dispatch =
             json!({"type":"supervisor_action","action":"dispatch","repository":"example/project",
             "item":7,"kind":"implement","pool":"large","reason":"recurring-pass-failure"})
             .to_string();
         let mut fix = parse_batch(&dispatch, &p).unwrap();
         fix[0].preflight(&api, &p, now).unwrap();
-        assert_eq!(fix[0].apply(&api, &p, &run).is_ok(), !fail_dispatch);
+        assert_eq!(fix[0].apply(&api, &p, &run, None).is_ok(), !fail_dispatch);
         assert_eq!(api.dispatches.get(), 1);
         // The next pass sees the bug and the reservation written by this one.
         assert!(bug[0].preflight(&api, &p, now).is_err());
@@ -223,7 +223,7 @@ fn pass_bugs_route_only_to_the_opted_in_owner_without_tracker_placement() {
         attempt: 1,
         now: 0,
     };
-    let receipt = requests[0].apply(&api, &p, &run).unwrap();
+    let receipt = requests[0].apply(&api, &p, &run, None).unwrap();
     assert_eq!(
         requests[0].link(&p, Some(&receipt)),
         "https://github.com/example/project/issues/7"
@@ -258,7 +258,7 @@ fn filed_bug_arrives_under_fixed_epic_on_board_at_p1() {
         attempt: 1,
         now: 0,
     };
-    requests[0].apply(&api, &p, &run).unwrap();
+    requests[0].apply(&api, &p, &run, None).unwrap();
     let calls = api.calls.borrow();
     assert_eq!(calls.len(), 4);
     assert_eq!(calls[0].0, "POST /repos/example/control/issues");

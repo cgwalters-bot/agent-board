@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod dispatch_rules;
 pub mod handback;
 pub(super) mod judgment;
 
@@ -89,8 +90,6 @@ const HELD_LABELS: &[&str] = &[
     "needs-human",
     crate::stop::SUPERVISOR_LABEL,
 ];
-/// Run states in which a dispatch run still holds its target.
-const RUNNING: &[&str] = &["queued", "in_progress", "waiting", "requested", "pending"];
 const RUN_PAGES: usize = 5;
 /// 1500 comments: four passes an hour log 96 a day. More refuses
 /// dispatches rather than undercount them.
@@ -254,7 +253,8 @@ pub fn compose(
         "operator": policy.settings.operator,
         "repositories": policy.settings.follow,
         "kinds": policy.kinds(),
-        "pools": policy.pools,
+        "pools": if policy.agent.dispatch_pass_rules { vec![&policy.agent.pool] } else { policy.pools.iter().collect() },
+        "dispatchPassRules": policy.agent.dispatch_pass_rules,
         "kindPools": policy.settings.kind_pools,
         "tiers": policy.tiers,
         "reasons": REASONS.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
@@ -315,13 +315,17 @@ pub struct Request {
     pub kind: String,
     pub pool: String,
     pub reason: String,
+    selection: Option<&'static str>,
 }
 
 impl Request {
     /// The log line names the request by its checked fields only.
     fn describe(&self) -> String {
+        let selection = self
+            .selection
+            .map_or(String::new(), |why| format!(", {why}"));
         format!(
-            "`dispatch` {} #{} ({}, {}, {})",
+            "`dispatch` {} #{} ({}, {}, {}{selection})",
             self.repository, self.item, self.kind, self.pool, self.reason
         )
     }
@@ -388,7 +392,9 @@ pub fn validate_batch(source: &str, policy: &Policy) -> Result<Vec<Request>> {
                 "Unknown supervisor action"
             );
             ensure!(
-                object.len() == FIELDS.len() && FIELDS.iter().all(|f| object.contains_key(*f)),
+                object.keys().all(|f| FIELDS.contains(&f.as_str()))
+                    && FIELDS.iter().all(|f| object.contains_key(*f)
+                        || (*f == "pool" && policy.agent.dispatch_pass_rules)),
                 "Unexpected or missing supervisor fields"
             );
             let repository = request["repository"].as_str().unwrap_or_default();
@@ -413,7 +419,15 @@ pub fn validate_batch(source: &str, policy: &Policy) -> Result<Vec<Request>> {
             .any(|i| i.repository.eq_ignore_ascii_case(repository) && i.issue == item);
             ensure!(!own, "The supervisor's own issues are not targets");
             let kind = request["kind"].as_str().unwrap_or_default();
-            let pool = request["pool"].as_str().unwrap_or_default();
+            let pool = if policy.agent.dispatch_pass_rules {
+                ensure!(
+                    request.get("pool").is_none_or(|p| p == policy.agent.pool.as_str()),
+                    "Requested pool is not the supervisor's configured default; the pass chooses any variant"
+                );
+                policy.agent.pool.as_str()
+            } else {
+                request["pool"].as_str().unwrap_or_default()
+            };
             // A kind's tier lets the agent pick among its automatic pools;
             // a hand-dispatch pool of that tier stays outside it.
             let fixed = policy
@@ -424,7 +438,7 @@ pub fn validate_batch(source: &str, policy: &Policy) -> Result<Vec<Request>> {
             ensure!(
                 policy.kinds().contains(&kind)
                     && policy.pools.iter().any(|p| p == pool)
-                    && fixed.is_none_or(|p| p.iter().any(|p| p == pool)),
+                    && (policy.agent.dispatch_pass_rules || fixed.is_none_or(|p| p.iter().any(|p| p == pool))),
                 "Kind or pool outside supervisor policy"
             );
             let reason = request["reason"].as_str().unwrap_or_default();
@@ -444,6 +458,7 @@ pub fn validate_batch(source: &str, policy: &Policy) -> Result<Vec<Request>> {
                 kind: kind.into(),
                 pool: pool.into(),
                 reason: reason.into(),
+                selection: None,
             })
         })
         .collect()
@@ -669,7 +684,7 @@ fn conversation(api: &dyn Api, repo: &str, number: u64, writers: bool) -> Result
 /// Reads only. The schema says what a request names; this says it is an
 /// issue the scheduler would act on, holding no supervisor note, with no run
 /// on it in flight.
-fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
+fn preflight_target(api: &dyn Api, policy: &Policy, r: &Request) -> Result<Value> {
     let issue = api.get(&format!("/repos/{}/issues/{}", r.repository, r.item))?;
     ensure!(issue["labels"].is_array(), "Missing issue labels");
     ensure!(
@@ -720,6 +735,11 @@ fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
             "Parent is not an approved epic"
         );
     }
+    Ok(issue)
+}
+
+fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
+    preflight_target(api, policy, r)?;
     ensure!(
         !in_flight(api, policy, &r.repository, r.item)?,
         "The issue has a run in flight"
@@ -752,8 +772,23 @@ fn recovery_ready(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
 
 /// Whether a dispatch run on the item is queued or running.
 fn in_flight(api: &dyn Api, policy: &Policy, repository: &str, item: u64) -> Result<bool> {
+    visit_active(api, policy, |run| {
+        Ok(run_target(run)
+            .is_some_and(|(repo, number)| repo.eq_ignore_ascii_case(repository) && number == item))
+    })
+}
+
+fn run_target(run: &Value) -> Option<(&str, u64)> {
+    run_title(run["display_title"].as_str()?).map(|(_, repo, item)| (repo, item))
+}
+
+fn visit_active(
+    api: &dyn Api,
+    policy: &Policy,
+    mut stop: impl FnMut(&Value) -> Result<bool>,
+) -> Result<bool> {
     let s = policy.settings;
-    for status in RUNNING {
+    for status in crate::pass::ACTIVE_RUNS {
         for page in 1.. {
             ensure!(page <= RUN_PAGES, "A listing is too long to check");
             let runs = api.get(&format!(
@@ -761,13 +796,10 @@ fn in_flight(api: &dyn Api, policy: &Policy, repository: &str, item: u64) -> Res
                 s.dispatch_repo, s.dispatch_workflow
             ))?;
             let runs = runs["workflow_runs"].as_array().context("workflow runs")?;
-            let busy = runs.iter().any(|run| {
-                run_title(run["display_title"].as_str().unwrap_or_default()).is_some_and(
-                    |(_, repo, number)| repo.eq_ignore_ascii_case(repository) && number == item,
-                )
-            });
-            if busy {
-                return Ok(true);
+            for run in runs {
+                if stop(run)? {
+                    return Ok(true);
+                }
             }
             if runs.len() < 100 {
                 break;
@@ -891,13 +923,16 @@ fn report(api: &dyn Api, policy: &Policy, source: &Source) -> Result<String> {
 
 /// Everything up to the first write: the requests, the batch, every target
 /// and the daily cap. Then the record of what is about to start: in the log,
-/// or in `ledger`, which a hand-back reads first.
+/// or in `ledger`, which a hand-back reads first. With `dispatchPassRules`,
+/// `leases` gets the pass's admission, which its dispatches check again
+/// and take leases under at their sends.
 fn prepare(
     api: &dyn Api,
     policy: &Policy,
     ctx: &Run,
     ledger: &mut Option<Ledger>,
     dropped: &mut Vec<String>,
+    leases: &mut Option<dispatch_rules::Check>,
 ) -> Result<(Vec<judgment::Checked>, Option<u64>)> {
     // A re-run would perform the same batch again, possibly long after the
     // pass that asked for it; the next scheduled pass asks afresh instead.
@@ -924,8 +959,24 @@ fn prepare(
     }
     .validate()
     .context("No default branch to dispatch on")?;
+    let started = std::time::Instant::now();
+    let clock = || ctx.now.saturating_add(started.elapsed().as_millis() as i64);
+    let bounded = super::Bounded::new(api, &s.limits, &clock);
+    let mut pass = None;
     for r in &mut requests {
-        r.preflight(api, policy, ctx.now)?;
+        if let judgment::Checked::Dispatch(request) = r
+            && policy.agent.dispatch_pass_rules
+        {
+            let check = match &mut pass {
+                Some(check) => check,
+                None => pass.insert(dispatch_rules::Check::load(&bounded, policy, ctx.now)?),
+            };
+            check
+                .dispatch(&bounded, policy, request)
+                .with_context(|| format!("dispatch {}#{}", request.repository, request.item))?;
+        } else {
+            r.preflight(api, policy, ctx.now)?;
+        }
     }
     if let Some(until) = ledger.as_ref().and_then(|l| l.blocked_until) {
         bail!(
@@ -951,6 +1002,10 @@ fn prepare(
             false
         }
     });
+    if let Some(check) = pass {
+        bounded.check_time()?;
+        *leases = Some(check);
+    }
     if let Some(ledger) = ledger {
         ledger.reserve(&requests, ctx);
         return Ok((requests, None));
@@ -980,7 +1035,9 @@ fn prepare(
 pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
     let mut ledger = None;
     let mut dropped = vec![];
-    let (requests, log_comment) = match prepare(api, policy, ctx, &mut ledger, &mut dropped) {
+    let mut leases = None;
+    let prepared = prepare(api, policy, ctx, &mut ledger, &mut dropped, &mut leases);
+    let (requests, log_comment) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             // The messages are fixed text or name checked fields and logins.
@@ -1000,7 +1057,7 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
             lines.push(format!("- {}: not attempted", r.describe()));
             continue;
         }
-        let sent = r.apply(api, policy, ctx);
+        let sent = r.apply(api, policy, ctx, leases.as_ref());
         let link = r.link(policy, sent.as_ref().ok());
         match sent {
             Ok(_) => lines.push(format!("- {}: done, {link}", r.describe())),

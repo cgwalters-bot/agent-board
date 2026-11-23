@@ -217,7 +217,8 @@ const EXCLUDED_LABELS: &[&str] = &[EPIC_LABEL, "question"];
 /// The board Status that holds an item.
 const BLOCKED_STATUS: &str = "Blocked";
 /// The run statuses that hold a slot, as the Actions API names them.
-const ACTIVE_RUNS: &[&str] = &["queued", "in_progress", "waiting", "requested", "pending"];
+pub(crate) const ACTIVE_RUNS: &[&str] =
+    &["queued", "in_progress", "waiting", "requested", "pending"];
 /// Dispatch runs past this bound are overdue, matching the poll's fix-run timeout.
 pub const RUN_TIMEOUT_SECONDS: i64 = 7 * 60 * 60;
 /// Cleanup must leave request and write headroom for ordinary follow-up.
@@ -2126,7 +2127,7 @@ impl Config {
         self.triage_pools.as_ref().unwrap_or(&self.plan_pools)
     }
 
-    fn pool(&self, name: &str) -> Option<&PoolSettings> {
+    pub(crate) fn pool(&self, name: &str) -> Option<&PoolSettings> {
         self.pools.0.iter().find(|(n, _)| n == name).map(|(_, s)| s)
     }
 
@@ -2278,7 +2279,7 @@ pub fn spent(snapshot: Option<&Value>, now: OffsetDateTime) -> std::result::Resu
 /// Why runs wait on `budget` at `share` of it: the week's spend there or
 /// past it ([`BUDGET_REACHED`]), or no spend reading. None without a
 /// budget. A grant holds each pool in its snapshot entry instead.
-fn budget_hold(
+pub(crate) fn budget_hold(
     config: &Config,
     snapshot: Option<&Value>,
     now: OffsetDateTime,
@@ -2290,6 +2291,15 @@ fn budget_hold(
         Ok(_) => Some(BUDGET_REACHED.into()),
         Err(why) => Some(why),
     }
+}
+
+pub(crate) fn adjusted_usage(config: &Config, mut snapshot: Value, now: OffsetDateTime) -> Value {
+    if config.grant().is_some()
+        && let Some(pools) = snapshot["pools"].as_object_mut()
+    {
+        pools.retain(|_, entry| entry["source"] == usage::GRANT_SOURCE);
+    }
+    resets::apply(config, snapshot, now)
 }
 
 /// A pool's room below its pace, in points of its paced window:
@@ -2692,6 +2702,54 @@ pub(crate) fn board_item<'a>(items: &'a [Value], board: &Board) -> Option<&'a Va
         item.pointer("/project/number").and_then(Value::as_u64) == Some(board.project)
             && text(item, "/project/owner/login").eq_ignore_ascii_case(&board.owner)
     })
+}
+
+/// `issue`'s [`FRESH_QUERY`] `node` as facts, with its Status on `board`.
+fn fresh_facts(node: &Value, issue: &ItemRef, board: &Board) -> Result<Facts> {
+    let mut facts = Facts::from_node(node)?;
+    let items = node["projectItems"]["nodes"]
+        .as_array()
+        .context("issue has no project items")?;
+    ensure!(
+        node["projectItems"]["totalCount"].as_u64() == Some(items.len() as u64),
+        "the boards of {} could not all be read",
+        issue.display()
+    );
+    facts.status = board_item(items, board)
+        .and_then(|item| item.pointer("/status/name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(facts)
+}
+
+/// `issue` read now, and why [`hold`] keeps a start outside the pass off
+/// it, with `busy` the issues a run or lease holds. Closing pull requests
+/// past the first page are not read, so that they hold it as unreadable,
+/// nor is a promotion handoff.
+pub(crate) fn outside_hold(
+    client: &impl Transport,
+    config: &Config,
+    issue: &ItemRef,
+    busy: &BTreeMap<String, String>,
+) -> Result<(Facts, Option<Hold>)> {
+    let board = config.github_board().context("no GitHub board")?;
+    let (owner, name) = issue.repository.split_once('/').context("repository")?;
+    let data = client.graphql(
+        &format!("{FRESH_QUERY}{FACTS}"),
+        json!({"owner": owner, "name": name, "number": issue.number}),
+    )?;
+    let node = data
+        .pointer("/repository/issue")
+        .filter(|n| n.is_object())
+        .with_context(|| format!("{} is not an issue", issue.display()))?;
+    let facts = fresh_facts(node, issue, board)?;
+    ensure!(
+        key(&facts.issue) == key(issue),
+        "{} read as another issue",
+        issue.display()
+    );
+    let held = hold(&facts, busy, &[&config.operator, &config.bot]);
+    Ok((facts, held))
 }
 
 /// Why an issue may not get a run now, or `None`. Only the bot's and the
@@ -8124,19 +8182,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn fresh(&self, issue: &ItemRef) -> Result<Facts> {
         let board = self.config.github_board().context("no GitHub board")?;
         let node = self.issue(FRESH_QUERY, issue)?;
-        let mut facts = Facts::from_node(&node)?;
-        let items = node["projectItems"]["nodes"]
-            .as_array()
-            .context("issue has no project items")?;
-        ensure!(
-            node["projectItems"]["totalCount"].as_u64() == Some(items.len() as u64),
-            "the boards of {} could not all be read",
-            issue.display()
-        );
-        facts.status = board_item(items, board)
-            .and_then(|item| item.pointer("/status/name"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let mut facts = fresh_facts(&node, issue, board)?;
         self.complete_pulls(&mut facts)?;
         self.handoff(facts)
     }

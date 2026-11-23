@@ -553,6 +553,41 @@ fn concurrent_retries_never_take_a_second_slot() {
     assert_eq!(forge.message(1), "a second lease of run 11");
 }
 
+/// A new dispatch of an item another start holds, bound or not, is refused;
+/// two that take different slots at once start one run of it at most.
+#[test]
+fn a_dispatch_is_refused_while_its_item_holds_a_lease() {
+    let config = Rc::new(config(json!({"wip": 3})));
+    let held = format!("{} holds a lease already", item().display());
+    let forge = forge(BOT, &[]);
+    let bound = json!({"run": 10, "item": item().display(), "pool": "claude",
+        "taken_at": ago(60), "expires_at": ago(-3600)});
+    forge.raw(&format!("{LEASE_REFS}/0"), &bound.to_string());
+    assert_eq!(
+        take(&forge, &config, 0, false).0.unwrap(),
+        Err(held.clone())
+    );
+    // The pass's start reads the leases before this one writes its own and
+    // writes its own first, into the slot this one saw taken.
+    let forge = self::forge(BOT, &[]);
+    forge.lease(0, "claude", 10, 3600);
+    let raced = config.clone();
+    let won = Rc::new(RefCell::new(None));
+    let saw = won.clone();
+    *forge.hook.borrow_mut() = Some(Box::new(move |forge: &Forge| {
+        release(forge, REPO, ("claude", 10), now()).unwrap();
+        *saw.borrow_mut() = take(forge, &raced, 0, false).0.unwrap().ok();
+    }));
+    assert_eq!(take(&forge, &config, 0, false).0.unwrap(), Err(held));
+    assert_eq!(won.borrow().as_ref().unwrap().slot, 0);
+    let live: Vec<_> = (read(&forge, REPO, now()).unwrap().into_iter())
+        .filter_map(|f| f.held.map(|h| (h.slot, h.lease.item)))
+        .collect();
+    assert_eq!(live, [(0, item().display())]);
+    let freed = format!("a second lease of {}", item().display());
+    assert_eq!(forge.message(1), freed);
+}
+
 #[test]
 fn lease_objects_are_never_written_to_an_unsafe_destination() {
     let config = config(json!({}));

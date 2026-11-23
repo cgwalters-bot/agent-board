@@ -4,12 +4,19 @@ use super::*;
 use crate::Footer;
 use crate::changes;
 use crate::dispatch::{GitHub, Start, StartOutcome};
+use crate::poll::Rest;
 use board_core::NEEDS_HUMAN_LABEL as NEEDS_HUMAN;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 mod infrastructure;
+
+/// What a dispatch the pass's leases did not admit says, and one whose
+/// lease could not be read or taken: its slot may be taken all the same.
+pub(super) const LEASE_REFUSED: &str =
+    "Lease refused: no slot under the pass's wip and pacing, or the item holds one";
+const LEASE_UNKNOWN: &str = "Lease state unknown: the pass's leases could not be read or written";
 
 pub const ACTIONS: &[&str] = &[
     "comment",
@@ -822,9 +829,67 @@ impl Checked {
         !matches!(self, Self::Write(Write::StatusUpdate { .. }))
     }
 
-    pub fn apply(&self, api: &dyn Api, p: &Policy, ctx: &Run) -> Result<Value> {
+    /// Performs it; a dispatch is admitted again by `pass` at its send and
+    /// takes a lease of its slots where there is one.
+    pub(super) fn apply(
+        &self,
+        api: &dyn Api,
+        p: &Policy,
+        ctx: &Run,
+        pass: Option<&super::dispatch_rules::Check>,
+    ) -> Result<Value> {
         let (method, path, body) = match self {
             Self::Dispatch(r) => {
+                let target = Target {
+                    caller: p.settings.dispatch_repo.clone(),
+                    workflow: p.settings.dispatch_workflow.clone(),
+                    git_ref: ctx.default_branch.clone(),
+                };
+                let item = board_core::ItemRef {
+                    host: crate::github::DEFAULT_HOST.into(),
+                    repository: r.repository.clone(),
+                    number: r.item,
+                };
+                let rest = match pass {
+                    Some(_) => Some(crate::supervise::DynRest(
+                        api.rest().context("A lease needs the REST client")?,
+                    )),
+                    None => None,
+                };
+                let leased = match (pass, &rest) {
+                    // As `agent-board dispatch` starts outside the pass: a
+                    // lease takes a slot under its wip and pacing, before
+                    // anything is written, so that a refusal spends no
+                    // recovery claim. Its reason may quote the private usage
+                    // snapshot, so the log has a fixed one. The lease is
+                    // judged by the usage the pass's rules admitted it by,
+                    // read again, not by the raw snapshot.
+                    (Some(check), Some(rest)) => {
+                        use crate::pass::lease;
+                        let config = check.config();
+                        lease::check_outside(config, &target, &r.pool)?;
+                        let usage = check.at_send(api, p, r)?;
+                        let now = time::OffsetDateTime::from_unix_timestamp_nanos(
+                            i128::from(ctx.now) * 1_000_000,
+                        )?;
+                        let request = lease::Request {
+                            pool: &r.pool,
+                            item: &item,
+                            run: 0,
+                            overridden: false,
+                        };
+                        let lines = &mut Vec::new();
+                        let held =
+                            lease::admit_with(rest, config, &request, now, lines, Some(&usage))
+                                .map_err(|_| anyhow::anyhow!(LEASE_UNKNOWN))?
+                                .map_err(|_| anyhow::anyhow!(LEASE_REFUSED))?;
+                        let leased =
+                            lease::Dispatch::new((rest, rest), config, (&item, &r.pool), now);
+                        *leased.reserved.borrow_mut() = Some(held);
+                        Some(leased)
+                    }
+                    _ => None,
+                };
                 if super::recovery_target(p, r) {
                     // Serialized executors recheck before reserving, and never
                     // retry an ambiguous dispatch without operator intervention.
@@ -835,15 +900,11 @@ impl Checked {
                         &json!({"body": signed(super::RECOVERY_CLAIM, None, &p.settings.footer)}),
                     )?;
                 }
-                let target = Target {
-                    caller: p.settings.dispatch_repo.clone(),
-                    workflow: p.settings.dispatch_workflow.clone(),
-                    git_ref: ctx.default_branch.clone(),
-                };
-                // The run is found by its title, so its details are not asked for.
+                // The run is found by its title, so its details are not asked
+                // for, but where a lease is bound to it.
                 let github = GitHub {
                     target: &target,
-                    run_details: false,
+                    run_details: pass.is_some(),
                 };
                 let start = Start {
                     issue_repository: None,
@@ -856,11 +917,27 @@ impl Checked {
                     runner: None,
                     base: None,
                 };
-                // `Api::send` refuses any status but a 2xx itself.
-                let send = |path: &str, body: &Value| {
-                    Ok((200, api.send("POST", &format!("/{path}"), body)?))
+                let outcome = match &leased {
+                    // The lease is bound to the run the dispatch names.
+                    Some(leased) => {
+                        let send = |path: &str, body: &Value| {
+                            let url = format!("{}{path}", crate::github::API_ROOT);
+                            let (status, answer) = Rest::send(leased, "POST", &url, body)?;
+                            // As `Api::send`'s, a refusal names only its status.
+                            let ok = (200..300).contains(&status);
+                            Ok((status, if ok { answer } else { Value::Null }))
+                        };
+                        github.start(&start, || Ok(()), send)
+                    }
+                    None => {
+                        // `Api::send` refuses any status but a 2xx itself.
+                        let send = |path: &str, body: &Value| {
+                            Ok((200, api.send("POST", &format!("/{path}"), body)?))
+                        };
+                        github.start(&start, || Ok(()), send)
+                    }
                 };
-                return match github.start(&start, || Ok(()), send) {
+                return match outcome {
                     StartOutcome::Started(_) | StartOutcome::Unnamed => Ok(Value::Null),
                     StartOutcome::NotStarted(error) | StartOutcome::Ambiguous(error) => Err(error),
                 };

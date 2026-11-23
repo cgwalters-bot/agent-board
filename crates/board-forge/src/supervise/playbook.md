@@ -38,6 +38,9 @@ Each request is exactly:
   epic-labeled plan in the configured epics repository. `pool` is one of its `pools`, and
   it must be the kind's pool where `kindPools` names one, or one of that
   tier's pools in `tiers` where it names a tier such as `tier-1`.
+  If the policy shows `dispatchPassRules: true`, omit `pool` (or repeat the
+  sole pool shown); the executor chooses the final pool and refuses pass-held
+  work. Do not request a variant or retry to get a different pool.
 - `reason` is one of the policy's `reasons`. The executor writes the run's
   brief from it. You cannot add text to the brief.
 

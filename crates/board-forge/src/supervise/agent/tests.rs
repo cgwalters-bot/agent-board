@@ -1,4 +1,5 @@
 use super::*;
+use crate::poll::RestResponse;
 use crate::supervise::tests::{board, settings, supervisor};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -50,6 +51,7 @@ fn accepts_only_a_triage_or_research_dispatch_inside_the_policy() {
             item: 3,
             kind: "research".into(),
             pool: "large".into(),
+            selection: None,
             reason: "no-plan".into(),
         }]
     );
@@ -253,14 +255,28 @@ const NOW: &str = "2026-10-16T12:00:00Z";
 
 /// A fake API for the executor: GETs answer from `objects`, the
 /// collaborator query from `issues`, and every write is recorded. A write
-/// to `fail` fails.
+/// to `fail` fails. Lease refs, by name under `refs/`, and their commits'
+/// messages are in `git`; a GET of `stall` takes that long. The first GET
+/// of `late`'s path makes its change, as another writer would; `overlay`
+/// answers the collaborator query for its issues in place of `issues`.
 struct Fake {
     objects: HashMap<String, Value>,
     issues: HashMap<u64, Value>,
     fail: Option<String>,
     calls: RefCell<Vec<(String, String, Value)>>,
     next_id: RefCell<u64>,
+    git: RefCell<(BTreeMap<String, String>, BTreeMap<String, String>)>,
+    stall: Option<(String, std::time::Duration)>,
+    late: RefCell<Option<(String, Late)>>,
+    overlay: RefCell<HashMap<u64, Value>>,
 }
+
+/// A change [`Fake`] makes between its reads.
+type Late = Box<dyn FnOnce(&Fake)>;
+
+/// The lease refs' listing path and a lease commit's.
+const LEASES: &str = "/repos/example/control/git/matching-refs/agent-board/leases/";
+const COMMITS: &str = "/repos/example/control/git/commits/";
 
 impl Fake {
     fn new(body: &str) -> Self {
@@ -270,6 +286,10 @@ impl Fake {
             fail: None,
             calls: RefCell::new(vec![]),
             next_id: RefCell::new(1000),
+            git: RefCell::default(),
+            stall: None,
+            late: RefCell::default(),
+            overlay: RefCell::default(),
         };
         fake.comment(body, "worker", false);
         fake.issue(3, json!({}));
@@ -319,6 +339,26 @@ impl Api for Fake {
         self.calls
             .borrow_mut()
             .push(("GET".into(), path.into(), Value::Null));
+        if let Some((_, pause)) = self.stall.as_ref().filter(|(p, _)| path.starts_with(p)) {
+            std::thread::sleep(*pause);
+        }
+        let late = self
+            .late
+            .borrow_mut()
+            .take_if(|(p, _)| path.starts_with(&*p));
+        if let Some((_, change)) = late {
+            change(self);
+        }
+        if path.starts_with(LEASES) {
+            let (refs, _) = &*self.git.borrow();
+            let refs = (refs.iter())
+                .map(|(name, sha)| json!({"ref": format!("refs/{name}"), "object": {"sha": sha}}));
+            return Ok(refs.collect());
+        }
+        if let Some(sha) = path.strip_prefix(COMMITS) {
+            let message = self.git.borrow().1.get(sha).cloned();
+            return Ok(json!({"message": message.context("no such commit")?}));
+        }
         if path.contains("/actions/workflows/dispatch.yml/runs?status=") {
             return Ok(self
                 .objects
@@ -388,7 +428,9 @@ impl Api for Fake {
                 json!({"repository": {"pullRequest": self.objects.get("conflict").cloned().unwrap_or(Value::Null)}}),
             );
         }
-        Ok(json!({"repository": {"issue": self.issues.get(&n).cloned().unwrap_or(Value::Null)}}))
+        let issue =
+            (self.overlay.borrow().get(&n).cloned()).or_else(|| self.issues.get(&n).cloned());
+        Ok(json!({"repository": {"issue": issue.unwrap_or(Value::Null)}}))
     }
 
     fn download(&self, _: &str, _: u64) -> Result<Vec<u8>> {
@@ -414,6 +456,80 @@ impl Api for Fake {
             return Ok(json!({"id": *id, "number": 738}));
         }
         Ok(json!({"id": *id}))
+    }
+
+    fn rest(&self) -> Option<&dyn crate::poll::Rest> {
+        Some(self)
+    }
+}
+
+/// The pass's lease reads and writes, as GitHub answers them, and the
+/// dispatch, which names its run.
+impl crate::poll::Rest for Fake {
+    fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+        let path = format!("/{}", url.strip_prefix(crate::github::API_ROOT).unwrap());
+        let body = if path == "/repos/example/control" {
+            json!({"private": true})
+        } else if let Some(n) = (path.strip_prefix("/repos/example/operator/issues/"))
+            .and_then(|p| p.strip_suffix("/comments?per_page=100"))
+        {
+            let nodes = &self.issues[&n.parse().unwrap()]["comments"]["nodes"];
+            let rest = (nodes.as_array().unwrap().iter())
+                .map(|c| json!({"user": {"login": c["author"]["login"]}, "body": c["body"]}));
+            rest.collect()
+        } else {
+            let mut body = Api::get(self, &path)?;
+            if let Some(runs) = body["workflow_runs"].as_array() {
+                body["total_count"] = runs.len().into();
+            }
+            body
+        };
+        Ok(RestResponse {
+            status: 200,
+            etag: None,
+            last_modified: None,
+            link: None,
+            body,
+        })
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        let path = format!("/{}", url.strip_prefix(crate::github::API_ROOT).unwrap());
+        let Some(git) = path.strip_prefix("/repos/example/control/git/") else {
+            let sent = Api::send(self, method, &path, body);
+            return Ok(match sent {
+                Ok(answer) => (200, json!({"workflow_run_id": answer["id"]})),
+                Err(_) => (422, json!({"message": "refused"})),
+            });
+        };
+        self.calls
+            .borrow_mut()
+            .push((method.into(), path.clone(), body.clone()));
+        let (refs, commits) = &mut *self.git.borrow_mut();
+        Ok(match (method, git) {
+            ("POST", "trees") => (201, json!({"sha": "tree"})),
+            ("POST", "commits") => {
+                let sha = format!("c{}", commits.len());
+                commits.insert(sha.clone(), body["message"].as_str().unwrap().into());
+                (201, json!({"sha": sha}))
+            }
+            ("POST", "refs") => {
+                let name = body["ref"].as_str().unwrap().strip_prefix("refs/").unwrap();
+                match refs.contains_key(name) {
+                    true => (422, json!({"message": "Reference already exists"})),
+                    false => {
+                        refs.insert(name.into(), body["sha"].as_str().unwrap().into());
+                        (201, json!({}))
+                    }
+                }
+            }
+            ("PATCH", name) => {
+                let name = name.strip_prefix("refs/").unwrap();
+                refs.insert(name.into(), body["sha"].as_str().unwrap().into());
+                (200, json!({}))
+            }
+            _ => panic!("unexpected {method} {path}"),
+        })
     }
 }
 
@@ -442,6 +558,374 @@ fn ctx(url: &str) -> Run {
         default_branch: "main".into(),
         attempt: 1,
         now: millis(&json!(NOW)).unwrap(),
+    }
+}
+
+#[test]
+fn dispatch_pass_rules_choose_and_log_the_pool_or_refuse_before_writes() {
+    use crate::pass::holds::{HOLDS_MARKER, HOLDS_SCHEMA};
+    use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA};
+    let source = tempfile::NamedTempFile::new().unwrap();
+    let pass = json!({
+        "operator": "operator", "bot": "worker", "dispatchRepo": "example/control",
+        "dispatchWorkflow": "dispatch.yml", "follow": [{"org": "example"}],
+        "board": {"owner": "example", "project": 1},
+        "holds": {"repository": "example/operator", "issue": 12, "epicFocus": true},
+        "usage": {"repository": "example/operator", "issue": 12},
+        "pools": {"claude": {}}, "openPrCap": 1, "wip": 2,
+        "mix": {"fable": {"share": 1.0, "when": ["P0", "review:deep", "epic"]}}
+    });
+    let mut config = supervisor();
+    config["agent"]["dispatchPassRules"] = true.into();
+    config["agent"]["passConfig"] = source.path().to_str().unwrap().into();
+    config["agent"]["pool"] = "claude".into();
+    config["agent"]["kinds"] = json!(["triage", "research", "implement"]);
+    config["agent"]["dailyCaps"]["comment"] = 1.into();
+    let s = Settings::from_json(&board(), &config, None).unwrap();
+    for (case, expected) in [
+        ("routine", "claude"),
+        ("P0", "fable"),
+        ("deep", "fable"),
+        ("other board", "claude"),
+        ("forced variant", "Requested pool"),
+        ("overlap", "overlap: held by the pass"),
+        ("published in-flight", "in-flight: held by the pass"),
+        ("published cap", "open-pr-cap: held by the pass"),
+        ("live cap", "1/1 open bot PRs"),
+        ("implement", "claude"),
+        // Each dispatch's lease takes a slot under wip before it is sent,
+        // counting every run listed, named or not, and every lease, not the
+        // published count: with one run in flight, the batch's second finds
+        // none, and with an unnamed one too, the first.
+        ("batch", "claude"),
+        ("unnamed wip", judgment::LEASE_REFUSED),
+        ("published wip", "wip: held by the pass"),
+        ("no leases", "needs leases on"),
+        ("expired lease", "claude"),
+        ("leased item", "in-flight: held now"),
+        ("second holds", "claude"),
+        ("live in-flight", "in-flight: held now"),
+        // Absence from the snapshot clears nothing: what the pass would
+        // hold now holds the item.
+        ("live needs-design", "needs-design: held now"),
+        ("live blocked", "blocked: held now"),
+        ("dependency", "waiting-on: held now"),
+        ("trusted pull", "pr-open: held now"),
+        ("visitor pull", "claude"),
+        ("assigned", "needs-human: assigned to the operator"),
+        // The usage issue is read only as far as its first snapshot.
+        ("usage elsewhere", "claude"),
+        ("pace", "pace: claude does not admit"),
+        ("override", "pace: claude does not admit"),
+        // The lease is judged by the usage the pass's rules adjust, as the
+        // preflight was: a spend override lifts a pace-only hold for both.
+        ("lifted pace", "claude"),
+        // What changes between the batch's reads and the send, during the
+        // cap census: a start of the pass's, an operator's hold and an
+        // edit of the usage snapshot, each refused before any lease.
+        ("pass starts between", judgment::LEASE_REFUSED),
+        ("needs-design between", "needs-design: held now"),
+        ("usage edited between", "untrusted editor evidence"),
+        ("weekly", "budget: weekly spend is at the cap"),
+        ("truncated", "stale or incomplete"),
+        ("missing bot holds", "No bot-authored snapshot"),
+        ("edited holds", "untrusted editor evidence"),
+        ("edited part", "untrusted editor evidence"),
+        ("edited usage", "untrusted editor evidence"),
+        // The pass renews an unchanged snapshot every HOLDS_REFRESH_HOURS;
+        // two missed renewals are stale.
+        ("renewed holds", "claude"),
+        ("stale holds", "stale or incomplete"),
+        ("bad priority", "Incomplete board evidence"),
+        ("budget", "collection budget exhausted"),
+        // The deadline passes during the cap census, after every read.
+        ("deadline", "collection budget exhausted"),
+        // The holds issue is private: its read's error is not logged.
+        ("unreadable holds", "Pass snapshots could not be read"),
+    ] {
+        let mut pass = pass.clone();
+        if case == "weekly" {
+            pass["budget"] = json!({"weeklyUsd": 5});
+        }
+        if case == "assigned" {
+            pass["assignHolds"] = true.into();
+        }
+        if case == "override" {
+            pass["pace"] = json!({"overrides": [{"pool": "claude", "mode": "hold", "until": "2026-10-17T00:00:00Z", "reason": "private"}]});
+        }
+        if case == "lifted pace" {
+            pass["pace"] = json!({"overrides": [{"pool": "claude", "mode": "spend", "until": "2026-10-17T00:00:00Z", "reason": "private"}]});
+        }
+        if case == "usage elsewhere" {
+            pass["usage"]["issue"] = 13.into();
+        }
+        pass["leases"] = (case != "no leases").into();
+        std::fs::write(source.path(), pass.to_string()).unwrap();
+        let kind = if matches!(case, "live cap" | "implement" | "batch") {
+            "implement"
+        } else {
+            "triage"
+        };
+        let mut requests = vec![request(json!({
+            "kind": kind,
+            "pool": (case == "forced variant").then_some("fable")
+        }))];
+        if case == "batch" {
+            requests.push(request(json!({"item": 4, "kind": "triage", "pool": null})));
+            requests.push(json!({"type": "supervisor_action", "action": "comment",
+                "repository": "example/project", "item": 5, "body": "note"}));
+        }
+        let mut fake = Fake::new(&block(&requests));
+        fake.issue(5, json!({}));
+        let labels = match case {
+            "deep" => json!([{"name": "review:deep"}]),
+            "live needs-design" => json!([{"name": "Needs-Design"}]),
+            _ => json!([]),
+        };
+        let pulls = match case {
+            "trusted pull" | "visitor pull" => json!([{"number": 30, "state": "OPEN",
+                "updatedAt": NOW, "repository": {"nameWithOwner": "example/project"},
+                "author": {"login": if case == "trusted pull" {"Worker"} else {"visitor"}}}]),
+            _ => json!([]),
+        };
+        let assignees = json!([{"login": if case == "assigned" {"Operator"} else {"worker"}}]);
+        for item in [3, 4] {
+            fake.issue(item, json!({"rest": {"labels": labels, "assignees": assignees}, "graph": {
+            "number": item, "repository": {"nameWithOwner": "example/project"},
+            "state": "OPEN", "createdAt": NOW,
+            "labels": {"nodes": labels, "totalCount": labels.as_array().unwrap().len()},
+            "issueDependenciesSummary": {"blockedBy": u64::from(case == "dependency")},
+            "closedByPullRequestsReferences": {"nodes": pulls, "totalCount": pulls.as_array().unwrap().len()},
+            "projectItems": {"pageInfo": {"hasNextPage": case == "bad priority"}, "totalCount": 1, "nodes": [{
+                "project": {"owner": {"login": "example"}, "number": if case == "other board" {2} else {1}},
+                "priority": {"name": if matches!(case, "P0" | "other board") {"P0"} else {"P1"}},
+                "status": {"name": if case == "live blocked" {"Blocked"} else {"Todo"}}
+            }]}
+            }}));
+        }
+        let (hold, reason, item) = match case {
+            "overlap" => ("overlap", "wait for #12", json!("EXAMPLE/PROJECT#3")),
+            "published in-flight" => (
+                "in-flight",
+                "waiting for run 42",
+                json!("example/project#3"),
+            ),
+            "published cap" => (
+                "open-pr-cap",
+                "wait for landing",
+                json!("example/project#3"),
+            ),
+            "published wip" => ("wip", "2 of 2 runs active", Value::Null),
+            _ => ("overlap-ignored", "independent", json!("example/project#3")),
+        };
+        let at = match case {
+            "renewed holds" => "2026-10-16T01:00:00Z",
+            "stale holds" => "2026-10-15T23:59:59Z",
+            _ => NOW,
+        };
+        let holds = json!({"schema": HOLDS_SCHEMA, "at": at,
+        "wip": {"in_flight": if case == "batch" { 2 } else { 0 }},
+        "truncated": u64::from(case == "truncated"), "holds": [
+            {"item": item, "kind": hold, "reason": reason, "epic": false, "operator": false},
+            {"item": "example/project#5", "kind": "overlap", "reason": "other item", "epic": false, "operator": false}
+        ]});
+        let mut usage = json!({"schema": USAGE_SCHEMA, "updated_at": NOW, "budget": {"spent_usd": 5}, "pools": {"claude": {
+            "hold": matches!(case, "pace" | "lifted pace"), "used_percent": 10, "window_minutes": 10080,
+            "observed_at": NOW, "resets_at": "2026-10-17T12:00:00Z"
+        }}});
+        if case == "lifted pace" {
+            usage["pools"]["claude"]["reason"] = crate::poll::pace::PACE_ONLY_REASON.into();
+        }
+        let comment = |body: String, author, edited: bool| {
+            json!({"updatedAt": NOW,
+            "author": {"login": author}, "body": body,
+            "lastEditedAt": edited.then_some(NOW), "editor": edited.then(|| json!({"login": "visitor"}))})
+        };
+        let body = format!("{HOLDS_MARKER}\n```json\n{holds}\n```\n");
+        let mut nodes = if case == "edited part" {
+            crate::pass::holds::split(&body, NOW, 200)
+                .unwrap()
+                .into_iter()
+                .enumerate()
+                .map(|(n, part)| comment(part, "worker", n == 1))
+                .collect()
+        } else if case == "second holds" {
+            // The pass edits its first holds comment; a later, more recently
+            // updated stray one is not the snapshot.
+            let mut stale = holds.clone();
+            stale["at"] = "2026-10-14T00:00:00Z".into();
+            let mut stray = comment(
+                format!("{HOLDS_MARKER}\n```json\n{stale}\n```\n"),
+                "worker",
+                false,
+            );
+            stray["updatedAt"] = "2026-10-16T12:00:01Z".into();
+            vec![comment(body, "worker", false), stray]
+        } else {
+            vec![comment(
+                body,
+                if case == "missing bot holds" {
+                    "visitor"
+                } else {
+                    "worker"
+                },
+                case == "edited holds",
+            )]
+        };
+        let usage = comment(
+            format!("{USAGE_MARKER}\n```json\n{usage}\n```\n"),
+            "worker",
+            case == "edited usage",
+        );
+        if case == "usage elsewhere" {
+            // A next page, which must not be read, has no cursor to read it by.
+            fake.issues.insert(
+                13,
+                json!({"comments": {"nodes": [usage], "pageInfo": {"hasNextPage": true}}}),
+            );
+        } else {
+            nodes.push(usage);
+        }
+        if case != "unreadable holds" {
+            fake.issues.insert(
+                12,
+                json!({"comments": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}),
+            );
+        }
+        if kind == "implement" {
+            fake.objects.insert(
+                "/repos/example/project/pulls?state=open&per_page=100&page=1".into(),
+                if case == "live cap" {
+                    json!([{"number": 25, "user": {"login": "Worker"}}])
+                } else {
+                    json!([])
+                },
+            );
+            fake.objects.insert("/repos/example/project/issues/3/parent".into(), json!({"repository_url": "https://api.github.com/repos/example/control", "number": 10}));
+            fake.objects.insert(
+                "/repos/example/control/issues/10".into(),
+                json!({"state": "open", "labels": [{"name": "epic"}]}),
+            );
+        }
+        if matches!(
+            case,
+            "live in-flight" | "batch" | "implement" | "unnamed wip"
+        ) {
+            let item = if case == "live in-flight" { 3 } else { 42 };
+            let mut runs = vec![json!({"id": 42, "created_at": NOW,
+                "display_title": format!("implement example/project#{item} (claude)")})];
+            if case == "unnamed wip" {
+                runs.push(json!({"id": 43, "created_at": NOW, "display_title": "Dispatch"}));
+            }
+            fake.objects
+                .insert("runs".into(), json!({"workflow_runs": runs}));
+        }
+        if matches!(case, "expired lease" | "leased item") {
+            let item = if case == "leased item" { 3 } else { 42 };
+            let expires = if case == "expired lease" {
+                "2026-10-16T11:59:00Z"
+            } else {
+                "2026-10-17T12:00:00Z"
+            };
+            let lease = json!({"run": 0, "item": format!("example/project#{item}"), "pool": "claude",
+                "taken_at": NOW, "expires_at": expires});
+            let (refs, commits) = &mut *fake.git.borrow_mut();
+            refs.insert("agent-board/leases/0".into(), "abc".into());
+            commits.insert("abc".into(), lease.to_string());
+        }
+        let census = "/repos/example/operator/issues/7/comments?since=";
+        let late: Option<Late> = match case {
+            "pass starts between" => Some(Box::new(|fake: &Fake| {
+                let lease = json!({"run": 77, "item": "example/project#3", "pool": "claude",
+                    "taken_at": NOW, "expires_at": "2026-10-17T12:00:00Z"});
+                let (refs, commits) = &mut *fake.git.borrow_mut();
+                refs.insert("agent-board/leases/1".into(), "pass".into());
+                commits.insert("pass".into(), lease.to_string());
+            })),
+            "needs-design between" => {
+                let mut graph = fake.issues[&3].clone();
+                graph["labels"] = json!({"nodes": [{"name": "needs-design"}], "totalCount": 1});
+                Some(Box::new(move |fake: &Fake| {
+                    fake.overlay.borrow_mut().insert(3, graph);
+                }))
+            }
+            "usage edited between" => {
+                let mut graph = fake.issues[&12].clone();
+                let nodes = graph["comments"]["nodes"].as_array_mut().unwrap();
+                let usage = nodes.last_mut().unwrap();
+                usage["lastEditedAt"] = NOW.into();
+                usage["editor"] = json!({"login": "visitor"});
+                Some(Box::new(move |fake: &Fake| {
+                    fake.overlay.borrow_mut().insert(12, graph);
+                }))
+            }
+            _ => None,
+        };
+        *fake.late.borrow_mut() = late.map(|late| (census.to_owned(), late));
+        let mut bounded = s.clone();
+        if case == "budget" {
+            bounded.limits.max_requests = 1;
+        }
+        if case == "deadline" {
+            bounded.limits.collection_timeout_seconds = 1;
+            fake.stall = Some((census.into(), std::time::Duration::from_millis(1100)));
+        }
+        let p = Policy::new(&bounded, &json!({"small": {}, "claude": {}, "fable": {}}))
+            .unwrap()
+            .unwrap();
+        let actual = execute(&fake, &p, &ctx(RESULT_URL));
+        let writes = fake.writes();
+        let dispatches: Vec<_> = (writes.iter())
+            .filter(|(_, path, _)| path.ends_with("/dispatches"))
+            .collect();
+        if matches!(expected, "claude" | "fable") {
+            assert_eq!(actual.ok, case != "batch", "{case}: {actual:?}");
+            assert_eq!(dispatches.len(), 1, "{case}: {writes:?}");
+            assert_eq!(dispatches[0].2["inputs"]["pool"], expected);
+            let selection = if expected == "fable" {
+                "pass mix"
+            } else {
+                "supervisor default"
+            };
+            let receipt = format!("({kind}, {expected}, no-plan, {selection})");
+            assert!(actual.lines[0].contains(&receipt));
+            assert!(writes[0].2["body"].as_str().unwrap().contains(&receipt));
+            // The dispatch's lease, bound to the run it started.
+            let (refs, commits) = &*fake.git.borrow();
+            let leased: Vec<Value> = (refs.values())
+                .map(|sha| serde_json::from_str(&commits[sha]).unwrap())
+                .filter(|l: &Value| l["item"] == "example/project#3")
+                .collect();
+            assert_eq!(leased.len(), 1, "{case}: {refs:?}");
+            assert!(leased[0]["run"].as_u64().unwrap() > 0, "{case}: {leased:?}");
+            if case == "batch" {
+                assert!(
+                    actual.lines[1].contains(judgment::LEASE_REFUSED),
+                    "{actual:?}"
+                );
+                assert!(actual.lines[2].contains("not attempted"), "{actual:?}");
+            }
+        } else if case == "unnamed wip" || case.ends_with(" between") {
+            // Refused at the send: the log has it, nothing started, and the
+            // executor holds no lease.
+            assert!(!actual.ok && dispatches.is_empty(), "{case}: {writes:?}");
+            assert!(actual.lines[0].contains(expected), "{case}: {actual:?}");
+            let refs: Vec<_> = fake.git.borrow().0.keys().cloned().collect();
+            let pass = (case == "pass starts between").then(|| "agent-board/leases/1".to_owned());
+            assert_eq!(refs, Vec::from_iter(pass), "{case}");
+        } else {
+            assert!(
+                !actual.ok && writes.is_empty(),
+                "{case}: {actual:?} {writes:?}"
+            );
+            assert!(actual.lines[0].contains(expected), "{case}: {actual:?}");
+            for private in ["wait for #12", "example/operator"] {
+                assert!(
+                    !actual.lines[0].contains(private),
+                    "{case}: private detail in the log: {actual:?}"
+                );
+            }
+        }
     }
 }
 

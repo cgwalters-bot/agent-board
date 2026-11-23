@@ -1667,7 +1667,9 @@ URL, one past --max-writes: it has this pass's progress`): its `progress_at`
 is kept nowhere else. `--max-writes 0` still writes nothing, and a preview
 says what its apply would. Where the comment
 already has the same holds the line is `holds: unchanged` and nothing is
-written, and a preview prints
+written, unless its `at` is six hours old: then it is written again for its
+time alone, so that a reader can tell a pass that still observes the holds
+from one that stopped. A preview prints
 `holds: publish to OWNER/REPO#N; a preview does not write it`. An applying
 pass that waited for another in progress, or that has spent its request
 budget or time bound, publishes nothing (`holds: not published; why`). A
@@ -5853,6 +5855,10 @@ read current ownership rather than risk a second lease for the same run.
 Retries of one run can still take two different slots, as when a slot frees
 between their reads; after taking one, admit reads the leases again and frees
 all but the run's lowest, so the later of the two keeps the run to one.
+A new dispatch's reservation (`run: 0`) is refused while any live lease,
+bound or not, names its item. Two of one item can still take different slots
+at once; each reads the leases again after taking its own and gives it back
+where another names the item, so at most one starts.
 
 A lease may be reaped once its `expires_at`, 24 hours after it was taken,
 has passed, or its run has ended: completed, or `in_progress` with every job

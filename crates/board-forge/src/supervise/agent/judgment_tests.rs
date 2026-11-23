@@ -47,7 +47,7 @@ fn resolved_profile_commit_is_published_in_state_and_run_log() {
     let text = lines(&[action("replace_state", json!({"body": "Memory"}))]);
     let mut requests = judgment::parse_batch(&text, &p).unwrap();
     requests[0].preflight(&fake, &p, run.now).unwrap();
-    requests[0].apply(&fake, &p, &run).unwrap();
+    requests[0].apply(&fake, &p, &run, None).unwrap();
     assert_eq!(
         fake.writes()[0].2["body"],
         format!("Memory\n\n{provenance}")
@@ -62,7 +62,7 @@ fn resolved_profile_commit_is_published_in_state_and_run_log() {
         panic!("expected replace_state");
     }
     requests[0].preflight(&fake, &p, run.now).unwrap();
-    assert!(requests[0].apply(&fake, &p, &run).is_err());
+    assert!(requests[0].apply(&fake, &p, &run, None).is_err());
     assert_eq!(fake.writes().len(), 1);
 }
 
@@ -2193,7 +2193,9 @@ fn listed_release_rechecks_holds_after_its_intermediate_writes() {
                 operator_only,
             };
             requests[0].preflight(&api, &p, 0).unwrap();
-            let err = requests[0].apply(&api, &p, &ctx(RESULT_URL)).unwrap_err();
+            let err = requests[0]
+                .apply(&api, &p, &ctx(RESULT_URL), None)
+                .unwrap_err();
             let expected = if operator_only {
                 "operator-only label"
             } else {
@@ -2246,7 +2248,7 @@ fn listed_release_cannot_authorize_a_later_hold() {
                 now: 0,
             };
             if released {
-                requests[0].apply(&fake, &p, &ctx).unwrap();
+                requests[0].apply(&fake, &p, &ctx, None).unwrap();
                 assert_eq!(fake.writes().len(), if pr { 2 } else { 3 });
             }
             let events = fake
@@ -2273,7 +2275,7 @@ fn listed_release_cannot_authorize_a_later_hold() {
                 "created_at": "2026-10-16T09:00:00Z"}),
             );
             fake.calls.borrow_mut().clear();
-            let err = requests[0].apply(&fake, &p, &ctx).unwrap_err();
+            let err = requests[0].apply(&fake, &p, &ctx, None).unwrap_err();
             assert!(
                 err.to_string().contains("not the approved holdEvent"),
                 "{err:#}"
@@ -2285,7 +2287,7 @@ fn listed_release_cannot_authorize_a_later_hold() {
             let s = Settings::from_json(&board(), &cfg, None).unwrap();
             let p = policy(&s);
             requests[0].preflight(&fake, &p, 0).unwrap();
-            requests[0].apply(&fake, &p, &ctx).unwrap();
+            requests[0].apply(&fake, &p, &ctx, None).unwrap();
         }
     }
 }

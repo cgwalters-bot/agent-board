@@ -5,7 +5,9 @@
 //! ([`agent::execute`]). Its settings are the poll's agent-board.json plus
 //! the supervisor's own file, both from the caller's default branch.
 use crate::github::{API_ROOT, Client, Transport};
-use crate::poll::{POLL_OPTIONS, Rest, known, option, validate_repository, validate_workflow};
+use crate::poll::{
+    POLL_OPTIONS, Rest, RestResponse, known, option, validate_repository, validate_workflow,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::cell::Cell;
@@ -30,6 +32,32 @@ pub trait Api {
     /// A write; anything but a 2xx status is an error naming only the
     /// status, as a response body could echo text into the public log.
     fn send(&self, method: &str, path: &str, body: &Value) -> Result<Value>;
+    /// The REST client under it, whose statuses its caller judges, as the
+    /// pass's leases do ([`crate::pass::lease`]); none where it has none.
+    fn rest(&self) -> Option<&dyn Rest> {
+        None
+    }
+}
+
+/// A [`Rest`] trait object, for code that takes a sized one.
+pub(crate) struct DynRest<'a>(pub &'a dyn Rest);
+
+impl Rest for DynRest<'_> {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        self.0.get(url, validator)
+    }
+
+    fn get_fresh(&self, url: &str) -> Result<RestResponse> {
+        self.0.get_fresh(url)
+    }
+
+    fn get_live(&self, url: &str) -> Result<RestResponse> {
+        self.0.get_live(url)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.0.send(method, url, body)
+    }
 }
 
 fn api_url(path: &str) -> String {
@@ -57,6 +85,10 @@ impl Api for Client {
             "{method} {path}: HTTP {status}"
         );
         Ok(body)
+    }
+
+    fn rest(&self) -> Option<&dyn Rest> {
+        Some(self)
     }
 }
 
@@ -90,12 +122,18 @@ impl<'a> Bounded<'a> {
     }
 
     fn spend(&self) -> Result<()> {
+        self.check_time()?;
         let remaining = self.remaining.get();
+        ensure!(remaining > 0, "collection budget exhausted");
+        self.remaining.set(remaining - 1);
+        Ok(())
+    }
+
+    fn check_time(&self) -> Result<()> {
         ensure!(
-            remaining > 0 && (self.clock)() < self.deadline_ms,
+            (self.clock)() < self.deadline_ms,
             "collection budget exhausted"
         );
-        self.remaining.set(remaining - 1);
         Ok(())
     }
 }
@@ -319,6 +357,8 @@ pub struct AgentSettings {
     /// `budget.harnessRepositories` a status update's spend split reads
     /// ([`crate::budget::split`]); absent, the update has no split.
     pub pass_config: Option<String>,
+    /// Route dispatches and check their admission against the pass policy.
+    pub dispatch_pass_rules: bool,
     /// `releaseList`: the items whose `needs-human` hold `release_listed`
     /// may take off, each with its reason ([`agent::judgment::Release`]).
     pub release_list: Vec<agent::judgment::Release>,
@@ -354,6 +394,7 @@ pub const AGENT_OPTIONS: &[&str] = &[
     "profile",
     "skipUnchangedFailures",
     "passConfig",
+    "dispatchPassRules",
     "bugEpic",
     "passFailureRepository",
     "releaseList",
@@ -767,6 +808,10 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
                     .context("supervisor agent.passConfig: a file path")
             })
             .transpose()?,
+        dispatch_pass_rules: get("dispatchPassRules")?
+            .map(|v| v.as_bool().context("supervisor agent.dispatchPassRules"))
+            .transpose()?
+            .unwrap_or(false),
         release_list: agent::judgment::release_list(get("releaseList")?)?,
     }))
 }
@@ -1270,6 +1315,7 @@ pub(crate) mod tests {
                 "tracker",
                 "project",
                 "passConfig",
+                "dispatchPassRules",
                 "bugEpic",
                 "passFailureRepository",
                 "releaseList",
@@ -1283,10 +1329,12 @@ pub(crate) mod tests {
         board["operatorAnswers"] = Value::Null;
         let mut cfg = supervisor();
         cfg["agent"]["state"] = Value::Null;
+        cfg["agent"]["dispatchPassRules"] = json!(false);
         let s = Settings::from_json(&board, &cfg, None).unwrap();
         assert!(!s.unset.contains(&"rebaseRounds".to_owned()));
         assert!(s.unset.contains(&"operatorAnswers".to_owned()));
         assert!(s.unset.contains(&"agent.state".to_owned()));
+        assert!(!s.unset.contains(&"agent.dispatchPassRules".to_owned()));
         cfg.as_object_mut().unwrap().remove("agent");
         let s = Settings::from_json(&board, &cfg, None).unwrap();
         assert!(s.unset.contains(&"agent".to_owned()));
@@ -1355,6 +1403,7 @@ pub(crate) mod tests {
             ("skipUnchangedFailures", json!("true")),
             ("passConfig", json!("")),
             ("passConfig", json!(1)),
+            ("dispatchPassRules", json!("true")),
         ] {
             let mut cfg = supervisor();
             cfg["agent"][key] = value.clone();

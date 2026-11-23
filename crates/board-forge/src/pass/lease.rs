@@ -105,6 +105,23 @@ fn stamp(at: OffsetDateTime) -> Result<String> {
     Ok(at.format(&Rfc3339)?)
 }
 
+/// The slot number of ref `name`, under `refs/`, where it names one.
+fn slot(name: &str) -> Option<u64> {
+    (name.strip_prefix(&format!("{LEASE_REFS}/")))
+        .and_then(|s| s.parse().ok())
+        .filter(|&s: &u64| s < LEASE_SLOTS && name == format!("{LEASE_REFS}/{s}"))
+}
+
+/// The lease ref `name`, under `refs/`, holds with commit `message`: none
+/// where the name is no slot or the message no lease.
+pub(crate) fn held(name: &str, message: &str) -> Option<Held> {
+    let lease = serde_json::from_str::<Lease>(message).ok()?;
+    Some(Held {
+        slot: slot(name)?,
+        lease,
+    })
+}
+
 /// The refs under [`LEASE_REFS`] in `repo`: each name under `refs/` and its
 /// commit.
 fn refs(client: &impl Rest, repo: &str) -> Result<Vec<(String, String)>> {
@@ -164,9 +181,7 @@ fn run_ended(
 pub fn read(client: &impl Rest, repo: &str, now: OffsetDateTime) -> Result<Vec<Found>> {
     let mut found = Vec::new();
     for (name, sha) in refs(client, repo)? {
-        let slot = (name.strip_prefix(&format!("{LEASE_REFS}/")))
-            .and_then(|s| s.parse().ok())
-            .filter(|&s: &u64| s < LEASE_SLOTS && name == format!("{LEASE_REFS}/{s}"));
+        let slot = slot(&name);
         let url = format!("{API_ROOT}repos/{repo}/git/commits/{sha}");
         let response = client.get(&url, None)?;
         ensure!(
@@ -174,11 +189,7 @@ pub fn read(client: &impl Rest, repo: &str, now: OffsetDateTime) -> Result<Vec<F
             "reading lease {name}: GitHub HTTP status {}",
             response.status
         );
-        let lease = serde_json::from_str::<Lease>(text(&response.body, "/message"));
-        let held = match (lease, slot) {
-            (Ok(lease), Some(slot)) => Some(Held { slot, lease }),
-            _ => None,
-        };
+        let held = held(&name, text(&response.body, "/message"));
         let ended = match &held {
             None => None,
             Some(held) => match at(&Value::from(held.lease.expires_at.as_str())) {
@@ -339,13 +350,28 @@ fn unleased(
 /// there is none. A run that holds a lease of the pool already gets it back,
 /// so a retry after a lost answer takes no second. `lines` gets that, a
 /// lease it reaped to take its slot, and an override. `--override` is
-/// refused unless the token is the operator's.
+/// refused unless the token is the operator's. A new dispatch's reservation
+/// is refused while any live lease names its item.
 pub fn admit(
     client: &impl Rest,
     config: &Config,
     request: &Request,
     now: OffsetDateTime,
     lines: &mut Vec<String>,
+) -> Result<std::result::Result<Held, String>> {
+    admit_with(client, config, request, now, lines, None)
+}
+
+/// [`admit`] by `usage` where given, in place of the published snapshot as
+/// read: one its caller has authenticated and adjusted by the pass's pace
+/// policy, as the pass's own admission did.
+pub fn admit_with(
+    client: &impl Rest,
+    config: &Config,
+    request: &Request,
+    now: OffsetDateTime,
+    lines: &mut Vec<String>,
+    usage: Option<&Value>,
 ) -> Result<std::result::Result<Held, String>> {
     let pool = request.pool;
     let account = if config.mix.contains_key(pool) {
@@ -376,21 +402,33 @@ pub fn admit(
         lines.push(format!("admit: run {} holds it already", request.run));
         return Ok(Ok(held.clone()));
     }
+    let item = request.item.display();
+    let of_item = |found: &[Found], slot: Option<u64>| {
+        (found.iter().filter(|f| f.live() && f.slot != slot))
+            .filter_map(|f| f.held.as_ref())
+            .filter(|h| h.lease.item.eq_ignore_ascii_case(&item))
+            .map(|h| h.lease.run)
+            .collect::<Vec<_>>()
+    };
+    let others = of_item(&found, None);
+    // A new dispatch of an item another start holds would be a second run
+    // of it, whichever path took that lease.
+    if request.run == 0 && !others.is_empty() {
+        return Ok(Err(format!("{item} holds a lease already")));
+    }
     // An item's identity alone cannot prove that this is the dispatched
     // run: a manual dispatch could race it. Only the dispatch response may
     // bind a reservation. The caller retries while that response is pending.
-    if found
-        .iter()
-        .filter(|f| f.live())
-        .filter_map(|f| f.held.as_ref())
-        .any(|h| h.lease.run == 0 && h.lease.item.eq_ignore_ascii_case(&request.item.display()))
-    {
+    if others.contains(&0) {
         return Ok(Err("dispatch reservation pending; retry admission".into()));
     }
     let (mut count, probe) = match request.overridden {
         true => (LEASE_SLOTS, false),
         false => {
-            let snapshot = published_usage(client, config)?;
+            let snapshot = match usage {
+                Some(usage) => Some(usage.clone()),
+                None => published_usage(client, config)?,
+            };
             if account != pool
                 && !room(snapshot.as_ref(), account, settings, now).is_ok_and(|r| r > 0.0)
             {
@@ -447,7 +485,18 @@ pub fn admit(
             }
             let held = Held { slot, lease };
             if request.run == 0 {
-                return Ok(Ok(held));
+                // Two dispatches of the item may each take a different slot
+                // at once, and no write arbitrates between slots. Of two that
+                // both wrote, the later reader sees the other and gives its
+                // own back, so at most one starts.
+                let found = read(client, repo, now)?;
+                if of_item(&found, Some(slot)).is_empty() {
+                    return Ok(Ok(held));
+                }
+                if let Some(own) = found.iter().find(|f| f.held.as_ref() == Some(&held)) {
+                    free(client, repo, own, &format!("a second lease of {item}"))?;
+                }
+                return Ok(Err(format!("{item} holds a lease already")));
             }
             return Ok(Ok(deduplicate(client, repo, request, now, held)?));
         }

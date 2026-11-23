@@ -102,6 +102,10 @@ pub const APPROVE_SUFFIX: &str = " to merge";
 /// How long an unchanged needs-you list goes unwritten ([`changed`]): past
 /// it, the pass writes it again for its `validated_at` alone.
 const NEEDS_YOU_REFRESH_HOURS: u64 = 1;
+/// How long an unchanged snapshot goes unwritten ([`changed`]): past it,
+/// the pass writes it again for its `at` alone, so that a reader can tell a
+/// pass that still observes the holds from one that stopped.
+pub const HOLDS_REFRESH_HOURS: u64 = 6;
 /// The most characters of a hold's question or reason an ask repeats; the
 /// hold's entry has it whole. The list doubles the operator's holds, which
 /// [`fit`] never leaves out.
@@ -2881,7 +2885,8 @@ pub(super) fn preserve_changed_at(list: &mut NeedsYou, previous: Option<&Value>)
 /// `body`, if any: its time alone is no change, nor the needs-you list's
 /// `validated_at` until [`NEEDS_YOU_REFRESH_HOURS`] after the published one,
 /// so that a list nothing changes is written again that often; the pass
-/// view's likewise ([`super::view::comparable`], [`super::view::due`]).
+/// view's likewise ([`super::view::comparable`], [`super::view::due`]), and
+/// the snapshot's `at` after [`HOLDS_REFRESH_HOURS`].
 pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
     let mut now = serde_json::to_value(snapshot)?;
     let validated = |s: &mut Value| {
@@ -2897,6 +2902,11 @@ pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
             parse_time(&last).is_none() || over(&last, at, NEEDS_YOU_REFRESH_HOURS)
         });
         let due = due || super::view::due(s.get("pass_view"), now.get("pass_view"));
+        let due = due
+            || parse_time(&snapshot.at).is_some()
+                && s["at"].as_str().is_none_or(|last| {
+                    parse_time(last).is_none() || over(last, &snapshot.at, HOLDS_REFRESH_HOURS)
+                });
         // Observation time alone is not activity. Counts and UTC rollover are.
         for value in [&mut s, &mut now] {
             if let Some(fields) = value
@@ -3594,6 +3604,29 @@ mod tests {
             ));
             assert!(!changed(Some(&body), &later).unwrap());
         }
+    }
+
+    /// An unchanged snapshot is written again for its time alone once
+    /// [`HOLDS_REFRESH_HOURS`] went by, and not before.
+    #[test]
+    fn unchanged_is_renewed_after_the_refresh_interval() {
+        let published = "2026-10-23T00:00:00Z";
+        let body = render(&snapshot(&[], published.into(), tally())).unwrap();
+        let later = |at: &str| {
+            let mut later = snapshot(&[], published.into(), tally());
+            later.at = at.into();
+            later
+        };
+        for (at, due) in [
+            ("2026-10-23T05:59:59Z", false),
+            ("2026-10-23T06:00:00Z", true),
+            ("2026-10-24T00:00:00Z", true),
+        ] {
+            assert_eq!(changed(Some(&body), &later(at)).unwrap(), due, "{at}");
+        }
+        let undated = body.replacen(&format!("\"at\":\"{published}\""), "\"at\":\"\"", 1);
+        assert_ne!(undated, body);
+        assert!(changed(Some(&undated), &later("2026-10-23T00:10:00Z")).unwrap());
     }
 
     /// `revisited` is absent without `revisit`, as `tally` has it, and

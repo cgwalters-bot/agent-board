@@ -89,7 +89,7 @@ pub(super) fn planning(
 
 // One draw over disjoint intervals: an unavailable variant's share falls
 // back, rather than increasing another variant's share. No retry loop.
-fn select_with(
+pub(crate) fn select_with(
     config: &Config,
     snapshot: Option<&Value>,
     (priority, labels, epic): (Option<&str>, Option<&[String]>, bool),

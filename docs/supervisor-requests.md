@@ -165,6 +165,62 @@ release train and scheduler-log settings are optional, so an organization
 without them leaves those checks not configured, and `unset` names them. The checks
 have been exercised against recorded responses only.
 
+#### Pass dispatch rules (opt-in)
+
+`agent.dispatchPassRules: true` prevents the agent from forcing a scarce pool
+or dispatching around the pass's holds. It uses the trusted `agent.passConfig`
+file and the pass bot's published holds and usage comments. It checks the
+author and last editor of each comment it uses. The pass renews an unchanged
+holds publication every six hours; holds older than twelve, and usage too old
+for pass pacing, are refused, as is missing or incomplete evidence.
+The executor does not fall back to legacy routing.
+The check runs before reserving or performing any dispatch in the batch. Its
+own reads count against the supervisor's configured request bound; the other
+targets' preflights and the daily cap census do not. The time bound covers the
+whole collection.
+
+Omit `pool` or repeat `agent.pool`, which must be a base pool in the pass
+configuration. This replaces `kindPools` routing for these requests. The base
+pool must admit work under the pass's pace rules; the pass's normal `mix` draw
+can then select a variant on verified board Priority or issue labels, with
+positive room on the variant's parent account. A child of an epic does not
+itself match `epic`. `plan_epic` still sends a planning request to stage 3,
+where the pass chooses the pool. The log names the actual pool, the dispatch
+reason, and whether the pool came from the default or the mix.
+
+The executor refuses published item or global holds (including overlap),
+ignoring informational entries such as `overlap-ignored`. The log gives the hold
+category, not private snapshot text, and a failed read of the snapshots a
+fixed message. An issue the snapshot does not list is not thereby clear: the
+executor reads it again as the pass does just before a start and applies the
+pass's hold rule, refusing a hold label such as `needs-design`, Status
+`Blocked`, an open dependency, an open pull request of the bot's or the
+operator's that closes it (or more than one page of them), and a run in flight
+or live lease on it. With the pass's `assignHolds`, an issue assigned to the
+operator is refused too, without reading whether they have responded. It
+reads no promotion handoff, and holds that come from the pass's history
+(overlap, triage cooldown, epic focus) are only as current as the snapshot.
+It applies the pass's pace and weekly budget rules, and re-counts open bot PRs
+for implements when `openPrCap` is configured. Published overlap is the pass's
+last observation, not a live path comparison or a lock shared with the
+scheduler.
+
+The pass configuration must have `leases` on: like `agent-board dispatch`
+outside the pass, each dispatch takes a lease of the pass's slots just before
+its writes, under its `wip` and pacing, counting every run of the dispatch
+workflow and every live lease, and binds it to the run started. Just before
+the lease, the executor checks the item's holds again as above and reads the
+usage comment again; the lease is judged by that authenticated usage, adjusted
+by the pass's pace overrides and banked resets, not by the raw comment. A
+lease is refused while another names the item, so a start the pass made since
+the batch's reads is not repeated. A dispatch that finds no free slot is
+refused with a fixed message and the batch stops;
+a lease taken for a dispatch that then fails holds its slot until it expires,
+as the pass's own do. These reads are outside the supervisor's request bound.
+Taking a lease writes refs under `refs/agent-board/leases/` in the private
+dispatch repository, so the executor's token needs contents write there.
+When absent or false, the existing request format and routing are unchanged.
+
 ## Recurring failure signatures
 
 The read-only collector adds `signatures`, `stranded`, `main` and `needs-you`
@@ -777,6 +833,7 @@ while it is left out, so a dropped or misspelled key is seen:
   long after an agent run a failing check may start another, a positive number) are
   required. The cooldown applies outside the daily pass. `kinds`, `maxDispatchesPerPass`, `maxDispatchesPerDay`,
   `dailyCaps`, `tracker`, `state`, `project`, `passConfig` and `releaseList` are described below;
+  `dispatchPassRules` defaults to `false`; see [pass dispatch rules](#pass-dispatch-rules-opt-in).
   `profile` and `skipUnchangedFailures` under [workflow steps](#workflow-steps).
   The health pass reads `passConfig` too: the `held` check leaves out a draft
   pull request whose base repository is in its `pr.noMerge`, the operator's

@@ -574,7 +574,7 @@ const RECENT_PULLS: &str = r#"query($owner: String!, $name: String!, $after: Str
 const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
     comments(first: 100, after: $cursor) {
-      nodes { databaseId url createdAt updatedAt lastEditedAt body author { login } editor { login } }
+      nodes { url createdAt updatedAt lastEditedAt body author { login } editor { login } }
       pageInfo { hasNextPage endCursor }
     }
   } }
@@ -604,6 +604,18 @@ pub(crate) fn issue_comments(
     number: u64,
     pages: usize,
 ) -> Result<Vec<Value>> {
+    issue_comments_until(api, repo, number, pages, |_| false)
+}
+
+/// [`issue_comments`] up to the page that holds the first comment `done`
+/// accepts, or all of them.
+pub(crate) fn issue_comments_until(
+    api: &dyn Api,
+    repo: &str,
+    number: u64,
+    pages: usize,
+    done: impl Fn(&Value) -> bool,
+) -> Result<Vec<Value>> {
     let (owner, name) = repo.split_once('/').context("repository")?;
     let mut all = vec![];
     let mut cursor = Value::Null;
@@ -620,6 +632,9 @@ pub(crate) fn issue_comments(
                 .iter()
                 .cloned(),
         );
+        if all.iter().any(&done) {
+            return Ok(all);
+        }
         match comments["pageInfo"]["hasNextPage"].as_bool() {
             Some(false) => return Ok(all),
             Some(true) => {
