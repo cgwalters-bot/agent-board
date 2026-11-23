@@ -4482,7 +4482,7 @@ pub(super) mod tests {
                 review_unread: None,
                 deferred: Vec::new(),
                 deferring: None,
-                red_floor: None,
+                turn_floor: None,
                 planned: 0,
                 folds: Vec::new(),
                 report_pulls: BTreeMap::new(),

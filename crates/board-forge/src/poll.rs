@@ -22,8 +22,9 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry as MapEntry};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub(crate) mod action_first;
-mod red_checks;
-pub use red_checks::RedChecks;
+mod priority_turn;
+use priority_turn::{PrioritySkip, PriorityTurn};
+pub use priority_turn::{RedChecks, ReviewTurn};
 pub mod approval;
 pub mod bounds;
 pub mod comments;
@@ -601,6 +602,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "ownSpaceOnly",
     "actionFirst",
     "redChecks",
+    "reviewTurn",
     "quietWaits",
     "foldRounds",
     "reviewPools",
@@ -699,6 +701,8 @@ pub struct PollPolicy {
     /// Prevent a spent walk from indefinitely deferring failed bot PRs.
     /// Off by default; discovery stays inside the existing PR authority and caps.
     pub red_checks: Option<RedChecks>,
+    /// Give fresh change requests a bounded turn before ordinary PR follow-up.
+    pub review_turn: Option<ReviewTurn>,
     /// Prevent re-reading, pass after pass, pull requests unchanged since a
     /// read that left them waiting on the operator alone ([`quiet`]). On unless
     /// the config sets it to `false`; each is read whole again within
@@ -1193,6 +1197,12 @@ pub struct PrOptions {
     pub action_first: bool,
     #[serde(default)]
     pub red_checks: Option<RedChecks>,
+    #[serde(
+        default,
+        deserialize_with = "priority_turn::review_turn_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub review_turn: Option<ReviewTurn>,
     /// On unless set to `false` (agent-board#1019).
     #[serde(default)]
     pub quiet_waits: Option<bool>,
@@ -1248,7 +1258,13 @@ impl PrOptions {
     /// The keys, as JSON names them.
     fn keys() -> Vec<String> {
         match serde_json::to_value(Self::default()) {
-            Ok(Value::Object(map)) => map.into_iter().map(|(key, _)| key).collect(),
+            Ok(Value::Object(map)) => map
+                .into_iter()
+                .map(|(key, _)| key)
+                // Unlike the other optional fields, an explicit null is
+                // invalid, so an unset reviewTurn is omitted on serialization.
+                .chain(["reviewTurn".to_owned()])
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -1382,6 +1398,7 @@ impl PrOptions {
             supervisor_holds,
             action_first,
             red_checks,
+            review_turn,
             quiet_waits,
             check_reruns,
             unstall,
@@ -1409,6 +1426,7 @@ impl PrOptions {
         policy.hold_missing_data = hold_missing_data;
         policy.action_first = action_first;
         policy.red_checks = red_checks;
+        policy.review_turn = review_turn;
         policy.quiet_waits = quiet_waits.unwrap_or(true);
         policy.supervisor_holds = supervisor_holds;
         policy.check_reruns = check_reruns;
@@ -1594,6 +1612,7 @@ impl PollPolicy {
             own_space_only: false,
             action_first: false,
             red_checks: None,
+            review_turn: None,
             quiet_waits: false,
             hold_dependencies: false,
             agent_recovery: false,
@@ -2882,16 +2901,22 @@ type ReviewStep = (Decision, Option<(u64, Option<String>)>);
 fn verdicts<'a>(pull: &'a Value, config: &Config) -> (Verdict<'a>, Verdict<'a>) {
     let at_head = reviews_at_head(pull);
     // An app's slug may be a user's login too: the type tells them apart.
-    let operator_review = |r: &Value| {
-        text(r, "/author/__typename") == "User" && text(r, "/author/login") == config.operator
-    };
-    let job_counts = config.review_workflow.is_some()
-        && from_fork(pull, &config.bot)
-        && pull["baseRepository"]["isPrivate"] == false;
     (
-        newest_verdict(&at_head, operator_review, false),
-        job_counts.then(|| job_verdict(pull)).flatten(),
+        newest_verdict(&at_head, |r| operator_review(r, config), false),
+        job_can_review(pull, config)
+            .then(|| job_verdict(pull))
+            .flatten(),
     )
+}
+
+fn job_can_review(pull: &Value, config: &Config) -> bool {
+    config.review_workflow.is_some()
+        && from_fork(pull, &config.bot)
+        && pull["baseRepository"]["isPrivate"] == false
+}
+
+fn operator_review(review: &Value, config: &Config) -> bool {
+    text(review, "/author/__typename") == "User" && text(review, "/author/login") == config.operator
 }
 
 /// The pull request's reviews of its head.
@@ -2906,11 +2931,12 @@ fn reviews_at_head(pull: &Value) -> Vec<&Value> {
 /// The review job's newest verdict on the head, whether or not it counts
 /// ([`verdicts`] says where it may).
 fn job_verdict(pull: &Value) -> Verdict<'_> {
-    let job_review = |r: &Value| {
-        text(r, "/author/__typename") == "Bot"
-            && r.pointer("/author/databaseId").and_then(Value::as_u64) == Some(ACTIONS_BOT_ID)
-    };
     newest_verdict(&reviews_at_head(pull), job_review, true)
+}
+
+fn job_review(review: &Value) -> bool {
+    text(review, "/author/__typename") == "Bot"
+        && review.pointer("/author/databaseId").and_then(Value::as_u64) == Some(ACTIONS_BOT_ID)
 }
 
 /// The repository and id of the run named by the one gh-aw marker in a
@@ -5723,7 +5749,7 @@ struct Pass<'a, R, G> {
     deferring: Option<Deferred>,
     /// The red-check turn's admission floor: reads stop above it until the
     /// decision's first write, which then finishes under the pass's bounds.
-    red_floor: Option<usize>,
+    turn_floor: Option<usize>,
     /// The review starts and reruns a preview plans, as an applying pass
     /// counts them in `dispatched`.
     planned: usize,
@@ -5880,7 +5906,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             review_unread: None,
             deferred: Vec::new(),
             deferring: None,
-            red_floor: None,
+            turn_floor: None,
             planned: 0,
             folds: Vec::new(),
             report_pulls: BTreeMap::new(),
@@ -5962,9 +5988,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if self.remaining == 0 {
             return Err(crate::pass::ShareSpent("poll request budget exhausted".into()).into());
         }
-        if self.red_floor.is_some_and(|floor| self.remaining <= floor) {
+        if self.turn_floor.is_some_and(|floor| self.remaining <= floor) {
             return Err(
-                crate::pass::ShareSpent("red-check turn reached its request floor".into()).into(),
+                crate::pass::ShareSpent("priority turn reached its request floor".into()).into(),
             );
         }
         self.remaining -= 1;
@@ -5972,9 +5998,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     }
 
     /// One write's request. A write that starts must finish its operation,
-    /// so it lifts the red-check floor ([`Pass::red_floor`]).
+    /// so it lifts the priority turn's floor ([`Pass::turn_floor`]).
     fn spend_write(&mut self) -> Result<()> {
-        self.red_floor = None;
+        self.turn_floor = None;
         self.spend()?;
         self.writes += 1;
         Ok(())
@@ -9263,10 +9289,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         &mut self,
         repo: &str,
         number: u64,
-        (merge_only, red_only): (bool, bool),
+        (merge_only, priority): (bool, Option<PriorityTurn>),
         required: &mut BTreeMap<String, (Vec<Value>, bool)>,
     ) -> Result<(String, bool, Option<Wait>, Option<Stepped>)> {
         let (owner, name) = repo.split_once('/').context("repository")?;
+        let red_only = priority == Some(PriorityTurn::RedCheck);
+        let review_only = priority == Some(PriorityTurn::Review);
         // The marker decides what is written, so a pass that applies reads it
         // whole and as it is, not from cached pages a 304 may leave standing.
         // A stop must be read before the label: needs-human labels before it
@@ -9276,8 +9304,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // labels here, or after them, so a new stop with no label reads them
         // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
         let mut pull = self.read_pull(owner, name, number)?;
-        if red_only && text(&pull, "/author/login") != self.config.bot {
-            return Err(red_checks::RedSkip("fresh PR author is not the configured bot").into());
+        if priority.is_some() && text(&pull, "/author/login") != self.config.bot {
+            return Err(PrioritySkip("fresh PR author is not the configured bot").into());
+        }
+        if review_only {
+            self.review_turn_candidate(repo, number, &pull)?;
         }
         if self.config.policy.pull.is_some()
             && (is_held(&pull) || labelled(&pull) || review_hold(self.config, &pull).is_some())
@@ -9308,7 +9339,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         let mut intake =
             ordinary_reviews(self.config, repo) && self.review_intake.pulls < reviews::INTAKE_PULLS;
-        if intake && !red_only {
+        if intake && priority.is_none() {
             self.review_intake.pulls += 1;
         }
         let mut comments = if merge_only {
@@ -9335,7 +9366,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             && stale::stopped_at(&marker, &comments)
                 .is_none_or(|at| self.now - at < time::Duration::seconds(STOP_WRITES_SECONDS))
         {
-            pull = self.read_pull(owner, name, number)?;
+            let fresh = self.read_pull(owner, name, number)?;
+            if review_only {
+                if fresh["headRefOid"] != pull["headRefOid"] {
+                    return Err(
+                        PrioritySkip("PR head changed while reading the round ledger").into(),
+                    );
+                }
+                self.review_turn_candidate(repo, number, &fresh)?;
+            }
+            pull = fresh;
         }
         // The open list was read at the start of the repository's walk, which
         // can be minutes ago: a pull request merged or closed since then gets
@@ -9350,33 +9390,51 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 None,
             ));
         }
-        // A search hit can be stale. Check the ledger and live CI before the
+        // A search hit can be stale. Check the ledger before the
         // ordinary decision path does anything (including draft/review work).
-        if red_only {
+        if priority.is_some() {
             let head = text(&pull, "/headRefOid");
             if head.is_empty()
                 || !text(&pull, "/baseRepository/nameWithOwner").eq_ignore_ascii_case(repo)
                 || pull["number"].as_u64() != Some(number)
                 || text(&pull, "/author/login") != self.config.bot
             {
-                return Err(
-                    red_checks::RedSkip("fresh PR identity does not match search result").into(),
-                );
+                return Err(PrioritySkip("fresh PR identity does not match search result").into());
             }
             // Removing the stop label resets the rounds even on this head.
             // Keep the marker's identity for claims made from that reset.
             if marker.sha.as_deref() == Some(head) && (!marker.stopped || labelled(&pull)) {
-                return Err(red_checks::RedSkip("current head already has a round marker").into());
+                return Err(PrioritySkip("current head already has a round marker").into());
             }
             if earliest_claim(&comments, &self.config.bot, &claim_from(&marker)).is_some() {
-                return Err(red_checks::RedSkip("an existing round claim holds this PR").into());
+                return Err(PrioritySkip("an existing round claim holds this PR").into());
+            }
+            if review_only
+                && !marker.stopped
+                && (marker.diagnosed || marker.rounds >= self.config.policy.fix_rounds())
+            {
+                return Err(PrioritySkip("fix rounds exhausted").into());
             }
             if let Some(why) = self.prior_fix_running(&marker, head)? {
-                return Err(red_checks::RedSkip(why).into());
+                return Err(PrioritySkip(why).into());
             }
+        }
+        let priority_review_run = if review_only {
+            Some(self.pull_review_run(repo, &pull)?)
+        } else {
+            None
+        };
+        let priority_review = if let Some(run) = &priority_review_run {
+            Some(self.review_turn_verdict(&pull, run.as_ref())?)
+        } else {
+            None
+        };
+        // Keep the evidence independently of the mutable PR enrichment below.
+        let priority_review = priority_review.cloned();
+        if red_only {
             self.more_checks(owner, name, number, &mut pull)?;
             if !truncated(&pull).is_empty() {
-                return Err(red_checks::RedSkip("fresh PR facts are incomplete").into());
+                return Err(PrioritySkip("fresh PR facts are incomplete").into());
             }
             let (base_required, queued) = self.base_checks(repo, &pull, required)?;
             if self
@@ -9384,9 +9442,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 .failed
                 .is_empty()
             {
-                return Err(
-                    red_checks::RedSkip("no current failed or overdue pending check").into(),
-                );
+                return Err(PrioritySkip("no current failed or overdue pending check").into());
             }
             if intake {
                 self.review_intake.pulls += 1;
@@ -9413,7 +9469,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             && is_harness(&pull, self.config)
             && !is_held(&pull)
             && !labelled(&pull)
-            && let Some(result) = self.dependency_hold(repo, number, &pull, &comments)?
+            && let Some(result) =
+                self.dependency_hold(repo, number, &pull, &comments, review_only)?
         {
             return Ok(result);
         }
@@ -9427,7 +9484,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         if publication_checks.is_none()
             && intake
-            && let Some(result) = self.ordinary_review(repo, &pull, &comments, &marker)?
+            && let Some(result) =
+                self.ordinary_review(repo, &pull, &comments, &marker, review_only)?
         {
             return Ok(result);
         }
@@ -9565,16 +9623,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         };
         // Kept to the fields the check reads: the cache is kept between passes.
         // Not read for a labelled pull request, as the fix run is not.
-        let review_run = match review_run_id(&pull, self.config) {
-            Some(run) if !labelled(&pull) => Some(
-                self.get_url(
-                    &format!("{API_ROOT}repos/{repo}/actions/runs/{run}"),
-                    slim_run,
-                    false,
-                )?
-                .0,
-            ),
-            _ => None,
+        let review_run = match priority_review_run {
+            Some(run) => run,
+            None => self.pull_review_run(repo, &pull)?,
         };
         let failed = fix_run
             .as_ref()
@@ -9916,6 +9967,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // one, and only where the step is taken. A read that fails is said
         // in its place, so that it cannot hold the round or the stop.
         let fix_rounds = self.config.policy.fix_rounds();
+        if review_only && (decision.action != "fix" || decision.round > Some(fix_rounds)) {
+            return Err(PrioritySkip("no ordinary fix round eligible").into());
+        }
         let diagnostic = match decision.action {
             "fix" => decision.round > Some(fix_rounds),
             "needs-human" => marker.diagnosed && !marker.stopped,
@@ -9940,6 +9994,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             && !self.config.policy.review_pools.is_empty()
             && matches!(decision.action, REVIEW | REVIEW_RERUN);
         let caps = self.caps.zip(kind).filter(|_| !deferred);
+        if review_only && caps.is_some_and(|(caps, kind)| caps.full(kind)) {
+            return Err(PrioritySkip("dispatch capped").into());
+        }
         let held = caps.and_then(|(caps, kind)| caps.check(kind));
         let (capped, before) = (held.is_some(), self.writes);
         let supervisor_empty_fix = self.config.policy.supervisor_holds
@@ -9974,6 +10031,16 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // on since the read above stops it too.
         let hold = if writing {
             self.read_pull(owner, name, number).and_then(|mut p| {
+                if let Some(review) = &priority_review {
+                    self.review_turn_candidate(repo, number, &p)?;
+                    if p["headRefOid"] != head || p["baseRefName"] != base {
+                        return Err(PrioritySkip("PR head or base changed before the fix").into());
+                    }
+                    let run = self.pull_review_run(repo, &p)?;
+                    if self.review_turn_verdict(&p, run.as_ref())? != review {
+                        return Err(PrioritySkip("formal review changed before the fix").into());
+                    }
+                }
                 if is_held(&p) {
                     return Ok(Some(format!("labelled {HOLD_LABEL}")));
                 }
@@ -10139,6 +10206,14 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 .ok()
                 .and_then(Option::as_ref)
                 .is_some_and(|d| d.starts_with("not "));
+        if review_only
+            && self.writes == before
+            && done
+                .as_ref()
+                .is_ok_and(|done| done.as_ref().is_some_and(|d| d.starts_with("not ")))
+        {
+            return Err(PrioritySkip("fix was not started").into());
+        }
         if let Some((caps, kind)) = caps
             && !capped
             && !selection_refused
@@ -10457,12 +10532,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         &mut self,
         repo: &str,
         open: Vec<Value>,
-        red_floor: Option<usize>,
+        priority: Option<(PriorityTurn, usize)>,
         outcome: &mut Outcome,
     ) -> Result<()> {
-        let red_only = red_floor.is_some();
+        let kind = priority.map(|(turn, _)| turn.name());
         let repo_key = repo.to_ascii_lowercase();
-        if !red_only && self.config.policy.maintainer_report.is_some() {
+        if priority.is_none() && self.config.policy.maintainer_report.is_some() {
             for p in &open {
                 if let Some(number) = p["number"].as_u64()
                     && !outcome.decided.contains(&(repo_key.clone(), number))
@@ -10517,7 +10592,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         numbers.sort_unstable();
         // Read whether or not a head waits for a review: a run of a head
         // pushed over since, or of a pull request closed, still takes a slot.
-        if !red_only {
+        if priority.is_none() {
             self.count_reviews(repo, outcome);
         }
         let mut required = BTreeMap::new();
@@ -10540,7 +10615,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             {
                 continue;
             }
-            if !red_only && changed.is_some_and(|changed| !changed.contains(&number)) {
+            if priority.is_none() && changed.is_some_and(|changed| !changed.contains(&number)) {
                 *outcome
                     .unchanged
                     .entry(repo.to_ascii_lowercase())
@@ -10548,22 +10623,23 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 continue;
             }
             // Decided from its listing, it costs no share.
-            let quiet = (!red_only && !merge_only && !left.contains_key(&number))
+            let quiet = (priority.is_none() && !merge_only && !left.contains_key(&number))
                 .then(|| self.quiet_replay(repo, number, listings.get(&number).copied()))
                 .flatten();
-            if red_floor
-                .is_some_and(|floor| self.remaining.saturating_sub(floor) < PULL_SHARE_MARGIN)
+            if let Some((turn, floor)) = priority
+                && self.remaining.saturating_sub(floor) < PULL_SHARE_MARGIN
             {
                 outcome.lines.push(format!(
-                    "{repo}#{number} red-check skip: request share spent"
+                    "{repo}#{number} {} skip: request share spent",
+                    turn.name()
                 ));
                 continue;
             }
             if quiet.is_none() && !self.share_allows(repo, Some(number)) {
-                if red_only {
-                    outcome.lines.push(format!(
-                        "{repo}#{number} red-check skip: request share spent"
-                    ));
+                if let Some(kind) = kind {
+                    outcome
+                        .lines
+                        .push(format!("{repo}#{number} {kind} skip: request share spent"));
                     continue;
                 }
                 break;
@@ -10580,10 +10656,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 }
                 (None, Some(quiet)) => Ok(quiet),
                 (None, None) => {
-                    self.red_floor = red_floor;
-                    let read = self.pull(repo, number, (merge_only, red_only), &mut required);
-                    self.red_floor = None;
-                    if !red_only {
+                    self.turn_floor = priority.map(|(_, floor)| floor);
+                    let read = self.pull(
+                        repo,
+                        number,
+                        (merge_only, priority.map(|(turn, _)| turn)),
+                        &mut required,
+                    );
+                    self.turn_floor = None;
+                    if priority.is_none() {
                         self.quiet_record(repo, number, listings.get(&number).copied(), &read);
                     }
                     read
@@ -10592,6 +10673,14 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             // A round's claim made its reads under way ([`Self::claim`]).
             self.rest.under_way(false);
             match read {
+                Ok((line, _, _, ref stepped))
+                    if priority.is_some_and(|(turn, _)| turn == PriorityTurn::Review)
+                        && stepped.as_ref().is_none_or(|step| step.action != "fix") =>
+                {
+                    outcome
+                        .lines
+                        .push(format!("{repo}#{number} review-turn skip: {line}"));
+                }
                 Ok((line, flying, wait, stepped)) => {
                     outcome.decided.insert((repo.to_ascii_lowercase(), number));
                     if let Some(p) = self.report_pulls.get_mut(&(repo.to_owned(), number))
@@ -10613,18 +10702,19 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 }
                 Err(error) if crate::pass::budget_spent(&error) => {
                     self.stop_at(repo, Some(number));
-                    if red_only {
+                    if let Some(kind) = kind {
                         outcome
                             .lines
-                            .push(format!("{repo}#{number} red-check skip: {error:#}"));
+                            .push(format!("{repo}#{number} {kind} skip: {error:#}"));
                         continue;
                     }
                     break;
                 }
-                Err(error) if error.is::<red_checks::RedSkip>() => {
+                Err(error) if error.is::<PrioritySkip>() => {
+                    let kind = kind.unwrap_or("priority");
                     outcome
                         .lines
-                        .push(format!("{repo}#{number} red-check skip: {error}"));
+                        .push(format!("{repo}#{number} {kind} skip: {error}"));
                 }
                 Err(error) => {
                     outcome.undecided.insert(repo.to_ascii_lowercase());
@@ -10954,7 +11044,10 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         outcome.error("pull requests: approved search", &error);
     }
     if policy.red_checks.is_some() {
-        pass.red_checks(&pr_follow, &missing, &mut outcome);
+        pass.priority_turn(PriorityTurn::RedCheck, &pr_follow, &missing, &mut outcome);
+    }
+    if policy.review_turn.is_some() {
+        pass.priority_turn(PriorityTurn::Review, &pr_follow, &missing, &mut outcome);
     }
     // The repositories the pass's share left unwalked, or walked in part.
     let mut waiting = BTreeSet::new();
@@ -14973,6 +15066,7 @@ mod tests {
         /// on, if one does.
         hold_after: Option<usize>,
         late_review_requests: Option<Value>,
+        /// Fields that change on a second read of the fixture PR at #470.
         late_pull_fields: Option<Value>,
         pull_reads: RefCell<usize>,
         /// The `mergeQueue` the report's query gives, null for a read that
@@ -15205,7 +15299,8 @@ mod tests {
             {
                 pull["reviewRequests"] = requests.clone();
             }
-            if *self.pull_reads.borrow() > 1
+            if number == 470
+                && *self.pull_reads.borrow() > 1
                 && let Some(fields) = self.late_pull_fields.as_ref().and_then(Value::as_object)
             {
                 for (key, value) in fields {
@@ -25703,7 +25798,11 @@ mod tests {
             "startedAt":"2026-10-11T19:59:59Z"});
         let initial = pull("pull-470", json!({"contexts":{"ci":overdue}}));
         let green = pull("pull-470", json!({}));
-        for (action, red_only) in [("fix", true), ("fix", false), ("needs-human", false)] {
+        for (action, priority) in [
+            ("fix", Some(PriorityTurn::RedCheck)),
+            ("fix", None),
+            ("needs-human", None),
+        ] {
             for (case, late) in [
                 ("unchanged", json!({})),
                 ("green", json!({"commits":green["commits"]})),
@@ -25740,7 +25839,7 @@ mod tests {
                     ..Pass::new(&fake, &fake, &cfg, now())
                 };
                 let (line, _, _, step) = pass
-                    .pull(REPO, 470, (false, red_only), &mut BTreeMap::new())
+                    .pull(REPO, 470, (false, priority), &mut BTreeMap::new())
                     .unwrap();
                 let step = step.unwrap();
                 assert_eq!(step.action, action, "{case}: {line}");
@@ -25799,7 +25898,7 @@ mod tests {
             ),
         ] {
             fake.page(
-                &red_checks::search_path(&cfg, status),
+                &priority_turn::search_path(&cfg, &format!("status:{status}")),
                 None,
                 None,
                 json!({"items":items,"total_count":items.len(),"incomplete_results":false}),
@@ -25958,7 +26057,12 @@ mod tests {
                 )
             };
             let mut outcome = Outcome::default();
-            pass.red_checks(&follow, &BTreeSet::new(), &mut outcome);
+            pass.priority_turn(
+                PriorityTurn::RedCheck,
+                &follow,
+                &BTreeSet::new(),
+                &mut outcome,
+            );
             let first_line = outcome.lines.iter().find(|l| l.starts_with(REPO)).unwrap();
             starts.insert(first_line.split_whitespace().next().unwrap().to_owned());
             assert!(
@@ -25977,13 +26081,13 @@ mod tests {
         // initial read but crosses the floor during claim read-back finishes
         // the round, having posted a claim.
         fake.page(
-            &red_checks::search_path(&cfg, "failure"),
+            &priority_turn::search_path(&cfg, "status:failure"),
             None,
             None,
             json!({"items":[item(REPO, 471)],"total_count":1,"incomplete_results":false}),
         );
         fake.page(
-            &red_checks::search_path(&cfg, "pending"),
+            &priority_turn::search_path(&cfg, "status:pending"),
             None,
             None,
             json!({"items":[],"total_count":0,"incomplete_results":false}),
@@ -26008,7 +26112,12 @@ mod tests {
                 ..Pass::new(&fake, &fake, &cfg, now())
             };
             let mut outcome = Outcome::default();
-            pass.red_checks(&follow, &BTreeSet::new(), &mut outcome);
+            pass.priority_turn(
+                PriorityTurn::RedCheck,
+                &follow,
+                &BTreeSet::new(),
+                &mut outcome,
+            );
             assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
             assert_eq!(pass.dispatched, dispatched, "{:?}", outcome.lines);
             assert!(pass.cut.is_none());
@@ -26565,6 +26674,256 @@ mod tests {
     }
 
     #[test]
+    fn review_turn_prioritizes_only_actionable_change_requests() {
+        let early = ["cgwalters-forge/a0", "cgwalters-forge/a1"];
+        let followed = [early[0].into(), early[1].into(), REPO.into()];
+        let change = |head| review("CHANGES_REQUESTED", user("cgwalters"), head, "fix this");
+        let approval = later(review("APPROVED", user("cgwalters"), HEAD, "fixed"));
+        let changed = |reviews| json!({"reviews": {"nodes": reviews, "pageInfo": {"hasPreviousPage": false}}});
+        let item = |repo, number| json!({"repository_url":format!("{API_ROOT}repos/{repo}"), "pull_request":{}, "number":number, "user":{"login":BOT}});
+        for (case, skip) in [
+            ("off", ""),
+            ("fresh", ""),
+            ("combined", ""),
+            ("operator before job", ""),
+            ("unproven job approval", ""),
+            ("job fresh", ""),
+            ("job unproven", "not an eligible verdict"),
+            ("stale", "no fresh formal"),
+            ("superseded", "no fresh formal"),
+            ("held", "PR is held"),
+            ("in flight", "still in flight"),
+            ("exhausted", "fix rounds exhausted"),
+            ("head changed", "head or base changed"),
+            ("verdict changed", "no fresh formal"),
+            ("dispatch capped", "dispatch capped"),
+            ("false positives", "request share spent"),
+        ] {
+            let mut fake = github();
+            let mut cfg = config();
+            if case != "off" {
+                let pr: PrOptions = serde_json::from_value(json!({"reviewTurn": {}})).unwrap();
+                pr.apply(&mut cfg.policy);
+            }
+            let combined = case == "combined";
+            cfg.policy.action_first = combined;
+            let mut items = vec![item(REPO, 470), item("elsewhere/unfollowed", 470)];
+            for (index, repo) in early.into_iter().enumerate() {
+                let mut open = Vec::new();
+                for n in 1..=if combined { 1 } else { 49 } {
+                    let number = 100 + index as u64 * 100 + n;
+                    let mut idle = pull("pull-470", json!({"number": number}));
+                    idle["baseRepository"]["nameWithOwner"] = json!(repo);
+                    idle["reviews"]["nodes"] = json!([]);
+                    idle["comments"]["nodes"] = json!([]);
+                    idle["comments"]["pageInfo"]["hasPreviousPage"] = json!(false);
+                    fake.pulls.insert(number, idle);
+                    open.push(json!({"number": number, "user": {"login": BOT}}));
+                    if case == "false positives" {
+                        items.push(item(repo, number));
+                    }
+                }
+                for (path, body) in [
+                    ("pulls?state=open&per_page=100", json!(open)),
+                    ("events?per_page=100", json!([])),
+                    ("rules/branches/main", fixture("rules")),
+                    ("branches/main", json!({"name":"main","protected":false})),
+                ] {
+                    fake.page(&format!("repos/{repo}/{path}"), None, None, body);
+                }
+            }
+            let fields = match case {
+                "stale" => changed(vec![change("older")]),
+                "superseded" => changed(vec![change(HEAD), later(change("older"))]),
+                "job fresh" | "job unproven" => {
+                    changed(vec![review("CHANGES_REQUESTED", job(), HEAD, "fix this")])
+                }
+                "operator before job" => changed(vec![
+                    change(HEAD),
+                    later(review("CHANGES_REQUESTED", job(), HEAD, "fix this too")),
+                ]),
+                "unproven job approval" => changed(vec![
+                    change(HEAD),
+                    later(review("APPROVED", job(), HEAD, "no provenance")),
+                ]),
+                "false positives" => changed(vec![]),
+                _ => changed(vec![change(HEAD)]),
+            };
+            if case == "job unproven" {
+                fake.page(
+                    &format!("repos/{REPO}/actions/runs/{REVIEW_RUN}"),
+                    None,
+                    None,
+                    job_run(&json!("older")),
+                );
+            }
+            let mut candidate = pull("pull-470", fields);
+            if case == "held" {
+                candidate["labels"]["nodes"] = json!([{"name": HOLD_LABEL}]);
+            }
+            fake.late_pull_fields = match case {
+                "head changed" => {
+                    let mut fields = changed(vec![change("newer")]);
+                    fields["headRefOid"] = json!("newer");
+                    Some(fields)
+                }
+                "verdict changed" => Some(changed(vec![change(HEAD), approval.clone()])),
+                _ => None,
+            };
+            fake.pulls.insert(470, candidate);
+            if combined {
+                let mut approved = pull("pull-470", changed(vec![approval.clone()]));
+                approved["number"] = json!(471);
+                approved["id"] = json!("pull-471");
+                let mut stale = pull("pull-470", changed(vec![change("older")]));
+                stale["number"] = json!(472);
+                stale["id"] = json!("pull-472");
+                fake.pulls.insert(471, approved);
+                fake.pulls.insert(472, stale);
+                items.push(item(REPO, 472));
+                fake.page(
+                    &action_first::approved_path(&cfg), None, None,
+                    json!({"items": [item(REPO, 471)], "total_count": 1, "incomplete_results": false}),
+                );
+                fake.page(
+                    &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+                    None,
+                    None,
+                    json!([470, 471, 472].map(|n| json!({"number":n,"user":{"login":BOT}}))),
+                );
+                for n in [471, 472] {
+                    fake.page(
+                        &format!("repos/{REPO}/issues/{n}/comments?per_page=100"),
+                        None,
+                        None,
+                        json!([]),
+                    );
+                }
+            }
+            let marker = match case {
+                "in flight" => Some(json!({"sha":"older","rounds":1,"run":8})),
+                "exhausted" => Some(json!({"sha":"older","rounds":cfg.policy.fix_rounds()})),
+                _ => None,
+            };
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None,
+                None,
+                json!(marker.into_iter().map(|marker| json!({"id":10,"user":{"login":BOT},"body":marker_body(&marker, "a round")})).collect::<Vec<_>>()),
+            );
+            fake.page(
+                &format!("repos/{}/actions/runs/8", cfg.dispatch_repo),
+                None,
+                None,
+                json!({"status":"in_progress"}),
+            );
+            let search = priority_turn::search_path(&cfg, "review:changes_requested");
+            fake.page(
+                &search,
+                None,
+                None,
+                json!({"items":items,"total_count":items.len(),"incomplete_results":false}),
+            );
+
+            let dispatcher = Fake::default();
+            let dispatching = ActionShare::new(&dispatcher, usize::MAX);
+            let shared = ActionShare::new(&fake, if combined { 160 } else { 82 });
+            let caps = caps::Caps::new(caps::Limits {
+                dispatch: (case == "dispatch capped").then_some(0),
+                ..caps::Limits::default()
+            });
+            let outcome = run_capped_after_direction(
+                &shared,
+                &shared,
+                &cfg,
+                State {
+                    share_cursor: Some(early[0].into()),
+                    ..State::default()
+                },
+                (&[], &followed),
+                applying(&dispatching),
+                Some(&caps),
+                now(),
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            let first = &outcome.steps[0];
+            if combined {
+                assert_eq!(
+                    (first.number, first.action, first.ran),
+                    (471, "merge", true),
+                    "{:?}",
+                    outcome.lines
+                );
+                let fix = &outcome.steps[1];
+                assert_eq!(
+                    (fix.number, fix.action, fix.ran),
+                    (470, "fix", true),
+                    "{:?}",
+                    outcome.lines
+                );
+                assert_eq!(outcome.dispatched, 1, "{:?}", outcome.lines);
+                assert!(
+                    outcome
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("#472 review-turn skip:")),
+                    "{:?}",
+                    outcome.lines
+                );
+                assert!(
+                    outcome
+                        .steps
+                        .iter()
+                        .any(|step| step.number == 472 && step.action != "fix"),
+                    "{:?}",
+                    outcome.lines
+                );
+            } else if matches!(
+                case,
+                "fresh" | "job fresh" | "operator before job" | "unproven job approval"
+            ) {
+                assert_eq!(
+                    (first.repository.as_str(), first.number, first.action),
+                    (REPO, 470, "fix")
+                );
+                assert!(first.ran, "{:?}", outcome.lines);
+                assert_eq!(outcome.dispatched, 1);
+                assert_eq!(outcome.steps.iter().filter(|s| s.number == 470).count(), 1);
+            } else {
+                assert_eq!(first.repository, early[0], "{case}: {:?}", outcome.lines);
+                assert_eq!(outcome.dispatched, 0, "{case}: {:?}", outcome.lines);
+                assert!(
+                    fake.writes.borrow().is_empty(),
+                    "{case}: {:?}",
+                    fake.writes.borrow()
+                );
+                assert!(!outcome.decided.contains(&(REPO.into(), 470)));
+                if !skip.is_empty() {
+                    assert!(
+                        outcome
+                            .lines
+                            .iter()
+                            .any(|l| l.contains("review-turn skip:") && l.contains(skip)),
+                        "{case}: {:?}",
+                        outcome.lines
+                    );
+                }
+            }
+            assert_eq!(
+                fake.sent
+                    .borrow()
+                    .iter()
+                    .filter(|(url, _)| url.ends_with(&search))
+                    .count(),
+                usize::from(case != "off")
+            );
+        }
+    }
+
+    #[test]
     fn action_first_discovery_keeps_a_decision_margin_and_resumes() {
         let fake = github();
         let cfg = config();
@@ -27086,7 +27445,7 @@ mod tests {
             review_unread: None,
             deferred: Vec::new(),
             deferring: None,
-            red_floor: None,
+            turn_floor: None,
             planned: 0,
             folds: Vec::new(),
             report_pulls: BTreeMap::new(),

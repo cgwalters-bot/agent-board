@@ -151,6 +151,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
         ("pr.rebaseRounds", Positive),
         ("pr.staleDays", Positive),
         ("pr.mergeQueue", Present),
+        ("pr.reviewTurn", Present),
         ("pr.reviewPools", Nonempty),
         ("pr.reviewDispatchRepositories", Nonempty),
         ("pr.maintainers", Nonempty),
@@ -213,6 +214,10 @@ mod tests {
         let github = classify(&json!({})).unwrap();
         assert!(github.unconfigured.contains("openPrCap"));
         assert!(github.unconfigured.contains("pr.agentRecovery"));
+        assert!(github.unconfigured.contains("pr.reviewTurn"));
+        let configured = classify(&json!({"pr": {"reviewTurn": {}}})).unwrap();
+        assert!(!configured.unconfigured.contains("pr.reviewTurn"));
+        assert!(!configured.disabled.contains("pr.reviewTurn"));
         assert!(github.unconfigured.contains("promote.botAuthorEmails"));
         for (emails, disabled) in [
             (json!([]), true),

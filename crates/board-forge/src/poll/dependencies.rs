@@ -218,6 +218,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         number: u64,
         pull: &Value,
         comments: &[Value],
+        review_turn: bool,
     ) -> Result<Option<PullStep>> {
         let Some(Admission {
             previous,
@@ -227,6 +228,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         else {
             return Ok(None);
         };
+        if review_turn {
+            return Err(PrioritySkip("dependency hold belongs to the ordinary walk").into());
+        }
         let mut held = previous
             .as_ref()
             .map(|(_, h)| h.clone())
