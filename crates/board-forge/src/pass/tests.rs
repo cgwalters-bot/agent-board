@@ -9597,6 +9597,17 @@ fn action_first_merges_two_approved_prs_in_repository_25_before_drafts_and_upstr
     let mut upstream_forge = Forge::new(None, false);
     upstream_forge.replay.requests = forge.replay.requests.clone();
     let upstream_report = apply(&upstream_forge, &upstream_cfg);
+    let clock_start = upstream_report
+        .lines
+        .iter()
+        .find_map(|l| l.strip_prefix("pull requests: clock rotation start point is "))
+        .expect("cache-only walk should log its start");
+    let upstream = &repositories[..10];
+    let start = upstream
+        .iter()
+        .position(|repo| repo == clock_start)
+        .unwrap();
+    let after = |reads: usize| Some(upstream[(start + reads) % upstream.len()].as_str());
     assert!(
         upstream_report
             .lines
@@ -9612,7 +9623,7 @@ fn action_first_merges_two_approved_prs_in_repository_25_before_drafts_and_upstr
             .unwrap()
             .share_cursor
             .as_deref(),
-        Some("aaa/upstream03")
+        after(2)
     );
     assert!(
         upstream_forge
@@ -9632,7 +9643,7 @@ fn action_first_merges_two_approved_prs_in_repository_25_before_drafts_and_upstr
     .unwrap();
     assert_eq!(
         next.state.as_ref().unwrap().share_cursor.as_deref(),
-        Some("aaa/upstream05")
+        after(4)
     );
 
     // Discovery approval is not authority. Fresh facts, noMerge and write
@@ -28747,7 +28758,11 @@ fn apply_starts_reviews_by_priority_within_wip() {
         };
         let mode = (Mode::Actions(&own()), limits);
         let now = forge.replay.now;
-        let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+        let state = State {
+            share_cursor: Some("cgwalters-forge/agentic-job".into()),
+            ..State::default()
+        };
+        let report = block(run(&forge, &forge, &config, state, mode, now)).unwrap();
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
         let (said, wrote) = review_steps(&forge, &report);
         assert_eq!(said, lines, "{name}: {:#?}", report.lines);
@@ -28924,8 +28939,8 @@ fn apply_sends_a_review_start_once() {
             8,
             2,
             vec![
-                start("cgwalters-forge/agentic-job#9", "started on claude"),
                 wait.clone(),
+                start("cgwalters-forge/agentic-job#9", "started on claude"),
             ],
             vec!["start cgwalters-forge/agentic-job#9"],
         ),
@@ -28933,7 +28948,7 @@ fn apply_sends_a_review_start_once() {
             "and it holds a slot of wip",
             WIP_BASE + 1,
             2,
-            vec![start("cgwalters-forge/agentic-job#9", &full), wait],
+            vec![wait, start("cgwalters-forge/agentic-job#9", &full)],
             vec![],
         ),
         (
@@ -28941,8 +28956,8 @@ fn apply_sends_a_review_start_once() {
             8,
             15,
             vec![
-                start("cgwalters-forge/agentic-job#9", "started on claude"),
                 person,
+                start("cgwalters-forge/agentic-job#9", "started on claude"),
             ],
             vec!["start cgwalters-forge/agentic-job#9"],
         ),
@@ -28980,8 +28995,8 @@ fn apply_sends_a_review_start_once() {
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
         let (said, wrote) = review_steps(&forge, &report);
         let lines = [
-            start("cgwalters-forge/agentic-job#9", &done),
             start(tracker, &done),
+            start("cgwalters-forge/agentic-job#9", &done),
         ];
         assert_eq!(said, lines, "{name}: {:#?}", report.lines);
         assert!(wrote.is_empty(), "{name}: {wrote:?}");

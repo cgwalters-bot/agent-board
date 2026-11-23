@@ -22,6 +22,8 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry as MapEntry};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub(crate) mod action_first;
+mod red_checks;
+pub use red_checks::RedChecks;
 pub mod approval;
 pub mod bounds;
 pub mod comments;
@@ -364,16 +366,17 @@ pub const FOLD_LIMIT: usize = 20;
 /// What `PULL_QUERY` and `CHECKS_QUERY` read of each check, so a later page
 /// is read as the first one is.
 macro_rules! check_fields {
-    () => {
-        r#"nodes {
+    ($run_age:literal, $status_age:literal) => {
+        concat!(r#"nodes {
         __typename
-        ... on CheckRun { id databaseId name status conclusion detailsUrl checkSuite { app { databaseId } workflowRun { event workflow { databaseId } } } isRequired(pullRequestNumber: $number) }
-        ... on StatusContext { id context state targetUrl description isRequired(pullRequestNumber: $number) }
-      } totalCount pageInfo { hasNextPage endCursor }"#
+        ... on CheckRun { id databaseId name status conclusion detailsUrl "#, $run_age, r#"checkSuite { app { databaseId } workflowRun { event workflow { databaseId } } } isRequired(pullRequestNumber: $number) }
+        ... on StatusContext { id context state targetUrl description "#, $status_age, r#"isRequired(pullRequestNumber: $number) }
+      } totalCount pageInfo { hasNextPage endCursor }"#)
     };
 }
 
-pub(crate) const PULL_QUERY: &str = concat!(
+macro_rules! pull_query {
+    ($($age:literal),+) => { concat!(
     r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -394,12 +397,16 @@ pub(crate) const PULL_QUERY: &str = concat!(
       reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
       series: commits(first: 100) { nodes { commit { oid messageHeadline } } pageInfo { hasNextPage } }
       commits(last: 1) { nodes { commit { oid committedDate message statusCheckRollup { state contexts(first: 100) { "#,
-    check_fields!(),
+    check_fields!($($age),+),
     r#" } } } } }
     }
   }
 }"#
-);
+) };
+}
+
+pub(crate) const PULL_QUERY: &str = pull_query!("", "");
+const TIMED_PULL_QUERY: &str = pull_query!("startedAt ", "createdAt ");
 
 /// What one list query says of a repository's open pull requests labelled
 /// [`LABEL`], so that those the pass would only skip take no reads of their
@@ -448,17 +455,22 @@ const STOP_WRITES_SECONDS: i64 = 60;
 /// The rest of a head's checks, a page after `$after` (cgwalters-forge/agent-board#129):
 /// re-running a review adds a second set of check runs, which can take a pull
 /// request past one page.
-const CHECKS_QUERY: &str = concat!(
+macro_rules! checks_query {
+    ($($age:literal),+) => { concat!(
     r#"query($owner: String!, $name: String!, $number: Int!, $after: String!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100, after: $after) { "#,
-    check_fields!(),
+    check_fields!($($age),+),
     r#" } } } } }
     }
   }
 }"#
-);
+) };
+}
+
+const CHECKS_QUERY: &str = checks_query!("", "");
+const TIMED_CHECKS_QUERY: &str = checks_query!("startedAt ", "createdAt ");
 /// The most pages of checks read for one head, the first included. Past them
 /// the pull request waits, as it did before any were read on.
 const CHECK_PAGES: usize = 5;
@@ -588,6 +600,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "ownerBranches",
     "ownSpaceOnly",
     "actionFirst",
+    "redChecks",
     "quietWaits",
     "foldRounds",
     "reviewPools",
@@ -683,6 +696,9 @@ pub struct PollPolicy {
     /// Prevent upstream/draft reads from starving ready own-space merges.
     /// Off by default; discovery and actions retain the poll's request bounds.
     pub action_first: bool,
+    /// Prevent a spent walk from indefinitely deferring failed bot PRs.
+    /// Off by default; discovery stays inside the existing PR authority and caps.
+    pub red_checks: Option<RedChecks>,
     /// Prevent re-reading, pass after pass, pull requests unchanged since a
     /// read that left them waiting on the operator alone ([`quiet`]). On unless
     /// the config sets it to `false`; each is read whole again within
@@ -1175,6 +1191,8 @@ pub struct PrOptions {
     pub supervisor_holds: bool,
     #[serde(default)]
     pub action_first: bool,
+    #[serde(default)]
+    pub red_checks: Option<RedChecks>,
     /// On unless set to `false` (agent-board#1019).
     #[serde(default)]
     pub quiet_waits: Option<bool>,
@@ -1337,6 +1355,9 @@ impl PrOptions {
                 );
             }
         }
+        if let Some(red) = self.red_checks {
+            red.validate(at)?;
+        }
         ensure!(
             self.stale_days <= stale::STALE_DAYS_LIMIT,
             "{at}staleDays is not 0 to {}",
@@ -1360,6 +1381,7 @@ impl PrOptions {
             hold_dependencies,
             supervisor_holds,
             action_first,
+            red_checks,
             quiet_waits,
             check_reruns,
             unstall,
@@ -1386,6 +1408,7 @@ impl PrOptions {
         policy.hold_dependencies = hold_dependencies;
         policy.hold_missing_data = hold_missing_data;
         policy.action_first = action_first;
+        policy.red_checks = red_checks;
         policy.quiet_waits = quiet_waits.unwrap_or(true);
         policy.supervisor_holds = supervisor_holds;
         policy.check_reruns = check_reruns;
@@ -1570,6 +1593,7 @@ impl PollPolicy {
             fix_plans: false,
             own_space_only: false,
             action_first: false,
+            red_checks: None,
             quiet_waits: false,
             hold_dependencies: false,
             agent_recovery: false,
@@ -1831,9 +1855,11 @@ fn walk<'r>(follow: &BTreeSet<&'r String>, cursor: Option<&str>) -> Vec<(&'r Str
         Some(None) => (cursor.clone(), None),
         None => (None, None),
     };
-    let (before, after): (Vec<&String>, Vec<&String>) = follow
+    let (mut before, mut after): (Vec<&String>, Vec<&String>) = follow
         .iter()
         .partition(|r| at.as_ref().is_some_and(|c| r.to_ascii_lowercase() < *c));
+    before.sort_by_cached_key(|r| r.to_ascii_lowercase());
+    after.sort_by_cached_key(|r| r.to_ascii_lowercase());
     let mut turns: Vec<(&String, Turn)> = Vec::new();
     let mut last = None;
     for repo in after.into_iter().chain(before) {
@@ -1847,6 +1873,35 @@ fn walk<'r>(follow: &BTreeSet<&'r String>, cursor: Option<&str>) -> Vec<(&'r Str
     }
     turns.extend(last);
     turns
+}
+
+/// Use the high bits of a golden-ratio Weyl sequence, rather than slot mod
+/// count. A fixed stride through slots then sweeps the range even when the
+/// stride and the count share a factor. Call only with a nonempty inventory.
+fn clock_start_index(now: OffsetDateTime, count: usize) -> usize {
+    const GOLDEN_RATIO_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
+    let slot = now
+        .unix_timestamp()
+        .div_euclid(crate::pass::authored::SLOT_MINUTES * 60);
+    let phase = (slot as u64).wrapping_mul(GOLDEN_RATIO_STEP);
+    ((u128::from(phase) * count as u128) >> u64::BITS) as usize
+}
+
+/// A cache-only caller loses both cursors. Vary the first repository by
+/// clock until the caller can carry the actual cut forward.
+fn clock_walk_start(
+    follow: &BTreeSet<&String>,
+    state: &State,
+    now: OffsetDateTime,
+) -> Option<String> {
+    if follow.len() < 2 || state.share_cursor.is_some() || state.action_first_cursor.is_some() {
+        return None;
+    }
+    let mut names: Vec<_> = follow.iter().map(|r| r.to_ascii_lowercase()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let start = clock_start_index(now, names.len());
+    Some(names.swap_remove(start))
 }
 
 /// A share cursor: a repository, or a pull request in one.
@@ -2567,7 +2622,7 @@ pub struct Checks {
 /// false on drafts, so it is not enough alone). A repository that requires
 /// nothing is judged on all its checks.
 pub fn classify_checks(pull: &Value, required: &[Value]) -> Checks {
-    judge_checks(pull, required, false)
+    judge_checks(pull, required, false, None)
 }
 
 /// [`classify_checks`] for a head the poll merges itself: every check on it
@@ -2577,7 +2632,7 @@ pub fn classify_checks(pull: &Value, required: &[Value]) -> Checks {
 /// checks would otherwise let a failed one through (cgwalters-forge/actions#79
 /// merged with its `egress-policy` job failing).
 pub fn classify_all_checks(pull: &Value, required: &[Value]) -> Checks {
-    judge_checks(pull, required, true)
+    judge_checks(pull, required, true, None)
 }
 
 /// Whether a base branch's rules (`GET rules/branches/{b}`) merge through a
@@ -2590,10 +2645,23 @@ fn merge_queued(rules: &Value) -> Result<bool> {
         .any(|r| r["type"] == "merge_queue"))
 }
 
-fn judge_checks(pull: &Value, required: &[Value], every: bool) -> Checks {
+fn judge_checks(
+    pull: &Value,
+    required: &[Value],
+    every: bool,
+    timeout: Option<(RedChecks, OffsetDateTime)>,
+) -> Checks {
     // Name, URL, required flag, state, app, and whether it is the review
     // status (a StatusContext; a check run of that name is an ordinary check).
-    type Check<'a> = (&'a str, Option<&'a str>, bool, &'a str, Option<u64>, bool);
+    type Check<'a> = (
+        &'a str,
+        Option<&'a str>,
+        bool,
+        &'a str,
+        Option<u64>,
+        bool,
+        bool,
+    );
     let all_runs = nodes(
         pull,
         "/commits/nodes/0/commit/statusCheckRollup/contexts/nodes",
@@ -2632,6 +2700,8 @@ fn judge_checks(pull: &Value, required: &[Value], every: bool) -> Checks {
         .filter(|c| !superseded(c))
         .map(|c| {
             let flag = c["isRequired"].as_bool().unwrap_or(false);
+            let expired =
+                |field: &str| timeout.is_some_and(|(red, now)| red.expired(c[field].as_str(), now));
             if c["__typename"] == "CheckRun" {
                 let state = if c["status"] == "COMPLETED" {
                     c["conclusion"].as_str().unwrap_or("")
@@ -2646,12 +2716,21 @@ fn judge_checks(pull: &Value, required: &[Value], every: bool) -> Checks {
                     c.pointer("/checkSuite/app/databaseId")
                         .and_then(Value::as_u64),
                     false,
+                    state == "PENDING" && expired("startedAt"),
                 )
             } else {
                 let name = text(c, "/context");
                 let review = name == REVIEW_CONTEXT;
                 let state = text(c, "/state");
-                (name, c["targetUrl"].as_str(), flag, state, None, review)
+                (
+                    name,
+                    c["targetUrl"].as_str(),
+                    flag,
+                    state,
+                    None,
+                    review,
+                    matches!(state, "PENDING" | "EXPECTED") && expired("createdAt"),
+                )
             }
         })
         .collect();
@@ -2666,7 +2745,7 @@ fn judge_checks(pull: &Value, required: &[Value], every: bool) -> Checks {
                 .and_then(Value::as_u64)
                 .is_none_or(|id| Some(id) == integration)
     };
-    for (name, _, flag, _, integration, _) in &checks {
+    for (name, _, flag, _, integration, _, _) in &checks {
         if *flag && !names.iter().any(|r| matches(r, name, *integration)) {
             names.push(json!({"context": name, "integration_id": integration}));
         }
@@ -2676,16 +2755,22 @@ fn judge_checks(pull: &Value, required: &[Value], every: bool) -> Checks {
     // an explicitly required status remains an independent merge requirement.
     let relevant = checks
         .iter()
-        .filter(|(name, _, _, _, integration, review)| {
+        .filter(|(name, _, _, _, integration, review, _)| {
             (all && !review) || names.iter().any(|r| matches(r, name, *integration))
         });
     let mut out = Checks {
         every,
         ..Checks::default()
     };
-    for (name, url, _, state, _, _) in relevant {
+    for (name, url, _, state, _, _, expired) in relevant {
         if FAILED.contains(state) {
             out.failed.push(((*name).into(), url.map(str::to_owned)));
+        } else if *expired && let Some((red, _)) = timeout {
+            // A pending job has no failure log and cannot be rerun.
+            out.failed.push((
+                format!("{name} (pending for over {}h)", red.pending_hours()),
+                None,
+            ));
         } else if !PASSED.contains(state) {
             out.pending.push((*name).into());
         }
@@ -2694,7 +2779,7 @@ fn judge_checks(pull: &Value, required: &[Value], every: bool) -> Checks {
     for name in names {
         if !checks
             .iter()
-            .any(|(n, _, _, _, integration, _)| matches(&name, n, *integration))
+            .any(|(n, _, _, _, integration, _, _)| matches(&name, n, *integration))
         {
             out.pending.push(context(&name));
         }
@@ -5636,6 +5721,9 @@ struct Pass<'a, R, G> {
     /// decided, which [`Pass::follow`] places.
     deferred: Vec<Deferred>,
     deferring: Option<Deferred>,
+    /// The red-check turn's admission floor: reads stop above it until the
+    /// decision's first write, which then finishes under the pass's bounds.
+    red_floor: Option<usize>,
     /// The review starts and reruns a preview plans, as an applying pass
     /// counts them in `dispatched`.
     planned: usize,
@@ -5792,6 +5880,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             review_unread: None,
             deferred: Vec::new(),
             deferring: None,
+            red_floor: None,
             planned: 0,
             folds: Vec::new(),
             report_pulls: BTreeMap::new(),
@@ -5873,7 +5962,21 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if self.remaining == 0 {
             return Err(crate::pass::ShareSpent("poll request budget exhausted".into()).into());
         }
+        if self.red_floor.is_some_and(|floor| self.remaining <= floor) {
+            return Err(
+                crate::pass::ShareSpent("red-check turn reached its request floor".into()).into(),
+            );
+        }
         self.remaining -= 1;
+        Ok(())
+    }
+
+    /// One write's request. A write that starts must finish its operation,
+    /// so it lifts the red-check floor ([`Pass::red_floor`]).
+    fn spend_write(&mut self) -> Result<()> {
+        self.red_floor = None;
+        self.spend()?;
+        self.writes += 1;
         Ok(())
     }
 
@@ -5895,8 +5998,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
             caps.count(Kind::Write);
         }
-        self.spend()?;
-        self.writes += 1;
+        self.spend_write()?;
         self.previous.clear();
         self.used.clear();
         let (status, response) = client.send(method, &format!("{API_ROOT}{path}"), &body)?;
@@ -5953,8 +6055,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     }
 
     fn mutate(&mut self, mutation: &str, variables: Value) -> Result<()> {
-        self.spend()?;
-        self.writes += 1;
+        self.spend_write()?;
         self.graphql.graphql(mutation, variables)?;
         Ok(())
     }
@@ -6346,9 +6447,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 }
                 caps.count(Kind::Dispatch);
             }
-            self.spend()?;
-            self.writes += 1;
-            Ok(())
+            self.spend_write()
         };
         match github.start(start, admit, |path, body| {
             dispatcher.send("POST", &format!("{API_ROOT}{path}"), body)
@@ -7829,8 +7928,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             return Ok(RE_RUN.into());
         }
         self.writable(&format!("repos/{repo}/"))?;
-        self.spend()?;
-        self.writes += 1;
+        self.spend_write()?;
         let url = format!("{API_ROOT}repos/{repo}/actions/runs/{id}/rerun-failed-jobs");
         if let Some(pool) = &pool {
             self.rest.preview_pool_start(pool);
@@ -8604,7 +8702,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             let after = after.to_owned();
             self.spend()?;
             let data = self.graphql.graphql(
-                CHECKS_QUERY,
+                if self.config.policy.red_checks.is_some() {
+                    TIMED_CHECKS_QUERY
+                } else {
+                    CHECKS_QUERY
+                },
                 json!({"owner": owner, "name": name, "number": number, "after": after}),
             )?;
             let commit = data
@@ -8738,7 +8840,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     fn read_pull(&mut self, owner: &str, name: &str, number: u64) -> Result<Value> {
         self.spend()?;
         let data = self.graphql.graphql(
-            PULL_QUERY,
+            if self.config.policy.red_checks.is_some() {
+                TIMED_PULL_QUERY
+            } else {
+                PULL_QUERY
+            },
             json!({"owner": owner, "name": name, "number": number}),
         )?;
         let mut pull = data
@@ -9091,12 +9197,73 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         Ok(pulls.clone())
     }
 
+    fn base_checks<'r>(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+        required: &'r mut BTreeMap<String, (Vec<Value>, bool)>,
+    ) -> Result<&'r (Vec<Value>, bool)> {
+        use std::collections::btree_map::Entry;
+        let base = text(pull, "/baseRefName");
+        Ok(match required.entry(base.to_owned()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
+                let rules = self.get(&format!("repos/{repo}/rules/branches/{encoded}"))?;
+                let branch = self.get(&format!("repos/{repo}/branches/{encoded}"))?;
+                entry.insert((required_checks(&rules, &branch)?, merge_queued(&rules)?))
+            }
+        })
+    }
+
+    fn check_timeout(&self, pull: &Value) -> Option<RedChecks> {
+        self.config.policy.red_checks.filter(|_| {
+            text(pull, "/author/login") == self.config.bot
+                && self
+                    .config
+                    .ours(text(pull, "/baseRepository/nameWithOwner"))
+        })
+    }
+
+    fn head_checks(&self, pull: &Value, required: &[Value], queued: bool) -> Checks {
+        let timeout = self.check_timeout(pull);
+        judge_checks(pull, required, !queued, timeout.map(|red| (red, self.now)))
+    }
+
+    /// Why a fix started for an earlier head may still be running: it can
+    /// push before it finishes. A dispatch without a run id waits out the
+    /// same window [`started`] gives it, from the marker's time. A stop is
+    /// not a dispatch; any new round claimed from it has its own receipt.
+    fn prior_fix_running(&mut self, marker: &Marker, head: &str) -> Result<Option<&'static str>> {
+        if marker.stopped || marker.sha.is_none() || marker.sha.as_deref() == Some(head) {
+            return Ok(None);
+        }
+        let running = match marker.run {
+            Some(run) => {
+                self.get(&format!(
+                    "repos/{}/actions/runs/{run}",
+                    self.config.dispatch_repo
+                ))?["status"]
+                    != "completed"
+            }
+            // A legacy marker without a time has no window to wait out.
+            None => timestamp(marker.at.as_deref())
+                .is_some_and(|at| (self.now - at).whole_seconds() <= FIX_RUN_TIMEOUT_SECONDS),
+        };
+        Ok(running.then_some(if marker.run.is_some() {
+            "a recorded fix run is still in flight"
+        } else {
+            "an unnamed fix run may still be in flight"
+        }))
+    }
+
     /// One pull request's decision line, and whether it is in flight.
     fn pull(
         &mut self,
         repo: &str,
         number: u64,
-        merge_only: bool,
+        (merge_only, red_only): (bool, bool),
         required: &mut BTreeMap<String, (Vec<Value>, bool)>,
     ) -> Result<(String, bool, Option<Wait>, Option<Stepped>)> {
         let (owner, name) = repo.split_once('/').context("repository")?;
@@ -9109,6 +9276,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // labels here, or after them, so a new stop with no label reads them
         // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
         let mut pull = self.read_pull(owner, name, number)?;
+        if red_only && text(&pull, "/author/login") != self.config.bot {
+            return Err(red_checks::RedSkip("fresh PR author is not the configured bot").into());
+        }
         if self.config.policy.pull.is_some()
             && (is_held(&pull) || labelled(&pull) || review_hold(self.config, &pull).is_some())
         {
@@ -9138,7 +9308,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         let mut intake =
             ordinary_reviews(self.config, repo) && self.review_intake.pulls < reviews::INTAKE_PULLS;
-        if intake {
+        if intake && !red_only {
             self.review_intake.pulls += 1;
         }
         let mut comments = if merge_only {
@@ -9179,6 +9349,48 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 None,
                 None,
             ));
+        }
+        // A search hit can be stale. Check the ledger and live CI before the
+        // ordinary decision path does anything (including draft/review work).
+        if red_only {
+            let head = text(&pull, "/headRefOid");
+            if head.is_empty()
+                || !text(&pull, "/baseRepository/nameWithOwner").eq_ignore_ascii_case(repo)
+                || pull["number"].as_u64() != Some(number)
+                || text(&pull, "/author/login") != self.config.bot
+            {
+                return Err(
+                    red_checks::RedSkip("fresh PR identity does not match search result").into(),
+                );
+            }
+            // Removing the stop label resets the rounds even on this head.
+            // Keep the marker's identity for claims made from that reset.
+            if marker.sha.as_deref() == Some(head) && (!marker.stopped || labelled(&pull)) {
+                return Err(red_checks::RedSkip("current head already has a round marker").into());
+            }
+            if earliest_claim(&comments, &self.config.bot, &claim_from(&marker)).is_some() {
+                return Err(red_checks::RedSkip("an existing round claim holds this PR").into());
+            }
+            if let Some(why) = self.prior_fix_running(&marker, head)? {
+                return Err(red_checks::RedSkip(why).into());
+            }
+            self.more_checks(owner, name, number, &mut pull)?;
+            if !truncated(&pull).is_empty() {
+                return Err(red_checks::RedSkip("fresh PR facts are incomplete").into());
+            }
+            let (base_required, queued) = self.base_checks(repo, &pull, required)?;
+            if self
+                .head_checks(&pull, base_required, *queued)
+                .failed
+                .is_empty()
+            {
+                return Err(
+                    red_checks::RedSkip("no current failed or overdue pending check").into(),
+                );
+            }
+            if intake {
+                self.review_intake.pulls += 1;
+            }
         }
         if text(&pull, "/author/login") == self.config.bot
             && let Some(hold) = review_hold(self.config, &pull)
@@ -9242,7 +9454,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if text(&pull, "/author/login") != self.config.bot {
             marker = Marker::default();
         }
-        self.more_checks(owner, name, number, &mut pull)?;
+        if !red_only {
+            self.more_checks(owner, name, number, &mut pull)?;
+        }
         self.operator_keys(&mut pull);
         let stacked = if merge_only {
             None
@@ -9250,25 +9464,66 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             self.stacked(repo, &pull)?
         };
         let base = text(&pull, "/baseRefName").to_owned();
-        if !required.contains_key(&base) {
-            let encoded: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
-            let rules = self.get(&format!("repos/{repo}/rules/branches/{encoded}"))?;
-            let branch = self.get(&format!("repos/{repo}/branches/{encoded}"))?;
-            let queued = merge_queued(&rules)?;
-            required.insert(base.clone(), (required_checks(&rules, &branch)?, queued));
-        }
-        let (base_required, queued) = &required[&base];
+        let (base_required, queued) = self.base_checks(repo, &pull, required)?;
         // Without a merge queue the poll's own merge is the last gate, so
         // every check on the head holds it, required or not (#163).
         let promoted = publication_checks.is_some();
         let mut checks = if let Some(checks) = publication_checks {
             checks
-        } else if *queued {
-            classify_checks(&pull, base_required)
         } else {
-            classify_all_checks(&pull, base_required)
+            self.head_checks(&pull, base_required, *queued)
         };
         let head = text(&pull, "/headRefOid");
+        // Keep the head's CI evidence separate from later synthetic failures
+        // (such as merge-group failures), which are not in the head rollup.
+        let head_failures = if !promoted
+            && !labelled(&pull)
+            && !checks.failed.is_empty()
+            && self.check_timeout(&pull).is_some()
+        {
+            let mut failed = checks.failed.clone();
+            failed.sort_unstable();
+            Some(failed)
+        } else {
+            None
+        };
+        // A fix can push a new head before it finishes. The ordinary walk
+        // must not use a timeout to start another fix in that window.
+        if !red_only
+            && !promoted
+            && !merge_only
+            && self.config.policy.red_checks.is_some()
+            && !labelled(&pull)
+            && !checks.failed.is_empty()
+        {
+            let untimed = judge_checks(&pull, base_required, !*queued, None);
+            if checks.failed.len() > untimed.failed.len()
+                && let Some(why) = self.prior_fix_running(&marker, head)?
+            {
+                let decision = step("wait", why).followed(None);
+                if self.config.policy.maintainer_report.is_some() {
+                    self.report_pulls.insert(
+                        (repo.to_owned(), number),
+                        report::Pull::observed(repo, number, &pull, &decision, false),
+                    );
+                }
+                return Ok((
+                    format!("{repo}#{number} {} wait: {why}", short(head)),
+                    true,
+                    None,
+                    Some(Stepped {
+                        repository: repo.to_owned(),
+                        number,
+                        head: head.to_owned(),
+                        action: decision.action,
+                        reason: decision.reason,
+                        ran: false,
+                        moved_at: moved_at(&pull),
+                        waiting: decision.waiting,
+                    }),
+                ));
+            }
+        }
         // Removals are read only for the bot's own pull requests from its fork,
         // whose marker can count them; out of the queue and not handed to a
         // human. A head that failed twice in the queue fails like a check.
@@ -9718,22 +9973,55 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // The hold is read again just before the step's first write: one put
         // on since the read above stops it too.
         let hold = if writing {
-            self.read_pull(owner, name, number).map(|p| {
+            self.read_pull(owner, name, number).and_then(|mut p| {
                 if is_held(&p) {
-                    Some(format!("labelled {HOLD_LABEL}"))
-                } else if supervisor_empty_fix
+                    return Ok(Some(format!("labelled {HOLD_LABEL}")));
+                }
+                if supervisor_empty_fix
                     && (p["state"] != "OPEN"
                         || p["headRefOid"] != head
                         || labelled(&p)
                         || p.pointer("/labels/pageInfo/hasNextPage") != Some(&Value::Bool(false)))
                 {
-                    Some(
+                    return Ok(Some(
                         "pull request closed, changed head, acquired a hold or has unread labels"
                             .into(),
-                    )
-                } else {
-                    review_hold(self.config, &p).map(|hold| hold.reason(&p, &marker))
+                    ));
                 }
+                if let Some(hold) = review_hold(self.config, &p) {
+                    return Ok(Some(hold.reason(&p, &marker)));
+                }
+                // A failing or overdue check can recover without a push.
+                // Don't claim a round or stop on evidence the fresh read no
+                // longer supports; let the next pass decide from scratch.
+                if let Some(failed) = &head_failures
+                    && matches!(
+                        decision.action,
+                        "fix" | "needs-human" | "triage" | CHECK_RERUN
+                    )
+                {
+                    if p["state"] != "OPEN"
+                        || p["headRefOid"] != head
+                        || p["baseRefName"] != base
+                        || p.pointer("/commits/nodes/0/commit/oid")
+                            .and_then(Value::as_str)
+                            != Some(head)
+                        || labelled(&p)
+                        || p["mergeQueueEntry"] != pull["mergeQueueEntry"]
+                        || p["autoMergeRequest"] != pull["autoMergeRequest"]
+                    {
+                        return Ok(Some(
+                            "pull request changed before the CI decision could be taken".into(),
+                        ));
+                    }
+                    self.more_checks(owner, name, number, &mut p)?;
+                    let mut fresh = self.head_checks(&p, base_required, *queued).failed;
+                    fresh.sort_unstable();
+                    if !truncated(&p).is_empty() || fresh != *failed {
+                        return Ok(Some("CI evidence changed or is incomplete".into()));
+                    }
+                }
+                Ok(None)
             })
         } else {
             Ok(None)
@@ -10162,9 +10450,23 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     }
 
     fn follow_open(&mut self, repo: &str, open: Vec<Value>, outcome: &mut Outcome) -> Result<()> {
-        if self.config.policy.maintainer_report.is_some() {
+        self.follow_candidates(repo, open, None, outcome)
+    }
+
+    fn follow_candidates(
+        &mut self,
+        repo: &str,
+        open: Vec<Value>,
+        red_floor: Option<usize>,
+        outcome: &mut Outcome,
+    ) -> Result<()> {
+        let red_only = red_floor.is_some();
+        let repo_key = repo.to_ascii_lowercase();
+        if !red_only && self.config.policy.maintainer_report.is_some() {
             for p in &open {
-                if let Some(number) = p["number"].as_u64() {
+                if let Some(number) = p["number"].as_u64()
+                    && !outcome.decided.contains(&(repo_key.clone(), number))
+                {
                     self.report_pulls.insert(
                         (repo.to_owned(), number),
                         report::Pull {
@@ -10215,7 +10517,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         numbers.sort_unstable();
         // Read whether or not a head waits for a review: a run of a head
         // pushed over since, or of a pull request closed, still takes a slot.
-        self.count_reviews(repo, outcome);
+        if !red_only {
+            self.count_reviews(repo, outcome);
+        }
         let mut required = BTreeMap::new();
         let left = self.left_labelled(repo, &open);
         let on_hold: BTreeSet<u64> = open
@@ -10236,7 +10540,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             {
                 continue;
             }
-            if changed.is_some_and(|changed| !changed.contains(&number)) {
+            if !red_only && changed.is_some_and(|changed| !changed.contains(&number)) {
                 *outcome
                     .unchanged
                     .entry(repo.to_ascii_lowercase())
@@ -10244,10 +10548,24 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 continue;
             }
             // Decided from its listing, it costs no share.
-            let quiet = (!merge_only && !left.contains_key(&number))
+            let quiet = (!red_only && !merge_only && !left.contains_key(&number))
                 .then(|| self.quiet_replay(repo, number, listings.get(&number).copied()))
                 .flatten();
+            if red_floor
+                .is_some_and(|floor| self.remaining.saturating_sub(floor) < PULL_SHARE_MARGIN)
+            {
+                outcome.lines.push(format!(
+                    "{repo}#{number} red-check skip: request share spent"
+                ));
+                continue;
+            }
             if quiet.is_none() && !self.share_allows(repo, Some(number)) {
+                if red_only {
+                    outcome.lines.push(format!(
+                        "{repo}#{number} red-check skip: request share spent"
+                    ));
+                    continue;
+                }
                 break;
             }
             self.deferring = None;
@@ -10262,8 +10580,12 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 }
                 (None, Some(quiet)) => Ok(quiet),
                 (None, None) => {
-                    let read = self.pull(repo, number, merge_only, &mut required);
-                    self.quiet_record(repo, number, listings.get(&number).copied(), &read);
+                    self.red_floor = red_floor;
+                    let read = self.pull(repo, number, (merge_only, red_only), &mut required);
+                    self.red_floor = None;
+                    if !red_only {
+                        self.quiet_record(repo, number, listings.get(&number).copied(), &read);
+                    }
                     read
                 }
             };
@@ -10291,7 +10613,18 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 }
                 Err(error) if crate::pass::budget_spent(&error) => {
                     self.stop_at(repo, Some(number));
+                    if red_only {
+                        outcome
+                            .lines
+                            .push(format!("{repo}#{number} red-check skip: {error:#}"));
+                        continue;
+                    }
                     break;
+                }
+                Err(error) if error.is::<red_checks::RedSkip>() => {
+                    outcome
+                        .lines
+                        .push(format!("{repo}#{number} red-check skip: {error}"));
                 }
                 Err(error) => {
                     outcome.undecided.insert(repo.to_ascii_lowercase());
@@ -10620,23 +10953,40 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     {
         outcome.error("pull requests: approved search", &error);
     }
+    if policy.red_checks.is_some() {
+        pass.red_checks(&pr_follow, &missing, &mut outcome);
+    }
     // The repositories the pass's share left unwalked, or walked in part.
     let mut waiting = BTreeSet::new();
     let mut upstream_cursor = None;
     let mut action_first_cursor = None;
     let mut action_first_positions = BTreeMap::new();
+    let clock_start = clock_walk_start(&pr_follow, &state, now);
+    if let Some(repo) = &clock_start {
+        outcome.lines.push(format!(
+            "pull requests: clock rotation start point is {repo}"
+        ));
+    }
     if config.policy.action_first {
-        (action_first_cursor, upstream_cursor, action_first_positions) =
-            pass.action_first(&pr_follow, &state, &missing, &mut outcome);
+        (action_first_cursor, upstream_cursor, action_first_positions) = pass.action_first(
+            &pr_follow,
+            &state,
+            clock_start.as_deref(),
+            &missing,
+            &mut outcome,
+        );
         if pass.apply.is_none() {
             action_first_cursor = state.action_first_cursor.clone();
             action_first_positions = state.action_first_positions.clone();
         }
         waiting.extend(outcome.undecided.iter().cloned());
     }
-    for (repo, turn) in walk(&pr_follow, state.share_cursor.as_deref())
-        .into_iter()
-        .filter(|_| !config.policy.action_first)
+    for (repo, turn) in walk(
+        &pr_follow,
+        state.share_cursor.as_deref().or(clock_start.as_deref()),
+    )
+    .into_iter()
+    .filter(|_| !config.policy.action_first)
     {
         let excluded = pass.envelope.as_ref().is_some_and(|e| !e.admits(repo))
             || missing.contains(&repo.to_ascii_lowercase());
@@ -14780,7 +15130,7 @@ mod tests {
                     "nodes": self.queue, "pageInfo": {"hasNextPage": !whole},
                 }}}}));
             }
-            if query == CHECKS_QUERY {
+            if matches!(query, CHECKS_QUERY | TIMED_CHECKS_QUERY) {
                 let after = variables["after"].as_str().unwrap();
                 let index: usize = after.strip_prefix('p').unwrap().parse().unwrap();
                 let number = variables["number"].as_u64().unwrap();
@@ -14836,7 +15186,7 @@ mod tests {
                     json!({"repository": {"visibility": self.report_visibility.get(&repo), "mergeQueue": queue}}),
                 );
             }
-            assert_eq!(query, PULL_QUERY);
+            assert!(matches!(query, PULL_QUERY | TIMED_PULL_QUERY));
             let number = variables["number"].as_u64().unwrap();
             let mut pull = self.pulls[&number].clone();
             if *self.labelled.borrow() {
@@ -25316,6 +25666,370 @@ mod tests {
     }
 
     #[test]
+    fn the_walk_rotates_only_without_a_carried_cursor() {
+        use crate::pass::authored::SLOT_MINUTES;
+        let names = ["O/C", "o/a", "o/b", "o/d"].map(str::to_owned);
+        let follow = names.iter().collect();
+        let state = State::default();
+        for cadence in [1, 2, 4] {
+            let mut starts = BTreeSet::new();
+            for turn in 0..32 {
+                let now = now() + time::Duration::minutes(SLOT_MINUTES * cadence * turn);
+                let start = clock_walk_start(&follow, &state, now).unwrap();
+                let turns = walk(&follow, Some(&start));
+                assert_eq!(turns[0].0.to_ascii_lowercase(), start);
+                assert_eq!(turns.len(), names.len());
+                starts.insert(start);
+            }
+            assert_eq!(starts.len(), names.len(), "cadence: {cadence}");
+        }
+        for state in [
+            State {
+                share_cursor: Some("o/b#12".into()),
+                ..State::default()
+            },
+            State {
+                action_first_cursor: Some("o/b".into()),
+                ..State::default()
+            },
+        ] {
+            assert_eq!(clock_walk_start(&follow, &state, now()), None);
+        }
+    }
+
+    #[test]
+    fn red_checks_revalidate_before_writing() {
+        let overdue = json!({"status":"IN_PROGRESS", "conclusion":null,
+            "startedAt":"2026-10-11T19:59:59Z"});
+        let initial = pull("pull-470", json!({"contexts":{"ci":overdue}}));
+        let green = pull("pull-470", json!({}));
+        for (action, red_only) in [("fix", true), ("fix", false), ("needs-human", false)] {
+            for (case, late) in [
+                ("unchanged", json!({})),
+                ("green", json!({"commits":green["commits"]})),
+                ("closed", json!({"state":"CLOSED"})),
+                ("new head", json!({"headRefOid":"newer"})),
+                (
+                    "unread checks",
+                    json!({"commits":pull("pull-470", json!({
+                    "contexts":{"ci":overdue},"truncated":{"checks":true}
+                }))["commits"]}),
+                ),
+            ] {
+                let mut fake = github();
+                let dispatcher = Fake::default();
+                let mut cfg = config();
+                cfg.policy.red_checks = Some(RedChecks::default());
+                fake.pulls.insert(470, initial.clone());
+                fake.late_pull_fields = Some(late);
+                let comments = if action == "fix" {
+                    json!([])
+                } else {
+                    let marker = json!({"sha":"older", "rounds":cfg.policy.fix_rounds()});
+                    json!([{"id":10,"user":{"login":BOT},"body":marker_body(&marker, "a round")}])
+                };
+                fake.page(
+                    &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                    None,
+                    None,
+                    comments,
+                );
+                let mut pass = Pass {
+                    apply: applying(&dispatcher),
+                    followed: [REPO.to_ascii_lowercase()].into_iter().collect(),
+                    ..Pass::new(&fake, &fake, &cfg, now())
+                };
+                let (line, _, _, step) = pass
+                    .pull(REPO, 470, (false, red_only), &mut BTreeMap::new())
+                    .unwrap();
+                let step = step.unwrap();
+                assert_eq!(step.action, action, "{case}: {line}");
+                assert_eq!(step.ran, case == "unchanged", "{action} {case}: {line}");
+                assert_eq!(
+                    fake.writes.borrow().is_empty(),
+                    case != "unchanged",
+                    "{line}"
+                );
+                assert_eq!(
+                    pass.dispatched,
+                    usize::from(action == "fix" && case == "unchanged")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn red_checks_decide_unlisted_prs_before_the_walk() {
+        let mut fake = github();
+        fake.page(
+            &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+            None,
+            None,
+            json!([
+                {"number": 473, "user": {"login": BOT}},
+                {"number": 477, "user": {"login": BOT}},
+            ]),
+        );
+        let mut cfg = config();
+        let pending =
+            |started| json!({"status":"IN_PROGRESS", "conclusion":null, "startedAt":started});
+        let failed = json!({"status":"COMPLETED", "conclusion":"FAILURE"});
+        let item = |repo, number| json!({"repository_url":format!("{API_ROOT}repos/{repo}"), "pull_request":{}, "number":number});
+        for (status, items) in [
+            (
+                "failure",
+                vec![
+                    item(REPO, 471),
+                    item(REPO, 472),
+                    item(REPO, 473),
+                    item(REPO, 478),
+                    item(REPO, 479),
+                    item("elsewhere/not-followed", 1),
+                ],
+            ),
+            (
+                "pending",
+                vec![
+                    item(REPO, 471),
+                    item(REPO, 474),
+                    item(REPO, 475),
+                    item(REPO, 476),
+                    item(REPO, 477),
+                ],
+            ),
+        ] {
+            fake.page(
+                &red_checks::search_path(&cfg, status),
+                None,
+                None,
+                json!({"items":items,"total_count":items.len(),"incomplete_results":false}),
+            );
+        }
+        for (number, check, marker, author) in [
+            (471, failed.clone(), Value::Null, BOT),
+            (472, failed.clone(), json!({"sha":HEAD,"rounds":1}), BOT),
+            (
+                473,
+                pending("2026-10-11T19:59:59Z"),
+                json!({"sha":"other-head","rounds":1,"run":8}),
+                BOT,
+            ),
+            (474, pending("2026-10-11T19:59:59Z"), Value::Null, BOT),
+            (475, pending("2026-10-11T20:00:00Z"), Value::Null, BOT),
+            (476, failed.clone(), Value::Null, "other-author"),
+            // A dispatch without a run id, whose fix pushed this head.
+            (
+                477,
+                pending("2026-10-11T19:59:59Z"),
+                json!({"sha":"other-head","rounds":1,"at":"2026-10-12T01:00:00Z"}),
+                BOT,
+            ),
+            (
+                478,
+                failed.clone(),
+                json!({"sha":HEAD,"rounds":1,"stopped":true}),
+                BOT,
+            ),
+            (
+                479,
+                failed,
+                json!({"sha":HEAD,"rounds":1,"stopped":true}),
+                BOT,
+            ),
+        ] {
+            let mut comments = if marker.is_null() {
+                vec![]
+            } else {
+                vec![json!({"id":10,"user":{"login":BOT},"body":marker_body(&marker, "a round")})]
+            };
+            if number == 479 {
+                let claim = json!({"from":"10"});
+                comments.push(json!({"id":11,"user":{"login":BOT},
+                    "body":format!("<!-- {CLAIM}: {claim} -->")}));
+            }
+            fake.page(
+                &format!("repos/{REPO}/issues/{number}/comments?per_page=100"),
+                None,
+                None,
+                json!(comments),
+            );
+            fake.pulls.insert(
+                number,
+                pull(
+                    "pull-470",
+                    json!({"number":number, "author":user(author), "contexts":{"ci":check}}),
+                ),
+            );
+        }
+        fake.page(
+            &format!("repos/{}/actions/runs/8", cfg.dispatch_repo),
+            None,
+            None,
+            json!({"status":"in_progress"}),
+        );
+
+        let list = [REPO];
+        let off = configured_pass(&fake, &cfg, State::default(), &[], &list);
+        assert!(!off.steps.iter().any(|s| s.action == "fix"));
+        assert!(
+            !fake
+                .sent
+                .borrow()
+                .iter()
+                .any(|(url, _)| url.contains("/search/issues"))
+        );
+
+        cfg.policy.red_checks = Some(RedChecks::default());
+        let outcome = configured_pass(&fake, &cfg, State::default(), &[], &list);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        for (number, action) in [
+            (471, "fix:"),
+            (474, "pending for over 6h"),
+            (478, "rounds start again"),
+        ] {
+            assert!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("{REPO}#{number} ")) && l.contains(action)),
+                "{:?}",
+                outcome.lines
+            );
+        }
+        for (pr, reason) in [
+            (format!("{REPO}#472"), "round marker"),
+            (format!("{REPO}#473"), "still in flight"),
+            (format!("{REPO}#475"), "no current failed or overdue"),
+            (format!("{REPO}#476"), "fresh PR author"),
+            (format!("{REPO}#479"), "existing round claim"),
+            (
+                format!("{REPO}#477"),
+                "unnamed fix run may still be in flight",
+            ),
+            ("elsewhere/not-followed#1".into(), "outside followed"),
+        ] {
+            assert!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("{pr} red-check skip:")) && l.contains(reason)),
+                "{:?}",
+                outcome.lines
+            );
+        }
+        for (number, why) in [
+            (473, "a recorded fix run is still in flight"),
+            (477, "an unnamed fix run may still be in flight"),
+        ] {
+            assert!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("{REPO}#{number} "))
+                        && l.contains(&format!("wait: {why}"))),
+                "{:?}",
+                outcome.lines
+            );
+        }
+        assert_eq!(outcome.decided.len(), 5);
+        for number in [473, 477] {
+            assert!(
+                outcome
+                    .steps
+                    .iter()
+                    .any(|s| s.number == number && s.action == "wait" && !s.ran)
+            );
+        }
+
+        // Tight shares let the red turn visit only a prefix, but the prefix
+        // changes with the clock and the ordinary walk keeps its own share.
+        let repo = REPO.to_owned();
+        let follow = [&repo].into_iter().collect();
+        let mut starts = BTreeSet::new();
+        for slot in (0..32).map(|turn| turn * 9) {
+            let mut pass = Pass {
+                remaining: 68,
+                ..Pass::new(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    OffsetDateTime::UNIX_EPOCH
+                        + time::Duration::minutes(slot * crate::pass::authored::SLOT_MINUTES),
+                )
+            };
+            let mut outcome = Outcome::default();
+            pass.red_checks(&follow, &BTreeSet::new(), &mut outcome);
+            let first_line = outcome.lines.iter().find(|l| l.starts_with(REPO)).unwrap();
+            starts.insert(first_line.split_whitespace().next().unwrap().to_owned());
+            assert!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.ends_with("request share spent"))
+            );
+            assert!(pass.cut.is_none());
+            assert!(pass.remaining >= PULL_SHARE_MARGIN);
+        }
+        assert_eq!(starts.len(), 9, "{starts:?}");
+
+        // A long history that crosses the local floor during the initial
+        // read posts nothing and leaves the walk its share. One that fits the
+        // initial read but crosses the floor during claim read-back finishes
+        // the round, having posted a claim.
+        fake.page(
+            &red_checks::search_path(&cfg, "failure"),
+            None,
+            None,
+            json!({"items":[item(REPO, 471)],"total_count":1,"incomplete_results":false}),
+        );
+        fake.page(
+            &red_checks::search_path(&cfg, "pending"),
+            None,
+            None,
+            json!({"items":[],"total_count":0,"incomplete_results":false}),
+        );
+        let path = format!("{API_ROOT}repos/{REPO}/issues/471/comments?per_page=100");
+        let share = 2 * (PULL_SHARE_MARGIN + 2);
+        for (pages, dispatched) in [(share / 2, 0), (PULL_SHARE_MARGIN / 2 + 1, 1)] {
+            for page in 1..=pages {
+                let url = if page == 1 {
+                    path.clone()
+                } else {
+                    format!("{path}&page={page}")
+                };
+                let next = (page < pages).then(|| format!("{path}&page={}", page + 1));
+                fake.rest.insert(url, (None, None, next, json!([])));
+            }
+            let dispatcher = Fake::default();
+            let mut pass = Pass {
+                remaining: share,
+                apply: applying(&dispatcher),
+                followed: [REPO.to_ascii_lowercase()].into_iter().collect(),
+                ..Pass::new(&fake, &fake, &cfg, now())
+            };
+            let mut outcome = Outcome::default();
+            pass.red_checks(&follow, &BTreeSet::new(), &mut outcome);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(pass.dispatched, dispatched, "{:?}", outcome.lines);
+            assert!(pass.cut.is_none());
+            if dispatched == 0 {
+                assert_eq!(pass.remaining, share / 2);
+                assert!(
+                    outcome
+                        .lines
+                        .iter()
+                        .any(|l| l.starts_with(&format!("{REPO}#471 red-check skip:"))
+                            && l.contains("request floor")),
+                    "{:?}",
+                    outcome.lines
+                );
+            } else {
+                assert!(pass.remaining < share / 2);
+            }
+        }
+    }
+
+    #[test]
     fn action_first_approved_handoff_preserves_review_slots() {
         for receipt in [CLAIM, MARKER, "listed"] {
             for apply in [false, true] {
@@ -25760,7 +26474,13 @@ mod tests {
         let repo = REPO.to_owned();
         let follow = [&repo].into_iter().collect();
         let mut outcome = Outcome::default();
-        pass.action_first(&follow, &State::default(), &BTreeSet::new(), &mut outcome);
+        pass.action_first(
+            &follow,
+            &State::default(),
+            None,
+            &BTreeSet::new(),
+            &mut outcome,
+        );
         assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
         assert!(outcome.steps.iter().any(|s| s.number == 470));
         assert!(!outcome.steps.iter().any(|s| s.number == 471));
@@ -25870,6 +26590,7 @@ mod tests {
                     action_first_cursor: cursor.clone(),
                     ..State::default()
                 },
+                None,
                 &BTreeSet::new(),
                 &mut outcome,
             );
@@ -25933,7 +26654,7 @@ mod tests {
             });
             let mut outcome = Outcome::default();
             let (next, _, positions) =
-                pass.action_first(&follow, &state, &BTreeSet::new(), &mut outcome);
+                pass.action_first(&follow, &state, None, &BTreeSet::new(), &mut outcome);
             assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
             let screens = shared.screens.borrow();
             assert_eq!(*screens, repos[(round % 2) * 8..(round % 2 + 1) * 8]);
@@ -26014,7 +26735,7 @@ mod tests {
             });
             let mut outcome = Outcome::default();
             let (next, _, positions) =
-                pass.action_first(&follow, &state, &BTreeSet::new(), &mut outcome);
+                pass.action_first(&follow, &state, None, &BTreeSet::new(), &mut outcome);
             assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
             assert_eq!(shared.screens.borrow().len(), 2);
             if pass.merged > 0 {
@@ -26052,8 +26773,13 @@ mod tests {
             git_ref: None,
         });
         let mut outcome = Outcome::default();
-        let (next, _, _) =
-            pass.action_first(&follow, &State::default(), &BTreeSet::new(), &mut outcome);
+        let (next, _, _) = pass.action_first(
+            &follow,
+            &State::default(),
+            None,
+            &BTreeSet::new(),
+            &mut outcome,
+        );
         assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
         assert_eq!(pass.merged, 1, "{:?}", outcome.lines);
         assert_eq!(shared.screens.borrow().len(), 4);
@@ -26103,7 +26829,7 @@ mod tests {
             });
             let mut outcome = Outcome::default();
             let (next, _, positions) =
-                pass.action_first(&follow, &state, &BTreeSet::new(), &mut outcome);
+                pass.action_first(&follow, &state, None, &BTreeSet::new(), &mut outcome);
             assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
             screened.extend(shared.screens.borrow().iter().cloned());
             if pass.merged > 0 {
@@ -26360,6 +27086,7 @@ mod tests {
             review_unread: None,
             deferred: Vec::new(),
             deferring: None,
+            red_floor: None,
             planned: 0,
             folds: Vec::new(),
             report_pulls: BTreeMap::new(),

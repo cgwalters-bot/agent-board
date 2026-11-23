@@ -46,6 +46,10 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
         "unsupported_capability: pr.actionFirst: GitHub PR discovery only"
     );
     ensure!(
+        value.pointer("/pr/redChecks").is_none(),
+        "unsupported_capability: pr.redChecks: GitHub PR discovery only"
+    );
+    ensure!(
         value.get("mix").is_none(),
         "unsupported_capability: mix: GitHub pool mixing only"
     );
