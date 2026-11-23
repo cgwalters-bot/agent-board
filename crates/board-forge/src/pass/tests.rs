@@ -20056,6 +20056,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
             p.maintainers,
             p.operator_paths,
             p.stale_days,
+            p.review_turn.is_some(),
         ])
     };
     let repo = "cgwalters-forge/bootc";
@@ -20066,7 +20067,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
         "draftReviewRepositories": [repo], "headOwners": ["cgwalters-forge"],
         "noMerge": [repo], "operatorPaths": [".github/pass.json", ".github/agentic-job/"],
         "maintainers": ["CGWALTERS-FORGE/BOOTC"],
-        "staleDays": 7, "mergeAuthors": ["updater[bot]"], "toilFixPool": "openai",
+        "staleDays": 7, "reviewTurn": {}, "mergeAuthors": ["updater[bot]"], "toilFixPool": "openai",
         "conflictFixPool": "claude", "mergeQueue": {"tries": 2}, "rebaseRounds": 1,
     });
     let unset = shared(&PollPolicy::default());
@@ -20092,6 +20093,11 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
         (json!({"mergeQueue": {}, "staleDays": 0}), true),
         (json!({"unstall": "true"}), false),
         (json!({"quietWaits": "true"}), false),
+        (json!({"reviewTurn": {}}), true),
+        (json!({"reviewTurn": {"limit": 1}}), false),
+        (json!({"reviewTurn": true}), false),
+        (json!({"reviewTurn": []}), false),
+        (json!({"reviewTurn": null}), false),
         (json!({"noMerge": [null]}), false),
         (json!({"noMerge": ["o/*"]}), false),
         (json!({"maintainers": ["o/*"]}), false),

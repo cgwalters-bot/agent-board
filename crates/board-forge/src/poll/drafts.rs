@@ -574,7 +574,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             approval: None,
         };
         let intake = if intake && text(&published, "/head/sha") == head {
-            self.ordinary_review(repo, pull, comments, marker)?
+            self.ordinary_review(repo, pull, comments, marker, false)?
         } else {
             None
         };

@@ -343,6 +343,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         pull: &Value,
         comments: &[Value],
         marker: &Marker,
+        review_turn: bool,
     ) -> Result<Option<IntakeStep>> {
         let draft = drafts::eligible(self.config, repo, pull);
         if (pull["isDraft"] != false && !draft)
@@ -450,6 +451,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     .any(|a| a == text(pull, "/author/login")))
         {
             return Ok(None);
+        }
+        if review_turn {
+            return Err(PrioritySkip("ordinary review intake takes precedence").into());
         }
         let line = format!(
             "{} {repo}#{number} {}: {}",

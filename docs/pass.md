@@ -926,6 +926,23 @@ marker's time. Before acting on failed or overdue checks, the poll re-reads the
 PR and its checks; if the head or failure evidence has changed, it leaves the
 decision to a later pass.
 
+### Changes-requested review turn (GitHub)
+
+Set `pr.reviewTurn` to `{}` to give the bot's PRs with a fresh formal change
+request a turn before the ordinary walk. It is off by default. After any
+approved and red-check turns, the poll searches `review:changes_requested`
+on one page of at most 100 results. Only followed, admitted own-space PRs
+enter the turn. It rotates them by the pass clock so persistent search hits
+cannot always take the first slots, and reserves at least half the remaining
+request share for the walk (up to 192 requests for the turn). A claimed
+round finishes under the normal pass bounds.
+
+Search is only an ordering hint. The latest eligible formal review must
+request changes on the current head, and the poll reads it again before
+writing. The existing round ledger, holds, fix scope, pacing and dispatch
+caps still apply. The turn starts only ordinary fix rounds; skipped PRs
+remain eligible for the ordinary walk under its existing rules.
+
 The hosted client gives the PR walk the pass's remaining read share, after the approved
 turn, intake and discovery, rather than the standalone poll's 500-request ceiling.
 It leaves the decision margin before starting another PR. Exhaustion during a
