@@ -3028,6 +3028,7 @@ struct Bounds {
     /// Requests by endpoint class and by cause ([`Spent`]).
     by_class: RefCell<BTreeMap<String, usize>>,
     by_cause: RefCell<BTreeMap<String, usize>>,
+    by_operation: RefCell<BTreeMap<String, OperationCounts>>,
     root_reads: RefCell<Option<RootReads>>,
 }
 
@@ -3074,6 +3075,7 @@ impl Bounds {
             cause: RefCell::new(None),
             by_class: RefCell::default(),
             by_cause: RefCell::default(),
+            by_operation: RefCell::default(),
             root_reads: RefCell::default(),
         }
     }
@@ -3102,7 +3104,13 @@ impl Bounds {
             revalidated: self.revalidated.get(),
             by_class: self.by_class.borrow().clone(),
             by_cause: self.by_cause.borrow().clone(),
+            by_operation: self.by_operation.borrow().clone(),
         }
+    }
+
+    fn operation(&self, name: &str, count: impl FnOnce(&mut OperationCounts)) {
+        let key = format!("{}/{}", self.stage.get().name(), name);
+        count(self.by_operation.borrow_mut().entry(key).or_default());
     }
 
     /// What `read` returns, its requests counted to `cause` instead of the
@@ -3247,6 +3255,7 @@ impl Bounds {
         by_stage[stage] -= 1;
         self.by_stage.set(by_stage);
         self.account(class, false);
+        self.operation(class, |row| row.0 = row.0.saturating_sub(1));
         self.left.set(self.left.get() + 1);
         self.revalidated.set(revalidated + 1);
     }
@@ -3295,7 +3304,14 @@ pub struct Spent {
     /// an epic (`epic OWNER/REPO#N`), or else the stage under way, by its
     /// [`Stage::name`].
     pub by_cause: BTreeMap<String, usize>,
+    by_operation: BTreeMap<String, OperationCounts>,
 }
+
+/// Summary row: requests charged (net of 304 refunds, so a stage's rows add
+/// up to its `by_stage` count), alias slots sent, aliases returned, reused
+/// reads, HTTP 304s, GraphQL points, and GraphQL calls with estimated points.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+struct OperationCounts(usize, usize, usize, usize, usize, u64, usize);
 
 impl std::fmt::Display for Spent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3514,6 +3530,31 @@ fn graphql_class(query: &str) -> String {
     }
 }
 
+/// Name the projections that share a hot endpoint without changing the query
+/// text (and thus the keys used by existing recordings).
+fn graphql_operation(query: &str) -> String {
+    let name = match query {
+        ISSUE_QUERY => "IssueFacts",
+        FRESH_QUERY => "FreshIssueFacts",
+        PULLS_QUERY => "IssueClosingPulls",
+        KIND_QUERY => "ItemKind",
+        BODY_QUERY => "IssueBody",
+        CLOSE_QUERY => "IssueCloseFacts",
+        VERDICT_REMOVALS_QUERY => "VerdictRemovals",
+        plan::COMMENTS_QUERY => "PlanComments",
+        wait::WAIT_QUERY => "AssignmentWait",
+        active::LINKS => "ActivePullLinks",
+        blockers::PULL_QUERY => "UnfollowedBlocker",
+        poll::LABELLED_QUERY => "LabelledPulls",
+        poll::SHARED_HEAD_QUERY => "SharedHeadPulls",
+        poll::CONTROL_HEAD_QUERY => "ControlHeadPulls",
+        needs::epics::CONTEXT_QUERY => "HoldsContext",
+        epics::EPIC_SUBS_QUERY => "EpicSubIssues",
+        _ => return graphql_class(query),
+    };
+    name.into()
+}
+
 /// A read the share of the stage under way refused ([`AFTER_PULL_REQUESTS`],
 /// [`AFTER_EPICS`]): what it did not reach waits for the next pass, a
 /// deferral rather than a failure of what it read.
@@ -3657,6 +3698,11 @@ impl<C> Budget<'_, C> {
 
     /// Spends one request of endpoint `class`, a write or a read.
     fn spend(&self, write: bool, class: &str) -> Result<()> {
+        self.charge(write, class, class)
+    }
+
+    /// [`Self::spend`], counted to `operation` in [`Spent::by_operation`].
+    fn charge(&self, write: bool, class: &str, operation: &str) -> Result<()> {
         let bounds = self.bounds;
         if bounds.rate_limited.borrow().is_some() {
             bounds.not_sent.set(bounds.not_sent.get() + 1);
@@ -3715,6 +3761,7 @@ impl<C> Budget<'_, C> {
         by_stage[bounds.stage.get() as usize] += 1;
         bounds.by_stage.set(by_stage);
         bounds.account(class, true);
+        bounds.operation(operation, |row| row.0 += 1);
         Ok(())
     }
 
@@ -3731,7 +3778,13 @@ impl<C> Budget<'_, C> {
 
     /// `result` of a GraphQL request, after counting its points: its
     /// `rateLimit { cost }` where it reads one, or else an estimate.
-    fn graphql_spent(&self, mutation: bool, result: Result<Value>) -> Result<Value> {
+    fn graphql_spent(
+        &self,
+        mutation: bool,
+        operation: &str,
+        aliases: usize,
+        result: Result<Value>,
+    ) -> Result<Value> {
         let bounds = self.bounds;
         let cost = result
             .as_ref()
@@ -3748,10 +3801,20 @@ impl<C> Budget<'_, C> {
         bounds
             .points
             .set(bounds.points.get().saturating_add(points));
+        bounds.operation(operation, |row| {
+            row.1 += aliases;
+            if let Ok(data) = &result {
+                row.2 += (0..aliases)
+                    .filter(|n| data[format!("r{n}")]["issueOrPullRequest"].is_object())
+                    .count();
+            }
+            row.5 = row.5.saturating_add(points);
+            row.6 += usize::from(cost.is_none());
+        });
         self.observe(result)
     }
 
-    fn spend_graphql(&self, mutation: bool, query: &str) -> Result<()> {
+    fn spend_graphql(&self, mutation: bool, query: &str, operation: &str) -> Result<()> {
         if let Some(limit) = self.bounds.graphql_limit.get()
             && self.bounds.points.get() >= limit
         {
@@ -3760,7 +3823,7 @@ impl<C> Budget<'_, C> {
             ))
             .into());
         }
-        self.spend(mutation, &graphql_class(query))
+        self.charge(mutation, &graphql_class(query), operation)
     }
 }
 
@@ -3802,12 +3865,13 @@ impl<C: Rest> Rest for Budget<'_, C> {
     }
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        let class = endpoint_class(url);
         if validator.is_none()
             && let Some(KeptRead::Rest(response)) = self.publication_read(url)
         {
+            self.bounds.operation(&class, |row| row.3 += 1);
             return Ok(response);
         }
-        let class = endpoint_class(url);
         self.spend(false, &class)?;
         let scoped = self.bounds.shared_responses.borrow().enabled;
         let current_scope = scoped
@@ -3860,6 +3924,9 @@ impl<C: Rest> Rest for Budget<'_, C> {
         });
         let sent_validator = condition.or(validator.filter(|_| !scoped || current_scope));
         let result = self.observe(self.inner.get(url, sent_validator));
+        if result.as_ref().is_ok_and(|r| r.status == 304) {
+            self.bounds.operation(&class, |row| row.4 += 1);
+        }
         let before = self.bounds.revalidated.get();
         if sent_validator.is_some() && result.as_ref().is_ok_and(|r| r.status == 304) {
             self.bounds.refund(&class);
@@ -4076,10 +4143,16 @@ impl<C: Rest + Transport> Budget<'_, C> {
                 && comments_match(&response.body, &old["comment_evidence"])
         });
         let data = if let Some(old) = evidence {
+            self.bounds.operation("PlanComments", |row| row.3 += 1);
             old["comment_evidence"].clone()
         } else {
-            self.spend_graphql(false, query)?;
-            self.graphql_spent(false, self.inner.graphql(query, variables.clone()))?
+            self.spend_graphql(false, query, "PlanComments")?;
+            self.graphql_spent(
+                false,
+                "PlanComments",
+                0,
+                self.inner.graphql(query, variables.clone()),
+            )?
         };
         if comments_match(&response.body, &data)
             && let Some(entry) = self.bounds.next_responses.borrow_mut().get_mut(&url)
@@ -4133,18 +4206,35 @@ fn comments_match(rest: &Value, data: &Value) -> bool {
 
 impl<C: Rest + Transport> Transport for Budget<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.graphql_counted(query, variables, &graphql_operation(query), 0)
+    }
+}
+
+impl<C: Rest + Transport> Budget<'_, C> {
+    fn graphql_counted(
+        &self,
+        query: &str,
+        variables: Value,
+        operation: &str,
+        aliases: usize,
+    ) -> Result<Value> {
         let mutation = is_mutation(query);
         let key = graphql_key(query, &variables).to_string();
         if !mutation && let Some(KeptRead::GraphQl(data)) = self.publication_read(&key) {
+            self.bounds.operation(operation, |row| row.3 += 1);
             return Ok(data);
         }
         if let Some(data) = self.plan_comments(query, &variables)? {
             self.keep_publication_read(key, KeptRead::GraphQl(data.clone()));
             return Ok(data);
         }
-        self.spend_graphql(mutation, query)?;
-        let mut data =
-            self.graphql_spent(mutation, self.inner.graphql(query, variables.clone()))?;
+        self.spend_graphql(mutation, query, operation)?;
+        let mut data = self.graphql_spent(
+            mutation,
+            operation,
+            aliases,
+            self.inner.graphql(query, variables.clone()),
+        )?;
         if query == plan::COMMENTS_QUERY
             && let Some(store) = self.bounds.living.borrow_mut().as_mut()
         {
@@ -4161,9 +4251,10 @@ impl<C: Rest + Transport> Transport for Budget<'_, C> {
 impl<C: crate::github::GraphQl> crate::github::GraphQl for Budget<'_, C> {
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let mutation = is_mutation(query);
-        self.spend_graphql(mutation, query)?;
+        let operation = graphql_operation(query);
+        self.spend_graphql(mutation, query, &operation)?;
         let result = self.inner.graphql(query, variables).await;
-        self.graphql_spent(mutation, result)
+        self.graphql_spent(mutation, &operation, 0, result)
     }
 }
 
@@ -4200,6 +4291,7 @@ impl<C> Kept<'_, C> {
     fn read(
         &self,
         key: Value,
+        operation: &str,
         read: impl FnOnce() -> Result<KeptRead>,
         keep: impl FnOnce(&KeptRead) -> bool,
     ) -> Result<KeptRead> {
@@ -4214,6 +4306,7 @@ impl<C> Kept<'_, C> {
                 };
             }
             if let Some(answer) = kept.reads.get(&key) {
+                self.inner.bounds.operation(operation, |row| row.3 += 1);
                 return Ok(answer.clone());
             }
         }
@@ -4244,7 +4337,7 @@ impl<C: Rest> Rest for Kept<'_, C> {
         let read = || Ok(KeptRead::Rest(self.inner.get(url, validator)?));
         // An error status is read again, as a transient one may pass.
         let ok = |read: &KeptRead| matches!(read, KeptRead::Rest(r) if r.status == 200);
-        match self.read(key, read, ok)? {
+        match self.read(key, &endpoint_class(url), read, ok)? {
             KeptRead::Rest(response) => Ok(response),
             KeptRead::GraphQl(_) => bail!("GET {url} was kept as a GraphQL answer"),
         }
@@ -4263,7 +4356,7 @@ impl<C: Rest + Transport> Transport for Kept<'_, C> {
         );
         let key = graphql_key(query, &variables);
         let read = || Ok(KeptRead::GraphQl(self.inner.graphql(query, variables)?));
-        match self.read(key, read, |_| true)? {
+        match self.read(key, &graphql_operation(query), read, |_| true)? {
             KeptRead::GraphQl(data) => Ok(data),
             KeptRead::Rest(_) => bail!("a GraphQL query was kept as a REST answer"),
         }
@@ -4404,8 +4497,13 @@ impl Report {
                 )
             })
             .unwrap_or_default();
+        let operations = if self.spent.by_operation.is_empty() {
+            String::new()
+        } else {
+            format!(", stage operations {}", json!(self.spent.by_operation))
+        };
         format!(
-            "{}, {}, starts {}, comments created {}, edited {}{not_ready}{planned}{skipped}{pressure}",
+            "{}, {}, starts {}, comments created {}, edited {}{not_ready}{planned}{skipped}{pressure}{operations}",
             self.summary,
             self.spent,
             json!(self.effects.starts),
@@ -8109,9 +8207,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     fn issue(&self, query: &str, issue: &ItemRef) -> Result<Value> {
         let (owner, name) = issue.repository.split_once('/').context("repository")?;
-        let data = self.client.graphql(
+        // Classify the projection before appending the shared fragment; keep
+        // the assembled query unchanged for the transport and recording key.
+        let data = self.client.graphql_counted(
             &format!("{query}{FACTS}"),
             json!({"owner": owner, "name": name, "number": issue.number}),
+            &graphql_operation(query),
+            0,
         )?;
         data.pointer("/repository/issue")
             .filter(|n| n.is_object())

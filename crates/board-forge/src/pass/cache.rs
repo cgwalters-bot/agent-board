@@ -298,7 +298,12 @@ mod tests {
         assert_eq!(client.get(&url, None).unwrap().body, json!([2]));
         assert_eq!(forge.conditional.get(), 1);
         forge.version.set(3);
-        let _ = client.graphql_spent(true, Err(anyhow::anyhow!("ambiguous mutation")));
+        let _ = client.graphql_spent(
+            true,
+            "mutation",
+            0,
+            Err(anyhow::anyhow!("ambiguous mutation")),
+        );
         assert_eq!(bounds.shared_responses.borrow().entries.len(), 1);
         assert_eq!(client.get(&url, None).unwrap().body, json!([3]));
         assert_eq!(forge.conditional.get(), 2);
