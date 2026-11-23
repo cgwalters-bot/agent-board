@@ -71,6 +71,7 @@ pub(super) fn classify(source: &Value) -> Result<Off> {
         "reserveOperator",
         "assignHolds",
         "readFreeHolds",
+        "scheduleRestReads",
         "leanReads",
         "bodyPlans",
         "leases",

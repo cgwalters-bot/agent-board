@@ -11193,7 +11193,9 @@ fn answered_verdict_release_rules() {
         ),
     ] {
         for board_triage in [true, false] {
-            let config = outside_harness(config(json!({"triageFollowUpDays": 3})));
+            let config = outside_harness(config(
+                json!({"triageFollowUpDays": 3, "scheduleRestReads": true}),
+            ));
             let mut forge = Forge::new(None, false);
             only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
             if board_triage {
@@ -11259,6 +11261,17 @@ fn answered_verdict_release_rules() {
             if let Some((label, at)) = removal {
                 verdict_removal(&mut forge, label, at);
             }
+            let timeline = format!(
+                "{API_ROOT}repos/cgwalters-forge/tracker/issues/446/timeline?per_page=100&page=1"
+            );
+            let body: Vec<_> = removal.into_iter().map(|(label, at)| {
+                json!({"event":"unlabeled", "label":{"name":label}, "created_at":at})
+            }).collect();
+            forge
+                .replay
+                .requests
+                .push(json!({"request": {"get": timeline},
+                "answer": {"status": 200, "link": null, "body": body}}));
             if plan {
                 let job = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 446,
                 "kind": "implement", "runner": "hosted", "brief": "Implement the bounded fix."});
@@ -11282,6 +11295,25 @@ fn answered_verdict_release_rules() {
             .unwrap();
             assert_eq!(forge.writes.borrow().len(), before, "{name}");
             assert_eq!(preview.failures, 0, "{name}: {:?}", preview.lines);
+            if released {
+                assert!(
+                    preview
+                        .lines
+                        .iter()
+                        .any(|line| line.starts_with("schedule REST verdict-removals: 1 resolved")),
+                    "{name}: {:?}",
+                    preview.lines
+                );
+                // The applying path must not restore the hold if REST lags
+                // the label removal that live GraphQL can see.
+                let rest = forge
+                    .replay
+                    .requests
+                    .iter_mut()
+                    .find(|entry| entry["request"]["get"] == timeline)
+                    .unwrap();
+                rest["answer"]["body"] = json!([]);
+            }
             let report = apply(&forge, &config);
             assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
             let rule = if released {
@@ -11348,6 +11380,273 @@ fn assignments(replay: &mut Replay, number: u64, events: &[(&str, &str, i64)], a
             "assignments": {"pageInfo": {"hasPreviousPage": events.len() >= 100},
                 "nodes": nodes}}}}}
     }));
+}
+
+const REST_REPO: &str = "cgwalters-forge/tracker";
+
+/// A board with the bot's standing assignment of the operator on tracker#446
+/// and REST look-ahead answers that a close followed it, with its issue and
+/// timeline URLs. GraphQL sees no close.
+fn rest_assignment_forge() -> (Forge, String, String) {
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    assignments(
+        &mut forge.replay,
+        446,
+        &[("AssignedEvent", "cgwalters-bot", 1)],
+        &["cgwalters"],
+    );
+    let url = format!("{API_ROOT}repos/{REST_REPO}/issues/446");
+    let timeline = format!("{url}/timeline?per_page=100&page=1");
+    let comments = format!("{url}/comments?per_page=100&page=1");
+    let at = (forge.replay.now + time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    let closed = (forge.replay.now + time::Duration::hours(2))
+        .format(&Rfc3339)
+        .unwrap();
+    for (get, body) in [
+        (&comments, json!([])),
+        (
+            &url,
+            json!({"html_url": format!("https://github.com/{REST_REPO}/issues/446"),
+            "state": "open", "number": 446, "assignees": [{"login": "cgwalters"}]}),
+        ),
+        (
+            &timeline,
+            json!([
+                {"event": "assigned", "created_at": at, "actor": {"login": "cgwalters-bot"},
+                    "assignee": {"login": "cgwalters"}},
+                {"event": "closed", "created_at": closed, "actor": {"login": "cgwalters"}}
+            ]),
+        ),
+    ] {
+        forge.replay.requests.push(json!({"request": {"get": get},
+            "answer": {"status": 200, "link": null, "body": body}}));
+    }
+    (forge, url, timeline)
+}
+
+fn rest_assignment_config() -> Config {
+    outside_harness(config(json!({"assignHolds": true,
+        "scheduleRestReads": true, "state": "pass-state.json", "triageFollowUpDays": 3})))
+}
+
+#[test]
+fn schedule_rest_assignments_revalidate_and_keep_applying_waits_live() {
+    assert!(!config(json!({})).schedule_rest_reads);
+    assert!(forgejo::check_options(&json!({"scheduleRestReads": false})).is_err());
+    let config = rest_assignment_config();
+    let (forge, url, timeline) = rest_assignment_forge();
+    let mut fixture = ConditionalRecording {
+        replay: forge,
+        reads: RefCell::default(),
+        traffic: RefCell::default(),
+        contextless: Cell::default(),
+    };
+    let run_pass = |fixture: &ConditionalRecording<Forge>, mode, state| {
+        block(run(
+            fixture,
+            fixture,
+            &config,
+            state,
+            (mode, Limits::default()),
+            fixture.replay.replay.now,
+        ))
+        .unwrap()
+    };
+    let cold = run_pass(&fixture, Mode::Preview, State::default());
+    let warm = run_pass(&fixture, Mode::Preview, cold.state.clone().unwrap());
+    for (report, count) in [(&cold, 0), (&warm, 2)] {
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert!(report.lines.iter().any(|line| line == &format!("schedule REST assignments: 1 resolved by REST, {} charged REST requests, {count} HTTP 304s, 0 GraphQL fallbacks needed", 2 - count)), "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("it was closed (assigned")),
+            "{:?}",
+            report.lines
+        );
+    }
+    // An applying pass can act on any answer, so it reads its waits live:
+    // REST's close does not release the wait GraphQL shows standing.
+    let caller = own();
+    let applied = run_pass(
+        &fixture,
+        Mode::Actions(&caller),
+        cold.state.clone().unwrap(),
+    );
+    assert_eq!(applied.failures, 0, "{:?}", applied.lines);
+    for (want, line) in [
+        (true, "assigned to cgwalters since"),
+        (false, "schedule REST assignments:"),
+    ] {
+        assert_eq!(
+            applied.lines.iter().any(|l| l.contains(line)),
+            want,
+            "{line}: {:?}",
+            applied.lines
+        );
+    }
+    assert!(
+        !fixture
+            .replay
+            .writes
+            .borrow()
+            .iter()
+            .any(|(_, url, _)| url.ends_with("/assignees"))
+    );
+    assert!(fixture.replay.dispatches().is_empty());
+    assert!(
+        fixture
+            .reads
+            .borrow()
+            .contains_key(&format!("GraphQL {}", wait::WAIT_QUERY))
+    );
+    let requests = &fixture.replay.replay.requests;
+    let events = requests.iter().find(|e| e["request"]["get"] == timeline);
+    let assigned = events.unwrap()["answer"]["body"][0].clone();
+    for (name, assignees, events, fallback) in [
+        (
+            "assignees and timeline disagree",
+            json!([]),
+            json!([assigned]),
+            1,
+        ),
+        (
+            "timeline lags current membership",
+            json!([{"login": "cgwalters"}]),
+            json!([]),
+            1,
+        ),
+        (
+            "both REST reads precede the assignment",
+            json!([]),
+            json!([]),
+            0,
+        ),
+    ] {
+        for entry in &mut fixture.replay.replay.requests {
+            if entry["request"]["get"] == url {
+                entry["answer"]["body"]["assignees"] = assignees.clone();
+            }
+            if entry["request"]["get"] == timeline {
+                entry["answer"]["body"] = events.clone();
+            }
+        }
+        let preview = run_pass(&fixture, Mode::Preview, State::default());
+        assert_eq!(preview.failures, 0, "{name}: {:?}", preview.lines);
+        let counts = format!(
+            "{} resolved by REST, 2 charged REST requests, 0 HTTP 304s, {fallback} GraphQL fallbacks needed",
+            1 - fallback
+        );
+        assert!(
+            (preview.lines.iter())
+                .any(|line| line == &format!("schedule REST assignments: {counts}")),
+            "{name}: {:?}",
+            preview.lines
+        );
+        // GraphQL's fallback reads the standing wait.
+        assert_eq!(
+            (preview.lines.iter()).any(|line| line.contains("assigned to cgwalters since")),
+            fallback == 1,
+            "{name}: {:?}",
+            preview.lines
+        );
+    }
+}
+
+/// A [`Forge`] that refuses REST GETs of `url` under a rate limit, the
+/// REST primary one's or another.
+struct RestLimited {
+    forge: Forge,
+    url: String,
+    primary: bool,
+}
+
+impl Broker for RestLimited {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.forge.usage(url)
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.forge.grant(url)
+    }
+}
+
+impl Rest for RestLimited {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        if url == self.url {
+            let error =
+                anyhow::anyhow!("GET {url}: GitHub HTTP status 403: API rate limit exceeded")
+                    .context(RateLimited(
+                        "GitHub rate limit: gave up after 3 retries".into(),
+                    ));
+            return Err(match self.primary {
+                true => error.context(crate::github::RestExhausted),
+                false => error,
+            });
+        }
+        self.forge.get(url, validator)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.forge.send(method, url, body)
+    }
+}
+
+impl Transport for RestLimited {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(&self.forge, query, variables)
+    }
+}
+
+impl crate::github::GraphQl for RestLimited {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
+/// An optional REST read refused under the REST primary limit falls back to
+/// GraphQL's separate pool and the pass goes on; any other rate limit still
+/// stops it.
+#[test]
+fn schedule_rest_primary_limit_falls_back_to_graphql() {
+    let config = rest_assignment_config();
+    for primary in [true, false] {
+        let (forge, _, timeline) = rest_assignment_forge();
+        let limited = RestLimited {
+            forge,
+            url: timeline,
+            primary,
+        };
+        let report = block(run(
+            &limited,
+            &limited,
+            &config,
+            State::default(),
+            (Mode::Preview, Limits::default()),
+            limited.forge.replay.now,
+        ))
+        .unwrap();
+        let lines = &report.lines;
+        let stopped = lines.iter().any(|l| l.starts_with("rate-limited: "));
+        assert_eq!(
+            (stopped, report.spent.rate_limited),
+            (!primary, !primary),
+            "{primary}: {lines:#?}"
+        );
+        if primary {
+            assert_eq!(report.failures, 0, "{lines:#?}");
+            for line in [
+                "schedule REST assignments: 0 resolved by REST, 2 charged REST requests, 0 HTTP 304s, 1 GraphQL fallbacks needed",
+                "assigned to cgwalters since",
+            ] {
+                assert!(lines.iter().any(|l| l.contains(line)), "{line}: {lines:#?}");
+            }
+        }
+    }
 }
 
 /// Every issue on the board read in `replay` labelled `label` as well.

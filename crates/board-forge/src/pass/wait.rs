@@ -375,7 +375,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         {
             return Ok(Waited::Go(None));
         }
-        let (assigned, comments) = match self.standing(issue) {
+        // Every answer of an applying pass can write or hold: a release, an
+        // unassignment, or a hold that a lagging REST timeline would keep.
+        // Two REST GETs are not one snapshot, so it reads GraphQL.
+        let (assigned, comments) = match self.standing(issue, !self.apply) {
             Ok(Some(standing)) => standing,
             Ok(None) => return Ok(Waited::Go(None)),
             Err(held) => return Ok(Waited::Held(held)),
@@ -486,12 +489,12 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
 
     /// The bot's standing assignment of the operator on `issue`, with the
     /// issue's comments, or a hold where either could not be read.
-    fn standing(&self, issue: &ItemRef) -> Result<Option<(Assignment, Vec<plan::Comment>)>, Hold> {
-        let config = self.config;
-        let read = self
-            .issue_read(issue, WAIT_QUERY)
-            .and_then(|node| assignment(&node, &config.operator, &config.bot));
-        let assigned = match read {
+    fn standing(
+        &self,
+        issue: &ItemRef,
+        look_ahead: bool,
+    ) -> Result<Option<(Assignment, Vec<plan::Comment>)>, Hold> {
+        let assigned = match self.wait_assignment(issue, look_ahead) {
             Ok(Some(assigned)) if assigned.standing => assigned,
             Ok(_) => return Ok(None),
             Err(error) => return Err(unreadable(error)),
@@ -499,6 +502,24 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         match plan::issue_comments(&self.client, issue) {
             Ok(comments) => Ok(Some((assigned, comments))),
             Err(error) => Err(unreadable(error)),
+        }
+    }
+
+    fn wait_assignment(&self, issue: &ItemRef, look_ahead: bool) -> Result<Option<Assignment>> {
+        let Config { operator, bot, .. } = self.config;
+        // An issue GET and a timeline GET.
+        let rest = look_ahead
+            .then(|| {
+                self.schedule_rest("assignments", 2, |read| {
+                    read.assignment(issue, operator, bot)
+                })
+            })
+            .flatten();
+        match rest {
+            Some(assigned) => Ok(assigned),
+            None => self
+                .issue_read(issue, WAIT_QUERY)
+                .and_then(|node| assignment(&node, operator, bot)),
         }
     }
 
@@ -512,7 +533,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             return None;
         }
         let operator = self.config.operator.as_str();
-        let (assigned, comments) = match self.standing(&facts.issue) {
+        let (assigned, comments) = match self.standing(&facts.issue, !self.apply) {
             Ok(standing) => standing?,
             Err(held) => return Some(held),
         };
@@ -627,10 +648,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         issue: &ItemRef,
         verdict: &plan::Comment,
         comments: &'c [plan::Comment],
+        look_ahead: bool,
     ) -> Result<Option<Response<'c>>> {
         let config = self.config;
-        let node = self.issue_read(issue, WAIT_QUERY)?;
-        let Some(assigned) = assignment(&node, &config.operator, &config.bot)? else {
+        let Some(assigned) = self.wait_assignment(issue, look_ahead)? else {
             return Ok(None);
         };
         if assigned.since < verdict.changed {

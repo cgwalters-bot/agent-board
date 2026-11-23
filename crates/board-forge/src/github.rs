@@ -192,6 +192,19 @@ impl std::fmt::Display for RateLimited {
 
 impl std::error::Error for RateLimited {}
 
+/// A REST GET refused under the hourly primary limit, beside its
+/// [`RateLimited`]: GraphQL's points are a separate pool.
+#[derive(Debug)]
+pub struct RestExhausted;
+
+impl std::fmt::Display for RestExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("REST primary rate limit exhausted")
+    }
+}
+
+impl std::error::Error for RestExhausted {}
+
 pub trait Transport {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value>;
 }
@@ -988,6 +1001,17 @@ fn rate_limit_message(body: &Value) -> bool {
         .is_some_and(|m| m.to_ascii_lowercase().contains("rate limit"))
 }
 
+/// Whether a REST refusal is the primary limit's: no requests left, no
+/// `Retry-After`, and no secondary limit named.
+fn primary_refusal(limits: &Limits, body: &Value) -> bool {
+    let secondary = body["message"]
+        .as_str()
+        .is_some_and(|m| m.to_ascii_lowercase().contains("secondary"));
+    limits.retry_after.is_none()
+        && limits.remaining.as_deref().map(str::trim) == Some("0")
+        && !secondary
+}
+
 /// Whether GitHub refused a response under a rate limit, and how long it
 /// asks to wait if so: a 429; a 403 that asks to wait, has no requests
 /// left or names a rate limit; or GraphQL rate-limit errors without data,
@@ -1351,9 +1375,10 @@ impl crate::poll::Rest for Client {
             let wait = matches!(status, 403 | 429).then(|| {
                 let body = response.body_mut().read_json().unwrap_or(Value::Null);
                 let limits = Limits::of(response.headers());
+                let primary = primary_refusal(&limits, &body);
                 (
                     rate_limited(status, &limits, &body, SystemTime::now()),
-                    body,
+                    (body, primary),
                 )
             });
             let (wait, refusal) = wait.unzip();
@@ -1371,12 +1396,15 @@ impl crate::poll::Rest for Client {
             anyhow::bail!("GET {path}: GitHub HTTP status {status}{retried}");
         }
         if let Some(why) = gave_up {
-            let body = refusal.unwrap_or_default();
+            let (body, primary) = refusal.unwrap_or_default();
             let message = body["message"].as_str().unwrap_or("message unavailable");
-            return Err(
-                anyhow::anyhow!("GET {path}: GitHub HTTP status {status}: {message}")
-                    .context(RateLimited(why)),
-            );
+            let error = anyhow::anyhow!("GET {path}: GitHub HTTP status {status}: {message}")
+                .context(RateLimited(why));
+            return Err(if primary {
+                error.context(RestExhausted)
+            } else {
+                error
+            });
         }
         let header = |name: &str| {
             response
@@ -2711,6 +2739,28 @@ mod tests {
         let reply = reply(403, None, Some("0"), PERMISSION);
         let wait = rate_limited(reply.status, &reply.limits, &Value::Null, past);
         assert_eq!(wait, Some(Wait::Asked(Duration::from_secs(1))));
+    }
+
+    /// Only an exhausted hourly REST limit is the primary one's.
+    #[test]
+    fn primary_refusal_table() {
+        const PRIMARY: &str = r#"{"message":"API rate limit exceeded for installation"}"#;
+        for (reply, primary) in [
+            (reply(403, None, Some("0"), PRIMARY), true),
+            (reply(429, None, Some(" 0 "), PRIMARY), true),
+            (reply(403, None, Some("12"), PRIMARY), false),
+            (reply(403, Some("30"), Some("0"), PRIMARY), false),
+            (reply(403, None, Some("0"), SECONDARY), false),
+            (reply(403, None, None, PRIMARY), false),
+        ] {
+            let body = serde_json::from_slice(&reply.body).unwrap_or(json!({}));
+            assert_eq!(
+                primary_refusal(&reply.limits, &body),
+                primary,
+                "{:?}",
+                reply.limits
+            );
+        }
     }
 
     /// The waits [`Backoff`] gives a run of refusals, by a clock that moves

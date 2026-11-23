@@ -148,7 +148,7 @@ opt-ins, not every optional key. The GitHub catalog consists of:
 - Boolean switches: `notifications`, `issueIntake`, `reserveScheduling`,
   `poolHeadroom`, `skipActiveWork`, `idleReplan`, `existingChildPlans`,
   `researchPlans`, `fixPlans`, `sessionPlans`, `triageClose`, `replanInvalid`, `operatorQuestionsOnly`,
-  `reserveOperator`, `assignHolds`, `readFreeHolds`, `leanReads`, `bodyPlans`, `leases`,
+  `reserveOperator`, `assignHolds`, `readFreeHolds`, `scheduleRestReads`, `leanReads`, `bodyPlans`, `leases`,
   `reruns`, `reapOverdueRuns`, `cleanupHistory`, `topDown`, `usage.probe`,
   `holds.needsYou`, `holds.approvalEvidence`, `holds.actNow`, `holds.passView`,
   `holds.today`, `holds.epicFocus`, `epics.close`, `epics.inWorkRepositories`,
@@ -3410,6 +3410,31 @@ Claim reads and reads inside a start bypass conditional caching. A full final
 array page is also read unconditionally: its body can remain unchanged while
 new comments add a successor page.
 
+On GitHub, `scheduleRestReads: true` lets schedule look-ahead use conditional
+issue GETs for the issue-versus-PR fallback, and conditional timeline GETs for
+assignment and verdict label-removal evidence. It uses the existing response
+cache and budgets; cross-pass revalidation needs persisted `state` and a
+matching credential context. A timeline must fit on one short page: treating a
+first page as complete could miss a later reassignment or label removal.
+Incomplete or ambiguous REST evidence falls back to GraphQL. Joined issue
+facts, editor provenance, close checks, start rechecks and a batch primary's
+state keep their existing reads: a lagging REST `open` on a closed primary
+would keep a stale batch record and send its extra to triage instead of its
+own plan. An applying pass reads assignment waits with GraphQL only, since
+any answer can release, unassign or hold, and reads
+verdict-release evidence with GraphQL while it can still write or dispatch.
+A REST read is tried only while the pass can still send its GraphQL fallback
+after it. A REST refusal under the primary hourly limit falls back to
+GraphQL's separate pool and ends REST look-ahead for the pass; any other rate
+limit still stops the pass. The schedule log counts REST resolutions, charged
+REST requests, 304s and fallbacks needed by operation; a cold assignment lookup
+costs two GETs, and three requests where it falls back.
+
+Tracker's public-only export keeps no timelines, so with it assignment and
+verdict timeline reads start cold every pass and only issue GETs can
+revalidate. Warming timelines needs a reviewed private state store, which
+does not exist yet; raw timelines must not enter the public export.
+
 Issue plan comments use REST to revalidate a complete history shorter than
 100 comments. The cold read also reads GraphQL: REST does not identify the
 last editor, and treating an edited plan as its author's word would let an
@@ -6291,6 +6316,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, one refused for news since the verdict waiting as `needs-close`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `readFreeHolds` | GitHub only: apply board-proven holds before assignment reads, leaving request budget for ready candidates; no cached holds or new eligibility; `false` |
+| `scheduleRestReads` | GitHub only: use [conditional REST issue and timeline reads](#persisting-conditional-responses) in schedule look-ahead; `false` |
 | `leanReads` | GitHub only: hold an unchanged candidate's triage cooldown or open-pr-cap again without reading it while the board shows it unchanged, see [lean reads](#lean-reads-github); `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `existingChildPlans` | GitHub only: let an epic plan post a dispatchable job plan on an existing open child via `post_job_plan`; existing repository, claim and write bounds remain; `false`. See [epic plans](epic-plans.md). |
