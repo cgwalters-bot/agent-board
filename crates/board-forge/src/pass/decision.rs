@@ -279,10 +279,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
 /// One read-only preview's decisions and what the next one may reuse.
 pub struct Preview {
     pub snapshot: Snapshot,
-    /// The pass's state as it would keep it: the disposable response index
-    /// bound to this credential context and configuration, plus the cursors
-    /// the applying pass carries. Passing it to the next preview makes that
-    /// one warm. Losing only its responses costs reads; losing the whole
+    /// The pass's state as it would keep it: fetched responses scoped to the
+    /// fetch context and representation, saved holds also scoped to config,
+    /// and cursors the applying pass carries. Passing it to the next preview
+    /// makes that one warm. Losing only its responses costs reads; losing the whole
     /// state also loses those cursors and retained intake, which can change
     /// what the next preview scans. With a `state` path, invalid disposable
     /// responses are discarded, but invalid durable state fails the preview. A
@@ -403,6 +403,7 @@ pub async fn preview<C: Rest + Transport + crate::github::GraphQl + Broker>(
 /// an earlier preview or poll. A 304 cannot confirm the credential scope.
 fn discard_cached_evidence(state: &mut State) {
     state.response_scope = None;
+    state.hold_scope = None;
     state.responses.clear();
     state.pass_responses.clear();
     state.quiet_waits.clear();
@@ -990,11 +991,20 @@ mod tests {
         // The returned state is what a caller persists, and it decodes whole.
         assert_eq!(State::from_json(&cold.state.to_json()).unwrap(), cold.state);
         let (warm, warm_sends) = run(&config, cold.state.clone());
-        assert_eq!(warm.snapshot, cold.snapshot);
-        assert_eq!(warm.state.response_scope, cold.state.response_scope);
-        assert!(warm_sends < cold_sends, "{warm_sends} < {cold_sends}");
-        assert!(warm.spent.requests < cold.spent.requests);
-        assert!(warm.spent.revalidated > cold.spent.revalidated);
+        let (reconfigured, reconfigured_sends) = run(&other_config, cold.state.clone());
+        for (case, again, sends) in [
+            ("same configuration", &warm, warm_sends),
+            ("other state path", &reconfigured, reconfigured_sends),
+        ] {
+            assert_eq!(again.snapshot, cold.snapshot, "{case}");
+            assert_eq!(
+                again.state.response_scope, cold.state.response_scope,
+                "{case}"
+            );
+            assert!(sends < cold_sends, "{case}: {sends} < {cold_sends}");
+            assert!(again.spent.requests < cold.spent.requests, "{case}");
+            assert!(again.spent.revalidated > cold.spent.revalidated, "{case}");
+        }
         let mut lost = cold.state.clone();
         lost.responses.clear();
         let mut corrupt = cold.state.clone();
@@ -1009,7 +1019,6 @@ mod tests {
             ("lost", &config, lost, 0),
             ("corrupt", &config, corrupt, 0),
             ("unsigned", &config, unsigned, 0),
-            ("other configuration", &other_config, cold.state.clone(), 0),
             ("other credential", &config, cold.state.clone(), 1),
         ] {
             forge.replay.identity.set(identity);
@@ -1020,7 +1029,7 @@ mod tests {
             assert!(sealed(&again.state), "{case}");
             assert_eq!(
                 again.state.response_scope == cold.state.response_scope,
-                !case.starts_with("other"),
+                identity == 0,
                 "{case}"
             );
         }

@@ -17709,7 +17709,7 @@ fn lean_reads_carry_unchanged_cooldowns_without_reading_them() {
 }
 
 #[test]
-fn lean_reads_preview_rereads_when_the_scope_cannot_be_verified() {
+fn lean_reads_preview_rereads_when_the_hold_scope_changes_or_is_unverified() {
     let (mut forge, mut cfg) = capped_forge(
         (Some(2), Some(2), "implement"),
         (false, |_: &mut _, _: &mut _| {}),
@@ -17749,8 +17749,26 @@ fn lean_reads_preview_rereads_when_the_scope_cannot_be_verified() {
     let first = preview(&cfg, State::default());
     assert!(first.state.response_scope.is_some());
     assert!(first.state.carried_holds.contains_key(issue));
-    let warm = preview(&cfg, first.state.clone());
+    let saved = first.state.to_json();
+    assert_ne!(
+        saved["response_scope"].as_str(),
+        first.state.response_scope.as_deref()
+    );
+    let decoded = State::from_json(&saved).unwrap();
+    assert_eq!(decoded, first.state);
+    let warm = preview(&cfg, decoded);
     assert_eq!(cap_reuse(&warm), Some(lean::Reused::Plan));
+
+    cfg.wip += 1;
+    let reconfigured = preview(&cfg, first.state.clone());
+    assert_eq!(cap_reuse(&reconfigured), None);
+    assert_eq!(
+        reconfigured.state.response_scope,
+        first.state.response_scope
+    );
+    assert_ne!(reconfigured.state.hold_scope, first.state.hold_scope);
+    assert!(reconfigured.spent.revalidated > 0);
+    cfg.wip -= 1;
 
     forge.contextless.set(true);
     let cold = preview(&cfg, first.state.clone());
@@ -20098,11 +20116,11 @@ fn body_plans_read_a_reused_body_without_a_plan_live() {
             json!({"bodyPlans": true, "reuseGraphqlItems": true, "state": "pass-state.json"}),
         );
         let own = own();
-        let pass = |state, mode| {
+        let pass = |cfg: &Config, state, mode| {
             let report = block(run(
                 &forge,
                 &forge,
-                &cfg,
+                cfg,
                 state,
                 (mode, Limits::default()),
                 now,
@@ -20111,8 +20129,19 @@ fn body_plans_read_a_reused_body_without_a_plan_live() {
             assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
             report
         };
-        let cold = pass(State::default(), Mode::Preview);
-        let warm = pass(next_state(&cold), Mode::Actions(&own));
+        let cold = pass(&cfg, State::default(), Mode::Preview);
+        let without_projection = config(
+            json!({"bodyPlans": true, "reuseGraphqlItems": false, "state": "pass-state.json"}),
+        );
+        let unprojected = pass(&without_projection, next_state(&cold), Mode::Preview);
+        let baseline = pass(&without_projection, State::default(), Mode::Preview);
+        assert_ne!(
+            next_state(&unprojected).response_scope,
+            next_state(&cold).response_scope
+        );
+        assert_eq!(unprojected.spent.revalidated, baseline.spent.revalidated);
+        assert_eq!(unprojected.spent.requests, baseline.spent.requests);
+        let warm = pass(&cfg, next_state(&cold), Mode::Actions(&own));
         assert!(
             warm.lines.iter().any(|l| l.contains("GraphQL reuses 1,")),
             "{name}: {:#?}",

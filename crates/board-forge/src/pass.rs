@@ -4769,20 +4769,35 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // No context means no persistent shared cache (including recordings and
     // transports without an authenticated identity). The old poll stays usable.
     let context = config.state.as_ref().and_then(|_| client.cache_context());
+    let reuse_graphql_items = config.reuse_graphql_items;
     let scope = context.as_ref().map(|context| {
         format!(
             "{:x}",
-            Sha256::digest(format!("agent-board/responses/v1\0{context}\0{config:?}"))
+            Sha256::digest(format!(
+                "agent-board/responses/v2\0{context}\0{reuse_graphql_items}"
+            ))
+        )
+    });
+    // A saved hold is a decision, not a fetched representation. A policy
+    // change can make work eligible without changing any remote item facts.
+    let hold_scope = scope.as_ref().map(|scope| {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("agent-board/holds/v1\0{scope}\0{config:?}"))
         )
     });
     if let Some(scope) = &scope {
         state.bind_responses(scope);
+        if state.hold_scope != hold_scope {
+            state.quiet_waits.clear();
+            state.carried_holds.clear();
+        }
         if state.interval_seconds == 0 {
             state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
         }
         let mut responses = bounds.shared_responses.borrow_mut();
         responses.enabled = true;
-        responses.graphql_enabled = config.reuse_graphql_items;
+        responses.graphql_enabled = reuse_graphql_items;
         responses.now = Some(now);
         responses.context = context;
         responses.seed(
@@ -4896,6 +4911,11 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         };
         let state = report.state.get_or_insert(previous);
         state.carried_holds = carried;
+        state.hold_scope = if state.quiet_waits.is_empty() && state.carried_holds.is_empty() {
+            None
+        } else {
+            hold_scope
+        };
         if state.interval_seconds == 0 {
             state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
         }
