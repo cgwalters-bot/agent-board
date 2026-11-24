@@ -3518,10 +3518,14 @@ pass runs on Linux runners: aliases through a case-insensitive filesystem are
 out of scope.
 
 `--cache-bytes` sets the separate file's response byte budget (24 MiB by
-default, excluding small JSON framing). Tracker should pass
-`--cache pass-responses.json --cache-bytes 268435456` for 256 MiB. The LRU
-and 256 KiB per-entry cap still apply. This limit is independent of the
-32 MiB limit on the pass state file.
+default, excluding small JSON framing). For example, use
+`--cache pass-responses.json --cache-bytes 536870912` for 512 MiB. Each
+entry, including its key, counts against that budget; there is no separate
+entry-count limit. Least-recently-used responses are evicted to fit the
+budget, and the 256 KiB per-entry cap still applies. Files larger than the
+budget plus framing are refused before parsing. Choose a budget that fits
+the runner's memory and storage: decoded responses can take more memory
+than the file. The cache budget is independent of the 32 MiB pass state limit.
 
 The same trust requirement applies to the separate file: a GitHub 304 does
 not authenticate cached content, and local checksums only detect corruption.

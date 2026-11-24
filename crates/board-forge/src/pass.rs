@@ -4740,10 +4740,7 @@ pub async fn run_with_response_cache<C: Rest + Transport + crate::github::GraphQ
             config.state.is_some(),
             "a separate response cache requires pass state"
         );
-        ensure!(
-            (1..=ResponseCache::MAX_BYTES).contains(&bytes),
-            "invalid response cache byte limit"
-        );
+        ensure!(bytes > 0, "response cache bytes must be positive");
     }
     run_pass(
         client,

@@ -1507,6 +1507,7 @@ fn cached_pass(
 /// on the forge, not in the disposable response map, including on a rerun.
 #[test]
 fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
+    const CACHE_BYTES: usize = 512 * 1024 * 1024;
     let config = config(json!({"state": ".state/poll.json"}));
     let mut expected = None;
     for cache in ["cold", "warm", "lost", "separate warm", "separate lost"] {
@@ -1528,7 +1529,7 @@ fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
                 state,
                 (mode, Limits::default()),
                 forge.replay.replay.now,
-                Some(ResponseCache::MAX_BYTES),
+                Some(CACHE_BYTES),
             ))
             .unwrap()
         };
@@ -1570,7 +1571,7 @@ fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
                     file.save(&path).unwrap();
                     assert!(std::fs::metadata(&path).unwrap().len() > STATE_BYTES);
                 }
-                ResponseCache::restore(&path, ResponseCache::MAX_BYTES, &mut state);
+                ResponseCache::restore(&path, CACHE_BYTES, &mut state);
                 if cache == "separate warm" {
                     assert!(
                         state.responses.contains_key(&format!(
