@@ -214,13 +214,17 @@ The index holds at most 1,024 responses, 24 MiB of serialized response data,
 and 256 KiB per entry. When a bound is reached, the pass evicts least-recently
 used responses first. Older unstamped entries come first, with URL order as a
 stable tie breaker. Saving leaves room for the other state fields within the
-32 MiB file limit. Eviction drops responses only. Newly
+32 MiB file limit; the summary reports the resulting effective save limit.
+Scoped passes keep full REST bodies and any revalidated comment-editor evidence
+together rather than duplicating them in the legacy pass map. Eviction drops
+responses only. Newly
 written entries include a SHA-256 corruption checksum; this is **not** writer
 authentication. Invalid responses are discarded with diagnostics. An incompatible
 response scope also starts cold; the log says whether the scope was absent or
 changed, never the scope digest. Each pass logs one
-eviction summary against these caps and splits its misses into responses it
-evicted itself and ones not cached. Legacy poll states still decode. A malformed
+eviction summary against these caps, counts oversized responses rejected at
+admission, and splits its misses into responses it evicted itself and ones not
+cached. Legacy poll states still decode. A malformed
 whole state or incompatible *poll-state* schema remains an error, rather than
 silently losing waiting asks: do not delete that state to repair its disposable
 responses. The file is parsed before the response bounds are applied; these are

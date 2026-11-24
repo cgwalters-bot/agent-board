@@ -1442,6 +1442,10 @@ fn response_cache_recorded_steady_state_comparison() {
     let lost = pass(lost_state);
     let lost_network: usize = forge.reads.borrow().values().sum();
     assert_eq!(warm.failures, 0, "{:?}", warm.lines);
+    assert!(warm.lines.iter().any(|l| l.contains("0 evicted this pass")));
+    assert!(warm.lines.iter().any(|l| {
+        l.starts_with("cache: evicted 0 disposable responses this pass, 0 more on save;")
+    }));
     assert_eq!(lost.failures, 0, "{:?}", lost.lines);
     let decisions = |r: &Report| {
         r.lines
@@ -20127,6 +20131,11 @@ fn body_plans_read_a_reused_body_without_a_plan_live() {
         let comments = forge.replay.comments_on("cgwalters-forge/tracker", 446);
         assert_eq!(comments.len(), 2, "{name}: {comments:#?}");
         assert_eq!(comments[0].starts_with(BODY_PLAN), added, "{name}");
+        assert!(
+            warm.lines
+                .iter()
+                .any(|l| l.contains("listed 1/1 item reads"))
+        );
     }
 }
 

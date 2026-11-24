@@ -430,13 +430,20 @@ the saved read was made: `updatedAt` has whole seconds, so an edit in the
 read's own second would not change it, and the runner's clock may be up to
 that far ahead of GitHub's. It is off by default and needs `state`
 and an authenticated cache scope.
-Missing or different evidence means a live read. A write attempt makes older
+An issues listing that includes a PR but omits its head OID cannot establish
+reuse by itself; it need not erase an earlier current-pass head observation
+when it reports the same node ID and `updatedAt`. Missing or different evidence
+means a live read. A write attempt makes older
 listing observations unusable, even when the write fails. Start/recovery and
 pre-write rechecks stay live; PR eligibility, reviews, mergeability and
 checks aren't reused. A change not yet reflected by a listing can still
 affect discovery until a later read sees it, but a reused body showing no
 plan is read again live, so a body plan added since is not outranked by a
 triage plan comment.
+
+`listed N/M item reads` counts discovery reads with usable current-pass listing
+evidence out of those that tried the GraphQL cache, even if the saved body was
+missing or its version did not match.
 
 The responses share the [existing state bounds](poll.md#disposable-rest-responses-partial-794).
 The pass's `cache:` summary line reports `GraphQL reuses` separately from REST

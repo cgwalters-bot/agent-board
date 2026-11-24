@@ -34,6 +34,8 @@ pub(super) struct Responses {
     pub misses: usize,
     pub modified: usize,
     pub graphql_reused: usize,
+    pub graphql_listed: usize,
+    pub graphql_lookups: usize,
     pub graphql_enabled: bool,
     /// The pass's clock, recorded on each GraphQL item read kept: no later
     /// than the read itself.
@@ -42,6 +44,7 @@ pub(super) struct Responses {
     /// Keys this pass evicted and has not kept again, and the misses on them.
     pub evicted: BTreeSet<String>,
     pub evicted_misses: usize,
+    oversized: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -163,6 +166,7 @@ pub(crate) struct Bounded {
     pub evicted: BTreeSet<String>,
     pub entries: usize,
     pub bytes: usize,
+    limit: usize,
 }
 
 impl Bounded {
@@ -184,6 +188,11 @@ fn last_used(entry: &Value) -> u64 {
     entry["last_used"].as_u64().unwrap_or_default()
 }
 
+fn entry_bytes(url: &str, entry: &Value) -> usize {
+    // Count the serialized key (including escaping), colon and comma too.
+    json!(url).to_string().len() + entry.to_string().len() + 2
+}
+
 #[derive(Default)]
 struct Index {
     sizes: BTreeMap<(u64, std::cmp::Reverse<String>), usize>,
@@ -191,9 +200,7 @@ struct Index {
 }
 
 impl Index {
-    fn insert(&mut self, url: &str, entry: &Value) {
-        // Count the serialized key (including escaping), colon and comma too.
-        let size = json!(url).to_string().len() + entry.to_string().len() + 2;
+    fn insert(&mut self, url: &str, entry: &Value, size: usize) {
         self.sizes
             .insert((last_used(entry), std::cmp::Reverse(url.to_owned())), size);
         self.bytes += size;
@@ -231,6 +238,7 @@ impl Index {
             evicted,
             entries: entries.len(),
             bytes: self.bytes,
+            limit,
         }
     }
 }
@@ -239,7 +247,7 @@ impl Index {
 pub(crate) fn bound(entries: &mut BTreeMap<String, Value>, limit: usize) -> Bounded {
     let mut index = Index::default();
     for (url, entry) in entries.iter() {
-        index.insert(url, entry);
+        index.insert(url, entry, entry_bytes(url, entry));
     }
     index.bound(entries, limit)
 }
@@ -303,16 +311,30 @@ impl Responses {
             return;
         }
         for node in body.as_array().into_iter().flatten() {
-            // The issues endpoint shows PRs too, but cannot attest to their heads.
-            let version = (!(collection == "issues" && node.get("pull_request").is_some()))
-                .then(|| {
-                    Version::read(
-                        &node["node_id"],
-                        &node["updated_at"],
-                        (collection == "pulls").then_some(&node["head"]["sha"]),
-                    )
-                })
-                .flatten();
+            let mut version = Version::read(
+                &node["node_id"],
+                &node["updated_at"],
+                (collection == "pulls").then_some(&node["head"]["sha"]),
+            );
+            if collection == "issues" && node.get("pull_request").is_some() {
+                // This listing cannot attest to a head. It can corroborate
+                // the identity and version of a complete, still-live read.
+                let same = node["number"]
+                    .as_u64()
+                    .and_then(|n| item_path(repo, n))
+                    .and_then(|at| self.observations.get(&at))
+                    .is_some_and(|(generation, prior)| {
+                        *generation == writes
+                            && prior.head.is_some()
+                            && version
+                                .as_ref()
+                                .is_some_and(|v| prior.id == v.id && prior.updated == v.updated)
+                    });
+                if same {
+                    continue;
+                }
+                version = None;
+            }
             self.observe_item(repo, &node["number"], version, writes);
         }
     }
@@ -324,16 +346,18 @@ impl Responses {
         key: &str,
         writes: usize,
     ) -> Option<Value> {
-        let (observed_writes, version) = self.observations.get(at)?;
+        self.graphql_lookups += 1;
+        let (_, version) = self
+            .observations
+            .get(at)
+            .filter(|(seen, _)| *seen == writes)?;
+        self.graphql_listed += 1;
         let entry = self.entries.get(key)?;
         let body = &entry["body"];
         let read_at = entry["read_at"]
             .as_str()
             .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())?;
-        if *observed_writes != writes
-            || query.version(body).as_ref() != Some(version)
-            || version.updated + READ_SKEW >= read_at
-        {
+        if query.version(body).as_ref() != Some(version) || version.updated + READ_SKEW >= read_at {
             return None;
         }
         let body = body.clone();
@@ -362,14 +386,15 @@ impl Responses {
         self.index = Index::default();
         for (key, entry) in &entries {
             self.stamp = self.stamp.max(last_used(entry));
-            self.index.insert(key, entry);
+            self.index.insert(key, entry, entry_bytes(key, entry));
         }
         self.entries = entries;
         self.index.bound(&mut self.entries, MAX_BYTES);
     }
 
     fn keep_entry(&mut self, key: String, mut entry: Value) {
-        if let Some(old) = self.entries.get(&key) {
+        let old = self.entries.remove(&key);
+        if let Some(old) = &old {
             self.index.remove(&key, old);
         }
         // Resume after all the saved uses, including after a restart. Order
@@ -377,7 +402,15 @@ impl Responses {
         self.stamp = self.stamp.saturating_add(1);
         entry["last_used"] = self.stamp.into();
         let entry = seal(entry);
-        self.index.insert(&key, &entry);
+        let size = entry_bytes(&key, &entry);
+        if size > MAX_ENTRY_BYTES {
+            self.oversized += 1;
+            if old.is_some() {
+                self.evicted.insert(key);
+            }
+            return;
+        }
+        self.index.insert(&key, &entry, size);
         self.evicted.remove(&key);
         self.entries.insert(key, entry);
         self.evicted
@@ -397,28 +430,89 @@ impl Responses {
         entry
     }
 
-    pub fn keep(&mut self, url: &str, response: &RestResponse) {
+    pub fn entry(&self, url: &str) -> Option<&Value> {
+        self.entries.get(&format!("{url}{REPRESENTATION}"))
+    }
+
+    pub fn keep_validated(
+        &mut self,
+        url: &str,
+        response: &RestResponse,
+        validated: Option<&Value>,
+    ) {
         if response.status != 200 || response.etag.is_none() {
             return;
         }
         let key = format!("{url}{REPRESENTATION}");
-        self.keep_entry(
-            key,
-            json!({
-                    "etag": response.etag, "link": response.link, "body": response.body
-            }),
-        );
+        let mut entry = json!({
+            "etag": response.etag, "link": response.link, "body": response.body
+        });
+        if let Some(old) = validated.filter(|old| old["comment_evidence"].is_object()) {
+            self.add_comment_evidence(
+                &key,
+                &mut entry,
+                &old["comment_query"],
+                &old["comment_evidence"],
+            );
+        }
+        self.keep_entry(key, entry);
+    }
+
+    pub fn keep_comment_evidence(
+        &mut self,
+        url: &str,
+        response: &RestResponse,
+        query: String,
+        data: &Value,
+    ) {
+        let key = format!("{url}{REPRESENTATION}");
+        let Some(mut entry) = self
+            .entries
+            .get(&key)
+            .filter(|entry| {
+                entry["body"] == response.body && entry["etag"].as_str() == response.etag.as_deref()
+            })
+            .cloned()
+        else {
+            return;
+        };
+        if self.add_comment_evidence(&key, &mut entry, &query.into(), data) {
+            self.keep_entry(key, entry);
+        }
+    }
+
+    /// Optional editor evidence must not force out its REST representation.
+    fn add_comment_evidence(
+        &self,
+        key: &str,
+        entry: &mut Value,
+        query: &Value,
+        evidence: &Value,
+    ) -> bool {
+        let mut enriched = entry.clone();
+        enriched["comment_query"] = query.clone();
+        enriched["comment_evidence"] = evidence.clone();
+        enriched["last_used"] = self.stamp.saturating_add(1).into();
+        enriched = seal(enriched);
+        if entry_bytes(key, &enriched) > MAX_ENTRY_BYTES {
+            return false;
+        }
+        *entry = enriched;
+        true
     }
 
     /// The pass's one eviction line, with `last` the bound of the state it
     /// keeps; never a URL, only counts against the caps.
     pub fn evictions(&self, last: &Bounded) -> String {
         format!(
-            "cache: evicted {} disposable responses this pass, {} more on save; kept {}/{MAX_ENTRIES} entries, {}/{MAX_BYTES} bytes",
+            "cache: evicted {} disposable responses this pass, {} more on save; kept {}/{MAX_ENTRIES} entries, {}/{} bytes on save ({} in pass); {} oversized responses rejected",
             self.evicted.len(),
             last.evicted.difference(&self.evicted).count(),
             last.entries,
             last.bytes,
+            last.limit,
+            MAX_BYTES,
+            self.oversized,
         )
     }
 
@@ -552,6 +646,74 @@ mod tests {
         assert_eq!(client.get(&url, None).unwrap().body, json!([1]));
         assert_eq!(forge.reads.get(), 4);
         assert_eq!(bounds.spent().requests, 3);
+    }
+
+    #[test]
+    fn warm_pass_keeps_its_working_set_under_the_caps() {
+        let forge = Forge::default();
+        let cold = bounds();
+        cold.cache_enabled.set(true);
+        cold.shared_responses.borrow_mut().graphql_enabled = true;
+        cold.shared_responses.borrow_mut().now =
+            Some(OffsetDateTime::parse("2026-11-08T00:10:00Z", &Rfc3339).unwrap());
+        let client = Budget {
+            inner: &forge,
+            bounds: &cold,
+        };
+        let item = json!({"repository": {"issue": {
+            "id": "I_1", "updatedAt": "2026-11-08T00:00:00Z", "body": "test plan"
+        }}});
+        *forge.item.borrow_mut() = item.clone();
+        assert_eq!(
+            client.graphql_item(ItemQuery::Body, "o/r", 1).unwrap(),
+            (item.clone(), false)
+        );
+
+        // Fits the shared response cap, but writing the same bodies to the
+        // legacy pass map as well exceeds the 32 MiB saved-state cap.
+        let urls: Vec<_> = (1..=88)
+            .map(|n| format!("{API_ROOT}repos/o/r/issues/{n}/comments"))
+            .collect();
+        *forge.listing.borrow_mut() = Some(json!(["x".repeat(200 * 1024)]));
+        for url in &urls {
+            assert_eq!(client.get(url, None).unwrap().status, 200);
+        }
+        let mut state = State {
+            interval_seconds: poll::MIN_INTERVAL_SECONDS,
+            responses: cold.shared_responses.take().entries,
+            pass_responses: cold.next_responses.take(),
+            ..State::default()
+        };
+        state.response_scope = Some("scope".into());
+        let saved = bound_state(&mut state);
+        assert!(saved.entries < MAX_ENTRIES && saved.bytes < MAX_BYTES);
+        assert!(saved.evicted.is_empty());
+
+        let warm = bounds();
+        let mut responses = warm.shared_responses.borrow_mut();
+        responses.graphql_enabled = true;
+        responses.seed(State::from_json(&state.to_json()).unwrap().responses);
+        responses.observe_board(
+            &json!({"number": 1, "id": "I_1", "updatedAt": "2026-11-08T00:00:00Z",
+            "repository": {"nameWithOwner": "o/r"}}),
+            0,
+        );
+        drop(responses);
+        let client = Budget {
+            inner: &forge,
+            bounds: &warm,
+        };
+        assert_eq!(
+            client.graphql_item(ItemQuery::Body, "o/r", 1).unwrap(),
+            (item, true)
+        );
+        for url in &urls {
+            assert_eq!(client.get(url, None).unwrap().status, 200);
+        }
+        let responses = warm.shared_responses.borrow();
+        assert_eq!(forge.conditional.get(), urls.len());
+        assert_eq!((responses.misses, responses.evicted_misses), (0, 0));
+        assert!(responses.evicted.is_empty());
     }
 
     #[test]
@@ -704,22 +866,28 @@ mod tests {
         };
         // Refresh the first entry before inserting a late-sorting fresh URL.
         for n in 0..MAX_ENTRIES {
-            responses.keep(&format!("{API_ROOT}a/{n:04}"), &ok("1"));
+            responses.keep_validated(&format!("{API_ROOT}a/{n:04}"), &ok("1"), None);
         }
         assert!(responses.get(&format!("{API_ROOT}a/0000")).is_some());
         let mut restarted = Responses::default();
         restarted.seed(responses.entries.clone());
-        restarted.keep(&format!("{API_ROOT}b"), &ok("1"));
+        restarted.keep_validated(&format!("{API_ROOT}b"), &ok("1"), None);
         assert!(restarted.get(&format!("{API_ROOT}b")).is_some());
         assert!(restarted.get(&format!("{API_ROOT}a/0000")).is_some());
         assert!(restarted.get(&format!("{API_ROOT}a/0001")).is_none());
-        responses.keep(&format!("{API_ROOT}b"), &ok("1"));
+        responses.keep_validated(&format!("{API_ROOT}b"), &ok("1"), None);
         assert!(responses.get(&format!("{API_ROOT}a/0001")).is_none());
         assert!(responses.get(&format!("{API_ROOT}c")).is_none());
+        for _ in 0..2 {
+            assert!(responses.get(&format!("{API_ROOT}oversized")).is_none());
+            let mut large = ok("1");
+            large.body = json!("x".repeat(MAX_ENTRY_BYTES));
+            responses.keep_validated(&format!("{API_ROOT}oversized"), &large, None);
+        }
         assert!(responses.get(&format!("{API_ROOT}a/0000")).is_some());
         assert_eq!(
             responses.misses(),
-            "misses 2 (1 evicted this pass, 1 not cached)"
+            "misses 4 (1 evicted this pass, 3 not cached)"
         );
         let mut state = responses.entries.clone();
         state.insert(format!("{API_ROOT}0"), json!({"body": []}));
@@ -728,7 +896,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "cache: evicted 1 disposable responses this pass, 1 more on save; kept {MAX_ENTRIES}/{MAX_ENTRIES} entries, {}/{MAX_BYTES} bytes",
+                "cache: evicted 1 disposable responses this pass, 1 more on save; kept {MAX_ENTRIES}/{MAX_ENTRIES} entries, {}/{MAX_BYTES} bytes on save ({MAX_BYTES} in pass); 2 oversized responses rejected",
                 last.bytes
             )
         );
@@ -950,6 +1118,12 @@ mod tests {
             if writes {
                 assert!(client.send("PATCH", API_ROOT, &json!({})).is_err());
             }
+            // The issues listing includes this PR but has no head OID. It
+            // must neither erase matching evidence nor revive it after a write.
+            client.revalidated_listing(
+                &format!("{API_ROOT}repos/o/r/issues?state=open"),
+                &json!([{"number": 1, "node_id": id, "updated_at": at, "pull_request": {}}]),
+            );
             warm.starting.set(starting);
             forge.identity.set(u64::from(!same_context));
             let current = item("item-2", CHANGED, &head);
@@ -959,9 +1133,13 @@ mod tests {
             assert_eq!(read, (if reuse { old.clone() } else { current }, reuse));
             assert_eq!(forge.graphql_reads.get(), usize::from(!reuse));
             assert_eq!(warm.spent().requests - prior_requests, usize::from(!reuse));
+            let cache = warm.shared_responses.borrow();
+            assert_eq!(cache.graphql_reused, usize::from(reuse));
+            let lookup = enabled && !starting && same_context;
+            assert_eq!(cache.graphql_lookups, usize::from(lookup));
             assert_eq!(
-                warm.shared_responses.borrow().graphql_reused,
-                usize::from(reuse)
+                cache.graphql_listed,
+                usize::from(lookup && !writes && listed_head.is_some())
             );
         }
     }

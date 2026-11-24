@@ -985,7 +985,7 @@ mod tests {
         };
         let (cold, cold_sends) = run(&config, State::default());
         assert!(!cold.state.responses.is_empty());
-        assert!(!cold.state.pass_responses.is_empty());
+        assert!(cold.state.pass_responses.is_empty());
         assert!(sealed(&cold.state));
         // The returned state is what a caller persists, and it decodes whole.
         assert_eq!(State::from_json(&cold.state.to_json()).unwrap(), cold.state);
@@ -1167,10 +1167,9 @@ mod tests {
         };
         let cold = preview(State::default());
         let mut carried = cold.state.clone();
-        // Keep the separate, sealed REST entry untouched.
         let (url, entry) = carried
-            .pass_responses
-            .iter_mut()
+            .responses
+            .iter()
             .find(|(_, entry)| {
                 entry["comment_evidence"]
                     .pointer("/repository/issue/comments/nodes/0")
@@ -1178,23 +1177,24 @@ mod tests {
             })
             .unwrap();
         let baseline_entry = entry.clone();
-        let rest = format!("GET {url}");
-        assert!(cache::admissible(
-            url,
-            &carried.responses[&format!("{url}{}", cache::REPRESENTATION)],
-            true
-        ));
+        let rest = format!("GET {}", url.strip_suffix(cache::REPRESENTATION).unwrap());
+        assert!(cache::admissible(url, entry, true));
         let comments = format!("GraphQL {}", plan::COMMENTS_QUERY);
         let url = url.clone();
-        let reads = |state| {
+        let reads = |state, conditional| {
             forge.reads.borrow_mut().clear();
             forge.traffic.borrow_mut().clear();
             let warm = preview(state);
-            assert!(forge.traffic.borrow().contains(&(rest.clone(), true)));
+            assert!(
+                forge
+                    .traffic
+                    .borrow()
+                    .contains(&(rest.clone(), conditional))
+            );
             assert_eq!(warm.snapshot, cold.snapshot);
             forge.reads.borrow().get(&comments).copied().unwrap_or(0)
         };
-        let warm_reads = reads(cold.state.clone());
+        let warm_reads = reads(cold.state.clone(), true);
         let mut tampered = baseline_entry.clone();
         tampered["comment_evidence"]["repository"]["issue"]["comments"]["nodes"][0]["editor"] =
             json!({"login": "tampered-editor"});
@@ -1203,13 +1203,22 @@ mod tests {
             entry.as_object_mut().unwrap().remove(field);
             entry
         };
-        for (case, entry) in [
-            ("tampered editor", tampered),
-            ("missing digest", without("digest")),
-            ("missing body", without("body")),
+        for (case, entry, conditional) in [
+            (
+                "no evidence",
+                cache::seal(without("comment_evidence")),
+                true,
+            ),
+            ("tampered editor", tampered, false),
+            ("missing digest", without("digest"), false),
+            ("missing body", without("body"), false),
         ] {
-            carried.pass_responses.insert(url.clone(), entry);
-            assert_eq!(reads(carried.clone()), warm_reads + 1, "{case}");
+            carried.responses.insert(url.clone(), entry);
+            assert_eq!(
+                reads(carried.clone(), conditional),
+                warm_reads + 1,
+                "{case}"
+            );
         }
         carried.interval_seconds = -1;
         let error = super::carried(carried).unwrap_err();
