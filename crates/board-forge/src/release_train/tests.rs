@@ -32,6 +32,9 @@ const CASES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The key of a fixture response that answers successive reads differently.
+const SEQUENCE: &str = "$sequence";
+
 struct Fake {
     responses: RefCell<serde_json::Map<String, Value>>,
     apply: bool,
@@ -132,8 +135,20 @@ impl Api for Fake {
                 "number": 7, "sha": "s", "title": body["title"], "labels": []}),
             );
         }
-        match self.responses.borrow().get(&decoded(path)) {
-            Some(body) if !body.is_null() => Ok(body.clone()),
+        let mut responses = self.responses.borrow_mut();
+        let body = match responses.get_mut(&decoded(path)) {
+            // Successive reads take a sequence's responses in turn, the last repeating.
+            Some(Value::Object(o)) if o.contains_key(SEQUENCE) => {
+                let sequence = o[SEQUENCE].as_array_mut().unwrap();
+                match sequence.len() {
+                    1 => sequence.first().cloned(),
+                    _ => Some(sequence.remove(0)),
+                }
+            }
+            body => body.cloned(),
+        };
+        match body {
+            Some(body) if !body.is_null() => Ok(body),
             _ => Err(Http {
                 method: method.into(),
                 path: path.split('?').next().unwrap_or_default().into(),
@@ -914,6 +929,7 @@ const BOT_REPOS: &str =
     "/user/repos?affiliation=owner&visibility=all&sort=full_name&direction=asc&per_page=100&page=1";
 const CALLER_HEAD: &str = "1111111111111111111111111111111111111111";
 const WRAPPER_MERGE: &str = "2222222222222222222222222222222222222222";
+const WRAPPER_AHEAD: &str = "3333333333333333333333333333333333333333";
 const CALLER_WORKFLOW: &str = ".github/workflows/review.yml";
 
 /// The historical recording lacks inventory/tree reads and never reached the
@@ -929,6 +945,9 @@ fn discovery_fixture(current: bool) -> Value {
         json!([wrapper_pr]);
     r[format!("/repos/cgwalters-forge/actions/compare/main...{WRAPPER_MERGE}")] =
         json!({"status": "behind"});
+    r[format!(
+        "/repos/cgwalters-forge/actions/compare/{WRAPPER_MERGE}...{CALLER_HEAD}?per_page=1"
+    )] = json!({"status": "behind"});
     r["/user"] = json!({"login": "cgwalters-bot", "public_repos": 4, "owned_private_repos": 0});
     r["/users/cgwalters-forge"] = json!({"type": "Organization"});
     r["/orgs/cgwalters-forge"] = json!({"public_repos": 6, "owned_private_repos": 0});
@@ -1046,6 +1065,206 @@ fn discovery_finds_the_unlisted_site_and_adds_fixture_exceptions() {
         assert!(out.contains("from cgwalters-bot/renamed-site:"));
         assert!(!out.contains("test_review.py"));
     }
+}
+
+#[test]
+fn caller_pinned_ahead_of_the_wrappers_merge_is_current() {
+    let mut f = discovery_fixture(true);
+    let comparison = format!(
+        "/repos/cgwalters-forge/actions/compare/{WRAPPER_MERGE}...{WRAPPER_AHEAD}?per_page=1"
+    );
+    let file = format!(
+        "/repos/cgwalters-forge/cgwalters-forge.github.io/contents/{CALLER_WORKFLOW}?ref={CALLER_HEAD}"
+    );
+    let reference = "cgwalters-forge/actions/.github/workflows/cgwalters-review.yml";
+    let ahead = format!("    uses: {reference}@{WRAPPER_AHEAD} # agentic-job v0.6.5");
+    let workflow = format!("jobs:\n  review:\n{ahead}\n");
+    f["responses"][&comparison] = json!({"status": "ahead"});
+    f["responses"][&file] = json!({"encoding": "base64", "content": base64(&workflow)});
+    let wrappers = "/repos/cgwalters-forge/actions";
+    let trees = |f: &mut Value, ahead_tree: &str| {
+        for (at, tree) in [
+            (WRAPPER_MERGE, "5".repeat(40)),
+            (WRAPPER_AHEAD, ahead_tree.into()),
+        ] {
+            f["responses"][format!("{wrappers}/contents/.github?ref={at}")] =
+                json!([{"name": "workflows", "type": "dir", "sha": tree}]);
+        }
+    };
+    trees(&mut f, &"5".repeat(40));
+    // A descendant's .github without workflows, or no .github at all.
+    let ahead_listing = format!("{wrappers}/contents/.github?ref={WRAPPER_AHEAD}");
+    let without_workflows = [
+        json!([{"name": "poll", "type": "dir", "sha": "7".repeat(40)}]),
+        Value::Null,
+    ];
+    let mut no_fork = f.clone();
+    no_fork["responses"][BOT_REPOS]
+        .as_array_mut()
+        .unwrap()
+        .retain(|fork| fork["full_name"] != "cgwalters-bot/renamed-site");
+    no_fork["responses"]["/user"]["public_repos"] = json!(3);
+    let pinned = format!(
+        "cgwalters-forge/cgwalters-forge.github.io:{CALLER_WORKFLOW} pins cgwalters-forge/actions@{WRAPPER_AHEAD}"
+    );
+    for apply in [false, true] {
+        let out = replay(&no_fork, apply).unwrap();
+        assert!(out.contains("v0.6.4: done"), "{out}");
+        assert!(!out.contains("open a PR"), "{out}");
+        // A descendant that may have reverted the bump or removed its
+        // workflows, or a pin GitHub cannot resolve, is left alone and holds
+        // done, naming where it is, with or without a fork to move it from.
+        for f in [&f, &no_fork] {
+            let mut reverted = f.clone();
+            trees(&mut reverted, &"6".repeat(40));
+            let without = without_workflows.clone().map(|listing| {
+                let mut f = f.clone();
+                f["responses"][&ahead_listing] = listing;
+                (f, "which descends")
+            });
+            let mut unknown = f.clone();
+            unknown["responses"][&comparison] = Value::Null;
+            for (f, why) in [
+                (reverted, "which descends"),
+                (unknown, "which GitHub cannot"),
+            ]
+            .into_iter()
+            .chain(without)
+            {
+                let out = replay(&f, apply).unwrap();
+                assert!(
+                    out.contains(&format!("v0.6.4: stall ({pinned}, {why}")),
+                    "{out}"
+                );
+                assert!(!out.contains("open a PR"), "{out}");
+            }
+        }
+    }
+
+    // Stale when selected, but advanced by the fresh read for the edit: no write.
+    let mut advanced = f.clone();
+    let stale = format!("jobs:\n  review:\n    uses: {reference}@{CALLER_HEAD}\n");
+    advanced["responses"][&file]["content"] = json!(base64(&stale));
+    let repo = "/repos/cgwalters-forge/cgwalters-forge.github.io";
+    let head = advanced["responses"][format!("{repo}/commits/main")].clone();
+    let moved = json!({"sha": WRAPPER_AHEAD, "commit": {"tree": {"sha": WRAPPER_AHEAD}}});
+    // Discovery, then the callers' check, then the edit read the head.
+    advanced["responses"][format!("{repo}/commits/main")] =
+        json!({SEQUENCE: [head.clone(), head, moved]});
+    advanced["responses"][format!("{repo}/contents/{CALLER_WORKFLOW}?ref={WRAPPER_AHEAD}")] =
+        json!({"encoding": "base64", "content": base64(&workflow)});
+    let out = replay(&advanced, true).unwrap();
+    assert!(out.contains("v0.6.4: callers"), "{out}");
+    assert!(
+        out.contains("cgwalters-forge.github.io is already current"),
+        "{out}"
+    );
+    for write in [
+        "/repos/cgwalters-bot/renamed-site/",
+        &format!("POST {repo}/pulls"),
+    ] {
+        assert!(!out.contains(write), "{out}");
+    }
+
+    // Advanced after discovery to add a stale caller beside the current one:
+    // the callers' check lists workflows again and the bump moves the new one.
+    let mut added = f.clone();
+    let (newer, extra) = ("4".repeat(40), ".github/workflows/extra.yml");
+    let r = &mut added["responses"];
+    let head = r[format!("{repo}/commits/main")].clone();
+    let moved = json!({"sha": newer, "commit": {"tree": {"sha": newer}}});
+    r[format!("{repo}/commits/main")] = json!({SEQUENCE: [head, moved]});
+    r[format!("{repo}/git/trees/{newer}?recursive=1")] = json!({"truncated": false, "tree": [
+        {"path": CALLER_WORKFLOW, "type": "blob", "mode": "100644"},
+        {"path": extra, "type": "blob", "mode": "100644"}
+    ]});
+    for (path, content) in [(CALLER_WORKFLOW, &workflow), (extra, &stale)] {
+        r[format!("{repo}/contents/{path}?ref={newer}")] =
+            json!({"encoding": "base64", "content": base64(content)});
+    }
+    let out = replay(&added, true).unwrap();
+    assert!(out.contains("v0.6.4: callers"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "open a PR on cgwalters-forge/cgwalters-forge.github.io from cgwalters-bot/renamed-site:release-train/v0.6.4 changing {extra}:"
+        )),
+        "{out}"
+    );
+
+    let old = format!("    uses: {reference}@{CALLER_HEAD} # agentic-job v0.6.3");
+    // Inventory saw the ahead pin, but the default branch has moved since, which
+    // could have reverted it or added a caller: retry rather than drop the repository.
+    let repo = "/repos/cgwalters-forge/cgwalters-forge.github.io";
+    let r = &mut no_fork["responses"];
+    r[OWNER_REPOS][2]["default_branch"] = json!("previous");
+    r[format!("{repo}/commits/previous")] = r[format!("{repo}/commits/main")].clone();
+    r[format!("{repo}/commits/main")]["sha"] = json!(WRAPPER_MERGE);
+    r[format!("{repo}/contents/{CALLER_WORKFLOW}?ref={WRAPPER_MERGE}")] =
+        json!({"encoding": "base64", "content": base64(&format!("jobs:\n  review:\n{old}\n"))});
+    let error = replay(&no_fork, true).unwrap_err();
+    assert!(error.contains("moved during discovery"), "{error}");
+
+    // An older pin in the same workflow still moves, without touching the newer one.
+    let mixed = format!("{workflow}  other:\n{old}\n");
+    f["responses"][&file]["content"] = json!(base64(&mixed));
+    f["responses"]["expectedTreeContent"] = json!([
+        ahead,
+        format!("    uses: {reference}@{WRAPPER_MERGE} # agentic-job v0.6.4")
+    ]);
+    // Also when the newer pin diverges: it holds done but not the bump.
+    for status in ["ahead", "diverged"] {
+        f["responses"][&comparison] = json!({"status": status});
+        let out = replay(&f, true).unwrap();
+        assert!(
+            out.contains("POST /repos/cgwalters-forge/cgwalters-forge.github.io/pulls"),
+            "{out}"
+        );
+    }
+    f["responses"][&file]["content"] = json!(base64(&workflow));
+    let out = replay(&f, true).unwrap();
+    assert!(
+        out.contains(&format!("v0.6.4: stall ({pinned}, which diverges")),
+        "{out}"
+    );
+
+    // A descendant without workflows does not stop the other callers' bumps.
+    for listing in without_workflows {
+        let mut f = discovery_fixture(false);
+        f["responses"][&comparison] = json!({"status": "ahead"});
+        f["responses"][&file] = json!({"encoding": "base64", "content": base64(&workflow)});
+        f["responses"][&ahead_listing] = listing;
+        let out = replay(&f, true).unwrap();
+        assert!(
+            out.contains("open a PR on cgwalters-forge/tracker "),
+            "{out}"
+        );
+        assert!(
+            !out.contains("open a PR on cgwalters-forge/cgwalters-forge.github.io "),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn holds_fit_a_comment_and_count_those_left_out() {
+    // Three fit with their separators, a fourth does not.
+    let hold = "h".repeat(HOLDS_LIMIT / 4);
+    let three = [hold.as_str(); 3].join("; ");
+    for (count, expected) in [
+        (1, hold.clone()),
+        (3, three.clone()),
+        (
+            5,
+            format!("{three}; 2 more holds, listed in the pass output"),
+        ),
+    ] {
+        assert_eq!(joined_holds(&vec![hold.clone(); count]), expected);
+    }
+    let long = "h".repeat(HOLDS_LIMIT + 1);
+    assert_eq!(
+        joined_holds(&[long]),
+        "1 more holds, listed in the pass output"
+    );
 }
 
 #[test]
@@ -1243,6 +1462,7 @@ fn workflow_references_are_exact_and_commit_pinned() {
         pin: WRAPPER_MERGE.into(),
         version: "0.6.4".into(),
     };
+    let moves_forward = |_: &str, pin: &str| Ok(pin == CALLER_HEAD);
     for (path, head, line) in [
         (CALLER_WORKFLOW, "jobs:\n", "  {job}:\n    uses: {ref}\n"),
         ("tests/pin.txt", "", "'{ref}'\n"),
@@ -1250,13 +1470,13 @@ fn workflow_references_are_exact_and_commit_pinned() {
         let line = |job: &str, at: &str| line.replace("{job}", job).replace("{ref}", at);
         let files = [(path.into(), format!("{head}{}", line("a", &followed)))];
         assert!(
-            repin_caller(&files, &wrappers, "tool", &to)
+            repin_caller(&files, &wrappers, "tool", &to, moves_forward)
                 .unwrap()
                 .is_empty()
         );
         let both = format!("{head}{}{}", line("a", &followed), line("b", &reference));
         let files = [(path.into(), both)];
-        let moved = repin_caller(&files, &wrappers, "tool", &to).unwrap();
+        let moved = repin_caller(&files, &wrappers, "tool", &to, moves_forward).unwrap();
         assert_eq!(moved.len(), 1, "{path}");
         let moved = &moved[0].1;
         assert!(moved.contains(&followed), "{moved}");
@@ -1278,11 +1498,11 @@ fn workflow_references_are_exact_and_commit_pinned() {
         pin: WRAPPER_MERGE.into(),
         version: "0.6.4".into(),
     };
-    let moved = repin_caller(&files, &wrappers, "tool", &to).unwrap();
+    let moved = repin_caller(&files, &wrappers, "tool", &to, moves_forward).unwrap();
     assert_eq!(moved.len(), 2);
     assert!(moved.iter().all(|(_, t)| !t.contains(CALLER_HEAD)));
     assert!(
-        repin_caller(&moved, &wrappers, "tool", &to)
+        repin_caller(&moved, &wrappers, "tool", &to, moves_forward)
             .unwrap()
             .is_empty()
     );
@@ -1444,6 +1664,9 @@ fn inventories_paginate_and_never_accept_partial_coverage() {
         used_reads: BTreeSet::new(),
         read_bytes: 0,
         callers: vec![],
+        listed: BTreeMap::new(),
+        pin_states: BTreeMap::new(),
+        held: BTreeSet::new(),
         followed: None,
         discovering: None,
     };

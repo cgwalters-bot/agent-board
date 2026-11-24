@@ -50,7 +50,17 @@ The steps of a train, each a pass:
    publish; bypassing only that forwarder breaks the cycle. All other release
    workflow/action pins remain on the reviewed release commit.
 5. **callers**: once that merges into the default branch, a PR on each caller
-   moving its commit pins of the configured wrapper workflows to that merge commit.
+   moving its older commit pins of the configured wrapper workflows to that merge commit.
+   A pin at the merge is already current, and so is a descendant whose
+   `.github/workflows` tree matches the merge's. A descendant whose workflows
+   differ or are gone (it may have reverted the bump), a divergent pin and a pin GitHub
+   cannot compare are left alone and, like callers following `main` below,
+   hold done: the other callers still get their PRs, and then the train
+   stalls naming each such pin. A caller without a fork whose pins need no
+   move is checked at the commit discovery read; if its default branch has
+   moved since, the pass ends with an error and the next one retries. For a
+   caller with a fork, the workflows are listed again at its newer head, so a
+   bump also moves a caller workflow added since discovery.
    Discover callers across every non-archived, non-fork repository of the
    wrappers repository's owner, not just the configuration's exceptions.
 6. **done**: close the tracking issue.
@@ -95,10 +105,11 @@ need no edit or PR.
 fork-name overrides; they never restrict discovery. Files are deduplicated.
 An entry with `files: []` only overrides a discovered repository's fork. The
 train inventories the bot's forks and reads their parent metadata, so a renamed
-fork works without an override. A missing or ambiguous fork, wrong parent,
-unreadable repository, truncated tree, incomplete inventory or exhausted request
-budget ends the pass with an explicit error, not partial coverage or done. No
-fork is created. Existing PRs still have to pass the default-branch, fork and
+fork works without an override. A missing fork is allowed only for an
+already-current caller without an override. Ambiguous forks, invalid overrides,
+unreadable repositories, truncated trees, incomplete inventories and exhausted
+request budgets end the pass with an explicit error, not partial coverage or done.
+No fork is created. Existing PRs still have to pass the default-branch, fork and
 review checks; stale pins after a merged bump require intervention, not done.
 
 ## Preview and apply
