@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub(crate) mod cache;
+pub use cache::ResponseCache;
 pub mod migrate;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -4720,6 +4721,30 @@ pub async fn run<C: Rest + Transport + crate::github::GraphQl + Broker>(
     (mode, limits): (Mode<'_>, Limits),
     now: OffsetDateTime,
 ) -> Result<Report> {
+    run_with_response_cache(client, dispatcher, config, state, (mode, limits), now, None).await
+}
+
+/// Like [`run`], with an optional independent byte budget for a separate
+/// response file. The caller takes the responses out before saving pass state.
+pub async fn run_with_response_cache<C: Rest + Transport + crate::github::GraphQl + Broker>(
+    client: &C,
+    dispatcher: &C,
+    config: &Config,
+    state: State,
+    (mode, limits): (Mode<'_>, Limits),
+    now: OffsetDateTime,
+    cache_bytes: Option<usize>,
+) -> Result<Report> {
+    if let Some(bytes) = cache_bytes {
+        ensure!(
+            config.state.is_some(),
+            "a separate response cache requires pass state"
+        );
+        ensure!(
+            (1..=ResponseCache::MAX_BYTES).contains(&bytes),
+            "invalid response cache byte limit"
+        );
+    }
     run_pass(
         client,
         dispatcher,
@@ -4727,7 +4752,7 @@ pub async fn run<C: Rest + Transport + crate::github::GraphQl + Broker>(
         state,
         (mode, limits),
         now,
-        false,
+        (false, cache_bytes),
     )
     .await
 }
@@ -4747,7 +4772,7 @@ pub async fn run_replay(
         State::default(),
         (Mode::Preview, limits),
         replay.now,
-        attribute_root,
+        (attribute_root, None),
     )
     .await
 }
@@ -4759,7 +4784,7 @@ async fn run_pass<C: Rest + Transport + crate::github::GraphQl + Broker>(
     state: State,
     (mode, limits): (Mode<'_>, Limits),
     now: OffsetDateTime,
-    attribute_root: bool,
+    (attribute_root, separate_limit): (bool, Option<usize>),
 ) -> Result<Report> {
     ensure!(
         config.forgejo_board().is_none(),
@@ -4767,6 +4792,7 @@ async fn run_pass<C: Rest + Transport + crate::github::GraphQl + Broker>(
     );
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, admit_by);
+    bounds.shared_responses.borrow_mut().separate_limit = separate_limit;
     if attribute_root {
         *bounds.root_reads.borrow_mut() = Some(RootReads::default());
     }
@@ -4842,14 +4868,13 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         responses.graphql_enabled = reuse_graphql_items;
         responses.now = Some(now);
         responses.context = context;
-        responses.seed(
-            state
-                .responses
-                .iter()
-                .filter(|(key, _)| cache::shared_key(key))
-                .map(|(key, entry)| (key.clone(), entry.clone()))
-                .collect(),
-        );
+        // The poll only uses unversioned keys. Move the shared map out rather
+        // than carrying copies of it through the stage and fallback states.
+        let (shared, poll) = std::mem::take(&mut state.responses)
+            .into_iter()
+            .partition(|(key, _)| cache::shared_key(key));
+        state.responses = poll;
+        responses.seed(shared);
     } else {
         // Responses bound to a context this transport cannot confirm are
         // neither reused nor carried on under their old scope.
@@ -4912,7 +4937,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         .zip(network_before)
         .map(|(after, before)| after.saturating_sub(before));
     if let Some(scope) = scope {
-        let responses = bounds.shared_responses.borrow();
+        let mut responses = bounds.shared_responses.borrow_mut();
         if report.state.is_none() {
             report.state = preserved_state;
         }
@@ -4921,7 +4946,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
             state
                 .responses
                 .retain(|key, _| bounds.writes.get() == 0 && !cache::shared_key(key));
-            state.responses.extend(responses.entries.clone());
+            state.responses.append(&mut responses.entries);
         }
         report.lines.push(format!(
             "cache: hits {}, {}, 304s {}, GraphQL reuses {}, listed {}/{} item reads, network sends {} (including retries), charged requests {}, GraphQL points {}",
@@ -4967,10 +4992,12 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         state.holds_pending = bounds.publication_pending.take();
         state.holds_summary_cursor = bounds.publication_summary_cursor.take();
         if state.response_scope.is_some() {
-            let last = cache::bound_state(state);
-            report
-                .lines
-                .push(bounds.shared_responses.borrow().evictions(&last));
+            let responses = bounds.shared_responses.borrow();
+            let last = match responses.separate_limit {
+                Some(limit) => cache::bound_separate(state, limit),
+                None => cache::bound_embedded(state),
+            };
+            report.lines.push(responses.evictions(&last));
         }
     }
     Ok(report)

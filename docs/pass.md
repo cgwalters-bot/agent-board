@@ -3500,6 +3500,39 @@ on the default branch; missing or unreadable artifacts mean cold state. Do
 not search for the newest artifact by name across workflows. Keep this
 potentially private response data out of public logs and artifacts.
 
+To keep response bodies out of that handoff, opt in on the GitHub pass with
+`--cache pass-responses.json`. The configuration must still name `state`:
+cursors, scope and other pass state stay there. A live preview reads the
+response file; only `--apply` replaces it. A missing, corrupt, oversized or
+out-of-scope response file means cold reads without losing the cursors. The
+first pass after switching ignores any embedded responses and starts cold.
+Without `--cache` the embedded format and its limits are unchanged.
+Use a distinct path. When a SQLite `store` is configured, avoid the reserved
+`-journal`, `-wal` and `-shm` suffixes, including case variants. With
+`--cache`, the pass refuses to start if the response file or any other pass
+file path it compares by name (`state`, `store`, `living_status`,
+`--fix-bounds`) is a symlink, even a dangling one, since a link can hide an
+alias; the configuration may be a link and is compared by its target. The
+response cache is written only after the state file and store are saved. The
+pass runs on Linux runners: aliases through a case-insensitive filesystem are
+out of scope.
+
+`--cache-bytes` sets the separate file's response byte budget (24 MiB by
+default, excluding small JSON framing). Tracker should pass
+`--cache pass-responses.json --cache-bytes 268435456` for 256 MiB. The LRU
+and 256 KiB per-entry cap still apply. This limit is independent of the
+32 MiB limit on the pass state file.
+
+The same trust requirement applies to the separate file: a GitHub 304 does
+not authenticate cached content, and local checksums only detect corruption.
+Restore only a file written by the trusted preceding applying pass. For an
+Actions cache that unrelated jobs can populate, verify the restored file
+against a digest recorded in the trusted handoff before passing it to the
+CLI. An exact key alone is not proof of provenance: another job could fill
+that key after eviction. Save only the response file in that cache and keep
+`state` in the trusted artifact. Do not put private responses in a cache
+readable by untrusted jobs.
+
 ### The state store
 
 Machine state is moving out of issue comments into a SQLite database

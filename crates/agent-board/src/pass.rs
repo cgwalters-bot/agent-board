@@ -4,10 +4,15 @@ use anyhow::{Context, Result, bail, ensure};
 use board_forge::caps::Limits;
 use board_forge::github::Client;
 use board_forge::github::{GraphQl, Transport};
-use board_forge::pass::{self, Config, Mode, PassRun, Recorder, Replay, Report, Seeded};
+use board_forge::pass::{
+    self, Config, Mode, PassRun, Recorder, Replay, Report, ResponseCache, Seeded,
+};
 use board_forge::poll::{Rest, State, bounds::FixBoundsSet};
 use std::time::{Duration, Instant};
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 use tokio::runtime::Runtime;
 
 #[derive(clap::Args)]
@@ -18,6 +23,12 @@ pub struct Pass {
     /// The pass configuration (docs/pass.md), from a trusted default-branch checkout [default: .github/pass.json in the current directory]. Credentials come from GH_TOKEN, GITHUB_TOKEN or gh auth token (in that order), never the file; DISPATCH_TOKEN overrides the token for starts.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
+    /// Keep GitHub responses in a separate disposable file instead of the configured state file. A live preview reads it; only --apply replaces it. Restore only a trusted previous pass's file.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["check_config", "record", "replay"])]
+    pub cache: Option<PathBuf>,
+    /// Byte budget for --cache entries (1 to 268435456 bytes; default 25165824, or 24 MiB).
+    #[arg(long, value_name = "BYTES", requires = "cache", value_parser = cache_bytes)]
+    pub cache_bytes: Option<usize>,
     /// Decide only this open GitHub PR through stage 2, skipping all other scheduling and publication. Preview by default; --apply retains pacing, holds, overlap, leases, WIP, bounds and caps. The repository must be followed by the trusted config. Example: agent-board pass --pull 'OWNER/REPO#123'; apply locally with --apply --max-dispatch 1 --max-writes 3.
     #[arg(long, value_name = "OWNER/REPO#N", conflicts_with = "check_config")]
     pub pull: Option<board_forge::poll::PullSelector>,
@@ -55,6 +66,99 @@ pub struct Pass {
 
 /// What `pass --check-config` prints for a configuration the pass accepts.
 const CONFIG_OK: &str = "pass: configuration ok";
+
+fn cache_bytes(text: &str) -> Result<usize> {
+    let bytes = text.parse()?;
+    ensure!(
+        (1..=ResponseCache::MAX_BYTES).contains(&bytes),
+        "cache bytes must be in 1..={}",
+        ResponseCache::MAX_BYTES
+    );
+    Ok(bytes)
+}
+
+/// Do not let the disposable cache replace another pass input or output.
+fn check_cache_path(
+    cache: &Path,
+    config_path: &Path,
+    config: &Config,
+    bounds: &[PathBuf],
+) -> Result<()> {
+    #[cfg(unix)]
+    fn same_file(left: &Path, right: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (left.metadata(), right.metadata()) {
+            (Ok(left), Ok(right)) => (left.dev(), left.ino()) == (right.dev(), right.ino()),
+            _ => false,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn same_file(_left: &Path, _right: &Path) -> bool {
+        false // Existing paths are compared after canonicalization below.
+    }
+
+    fn destination(path: &Path) -> Result<PathBuf> {
+        // Writing through a dangling link can create an alias that
+        // canonicalize cannot resolve before the pass writes.
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            ensure!(
+                !metadata.is_symlink(),
+                "--cache and other pass file paths must not be symlinks: {}",
+                path.display()
+            );
+        }
+        if let Ok(resolved) = path.canonicalize() {
+            return Ok(resolved);
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = path.file_name().context("expected a file path")?;
+        Ok(parent
+            .canonicalize()
+            .unwrap_or(std::path::absolute(parent)?)
+            .join(name))
+    }
+    ensure!(
+        config.forgejo_board().is_none(),
+        "unsupported_capability: --cache: GitHub-only"
+    );
+    let state = config
+        .state
+        .as_deref()
+        .context("--cache requires a state path in the pass config")?;
+    let cache = destination(cache)?;
+    let store = config.store.as_deref().map(Path::new);
+    let companions = store.map(board_forge::store::companion_paths);
+    // The pass never writes the configuration, so a link to it may resolve.
+    let config_path = config_path.canonicalize().unwrap_or(config_path.into());
+    for path in [
+        Some(config_path.as_path()),
+        Some(Path::new(state)),
+        store,
+        config.living_status.as_deref().map(Path::new),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(bounds.iter().map(PathBuf::as_path))
+    .chain(companions.iter().flatten().map(PathBuf::as_path))
+    {
+        ensure!(
+            cache != destination(path)? && !same_file(&cache, path),
+            "--cache must differ from {}",
+            path.display()
+        );
+    }
+    // Before either spelling exists, file identity cannot reveal an alias
+    // through case folding or another mount of the store's directory.
+    ensure!(
+        store.is_none() || !board_forge::store::has_companion_suffix(&cache),
+        "--cache must not use a SQLite companion suffix when store is configured"
+    );
+    Ok(())
+}
 
 #[derive(clap::Subcommand)]
 pub enum PassCommand {
@@ -286,6 +390,9 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     } else {
         args.fix_bounds.clone()
     };
+    if let Some(cache) = &args.cache {
+        check_cache_path(cache, path, &config, &bounds)?;
+    }
     if let Some(board) = config.forgejo_board() {
         // Stop unsupported operations before opening files or looking up any
         // credentials, including the GitHub apply/record/replay paths below.
@@ -436,6 +543,10 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                     }
                     // Only an applying pass writes the cache; a preview reads it.
                     let mut state = config.state.as_deref().map(load_state).unwrap_or_default();
+                    let cache_bytes = args.cache_bytes.unwrap_or(ResponseCache::DEFAULT_BYTES);
+                    if let Some(path) = &args.cache {
+                        ResponseCache::restore(path, cache_bytes, &mut state);
+                    }
                     if let (true, Some(path)) = (config.change_sweep_hours > 0, &config.store) {
                         state.changes = load_changes(path);
                     }
@@ -447,21 +558,49 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                     let dispatcher = Client::from_var("DISPATCH_TOKEN")
                         .map(|dispatcher| dispatcher.retry_within(deadline));
                     let dispatcher = dispatcher.as_ref().unwrap_or(&client);
-                    let pass = pass::run(&client, dispatcher, &config, state, (mode, limits), now);
-                    let report = runtime.block_on(pass)?;
-                    if let (true, Some(path), Some(state)) =
-                        (args.apply, &config.state, &report.state)
+                    let mut report = runtime.block_on(pass::run_with_response_cache(
+                        &client,
+                        dispatcher,
+                        &config,
+                        state,
+                        (mode, limits),
+                        now,
+                        args.cache.as_ref().map(|_| cache_bytes),
+                    ))?;
+                    let mut cache = None;
+                    if let (true, Some(state_path), Some(state)) =
+                        (args.apply, &config.state, &mut report.state)
                     {
+                        cache = args.cache.as_ref().and_then(|_| ResponseCache::take(state));
                         let bytes = serde_json::to_vec(&state.to_json())?;
                         ensure!(
                             bytes.len() as u64 <= pass::STATE_BYTES,
                             "pass state exceeds {} bytes",
                             pass::STATE_BYTES
                         );
-                        std::fs::write(path, bytes).with_context(|| format!("write {path}"))?;
+                        std::fs::write(state_path, bytes)
+                            .with_context(|| format!("write {state_path}"))?;
                     }
-                    if let (true, Some(path)) = (args.apply, &config.store) {
-                        save_store(path, &report, now);
+                    let stored = match (args.apply, &config.store) {
+                        (true, Some(path)) => save_store(path, &report, now),
+                        _ => true,
+                    };
+                    if let (Some(cache_path), Some(cache)) = (&args.cache, cache) {
+                        // The files could not be compared by identity until
+                        // state and store existed (e.g. case-folded aliases),
+                        // so skip the write if the store was not saved.
+                        let saved = if stored {
+                            check_cache_path(cache_path, path, &config, &bounds)
+                                .and_then(|()| cache.save(cache_path))
+                        } else {
+                            Err(anyhow::anyhow!("the store was not saved"))
+                        };
+                        if let Err(error) = saved {
+                            eprintln!(
+                                "warning: could not save pass response cache {}: {error:#}",
+                                cache_path.display()
+                            );
+                        }
                     }
                     report
                 }
@@ -544,7 +683,8 @@ fn load_changes(path: &str) -> Option<board_forge::changes::diff::State> {
 /// changes watermarks in the store.
 /// No decision reads it yet, so a store that cannot be saved only warns:
 /// the pass's own writes are done, and the next pass rebuilds it.
-fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
+/// Whether the store was saved.
+fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) -> bool {
     let records = report.records.borrow();
     match board_forge::store::save(std::path::Path::new(path), &records, now) {
         Ok(saved) => {
@@ -559,8 +699,12 @@ fn save_store(path: &str, report: &Report, now: time::OffsetDateTime) {
                 "store: {} dispatch record(s), {} triage verdict(s), {} plan(s), {} hold(s){watermarks}",
                 saved.dispatches, saved.verdicts, saved.plans, saved.holds
             );
+            true
         }
-        Err(error) => eprintln!("warning: store {path} not saved: {error:#}"),
+        Err(error) => {
+            eprintln!("warning: store {path} not saved: {error:#}");
+            false
+        }
     }
 }
 
@@ -621,6 +765,34 @@ mod next_tests {
         );
         assert!(!data.contains("::") && !data.contains("##["), "{data}");
         assert_eq!(serde_json::from_str::<Value>(data).unwrap(), receipt);
+    }
+
+    #[test]
+    fn separate_cache_flags_are_opt_in_and_bounded() {
+        #[derive(Parser)]
+        struct Args {
+            #[command(flatten)]
+            pass: Pass,
+        }
+        let decode = |extra: &[&str]| {
+            Args::try_parse_from(["pass"].into_iter().chain(extra.iter().copied()))
+        };
+        let legacy = decode(&[]).unwrap().pass;
+        assert_eq!((legacy.cache, legacy.cache_bytes), (None, None));
+        let separate = decode(&["--cache", "responses.json", "--cache-bytes", "268435456"])
+            .unwrap()
+            .pass;
+        assert_eq!(separate.cache.as_deref(), Some(Path::new("responses.json")));
+        assert_eq!(separate.cache_bytes, Some(256 * 1024 * 1024));
+        for flags in [
+            &["--cache-bytes", "1"][..],
+            &["--cache", "responses.json", "--cache-bytes", "268435457"],
+            &["--cache", "responses.json", "--cache-bytes", "0"],
+            &["--cache", "responses.json", "--replay", "fixture.json"],
+            &["--cache", "responses.json", "--check-config"],
+        ] {
+            assert!(decode(flags).is_err(), "{flags:?}");
+        }
     }
 
     #[test]
@@ -703,6 +875,24 @@ mod next_tests {
             .unwrap();
         assert_eq!(load_state(name), State::default());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_cannot_alias_sqlite_companions() {
+        let config_path = Path::new("config.json");
+        let mut config =
+            Config::parse_sources(include_str!("../../../fixtures/pass/config.json")).unwrap();
+        config.state = Some("state.json".into());
+        config.store = Some("pass.db".into());
+
+        check_cache_path(Path::new("responses.json"), config_path, &config, &[]).unwrap();
+        for path in ["pass.db-journal", "pass.db-wal", "pass.db-shm"] {
+            let error = check_cache_path(Path::new(path), config_path, &config, &[]).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("--cache must differ from {path}")
+            );
+        }
     }
 
     #[derive(Parser)]
