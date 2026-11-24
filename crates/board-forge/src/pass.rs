@@ -3930,13 +3930,13 @@ impl<C: Rest> Rest for Budget<'_, C> {
             && !url.contains('#');
         let enabled = validator.is_none()
             && self.bounds.cache_enabled.get()
-            && (!scoped || cacheable)
+            && !scoped
             && !self.bounds.starting.get()
             && !self.bounds.finishing.get();
         let cached = if cacheable {
             self.bounds.shared_responses.borrow_mut().get(url)
         } else {
-            (enabled && !scoped)
+            enabled
                 .then(|| self.bounds.responses.borrow().get(url).cloned())
                 .flatten()
         }
@@ -3985,10 +3985,12 @@ impl<C: Rest> Rest for Budget<'_, C> {
                 && result.as_ref().is_ok_and(|r| r.status == 200),
         );
         let mut response = result?;
+        let mut validated = None;
         if response.status == 304
             && condition.is_some()
             && let Some(cached) = &cached
         {
+            validated = Some(cached);
             response.status = 200;
             response.body = cached["body"].clone();
             response.etag = response
@@ -4022,7 +4024,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
             self.bounds
                 .shared_responses
                 .borrow_mut()
-                .keep(url, &response);
+                .keep_validated(url, &response, validated);
         }
         if current_scope && response.status == 200 {
             self.revalidated_listing(url, &response.body);
@@ -4175,7 +4177,14 @@ impl<C: Rest + Transport> Budget<'_, C> {
         validate_repository(&format!("{owner}/{name}"))?;
         let url =
             format!("{API_ROOT}repos/{owner}/{name}/issues/{number}/comments?per_page=100&page=1");
-        let previous = self.bounds.responses.borrow().get(&url).cloned();
+        let shared = self.bounds.shared_responses.borrow();
+        let scoped = shared.enabled;
+        let previous = if scoped {
+            shared.entry(&url).cloned()
+        } else {
+            self.bounds.responses.borrow().get(&url).cloned()
+        };
+        drop(shared);
         let revalidated = self.bounds.revalidated.get();
         let response = self.get(&url, None)?;
         ensure!(
@@ -4210,9 +4219,15 @@ impl<C: Rest + Transport> Budget<'_, C> {
                 self.inner.graphql(query, variables.clone()),
             )?
         };
-        if comments_match(&response.body, &data)
-            && let Some(entry) = self.bounds.next_responses.borrow_mut().get_mut(&url)
-        {
+        if !comments_match(&response.body, &data) {
+            return Ok(Some(data));
+        }
+        if scoped {
+            let mut shared = self.bounds.shared_responses.borrow_mut();
+            if self.inner.cache_context().as_ref() == shared.context.as_ref() {
+                shared.keep_comment_evidence(&url, &response, fnv(query), &data);
+            }
+        } else if let Some(entry) = self.bounds.next_responses.borrow_mut().get_mut(&url) {
             let mut enriched = entry.clone();
             enriched["comment_query"] = fnv(query).into();
             enriched["comment_evidence"] = data.clone();
@@ -4883,8 +4898,9 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
             state.responses.extend(responses.entries.clone());
         }
         report.lines.push(format!(
-            "cache: hits {}, {}, 304s {}, GraphQL reuses {}, network sends {} (including retries), charged requests {}, GraphQL points {}",
+            "cache: hits {}, {}, 304s {}, GraphQL reuses {}, listed {}/{} item reads, network sends {} (including retries), charged requests {}, GraphQL points {}",
             responses.hits, responses.misses(), responses.modified, responses.graphql_reused,
+            responses.graphql_listed, responses.graphql_lookups,
             report.network_sends.map(|sends| sends.to_string()).unwrap_or_else(|| "unavailable".into()),
             bounds.limit.get().saturating_sub(bounds.left.get()), bounds.points.get()
         ));
