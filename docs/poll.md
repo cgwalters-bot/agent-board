@@ -197,8 +197,10 @@ The GitHub pass extends the existing `state` response map and shared request
 budget; no control-app service is contacted. With no `state` path it is off.
 The full REST representation index is rebuilt from URL keys ending in
 `#agent-board-rest-v1`; poll's slim responses retain their distinct URL keys.
-The response scope hashes the API host, REST Accept/API version, credential
-context and parsed configuration. Credentials themselves are never serialized.
+The response scope hashes the fetch context (API root, REST Accept/API version
+and credential identity), the cache representation version, and whether
+`reuseGraphqlItems` changes the GraphQL projection. Decision settings do not
+invalidate fetched responses. Credentials themselves are never serialized.
 Dispatcher reads participate only with the same credential context as the
 primary client; a distinct or contextless dispatcher always reads directly.
 An older unscoped state starts cold on activation; its pending intake, refusal

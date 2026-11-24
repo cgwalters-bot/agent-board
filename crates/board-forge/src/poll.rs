@@ -2023,6 +2023,8 @@ pub struct State {
     pub interval_seconds: i64,
     /// Disposable responses only; cursors and pending asks are not scoped away.
     pub response_scope: Option<String>,
+    /// Configuration and response scope for the pass's derived holds.
+    pub hold_scope: Option<String>,
     /// Responses by URL: `etag`, `last_modified`, `next` and `body`.
     pub responses: BTreeMap<String, Value>,
     /// Raw pass GET responses, separate from the poll's slimmed bodies.
@@ -2128,14 +2130,15 @@ pub struct State {
 }
 
 impl State {
-    /// Discard only responses on a host/credential/representation/config change.
+    /// Discard responses and derived holds on a fetch scope change.
     /// In particular, pending intake and fairness cursors must survive cache loss.
     pub fn bind_responses(&mut self, scope: &str) {
         if let Some(line) = self.rebind_line(scope) {
             eprintln!("{line}");
             self.responses.clear();
             self.pass_responses.clear();
-            // Decided under another configuration or identity.
+            // Decided using a different fetch context or representation.
+            self.hold_scope = None;
             self.quiet_waits.clear();
             self.carried_holds.clear();
             self.response_scope = Some(scope.to_owned());
@@ -2166,6 +2169,7 @@ impl State {
             eprintln!("cache: no credential context to confirm the response scope; cold reads");
             self.responses.clear();
             self.pass_responses.clear();
+            self.hold_scope = None;
             self.quiet_waits.clear();
             self.carried_holds.clear();
         }
@@ -2221,7 +2225,17 @@ impl State {
             .and_then(Value::as_i64)
             .filter(|s| (MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(s))
             .context("poll state interval_seconds is missing or out of bounds")?;
-        let signed = object.get("response_scope").is_some_and(Value::is_string);
+        // Keep the existing on-disk field so older binaries can read durable
+        // state and treat the combined scope as a cold cache on rollback.
+        let scope = object.get("response_scope").and_then(Value::as_str);
+        let signed = scope.is_some();
+        let (response_scope, hold_scope) = match scope {
+            Some(scope) => match scope.split_once(':') {
+                Some((responses, holds)) => (Some(responses), Some(holds)),
+                None => (Some(scope), None),
+            },
+            None => (None, None),
+        };
         let mut responses = object
             .get("responses")
             .and_then(Value::as_object)
@@ -2438,9 +2452,9 @@ impl State {
             .map(crate::pass::maintain::Day::from_json)
             .transpose()?;
         Ok(Self {
-            response_scope: object
-                .get("response_scope")
-                .and_then(Value::as_str)
+            response_scope: response_scope.map(str::to_owned),
+            hold_scope: hold_scope
+                .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
                 .map(str::to_owned),
             interval_seconds,
             responses,
@@ -2487,7 +2501,10 @@ impl State {
             state["pass_responses"] = json!(self.pass_responses);
         }
         if let Some(scope) = &self.response_scope {
-            state["response_scope"] = scope.as_str().into();
+            state["response_scope"] = match &self.hold_scope {
+                Some(holds) => format!("{scope}:{holds}").into(),
+                None => scope.as_str().into(),
+            };
         }
         if let Some(cursor) = &self.operator_cursor {
             state["operator_cursor"] = cursor.as_str().into();
@@ -11366,6 +11383,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
     } = cursors;
     outcome.state = State {
         response_scope: state.response_scope,
+        hold_scope: None,
         interval_seconds: next_interval(previous, active),
         responses: pass.used,
         pass_responses: BTreeMap::new(),

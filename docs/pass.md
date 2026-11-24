@@ -358,8 +358,8 @@ unchanged pull request(s) waiting on the operator from their listings`).
 
 The state keeps at most 1,000 entries, validated on load; they hold no text,
 only the head, times and which of the two waits. A pass with the option set
-to `false`, or with another configuration or token (the response cache's scope), drops
-them. The state file is already trusted (see
+to `false`, or with another configuration or fetch context, drops them. The
+state file is already trusted (see
 [persisting conditional responses](#persisting-conditional-responses)); a
 forged entry could only repeat one of these waits, which takes no step. Only
 an applying pass writes the state, so a preview decides from what the last
@@ -412,12 +412,11 @@ forged entry can only hold a candidate, for at most four hours and only while
 the board shows the facts it names, never start one. A pass without the option,
 or with another configuration or token, drops them. A binary older than this
 one refuses a state file with `carried_holds`; set `leanReads: false` or
-delete the file to roll back. Without `state` nothing is carried. The response
-cache's scope covers the whole configuration, so the first pass of a binary
-with this option, set or not, starts with cold reads and no `quiet_waits`, as
-after any new configuration field. A caller that
-publishes a filtered copy of its state, as tracker does, carries them only once
-that copy keeps `carried_holds` for its public repositories (agent-board#1048).
+delete the file to roll back. Without `state` nothing is carried. The pass
+keeps a separate configuration digest for `carried_holds` and `quiet_waits`:
+a policy change drops those decisions without invalidating fetched responses.
+Both digests travel in the opaque `response_scope` field, so an older binary
+can still read the state and starts with cold reads.
 
 ## GraphQL item reuse (GitHub)
 
@@ -441,8 +440,8 @@ triage plan comment.
 The responses share the [existing state bounds](poll.md#disposable-rest-responses-partial-794).
 The pass's `cache:` summary line reports `GraphQL reuses` separately from REST
 validator hits and 304s.
-The first pass after upgrading starts with a cold cache because the response
-scope includes the configuration shape.
+Changing `reuseGraphqlItems` starts with a cold cache because it changes the
+item representation. Unrelated config edits keep the response cache.
 
 ## Local GitHub credentials
 
