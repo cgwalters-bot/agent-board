@@ -26,7 +26,7 @@ pub struct Pass {
     /// Keep GitHub responses in a separate disposable file instead of the configured state file. A live preview reads it; only --apply replaces it. Restore only a trusted previous pass's file.
     #[arg(long, value_name = "FILE", conflicts_with_all = ["check_config", "record", "replay"])]
     pub cache: Option<PathBuf>,
-    /// Byte budget for --cache entries (1 to 268435456 bytes; default 25165824, or 24 MiB).
+    /// Positive byte budget for --cache entries (default 25165824 bytes, or 24 MiB).
     #[arg(long, value_name = "BYTES", requires = "cache", value_parser = cache_bytes)]
     pub cache_bytes: Option<usize>,
     /// Decide only this open GitHub PR through stage 2, skipping all other scheduling and publication. Preview by default; --apply retains pacing, holds, overlap, leases, WIP, bounds and caps. The repository must be followed by the trusted config. Example: agent-board pass --pull 'OWNER/REPO#123'; apply locally with --apply --max-dispatch 1 --max-writes 3.
@@ -69,11 +69,7 @@ const CONFIG_OK: &str = "pass: configuration ok";
 
 fn cache_bytes(text: &str) -> Result<usize> {
     let bytes = text.parse()?;
-    ensure!(
-        (1..=ResponseCache::MAX_BYTES).contains(&bytes),
-        "cache bytes must be in 1..={}",
-        ResponseCache::MAX_BYTES
-    );
+    ensure!(bytes > 0, "cache bytes must be positive");
     Ok(bytes)
 }
 
@@ -779,14 +775,13 @@ mod next_tests {
         };
         let legacy = decode(&[]).unwrap().pass;
         assert_eq!((legacy.cache, legacy.cache_bytes), (None, None));
-        let separate = decode(&["--cache", "responses.json", "--cache-bytes", "268435456"])
+        let separate = decode(&["--cache", "responses.json", "--cache-bytes", "268435457"])
             .unwrap()
             .pass;
         assert_eq!(separate.cache.as_deref(), Some(Path::new("responses.json")));
-        assert_eq!(separate.cache_bytes, Some(256 * 1024 * 1024));
+        assert_eq!(separate.cache_bytes, Some(256 * 1024 * 1024 + 1));
         for flags in [
             &["--cache-bytes", "1"][..],
-            &["--cache", "responses.json", "--cache-bytes", "268435457"],
             &["--cache", "responses.json", "--cache-bytes", "0"],
             &["--cache", "responses.json", "--replay", "fixture.json"],
             &["--cache", "responses.json", "--check-config"],

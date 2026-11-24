@@ -4,9 +4,8 @@ use super::*;
 
 pub(super) const REPRESENTATION: &str = "#agent-board-rest-v1";
 const GRAPHQL_REPRESENTATION: &str = "#agent-board-graphql-item-v1-";
-pub(crate) const MAX_ENTRIES: usize = 1024;
+const LEGACY_MAX_ENTRIES: usize = 1024;
 pub(crate) const MAX_BYTES: usize = 24 * 1024 * 1024;
-pub(super) const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 // The two maps and the 64-byte scope digest need a fixed amount of JSON framing.
 const FILE_OVERHEAD: usize = 256;
 pub(crate) const LEGACY_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -54,6 +53,10 @@ pub(super) struct Responses {
 impl Responses {
     fn limit(&self) -> usize {
         self.separate_limit.unwrap_or(MAX_BYTES)
+    }
+
+    fn entry_limit(&self) -> Option<usize> {
+        self.separate_limit.is_none().then_some(LEGACY_MAX_ENTRIES)
     }
 }
 
@@ -225,7 +228,12 @@ impl Index {
         }
     }
 
-    fn bound(&mut self, entries: &mut BTreeMap<String, Value>, limit: usize) -> Bounded {
+    fn bound(
+        &mut self,
+        entries: &mut BTreeMap<String, Value>,
+        limit: usize,
+        entry_limit: Option<usize>,
+    ) -> Bounded {
         let mut evicted = BTreeSet::new();
         self.sizes.retain(|(_, url), size| {
             if *size <= MAX_ENTRY_BYTES {
@@ -236,7 +244,17 @@ impl Index {
             evicted.insert(url.0.clone());
             false
         });
-        while self.bytes > limit || self.sizes.len() > MAX_ENTRIES {
+        self.evict(entries, limit, entry_limit, evicted)
+    }
+
+    fn evict(
+        &mut self,
+        entries: &mut BTreeMap<String, Value>,
+        limit: usize,
+        entry_limit: Option<usize>,
+        mut evicted: BTreeSet<String>,
+    ) -> Bounded {
+        while self.bytes > limit || entry_limit.is_some_and(|max| self.sizes.len() > max) {
             let Some(((_, url), size)) = self.sizes.pop_first() else {
                 break;
             };
@@ -255,11 +273,19 @@ impl Index {
 
 /// Eviction affects responses only, never pending asks, receipts or accounting.
 pub(crate) fn bound(entries: &mut BTreeMap<String, Value>, limit: usize) -> Bounded {
+    bound_entries(entries, limit, Some(LEGACY_MAX_ENTRIES))
+}
+
+fn bound_entries(
+    entries: &mut BTreeMap<String, Value>,
+    limit: usize,
+    entry_limit: Option<usize>,
+) -> Bounded {
     let mut index = Index::default();
     for (url, entry) in entries.iter() {
         index.insert(url, entry, entry_bytes(url, entry));
     }
-    index.bound(entries, limit)
+    index.bound(entries, limit, entry_limit)
 }
 
 /// Legacy embedded format only: leave room for the rest of the state file.
@@ -284,8 +310,10 @@ pub(super) fn bound_separate(state: &mut State, limit: usize) -> Bounded {
     for entry in state.pass_responses.values_mut() {
         *entry = seal(std::mem::take(entry));
     }
-    let evidence = bound(&mut state.pass_responses, limit);
-    let mut kept = bound(&mut state.responses, limit - evidence.bytes);
+    // Each serialized entry (including its key) consumes part of the shared
+    // byte budget, so the budget also bounds the number of entries.
+    let evidence = bound_entries(&mut state.pass_responses, limit, None);
+    let mut kept = bound_entries(&mut state.responses, limit - evidence.bytes, None);
     kept.bytes += evidence.bytes;
     kept.limit = limit;
     kept
@@ -311,9 +339,8 @@ struct RawCache<'a> {
     pass_responses: RawEntries<'a>,
 }
 
-/// A map refused past the entry count or per-entry size before any entry
-/// is decoded. A decoded `Value` can be many times its text's size, so
-/// this bounds each entry, not the total: only restore a trusted file.
+/// Refuse oversized entries before decoding any of them. A decoded `Value`
+/// can be many times its text's size: only restore a trusted file.
 struct RawEntries<'a>(Vec<(String, &'a serde_json::value::RawValue)>);
 
 impl<'de: 'a, 'a> Deserialize<'de> for RawEntries<'a> {
@@ -334,7 +361,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for RawEntries<'a> {
                 while let Some((url, entry)) =
                     map.next_entry::<String, &serde_json::value::RawValue>()?
                 {
-                    if entries.len() == MAX_ENTRIES || entry.get().len() > MAX_ENTRY_BYTES {
+                    if entry.get().len() > MAX_ENTRY_BYTES {
                         return Err(serde::de::Error::custom(
                             "response cache exceeds its entry bounds",
                         ));
@@ -366,7 +393,6 @@ impl RawEntries<'_> {
 
 impl ResponseCache {
     pub const DEFAULT_BYTES: usize = MAX_BYTES;
-    pub const MAX_BYTES: usize = MAX_FILE_BYTES;
 
     /// Ignore the embedded maps when the caller opts into the separate file.
     /// Missing or bad cache data must not reset cursors or scope in pass state.
@@ -384,10 +410,10 @@ impl ResponseCache {
                 "response cache must be a regular file"
             );
             let file = std::fs::File::open(path)?;
-            let max = (limit.min(Self::MAX_BYTES) + FILE_OVERHEAD) as u64;
+            let max = (limit as u64).saturating_add(FILE_OVERHEAD as u64);
             ensure!(file.metadata()?.len() <= max, "response cache is too large");
             let mut bytes = Vec::new();
-            file.take(max + 1).read_to_end(&mut bytes)?;
+            file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
             ensure!(bytes.len() as u64 <= max, "response cache is too large");
             let raw: RawCache = serde_json::from_slice(&bytes)?;
             ensure!(raw.scope == scope, "response cache scope mismatch");
@@ -397,8 +423,8 @@ impl ResponseCache {
                 pass_responses: raw.pass_responses.decode()?,
             };
             drop(bytes);
-            let evidence = bound(&mut cache.pass_responses, limit);
-            let responses = bound(&mut cache.responses, limit - evidence.bytes);
+            let evidence = bound_entries(&mut cache.pass_responses, limit, None);
+            let responses = bound_entries(&mut cache.responses, limit - evidence.bytes, None);
             ensure!(
                 evidence.evicted.is_empty() && responses.evicted.is_empty(),
                 "response cache exceeds its entry bounds"
@@ -571,8 +597,8 @@ impl Responses {
             self.index.insert(key, entry, entry_bytes(key, entry));
         }
         self.entries = entries;
-        let limit = self.limit();
-        self.index.bound(&mut self.entries, limit);
+        let (limit, entry_limit) = (self.limit(), self.entry_limit());
+        self.index.bound(&mut self.entries, limit, entry_limit);
     }
 
     fn keep_entry(&mut self, key: String, mut entry: Value) {
@@ -596,9 +622,15 @@ impl Responses {
         self.index.insert(&key, &entry, size);
         self.evicted.remove(&key);
         self.entries.insert(key, entry);
-        let limit = self.limit();
-        self.evicted
-            .append(&mut self.index.bound(&mut self.entries, limit).evicted);
+        let (limit, entry_limit) = (self.limit(), self.entry_limit());
+        // Seeded entries were already bounded, and the new one passed the
+        // size check above. Don't rescan the whole cache on each use.
+        self.evicted.append(
+            &mut self
+                .index
+                .evict(&mut self.entries, limit, entry_limit, BTreeSet::new())
+                .evicted,
+        );
     }
 
     pub fn get(&mut self, url: &str) -> Option<Value> {
@@ -689,7 +721,7 @@ impl Responses {
     /// keeps; never a URL, only counts against the caps.
     pub fn evictions(&self, last: &Bounded) -> String {
         format!(
-            "cache: evicted {} disposable responses this pass, {} more on save; kept {}/{MAX_ENTRIES} entries, {}/{} bytes on save ({} in pass); {} oversized responses rejected",
+            "cache: evicted {} disposable responses this pass, {} more on save; kept {} entries, {}/{} bytes on save ({} in pass); {} oversized responses rejected",
             self.evicted.len(),
             last.evicted.difference(&self.evicted).count(),
             last.entries,
@@ -870,7 +902,7 @@ mod tests {
         };
         state.response_scope = Some("scope".into());
         let saved = bound_embedded(&mut state);
-        assert!(saved.entries < MAX_ENTRIES && saved.bytes < MAX_BYTES);
+        assert!(saved.entries < LEGACY_MAX_ENTRIES && saved.bytes < MAX_BYTES);
         assert!(saved.evicted.is_empty());
 
         let warm = bounds();
@@ -1003,12 +1035,15 @@ mod tests {
             assert_eq!(changed.intake_waiting, original.intake_waiting);
             assert_eq!(changed.intake_refused, original.intake_refused);
         }
-        let mut entries = (0..MAX_ENTRIES + 1)
+        let mut entries = (0..=LEGACY_MAX_ENTRIES)
             .map(|n| (format!("{url}/{n}"), json!({"body": []})))
             .collect();
         let bounded = bound(&mut entries, MAX_BYTES);
-        assert_eq!(entries.len(), MAX_ENTRIES);
-        assert_eq!((bounded.evicted.len(), bounded.entries), (1, MAX_ENTRIES));
+        assert_eq!(entries.len(), LEGACY_MAX_ENTRIES);
+        assert_eq!(
+            (bounded.evicted.len(), bounded.entries),
+            (1, LEGACY_MAX_ENTRIES)
+        );
         entries.insert("large".into(), json!({"body": "x".repeat(MAX_ENTRY_BYTES)}));
         let bounded = bound(&mut entries, MAX_BYTES);
         assert!(!entries.contains_key("large"));
@@ -1049,7 +1084,7 @@ mod tests {
             body: json!([]),
         };
         // Refresh the first entry before inserting a late-sorting fresh URL.
-        for n in 0..MAX_ENTRIES {
+        for n in 0..LEGACY_MAX_ENTRIES {
             responses.keep_validated(&format!("{API_ROOT}a/{n:04}"), &ok("1"), None);
         }
         assert!(responses.get(&format!("{API_ROOT}a/0000")).is_some());
@@ -1080,7 +1115,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "cache: evicted 1 disposable responses this pass, 1 more on save; kept {MAX_ENTRIES}/{MAX_ENTRIES} entries, {}/{MAX_BYTES} bytes on save ({MAX_BYTES} in pass); 2 oversized responses rejected",
+                "cache: evicted 1 disposable responses this pass, 1 more on save; kept {LEGACY_MAX_ENTRIES} entries, {}/{MAX_BYTES} bytes on save ({MAX_BYTES} in pass); 2 oversized responses rejected",
                 last.bytes
             )
         );
@@ -1104,7 +1139,7 @@ mod tests {
                 .responses
                 .insert(format!("{url}{REPRESENTATION}"), entry.clone());
         }
-        let separate = bound_separate(&mut state, ResponseCache::MAX_BYTES);
+        let separate = bound_separate(&mut state, 64 * 1024 * 1024);
         assert!(separate.bytes as u64 > STATE_BYTES);
         assert_eq!(separate.entries, 192);
         let kept = bound_embedded(&mut state);
@@ -1176,7 +1211,6 @@ mod tests {
             "no scope",
             "oversized",
             "dense entry",
-            "too many entries",
             "corrupt JSON",
             "changed body",
             "missing",
@@ -1195,13 +1229,6 @@ mod tests {
                 "dense entry" => {
                     let numbers = vec!["0"; MAX_ENTRY_BYTES / 2 + 1].join(",");
                     write_raw(format!(r#""{url}":{{"body":[{numbers}]}}"#));
-                    MAX_BYTES
-                }
-                "too many entries" => {
-                    let entries: Vec<_> = (0..=MAX_ENTRIES)
-                        .map(|n| format!(r#""{API_ROOT}{n}":{{"body":[]}}"#))
-                        .collect();
-                    write_raw(entries.join(","));
                     MAX_BYTES
                 }
                 "corrupt JSON" => {
@@ -1229,6 +1256,54 @@ mod tests {
                 "{problem}"
             );
         }
+    }
+
+    #[test]
+    fn separate_cache_keeps_more_than_the_legacy_entry_limit() {
+        let mut live = Responses {
+            separate_limit: Some(MAX_BYTES),
+            ..Responses::default()
+        };
+        for n in 0..=LEGACY_MAX_ENTRIES {
+            live.keep_entry(
+                format!("{API_ROOT}{n}{REPRESENTATION}"),
+                json!({"body": []}),
+            );
+        }
+        assert!(live.evicted.is_empty());
+        assert_eq!(live.entries.len(), LEGACY_MAX_ENTRIES + 1);
+        let mut state = State {
+            response_scope: Some("scope".into()),
+            responses: live.entries,
+            ..State::default()
+        };
+        let kept = bound_separate(&mut state, MAX_BYTES);
+        assert_eq!(kept.entries, LEGACY_MAX_ENTRIES + 1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("responses.json");
+        let cache = ResponseCache::take(&mut state).unwrap();
+        cache.save(&path).unwrap();
+
+        // Both the exact entry budget and the largest representable budget
+        // (which must not overflow the file-read guard) permit a warm restore.
+        for limit in [kept.bytes, usize::MAX] {
+            ResponseCache::restore(&path, limit, &mut state);
+            assert_eq!(state.responses, cache.responses);
+            let mut warm = Responses {
+                separate_limit: Some(limit),
+                ..Responses::default()
+            };
+            warm.seed(std::mem::take(&mut state.responses));
+            assert_eq!(warm.entries.len(), LEGACY_MAX_ENTRIES + 1);
+        }
+        let mut smaller = cache.responses.clone();
+        let trimmed = bound_entries(&mut smaller, kept.bytes - 1, None);
+        assert_eq!(
+            trimmed.evicted,
+            BTreeSet::from([format!("{API_ROOT}0{REPRESENTATION}")])
+        );
+        ResponseCache::restore(&path, kept.bytes - 1, &mut state);
+        assert!(state.responses.is_empty());
     }
 
     #[test]
