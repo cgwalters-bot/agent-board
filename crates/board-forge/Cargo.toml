@@ -11,7 +11,7 @@ getrandom = "0.3"
 flate2 = "1"
 board-core = { path = "../board-core" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml_ng = "0.10"
 safe-outputs = { git = "https://github.com/cgwalters-forge/agentic-job", rev = "009ac9883c9278293114c54f8376a5f40d88300f" }
 sha2 = "0.10"

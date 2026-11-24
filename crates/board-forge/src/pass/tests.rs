@@ -1509,7 +1509,29 @@ fn cached_pass(
 fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
     let config = config(json!({"state": ".state/poll.json"}));
     let mut expected = None;
-    for cache in ["cold", "warm", "lost"] {
+    for cache in ["cold", "warm", "lost", "separate warm", "separate lost"] {
+        let separate = cache.starts_with("separate");
+        let pass = |forge: &ConditionalRecording<Forge>, state, apply| {
+            if !separate {
+                return cached_pass(forge, &config, state, apply);
+            }
+            let own = own();
+            let mode = if apply {
+                Mode::Actions(&own)
+            } else {
+                Mode::Preview
+            };
+            block(run_with_response_cache(
+                forge,
+                forge,
+                &config,
+                state,
+                (mode, Limits::default()),
+                forge.replay.replay.now,
+                Some(ResponseCache::MAX_BYTES),
+            ))
+            .unwrap()
+        };
         let mut forge = ConditionalRecording {
             replay: Forge::new(None, false),
             reads: RefCell::default(),
@@ -1523,10 +1545,43 @@ fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
             .insert("o/r#1".into(), "2026-10-23T00:00:00Z".into());
         state.intake_refused.push("o/r#1/issuecomment-2".into());
         if cache != "cold" {
-            let seed = cached_pass(&forge, &config, state, false);
+            let seed = pass(&forge, state, false);
             assert_eq!(seed.failures, 0, "{:?}", seed.lines);
-            state = State::from_json(&seed.state.unwrap().to_json()).unwrap();
-            assert!(!state.responses.is_empty());
+            let mut seeded = seed.state.unwrap();
+            assert!(!seeded.responses.is_empty());
+            if separate {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("responses.json");
+                if cache == "separate warm" {
+                    let padding = cache::seal(json!({"body": "x".repeat(192 * 1024)}));
+                    for n in 0..176 {
+                        seeded.responses.insert(
+                            format!("{API_ROOT}unused/{n}{}", cache::REPRESENTATION),
+                            padding.clone(),
+                        );
+                    }
+                }
+                let file = ResponseCache::take(&mut seeded).unwrap();
+                let durable = seeded.to_json();
+                assert!(durable.to_string().len() as u64 <= STATE_BYTES);
+                state = State::from_json(&durable).unwrap();
+                assert!(state.responses.is_empty() && state.pass_responses.is_empty());
+                if cache == "separate warm" {
+                    file.save(&path).unwrap();
+                    assert!(std::fs::metadata(&path).unwrap().len() > STATE_BYTES);
+                }
+                ResponseCache::restore(&path, ResponseCache::MAX_BYTES, &mut state);
+                if cache == "separate warm" {
+                    assert!(
+                        state.responses.contains_key(&format!(
+                            "{API_ROOT}unused/175{}",
+                            cache::REPRESENTATION
+                        ))
+                    );
+                }
+            } else {
+                state = State::from_json(&seeded.to_json()).unwrap();
+            }
             assert!(forge.replay.writes.borrow().is_empty());
             if cache == "lost" {
                 state.responses.clear();
@@ -1534,7 +1589,7 @@ fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
         }
         forge.reads.borrow_mut().clear();
         forge.traffic.borrow_mut().clear();
-        let report = cached_pass(&forge, &config, state, true);
+        let report = pass(&forge, state, true);
         assert_eq!(report.failures, 0, "{cache}: {:?}", report.lines);
         assert_eq!(
             forge.replay.dispatches().len(),
@@ -1552,7 +1607,7 @@ fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
             traffic[..first_write]
                 .iter()
                 .any(|(_, conditional)| *conditional),
-            cache == "warm"
+            cache.ends_with("warm")
         );
         drop(traffic);
         let writes = forge.replay.writes.borrow().clone();
@@ -1561,13 +1616,23 @@ fn response_cache_applying_cold_warm_and_lost_preserve_actions() {
         } else {
             expected = Some(writes.clone());
         }
-        let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
+        let mut state = report.state.unwrap();
+        if separate {
+            let file = ResponseCache::take(&mut state).unwrap();
+            if cache == "separate warm" {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("kept.json");
+                file.save(&path).unwrap();
+                assert!(std::fs::metadata(&path).unwrap().len() > STATE_BYTES);
+            }
+        }
+        let state = State::from_json(&state.to_json()).unwrap();
         assert_eq!(state.intake_waiting["o/r#1"], "2026-10-23T00:00:00Z");
         assert_eq!(state.intake_refused, ["o/r#1/issuecomment-2"]);
         // Simulate loss after real writes too, leaving the action state alone.
         let mut lost = state;
         lost.responses.clear();
-        let again = cached_pass(&forge, &config, lost, true);
+        let again = pass(&forge, lost, true);
         assert_eq!(again.failures, 0, "{cache}: {:?}", again.lines);
         assert_eq!(
             *forge.replay.writes.borrow(),

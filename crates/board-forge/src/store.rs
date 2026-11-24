@@ -373,8 +373,7 @@ fn inspect(path: &Path, flags: OpenFlags) -> Result<(Connection, usize)> {
     );
     // SQLite would play a journal back into the file on its first read,
     // past the bounds checked here; this build never leaves one behind.
-    for suffix in JOURNALS {
-        let journal = sibling(path, suffix);
+    for journal in companion_paths(path) {
         ensure!(
             std::fs::symlink_metadata(&journal).is_err(),
             "a journal beside it: {}",
@@ -475,8 +474,7 @@ fn replace(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    for suffix in std::iter::once("").chain(JOURNALS) {
-        let file = sibling(path, suffix);
+    for file in std::iter::once(path.to_path_buf()).chain(companion_paths(path)) {
         match std::fs::remove_file(&file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -488,8 +486,25 @@ fn replace(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The suffixes of the files SQLite keeps beside a database.
-const JOURNALS: [&str; 3] = ["-journal", "-wal", "-shm"];
+const JOURNAL_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
+/// Paths reserved for SQLite beside the store, even if they do not yet exist.
+pub fn companion_paths(path: &Path) -> [std::path::PathBuf; 3] {
+    JOURNAL_SUFFIXES.map(|suffix| sibling(path, suffix))
+}
+
+/// Whether a file is named like a SQLite companion, regardless of its stem.
+pub fn has_companion_suffix(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy().to_uppercase();
+    let name = name.trim_end_matches(['.', ' ']);
+    JOURNAL_SUFFIXES.iter().any(|suffix| {
+        name.get(name.len().saturating_sub(suffix.len())..)
+            .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
+    })
+}
 
 fn sibling(path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut file = path.as_os_str().to_owned();

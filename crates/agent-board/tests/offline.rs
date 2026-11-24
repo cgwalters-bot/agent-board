@@ -3848,6 +3848,95 @@ fn pass_check_config_table() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn pass_cache_cannot_alias_durable_state() {
+    let dir = std::env::temp_dir().join(format!("agent-board-cache-alias-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    config["state"] = "state.json".into();
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    std::os::unix::fs::symlink("responses.json", dir.join("state.json")).unwrap();
+    // A linked configuration is read only, so it is compared by its target.
+    std::os::unix::fs::symlink("config.json", dir.join("linked.json")).unwrap();
+    for (cache, expected) in [
+        ("responses.json", "must not be symlinks: state.json"),
+        ("config.json", "--cache must differ from"),
+    ] {
+        let output = command()
+            .args(["pass", "--config", "linked.json", "--cache", cache])
+            .current_dir(&dir)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(expected), "{cache}: {error}");
+    }
+    assert!(!dir.join("responses.json").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn pass_apply_refuses_sqlite_companion_aliases_before_touching_store() {
+    use board_forge::store::{self, Records};
+
+    let dir = std::env::temp_dir().join(format!("agent-board-cache-store-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store_path = dir.join("pass.db");
+    store::save(
+        &store_path,
+        &Records::default(),
+        time::OffsetDateTime::UNIX_EPOCH,
+    )
+    .unwrap();
+    let saved_store = std::fs::read(&store_path).unwrap();
+    let mut config: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    config["state"] = "state.json".into();
+    config["store"] = "pass.db".into();
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    std::fs::create_dir(dir.join("other")).unwrap();
+
+    for cache in [
+        "PASS.DB-JOURNAL",
+        "PASS.DB-WAL",
+        "PASS.DB-SHM",
+        "other/pass.db-journal",
+    ] {
+        let output = command()
+            .args([
+                "pass",
+                "--apply",
+                "--config",
+                "config.json",
+                "--cache",
+                cache,
+            ])
+            .current_dir(&dir)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains(
+                "--cache must not use a SQLite companion suffix when store is configured"
+            ),
+            "{cache}: {error}"
+        );
+        assert!(!dir.join(cache).exists());
+        assert_eq!(std::fs::read(&store_path).unwrap(), saved_store);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// `--fix-bounds` parses twice on pass and poll, and every path it names is
 /// read: two good files get past reading them, and a missing second fails.
 #[test]

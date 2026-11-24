@@ -1,4 +1,4 @@
-//! Disposable REST and version-checked GraphQL representations in poll state.
+//! Disposable REST and version-checked GraphQL representations.
 //! The map is a rebuildable representation index, not action state.
 use super::*;
 
@@ -6,6 +6,9 @@ pub(super) const REPRESENTATION: &str = "#agent-board-rest-v1";
 const GRAPHQL_REPRESENTATION: &str = "#agent-board-graphql-item-v1-";
 pub(crate) const MAX_ENTRIES: usize = 1024;
 pub(crate) const MAX_BYTES: usize = 24 * 1024 * 1024;
+pub(super) const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
+// The two maps and the 64-byte scope digest need a fixed amount of JSON framing.
+const FILE_OVERHEAD: usize = 256;
 pub(crate) const LEGACY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 256 * 1024;
 const MAX_OBSERVATIONS: usize = BOARD_PAGES * 100;
@@ -25,6 +28,7 @@ pub(super) fn shared_key(key: &str) -> bool {
 
 #[derive(Default)]
 pub(super) struct Responses {
+    pub separate_limit: Option<usize>,
     pub enabled: bool,
     pub context: Option<String>,
     pub entries: BTreeMap<String, Value>,
@@ -45,6 +49,12 @@ pub(super) struct Responses {
     pub evicted: BTreeSet<String>,
     pub evicted_misses: usize,
     oversized: usize,
+}
+
+impl Responses {
+    fn limit(&self) -> usize {
+        self.separate_limit.unwrap_or(MAX_BYTES)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -252,8 +262,8 @@ pub(crate) fn bound(entries: &mut BTreeMap<String, Value>, limit: usize) -> Boun
     index.bound(entries, limit)
 }
 
-/// Reserve room for the rest of the saved state before keeping responses.
-pub(super) fn bound_state(state: &mut State) -> Bounded {
+/// Legacy embedded format only: leave room for the rest of the state file.
+pub(super) fn bound_embedded(state: &mut State) -> Bounded {
     let mut entries = std::mem::take(&mut state.responses);
     let other_bytes = state.to_json().to_string().len();
     let limit = (STATE_BYTES as usize)
@@ -262,6 +272,178 @@ pub(super) fn bound_state(state: &mut State) -> Bounded {
     let bounded = bound(&mut entries, limit);
     state.responses = entries;
     bounded
+}
+
+/// Bound both maps in the separate file without charging for any pass state.
+pub(super) fn bound_separate(state: &mut State, limit: usize) -> Bounded {
+    // A scoped read uses the shared index for the REST body. The old pass map
+    // is needed only for the GraphQL editor evidence paired with those reads.
+    state
+        .pass_responses
+        .retain(|_, entry| entry.get("comment_evidence").is_some());
+    for entry in state.pass_responses.values_mut() {
+        *entry = seal(std::mem::take(entry));
+    }
+    let evidence = bound(&mut state.pass_responses, limit);
+    let mut kept = bound(&mut state.responses, limit - evidence.bytes);
+    kept.bytes += evidence.bytes;
+    kept.limit = limit;
+    kept
+}
+
+/// Only response representations and their scope travel in the disposable file.
+/// The digest checks detect corruption, not a writer who can forge the file.
+#[derive(Serialize)]
+pub struct ResponseCache {
+    scope: String,
+    responses: BTreeMap<String, Value>,
+    pass_responses: BTreeMap<String, Value>,
+}
+
+/// The file as read: entries stay raw JSON text until the scope matches.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCache<'a> {
+    scope: String,
+    #[serde(borrow)]
+    responses: RawEntries<'a>,
+    #[serde(borrow)]
+    pass_responses: RawEntries<'a>,
+}
+
+/// A map refused past the entry count or per-entry size before any entry
+/// is decoded. A decoded `Value` can be many times its text's size, so
+/// this bounds each entry, not the total: only restore a trusted file.
+struct RawEntries<'a>(Vec<(String, &'a serde_json::value::RawValue)>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for RawEntries<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Visitor<'a> {
+            type Value = RawEntries<'a>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map of cached responses")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some((url, entry)) =
+                    map.next_entry::<String, &serde_json::value::RawValue>()?
+                {
+                    if entries.len() == MAX_ENTRIES || entry.get().len() > MAX_ENTRY_BYTES {
+                        return Err(serde::de::Error::custom(
+                            "response cache exceeds its entry bounds",
+                        ));
+                    }
+                    entries.push((url, entry));
+                }
+                Ok(RawEntries(entries))
+            }
+        }
+        deserializer.deserialize_map(Visitor(std::marker::PhantomData))
+    }
+}
+
+impl RawEntries<'_> {
+    /// Check each entry's digest as it is decoded, so a corrupt file is
+    /// refused after decoding at most one bounded entry. Intact entries were
+    /// held in memory by the pass that wrote them.
+    fn decode(self) -> Result<BTreeMap<String, Value>> {
+        self.0
+            .into_iter()
+            .map(|(url, raw)| {
+                let entry: Value = serde_json::from_str(raw.get())?;
+                ensure!(admissible(&url, &entry, true), "invalid cached response");
+                Ok((url, entry))
+            })
+            .collect()
+    }
+}
+
+impl ResponseCache {
+    pub const DEFAULT_BYTES: usize = MAX_BYTES;
+    pub const MAX_BYTES: usize = MAX_FILE_BYTES;
+
+    /// Ignore the embedded maps when the caller opts into the separate file.
+    /// Missing or bad cache data must not reset cursors or scope in pass state.
+    pub fn restore(path: &std::path::Path, limit: usize, state: &mut State) {
+        state.responses.clear();
+        state.pass_responses.clear();
+        // Without a durable scope no file can match; don't read one.
+        let Some(scope) = state.response_scope.as_deref() else {
+            return;
+        };
+        let load = || -> Result<Self> {
+            use std::io::Read;
+            ensure!(
+                std::fs::symlink_metadata(path)?.is_file(),
+                "response cache must be a regular file"
+            );
+            let file = std::fs::File::open(path)?;
+            let max = (limit.min(Self::MAX_BYTES) + FILE_OVERHEAD) as u64;
+            ensure!(file.metadata()?.len() <= max, "response cache is too large");
+            let mut bytes = Vec::new();
+            file.take(max + 1).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() as u64 <= max, "response cache is too large");
+            let raw: RawCache = serde_json::from_slice(&bytes)?;
+            ensure!(raw.scope == scope, "response cache scope mismatch");
+            let mut cache = Self {
+                scope: raw.scope,
+                responses: raw.responses.decode()?,
+                pass_responses: raw.pass_responses.decode()?,
+            };
+            drop(bytes);
+            let evidence = bound(&mut cache.pass_responses, limit);
+            let responses = bound(&mut cache.responses, limit - evidence.bytes);
+            ensure!(
+                evidence.evicted.is_empty() && responses.evicted.is_empty(),
+                "response cache exceeds its entry bounds"
+            );
+            Ok(cache)
+        };
+        match load() {
+            Ok(cache) => {
+                state.responses = cache.responses;
+                state.pass_responses = cache.pass_responses;
+            }
+            // Don't print decoder errors that might quote cached content.
+            Err(_) => eprintln!(
+                "warning: missing, unreadable or out-of-scope pass response cache; cold reads"
+            ),
+        }
+    }
+
+    /// Keep the scope in pass state but take all response data out before saving it.
+    pub fn take(state: &mut State) -> Option<Self> {
+        let responses = std::mem::take(&mut state.responses);
+        let pass_responses = std::mem::take(&mut state.pass_responses);
+        Some(Self {
+            scope: state.response_scope.clone()?,
+            responses,
+            pass_responses,
+        })
+    }
+
+    /// Replace the disposable file atomically; an interrupted write leaves the old one.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let mut file =
+            tempfile::NamedTempFile::new_in(parent).context("create temporary response cache")?;
+        let mut writer = std::io::BufWriter::new(file.as_file_mut());
+        serde_json::to_writer(&mut writer, self).context("encode response cache")?;
+        use std::io::Write;
+        writer.flush().context("flush response cache")?;
+        drop(writer);
+        file.persist(path).context("replace response cache")?;
+        Ok(())
+    }
 }
 
 impl Responses {
@@ -389,7 +571,8 @@ impl Responses {
             self.index.insert(key, entry, entry_bytes(key, entry));
         }
         self.entries = entries;
-        self.index.bound(&mut self.entries, MAX_BYTES);
+        let limit = self.limit();
+        self.index.bound(&mut self.entries, limit);
     }
 
     fn keep_entry(&mut self, key: String, mut entry: Value) {
@@ -413,8 +596,9 @@ impl Responses {
         self.index.insert(&key, &entry, size);
         self.evicted.remove(&key);
         self.entries.insert(key, entry);
+        let limit = self.limit();
         self.evicted
-            .append(&mut self.index.bound(&mut self.entries, MAX_BYTES).evicted);
+            .append(&mut self.index.bound(&mut self.entries, limit).evicted);
     }
 
     pub fn get(&mut self, url: &str) -> Option<Value> {
@@ -511,7 +695,7 @@ impl Responses {
             last.entries,
             last.bytes,
             last.limit,
-            MAX_BYTES,
+            self.limit(),
             self.oversized,
         )
     }
@@ -685,7 +869,7 @@ mod tests {
             ..State::default()
         };
         state.response_scope = Some("scope".into());
-        let saved = bound_state(&mut state);
+        let saved = bound_embedded(&mut state);
         assert!(saved.entries < MAX_ENTRIES && saved.bytes < MAX_BYTES);
         assert!(saved.evicted.is_empty());
 
@@ -920,7 +1104,10 @@ mod tests {
                 .responses
                 .insert(format!("{url}{REPRESENTATION}"), entry.clone());
         }
-        let kept = bound_state(&mut state);
+        let separate = bound_separate(&mut state, ResponseCache::MAX_BYTES);
+        assert!(separate.bytes as u64 > STATE_BYTES);
+        assert_eq!(separate.entries, 192);
+        let kept = bound_embedded(&mut state);
         assert!(kept.bytes > 23 * 1024 * 1024 && kept.bytes <= MAX_BYTES);
         // The older separate pass response map can itself use up to 16 MiB.
         for n in 0..80 {
@@ -928,7 +1115,7 @@ mod tests {
                 .pass_responses
                 .insert(format!("{API_ROOT}other/{n}"), entry.clone());
         }
-        let kept = bound_state(&mut state);
+        let kept = bound_embedded(&mut state);
         assert!(!kept.evicted.is_empty());
         let saved = serde_json::to_vec(&state.to_json()).unwrap();
         assert!(saved.len() as u64 <= STATE_BYTES);
@@ -936,6 +1123,112 @@ mod tests {
         assert_eq!(decoded.responses.len(), kept.entries);
         assert_eq!(decoded.intake_waiting, state.intake_waiting);
         assert_eq!(decoded.pass_responses.len(), 80);
+    }
+
+    #[test]
+    fn separate_file_round_trips_only_scoped_and_bounded_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("responses.json");
+        let mut state = State {
+            interval_seconds: poll::MIN_INTERVAL_SECONDS,
+            response_scope: Some("scope".into()),
+            scan_cursor: Some("o/r#1".into()),
+            ..State::default()
+        };
+        let url = format!("{API_ROOT}small{REPRESENTATION}");
+        state
+            .responses
+            .insert(url.clone(), seal(json!({"body": ["distinctive body"]})));
+        state.responses.insert(
+            format!("{API_ROOT}large{REPRESENTATION}"),
+            seal(json!({"body": "a".repeat(MAX_ENTRY_BYTES)})),
+        );
+        let evidence_url = format!("{API_ROOT}evidence");
+        state.pass_responses.insert(
+            evidence_url.clone(),
+            json!({"body": [], "comment_evidence": {}}),
+        );
+        let kept = bound_separate(&mut state, MAX_BYTES);
+        assert_eq!(kept.entries, 1, "the per-entry cap still applies");
+        assert_eq!(kept.limit, MAX_BYTES, "both maps share the file budget");
+        let cache = ResponseCache::take(&mut state).unwrap();
+        let saved = state.to_json().to_string();
+        assert!(!saved.contains("distinctive body"));
+        assert!(state.responses.is_empty() && state.pass_responses.is_empty());
+        let mut loaded = State::from_json(&serde_json::from_str(&saved).unwrap()).unwrap();
+        cache.save(&path).unwrap();
+        ResponseCache::restore(&path, MAX_BYTES, &mut loaded);
+        assert_eq!(loaded.responses[&url]["body"], json!(["distinctive body"]));
+        assert!(admissible(
+            &evidence_url,
+            &loaded.pass_responses[&evidence_url],
+            true
+        ));
+        let warm = loaded.clone();
+        // Written raw: these entries must be refused before they are decoded.
+        let write_raw = |responses: String| {
+            let file =
+                format!(r#"{{"scope":"scope","responses":{{{responses}}},"pass_responses":{{}}}}"#);
+            std::fs::write(&path, file).unwrap();
+        };
+        for problem in [
+            "wrong scope",
+            "no scope",
+            "oversized",
+            "dense entry",
+            "too many entries",
+            "corrupt JSON",
+            "changed body",
+            "missing",
+        ] {
+            let mut loaded = warm.clone();
+            let limit = match problem {
+                "wrong scope" => {
+                    loaded.response_scope = Some("other scope".into());
+                    MAX_BYTES
+                }
+                "no scope" => {
+                    loaded.response_scope = None;
+                    MAX_BYTES
+                }
+                "oversized" => 1,
+                "dense entry" => {
+                    let numbers = vec!["0"; MAX_ENTRY_BYTES / 2 + 1].join(",");
+                    write_raw(format!(r#""{url}":{{"body":[{numbers}]}}"#));
+                    MAX_BYTES
+                }
+                "too many entries" => {
+                    let entries: Vec<_> = (0..=MAX_ENTRIES)
+                        .map(|n| format!(r#""{API_ROOT}{n}":{{"body":[]}}"#))
+                        .collect();
+                    write_raw(entries.join(","));
+                    MAX_BYTES
+                }
+                "corrupt JSON" => {
+                    std::fs::write(&path, b"not JSON").unwrap();
+                    MAX_BYTES
+                }
+                "changed body" => {
+                    cache.save(&path).unwrap();
+                    let bytes = std::fs::read_to_string(&path).unwrap();
+                    std::fs::write(&path, bytes.replace("distinctive body", "other body")).unwrap();
+                    MAX_BYTES
+                }
+                "missing" => {
+                    std::fs::remove_file(&path).unwrap();
+                    MAX_BYTES
+                }
+                _ => unreachable!(),
+            };
+            let scope = loaded.response_scope.clone();
+            ResponseCache::restore(&path, limit, &mut loaded);
+            assert_eq!(loaded.scan_cursor, state.scan_cursor, "{problem}");
+            assert_eq!(loaded.response_scope, scope, "{problem}");
+            assert!(
+                loaded.responses.is_empty() && loaded.pass_responses.is_empty(),
+                "{problem}"
+            );
+        }
     }
 
     #[test]
