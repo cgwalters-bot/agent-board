@@ -441,6 +441,12 @@ fn prepare<C: Rest + Transport>(
         Some(r) => read_receipt(client, config, repo, number, r, comments.len())?,
         None => Receipt::Opaque,
     };
+    // Its upstream PR's own rounds own the branch now; publishing to it
+    // again would overwrite their work.
+    hold!(
+        !matches!(&recorded, Receipt::Confirmed(record) if record.handed_over),
+        "handed over to its upstream PR; nothing to publish"
+    );
     let branch_of = |branch: &str| {
         ensure!(
             branch == original_branch || publication_branch(branch),

@@ -21403,6 +21403,10 @@ fn config_table() {
         ),
         (promote(json!({"draft": true})), "unknown field `draft`"),
         (
+            promote(json!({"followUpstream": true})),
+            "promote followUpstream needs promote publish",
+        ),
+        (
             promote(
                 json!({"forks": {"o/fork": {"upstream": "up/project", "base": "main",
                 "draft": true}}}),

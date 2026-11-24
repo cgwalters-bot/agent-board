@@ -630,7 +630,8 @@ work, without weakening the current-head authorization boundary.
   base requirements within the existing poll request budget. Red upstream CI
   feeds the original fork PR's bounded fix rounds, even when its approved head
   and branch differ from the publication head and branch. Fixes target the
-  fork PR, never write upstream, and retain its existing holds and round ledger.
+  fork PR, never write upstream, and retain its existing holds and round ledger,
+  unless `promote.followUpstream` hands the fork PR over (below).
   Upstream check reruns are not attempted through the fork's retry machinery.
    Missing or pending upstream CI does not start a repair or certify success.
    A repaired fork head supersedes its old receipt: polling waits for renewed
@@ -670,9 +671,28 @@ work, without weakening the current-head authorization boundary.
   ambiguous POST failure is not retried in the same invocation: the next
   invocation observes existing upstream PRs first, and never creates a second
   one intentionally. Concurrent invocations still need caller serialization;
-  GitHub does not offer an atomic create-if-absent status comment. Nothing
-  except the PR is posted upstream. Fork PRs remain open: capped, recoverable
-  fork closure requires separate acceptance after the handoff replay proof.
+  GitHub does not offer an atomic create-if-absent status comment. Publication
+  posts nothing upstream except the PR. Fork PRs remain open, unless the caller
+  sets `promote.followUpstream` (agent-board#1205): then stage 2, finding a
+  fork PR's rewritten publication (on its own `bot/promote/<oid>` branch,
+  which a republished repair keeps) current and open upstream, and finding
+  that its upstream PR passes the checks of that PR's own turns (its
+  repository followed and not handed to its maintainers, its head the bot's
+  fork's or a `pr.headOwners` repository's, no fix plans routing, and the fix
+  bounds, owner-branches opt-in and shared heads admitting a round), comments
+  on the source issue, records the hand-over in the receipt (`handed_over`)
+  and closes the fork PR. Both PRs are read again before the comment and
+  before the receipt edit; a hold, unread labels, a push or a close on either
+  stops the step. The receipt is the hand-over: a retry after it only closes
+  the fork PR, and publication no longer updates that publication. Until a
+  receipt records it, the upstream PR gets no round or branch update, since
+  moving it off the published head would refuse the hand-over: stage 2 finds
+  the fork PRs whose receipts may name a bot PR among its cross-references,
+  which the receipt's link leaves, and holds one that a receipt names without
+  the record, or one on a promotion branch or from a publication fork that no
+  receipt names. The upstream PR then takes stage 2's ordinary rounds on its
+  publication branch, within the fix bounds, without another approval; those
+  rounds keep their round-ledger comments on it.
   No unsigned head is published: sign-off completeness is checked independently
   of DCO detection before publication. Live publication and bot-fork staging
   verification remain unverified by the offline fixtures.
@@ -687,7 +707,9 @@ The answers to the brief's open questions:
    issue and whether the link closes it or only delivers a partial slice.
    Legacy readable-only receipts still prevent duplicate publication,
    but their prose never authorizes a handoff. With the existing configured
-   `promote.forks` mapping (absent/empty is off), the pass scans at most ten
+   `promote.forks` mapping (absent/empty is off), or with
+   `promote.followUpstream` the targets stage 2 resolves, discovered forks
+   included, since it may close fork PRs there, the pass scans at most ten
    100-row pages per open source issue's cross-reference timeline in its
    request/time budget, including closed PRs and historical body links. It
    does not enumerate unrelated fork PR history. Visitor comments are ignored
@@ -711,8 +733,11 @@ The answers to the brief's open questions:
    an error or completion. A verified merged `Part of` slice does not complete
     its source or conflict with the next slice. These refusals reuse the existing
     unknown-promotion hold, not a new state store. Start rechecks
-   use the same verifier. Fork closure is **not delivered**: it needs its own
-   capped, recoverable acceptance after replay proof. Caller rollout and
+   use the same verifier. Fork closure is off by default (`promote.followUpstream`);
+   with it, a fork PR is done, not abandoned, and its upstream PR may move on
+   from the published head on the recorded branch, only when its
+   authenticated receipt records the hand-over, however the fork PR was
+   closed. Caller rollout and
    staging acceptance remain tracker#1464, separately approved; no live
    promotion or bot-fork acceptance is claimed by edited response scenarios.
 2. **`--human-text`.** Only the operator's command carries the marker; the

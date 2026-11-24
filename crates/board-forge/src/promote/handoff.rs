@@ -7,6 +7,33 @@ pub(super) const SCHEMA: &str = "agent-board/promoted/v1";
 pub(super) const FENCE: &str = "agent-board-promoted";
 pub(crate) const STATUS: &str = "<!-- agent-board-promote-status -->";
 
+/// Marks the bot's comment saying on fork PR `repo#n`'s source issue, which
+/// several slices' fork PRs may share, that its work approved at `approved`
+/// moves to upstream PR `upstream` (`OWNER/REPO#N`) under
+/// `promote.followUpstream` (agent-board#1205). It only keeps a retry from
+/// posting it twice: the receipt's [`Record::handed_over`] is the hand-over.
+pub(crate) fn handover_marker(repo: &str, n: u64, upstream: &str, approved: &str) -> String {
+    format!("<!-- agent-board-followed-upstream {repo}#{n} {upstream} {approved} -->")
+}
+
+/// Whether one of the bot's `comments`, by its REST login, carries `marker`.
+pub(crate) fn posted(bot: &str, marker: &str, comments: &[Value]) -> bool {
+    comments.iter().any(|c| {
+        c["user"]["login"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(bot))
+            && c["body"].as_str().is_some_and(|b| b.contains(marker))
+    })
+}
+
+/// The approved head that a rewritten publication's branch was cut for
+/// ([`rewrite::branch`]); it stays when a repaired head is published again.
+pub(crate) fn promoted_head(branch: &str) -> Option<&str> {
+    branch
+        .strip_prefix(&rewrite::branch(""))
+        .filter(|head| oid(head))
+}
+
 /// A confirmed publication: what the pass hands off, and what a publication
 /// retry skips or updates without rebuilding the published head.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -27,6 +54,13 @@ pub(super) struct Record {
     /// older receipts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) cut: Option<rewrite::Cut>,
+    /// Stage 2 handed the fork PR over to the upstream PR under
+    /// `promote.followUpstream` (agent-board#1205): that PR's own rounds move
+    /// its head on `published_branch`, and publication no longer follows the
+    /// fork PR. Only this authenticated record says so, never a comment or
+    /// who closed the fork PR.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) handed_over: bool,
 }
 
 /// The issues of `repo` that `body` closes or is part of.
@@ -37,7 +71,7 @@ fn linked(repo: &str, body: &str) -> Vec<u64> {
         .collect()
 }
 
-pub(super) fn source(repo: &str, pull: &Value) -> Result<u64> {
+pub(crate) fn source(repo: &str, pull: &Value) -> Result<u64> {
     let body = pull["body"].as_str().context("missing source linkage")?;
     let issues = linked(repo, body);
     ensure!(
@@ -81,11 +115,23 @@ pub(super) fn success(
             source(repo, pull)?,
         ),
         cut: cut.cloned(),
+        handed_over: false,
     };
     Ok(format!(
         "Published approved head {head} as https://github.com/{upstream}/pull/{n}. Fork PR stays open; Status/scheduling uses verified upstream state.\n\n{STATUS}\n\n```{FENCE}\n{}\n```",
         serde_json::to_string_pretty(&record)?
     ))
+}
+
+/// The upstream PR's URL, which the receipt's text also links: GitHub then
+/// lists the fork PR among that PR's cross-references ([`publishes`]).
+fn upstream_url(record: &Record) -> String {
+    format!(
+        "https://{}/{}/pull/{}",
+        crate::github::DEFAULT_HOST,
+        record.upstream_repository,
+        record.upstream_pr
+    )
 }
 
 /// Enrich the existing per-pass facts. No new store, client or mutation path.
@@ -100,12 +146,18 @@ pub(crate) fn enrich(
         Err(error) if crate::pass::budget_spent(&error) => {
             // Discard even earlier repositories' conclusions: an interrupted
             // read must not turn an unverified handoff into an absent one.
+            // Discovered forks may be any of the midstream owner's.
             if let Some(settings) = &config.promote {
+                let owner = (config.midstream.as_ref())
+                    .filter(|_| hands_over(config))
+                    .map(|m| m.owner.as_str());
                 for facts in items.values_mut().filter(|facts| {
-                    settings
-                        .forks
-                        .keys()
-                        .any(|repo| repo.eq_ignore_ascii_case(&facts.issue.repository))
+                    let repo = &facts.issue.repository;
+                    settings.forks.keys().any(|r| r.eq_ignore_ascii_case(repo))
+                        || owner.is_some_and(|owner| {
+                            repo.split_once('/')
+                                .is_some_and(|(o, _)| o.eq_ignore_ascii_case(owner))
+                        })
                 }) {
                     facts.promotion = Some(Promotion::Unknown);
                 }
@@ -114,6 +166,14 @@ pub(crate) fn enrich(
         }
         result => result,
     }
+}
+
+/// Whether stage 2 may hand fork PRs over (`promote.followUpstream`).
+fn hands_over(config: &Config) -> bool {
+    config
+        .promote
+        .as_ref()
+        .is_some_and(|p| p.publish && p.follow_upstream)
 }
 
 fn enrich_within(
@@ -126,7 +186,13 @@ fn enrich_within(
     let Some(settings) = config.promote.as_ref().filter(|_| enabled(config)) else {
         return Ok(skipped);
     };
-    for (repo, target) in &settings.forks {
+    // Where stage 2 may hand fork PRs over and close them, its own targets,
+    // discovered ones included: closed, they still count here.
+    let forks = match hands_over(config) {
+        true => targets(client, config)?,
+        false => settings.forks.clone(),
+    };
+    for (repo, target) in &forks {
         if !items
             .values()
             .any(|f| f.open && f.issue.repository.eq_ignore_ascii_case(repo))
@@ -357,6 +423,9 @@ fn enrich_pull(
             }),
         )));
     }
+    // A fork PR whose receipt records its hand-over gave its work to the
+    // upstream PR: done here, not abandoned, even once the setting is off
+    // again. Closed any other way, the published head must still match.
     let upstream = verify_upstream(client, &config.bot, repo, target, &pull, &record)?;
     let partial_merge =
         !record.completes_source && upstream["state"] == "closed" && upstream["merged"] == true;
@@ -411,6 +480,9 @@ pub(super) fn verify_record(
     repository(&pull["base"]["repo"], repo)
 }
 
+/// Once `record` is [`Record::handed_over`], the upstream PR's fix rounds
+/// push to the recorded branch, so its head may have moved on from the
+/// published one; it must still be that branch.
 pub(super) fn verify_upstream(
     client: &impl Rest,
     bot: &str,
@@ -448,7 +520,7 @@ pub(super) fn verify_upstream(
     let linked = linked(repo, upstream_body);
     ensure!(
         upstream["number"] == record.upstream_pr
-            && upstream["head"]["sha"] == record.published_oid
+            && (record.handed_over || upstream["head"]["sha"] == record.published_oid)
             && upstream["head"]["repo"]["full_name"] == head_repo
             && upstream["head"]["ref"] == record.published_branch
             && upstream["base"]["ref"] == target.base
@@ -469,18 +541,50 @@ pub(super) fn verify_upstream(
 /// A fork's authenticated publication, for routing upstream CI back to its
 /// original PR. Prose and visitor comments cannot select a repair target.
 pub(crate) enum Publication {
-    Current(Value),
+    Current(Box<Published>),
     AwaitingApproval,
 }
 
-pub(crate) fn published(
-    client: &(impl Rest + Transport),
-    bot: &str,
-    repo: &str,
-    target: &crate::pass::promote::Fork,
-    pull: &Value,
-    comments: &[Value],
-) -> Result<Option<Publication>> {
+/// A fork PR's current publication: its upstream PR, read and verified as
+/// `upstream`, and the authenticated receipt that records it.
+pub(crate) struct Published {
+    pub(crate) upstream: Value,
+    pub(super) record: Record,
+    pub(super) receipt: u64,
+}
+
+impl Published {
+    /// Whether the receipt records the hand-over ([`Record::handed_over`]).
+    pub(crate) fn handed_over(&self) -> bool {
+        self.record.handed_over
+    }
+
+    /// Whether publication rewrote the approved head onto its own branch
+    /// ([`rewrite::branch`]). Only such a publication is handed over: a
+    /// direct one shares its branch with the fork PR and its round ledger.
+    pub(crate) fn rewritten(&self) -> bool {
+        promoted_head(&self.record.published_branch).is_some()
+    }
+
+    /// The receipt comment's id, and its body once it records the hand-over.
+    pub(crate) fn handover(&self) -> Result<(u64, String)> {
+        let record = Record {
+            handed_over: true,
+            ..self.record.clone()
+        };
+        let body = format!(
+            "Published approved head {} as {}. Handed over: work continues there in the poll's rounds, and this fork PR is closed or being closed.\n\n{STATUS}\n\n```{FENCE}\n{}\n```",
+            record.approved_oid,
+            upstream_url(&record),
+            serde_json::to_string_pretty(&record)?
+        );
+        Ok((self.receipt, body))
+    }
+}
+
+/// The bot's one receipt among fork PR `comments`, if any: confirmed, or a
+/// pending publication's status comment.
+fn receipt<'c>(bot: &str, comments: &'c [Value]) -> Result<Option<&'c Value>> {
     let receipts: Vec<_> = comments
         .iter()
         .filter(|c| {
@@ -493,7 +597,50 @@ pub(crate) fn published(
         })
         .collect();
     ensure!(receipts.len() <= 1, "duplicate handoff records");
-    let Some(receipt) = receipts.first() else {
+    Ok(receipts.first().copied())
+}
+
+/// Whether fork PR `pull` of `repo`, with `comments`, has an authenticated
+/// receipt naming `upstream`'s PR `n` as its publication, and if so whether
+/// it records the hand-over. A pending publication names none yet.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publishes(
+    client: &impl Transport,
+    bot: &str,
+    repo: &str,
+    target: &crate::pass::promote::Fork,
+    pull: &Value,
+    comments: &[Value],
+    upstream: &str,
+    n: u64,
+) -> Result<Option<bool>> {
+    let Some(receipt) = receipt(bot, comments)? else {
+        return Ok(None);
+    };
+    let number = pull["number"].as_u64().context("missing fork number")?;
+    let body = receipt["body"]
+        .as_str()
+        .context("missing publication receipt body")?;
+    if super::publish::pending(body)? {
+        return Ok(None);
+    }
+    let record = read_record(client, bot, repo, number, receipt, comments.len())?;
+    verify_record(repo, target, pull, &record)?;
+    Ok(
+        (record.upstream_repository.eq_ignore_ascii_case(upstream) && record.upstream_pr == n)
+            .then_some(record.handed_over),
+    )
+}
+
+pub(crate) fn published(
+    client: &(impl Rest + Transport),
+    bot: &str,
+    repo: &str,
+    target: &crate::pass::promote::Fork,
+    pull: &Value,
+    comments: &[Value],
+) -> Result<Option<Publication>> {
+    let Some(receipt) = receipt(bot, comments)? else {
         return Ok(None);
     };
     ensure!(
@@ -529,7 +676,13 @@ pub(crate) fn published(
     if upstream["state"] == "open" {
         contained(client, target, &record)?;
     }
-    Ok(Some(Publication::Current(upstream)))
+    Ok(Some(Publication::Current(Box::new(Published {
+        upstream,
+        record,
+        receipt: receipt["id"]
+            .as_u64()
+            .context("invalid handoff comment id")?,
+    }))))
 }
 
 /// An open publication carries only its recorded commits while upstream

@@ -21,6 +21,14 @@ pub struct Promote {
     #[serde(default)]
     pub on_approval: bool,
 
+    /// Once a fork pull request's publication is verified and its upstream
+    /// pull request open, stage 2 closes the fork pull request with a link,
+    /// says so on its source issue, and leaves upstream fixes to the bot's own
+    /// upstream pull request's rounds (agent-board#1205): the one approval
+    /// that published it is the only gate. Off by default; needs `publish`.
+    #[serde(default)]
+    pub follow_upstream: bool,
+
     /// Exact former Git author emails for replay and sign-off of commits with
     /// no mapped author and an expected bot committer. Empty leaves this exception off.
     #[serde(default)]
@@ -73,6 +81,12 @@ impl Promote {
                 .as_ref()
                 .is_none_or(|m| m.topic == "bot-midstream"),
             "promotion requires midstream.topic=bot-midstream to preserve no-merge protection"
+        );
+        // Without publication the poll reads no upstream CI or receipt,
+        // so the switch would silently do nothing.
+        ensure!(
+            !self.follow_upstream || self.publish,
+            "promote followUpstream needs promote publish"
         );
         let mut seen = BTreeSet::new();
         for (fork, to) in &self.forks {

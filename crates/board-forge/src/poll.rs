@@ -766,6 +766,10 @@ pub struct PollPolicy {
     /// Pass-only promotion targets: authenticated publication CI feeds the
     /// original fork PR's existing bounded fix rounds. Empty by default.
     pub publication_forks: BTreeMap<String, crate::pass::promote::Fork>,
+    /// Pass-only `promote.followUpstream`: a fork PR whose publication is
+    /// current and open upstream is closed with a link instead
+    /// ([`publication::Promoted::Upstream`]). Off by default.
+    pub follow_promoted: bool,
     /// Pass-only fail-closed scope when publication discovery is unavailable.
     pub unavailable_publication_forks: Vec<String>,
     /// The pass's `pr.operatorPaths` (agent-board#683): paths, or with a
@@ -1567,6 +1571,7 @@ impl PollPolicy {
         let mut policy = Self {
             pull: None,
             publication_forks: BTreeMap::new(),
+            follow_promoted: false,
             unavailable_publication_forks: vec![],
             open_pr_cap: get("openPrCap")?
                 .map(|cap| {
@@ -9222,6 +9227,35 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         (line, false, Some(wait), stepped)
     }
 
+    /// Why `repo`'s pull request `number`, `pull`, gets no round: the fix
+    /// bounds, the head repository's [`Self::owner_branches`] opt-in or a
+    /// [`Self::shared_head`] leave it to the operator. Repairs and their
+    /// triage share these checks; the caller independently checks each
+    /// dispatched kind against its own bounds.
+    fn round_refusal(&mut self, repo: &str, number: u64, pull: &Value) -> Option<String> {
+        let author = text(pull, "/author/login");
+        let bounds = &self.config.policy.fix_bounds;
+        if let Some(why) = bounds.refusal(repo, author, text(pull, "/headRefName")) {
+            return Some(why);
+        }
+        if self.config.policy.owner_branches {
+            let cross = pull["isCrossRepository"].as_bool().unwrap_or(false);
+            let owner = text(pull, "/headRepositoryOwner/login");
+            let own = cross && owner.eq_ignore_ascii_case(&self.config.bot);
+            let head = match cross {
+                true => text(pull, "/headRepository/nameWithOwner"),
+                false => repo,
+            };
+            if let Some(why) = self.owner_branches(head, own) {
+                return Some(why);
+            }
+        }
+        let Some((owner, name)) = repo.split_once('/') else {
+            return Some("its repository has no owner".into());
+        };
+        self.shared_head(owner, name, number)
+    }
+
     /// Why agentic-job's apply would refuse to push a round's commit to a
     /// pull request's head in repository `head`, unless it is the bot's own
     /// fork (`own`): its default branch has no [`OWNER_BRANCHES`] naming it.
@@ -9660,10 +9694,19 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         {
             return Ok(result);
         }
-        let publication_checks = if !merge_only && !labelled(&pull) {
-            self.publication_checks(repo, number, &pull, &comments)?
-        } else {
-            None
+        let publication_checks = match (!merge_only && !labelled(&pull))
+            .then(|| self.publication_checks(repo, number, &pull, &comments))
+            .transpose()?
+            .flatten()
+        {
+            Some(publication::Promoted::Upstream(upstream)) => {
+                if let Some(why) = publication::handover_hold(&pull) {
+                    return Ok(self.person_skip(repo, number, merge_only, &pull, &why));
+                }
+                return self.hand_over(repo, &pull, &upstream);
+            }
+            Some(publication::Promoted::Checks(checks)) => Some(checks),
+            None => None,
         };
         if publication_checks.is_none() && drafts::eligible(self.config, repo, &pull) {
             return self.draft_review(repo, &mut pull, &comments, &marker, intake);
@@ -10072,36 +10115,21 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 format!("open-pr-cap: land {repo}#{older} first; overlapping paths"),
             );
         }
-        // Repairs and their triage share the fix scope checks here. The caller
-        // independently checks each dispatched kind against its own bounds.
-        let bounds = &self.config.policy.fix_bounds;
+        // A fork PR's hand-over asks the same of its upstream PR
+        // ([`publication`]), and a push here is what it must come before.
         let round = matches!(
             decision.action,
             "fix" | "continue" | "rebase" | "answer" | "triage" | "triage-grant" | RUN_RERUN
         );
         let mut left = round
-            .then(|| {
-                let author = text(&pull, "/author/login");
-                bounds.refusal(repo, author, text(&pull, "/headRefName"))
-            })
+            .then(|| self.round_refusal(repo, number, &pull))
             .flatten();
-        if round && left.is_none() && self.config.policy.owner_branches {
-            let cross = pull["isCrossRepository"].as_bool().unwrap_or(false);
-            let owner = text(&pull, "/headRepositoryOwner/login");
-            let own = cross && owner.eq_ignore_ascii_case(&self.config.bot);
-            let head = match cross {
-                true => text(&pull, "/headRepository/nameWithOwner"),
-                false => repo,
-            };
-            left = self.owner_branches(head, own);
+        let updates = decision.action == "update"
+            || (decision.action == "merge" && !queued && pull["mergeStateStatus"] == BEHIND);
+        if left.is_none() && (round || updates) {
+            left = self.unhanded_publication(repo, number, &pull);
         }
-        if round && left.is_none() {
-            left = self.shared_head(owner, name, number);
-        }
-        if left.is_none()
-            && (decision.action == "update"
-                || (decision.action == "merge" && !queued && pull["mergeStateStatus"] == BEHIND))
-        {
+        if left.is_none() && updates {
             left = self.handover_shared_head(repo, number);
         }
         if let Some(why) = &left {
@@ -15327,6 +15355,9 @@ mod tests {
         late_review_requests: Option<Value>,
         /// Fields that change on a second read of the fixture PR at #470.
         late_pull_fields: Option<Value>,
+        /// A pull request whose head moves once `PULL_QUERY` was read this
+        /// many times, and that number.
+        moved_after: Option<(u64, usize)>,
         pull_reads: RefCell<usize>,
         /// The `mergeQueue` the report's query gives, null for a read that
         /// fails; none gives a repository without a merge queue.
@@ -15552,6 +15583,12 @@ mod tests {
                 && let Some(labels) = pull["labels"]["nodes"].as_array_mut()
             {
                 labels.push(json!({"name": "Hold"}));
+            }
+            if self
+                .moved_after
+                .is_some_and(|(n, after)| n == number && *self.pull_reads.borrow() > after)
+            {
+                pull["headRefOid"] = json!("f".repeat(40));
             }
             if *self.pull_reads.borrow() > 1
                 && let Some(requests) = &self.late_review_requests

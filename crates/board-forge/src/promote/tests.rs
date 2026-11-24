@@ -3519,6 +3519,107 @@ fn publication_rebases_and_signs_independently_of_dco() {
                     assert_eq!(notices.len(), 1);
                     assert!(notices[0].contains("live upstream handoff identity mismatch"));
                     assert_eq!(items[&key].promotion, Some(crate::pass::Promotion::Unknown));
+                    // A receipt that records its hand-over under
+                    // followUpstream (agent-board#1205), edited by the bot
+                    // alone, lets the upstream PR's own rounds move its head
+                    // on the recorded branch, but not off it; however the
+                    // fork PR was closed, and also once the setting is off
+                    // or the pair was discovered rather than configured.
+                    // Without that record, a closed fork PR still needs the
+                    // published head.
+                    for entry in &mut replay.requests {
+                        if entry["request"]["get"]
+                            .as_str()
+                            .is_some_and(|p| p.ends_with("/pulls/34"))
+                        {
+                            entry["answer"]["body"]["state"] = json!("closed");
+                        }
+                    }
+                    let receipt = comments(&mut replay)[0].clone();
+                    let record = handoff::decode(receipt["body"].as_str().unwrap())
+                        .unwrap()
+                        .unwrap();
+                    let handed = handoff::Published {
+                        upstream: Value::Null,
+                        record,
+                        receipt: 99,
+                    }
+                    .handover()
+                    .unwrap()
+                    .1;
+                    const LATER: &str = "2026-10-23T01:00:00Z";
+                    // Discovered pairs are read only where stage 2 may hand
+                    // over: with the setting off, status reads as before.
+                    for (handed_over, branch, editor, discovered, open) in [
+                        (true, rewrite::branch(HEAD), "cgwalters-bot", None, true),
+                        (
+                            true,
+                            rewrite::branch(HEAD),
+                            "cgwalters-bot",
+                            Some(true),
+                            true,
+                        ),
+                        (
+                            true,
+                            rewrite::branch(HEAD),
+                            "cgwalters-bot",
+                            Some(false),
+                            false,
+                        ),
+                        (true, "other".into(), "cgwalters-bot", None, false),
+                        // Someone else wrote the record into the receipt.
+                        (true, rewrite::branch(HEAD), "visitor", None, false),
+                        (false, rewrite::branch(HEAD), "cgwalters-bot", None, false),
+                    ] {
+                        let mut thread = receipt.clone();
+                        if handed_over {
+                            thread["body"] = json!(handed);
+                            thread["updated_at"] = json!(LATER);
+                        }
+                        *comments(&mut replay) = json!([thread]);
+                        sync_metadata(&mut replay);
+                        if handed_over {
+                            let node = &mut comment_metadata(&mut replay)[0];
+                            node["lastEditedAt"] = json!(LATER);
+                            node["editor"] = json!({"login": editor});
+                        }
+                        let mut config = handoff_scenario().1;
+                        if let Some(follow) = discovered {
+                            let promote = config.promote.as_mut().unwrap();
+                            promote.forks.clear();
+                            promote.publish = true;
+                            promote.follow_upstream = follow;
+                            config.midstream = Some(pass::midstream::Midstream {
+                                owner: "cgwalters-forge".into(),
+                                topic: "bot-midstream".into(),
+                            });
+                            let metadata = body(&mut replay, &format!("repos/{REPO}"));
+                            metadata["parent"]["default_branch"] = json!("main");
+                            let metadata = metadata.clone();
+                            let list =
+                                format!("{API}orgs/cgwalters-forge/repos?type=public&per_page=100");
+                            replay.requests.retain(|e| e["request"]["get"] != list);
+                            replay.requests.push(json!({"request":{"get":list},
+                                "answer":{"status":200,"link":null,"body":[metadata]}}));
+                        }
+                        body(&mut replay, "/pulls/70")["head"]["ref"] = json!(branch);
+                        items.get_mut(&key).unwrap().promotion = None;
+                        let notices = handoff::enrich(&replay, &config, &mut items).unwrap();
+                        let unread = discovered == Some(false);
+                        assert_eq!(
+                            notices.is_empty(),
+                            open || unread,
+                            "{handed_over} {branch} {editor} {discovered:?}: {notices:?}"
+                        );
+                        assert_eq!(
+                            matches!(&items[&key].promotion, Some(crate::pass::Promotion::Open(p)) if p.number == 70),
+                            open,
+                            "{handed_over} {branch} {editor} {discovered:?}"
+                        );
+                        if unread {
+                            assert_eq!(items[&key].promotion, None);
+                        }
+                    }
                 }
             }
         }

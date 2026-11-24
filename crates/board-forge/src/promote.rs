@@ -1053,9 +1053,10 @@ fn stack_gate(
         upstream: upstream.into(),
         base: base.into(),
     };
-    if let Some(handoff::Publication::Current(pr)) =
+    if let Some(handoff::Publication::Current(publication)) =
         handoff::published(client, &config.bot, repo, &target, parent, &comments)?
     {
+        let pr = &publication.upstream;
         let pn = pr["number"]
             .as_u64()
             .context("invalid parent upstream PR number")?;
