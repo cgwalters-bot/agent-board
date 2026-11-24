@@ -35,6 +35,9 @@ pub const PAGE_SIZE: u64 = 100;
 pub const CACHE_SCHEMA: &str = "agent-board.release-train-cache.v1";
 /// Release notes carried into a pin bump's description, in characters.
 const NOTES_LIMIT: usize = 30_000;
+/// Holds quoted in a stall comment, in bytes, below GitHub's 65,536-character
+/// comment limit; the pass output lists them all.
+const HOLDS_LIMIT: usize = 60_000;
 const SECURE_HOST_PIN: &str = "secure-host/Containerfile.pin";
 const SECURE_HOST_IMAGE: &str = "ghcr.io/cgwalters-forge/secure-host";
 // Repeated reference strings could otherwise multiply full YAML parses during
@@ -266,7 +269,12 @@ fn caller_workflow(text: &str) -> Result<serde_yaml_ng::Value> {
     Ok(value)
 }
 
-fn set_caller_pins(value: &mut serde_yaml_ng::Value, wrappers: &Target, to: &str) {
+fn set_caller_pins(
+    value: &mut serde_yaml_ng::Value,
+    wrappers: &Target,
+    from: &BTreeSet<&str>,
+    to: &str,
+) {
     if let Some(jobs) = value
         .get_mut("jobs")
         .and_then(serde_yaml_ng::Value::as_mapping_mut)
@@ -275,7 +283,7 @@ fn set_caller_pins(value: &mut serde_yaml_ng::Value, wrappers: &Target, to: &str
             if let Some(uses) = job.get_mut("uses")
                 && let Some(reference) = uses.as_str()
                 && let Some((target, pin)) = reference.split_once('@')
-                && pin != FOLLOWED_BRANCH
+                && from.contains(pin)
                 && wrappers
                     .files
                     .iter()
@@ -292,6 +300,7 @@ fn repin_caller(
     wrappers: &Target,
     project: &str,
     to: &Pin,
+    mut moves_forward: impl FnMut(&str, &str) -> Result<bool>,
 ) -> Result<Vec<(String, String)>> {
     ensure!(full_sha(&to.pin), "wrappers merge is not a full commit SHA");
     let mut out = vec![];
@@ -301,27 +310,37 @@ fn repin_caller(
             !pins.is_empty(),
             "{path} no longer pins a configured wrapper"
         );
+        let mut from = BTreeSet::new();
+        for &(start, len, _) in &pins {
+            let pin = &text[start..start + len];
+            if moves_forward(path, pin)? {
+                from.insert(pin);
+            }
+        }
+        if from.is_empty() {
+            continue;
+        }
         let expected = if workflow_file(path) {
             ensure!(
                 pins.len() <= MAX_WORKFLOW_REFERENCES,
                 "{path}: workflow reference edit budget exhausted"
             );
             let mut value = caller_workflow(text)?;
-            set_caller_pins(&mut value, wrappers, &to.pin);
+            set_caller_pins(&mut value, wrappers, &from, &to.pin);
             Some(value)
         } else {
             None
         };
         let mut moved = text.clone();
         for (start, len, _) in pins.into_iter().rev() {
-            if moved[start..start + len] == *FOLLOWED_BRANCH {
+            if !from.contains(&text[start..start + len]) {
                 continue;
             }
             let mut candidate = moved.clone();
             candidate.replace_range(start..start + len, &to.pin);
             if let Some(expected) = &expected {
                 let mut value = caller_workflow(&candidate)?;
-                set_caller_pins(&mut value, wrappers, &to.pin);
+                set_caller_pins(&mut value, wrappers, &from, &to.pin);
                 if value != *expected {
                     continue;
                 }
@@ -768,9 +787,20 @@ pub struct Facts {
     pub secure_host: Option<Pull>,
     /// Each caller's repository and PR.
     pub callers: Vec<(String, Option<Pull>)>,
-    /// Why callers following the wrappers' `FOLLOWED_BRANCH` may not run
-    /// the merged wrappers bump, if they may not.
-    pub followers: Option<String>,
+    /// Why callers following the wrappers' `FOLLOWED_BRANCH`, or pinned to
+    /// a commit the train cannot move, may not run the merged wrappers bump.
+    pub holds: Vec<String>,
+}
+
+/// What a caller's commit pin of the wrappers is to the wrappers merge.
+#[derive(Clone, Debug)]
+enum CallerPin {
+    /// An ancestor, which the train moves to the merge.
+    Behind,
+    /// A descendant whose workflows match the merge's.
+    Current,
+    /// Neither, which the train leaves alone and which holds done, and why.
+    Held(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -888,13 +918,28 @@ pub fn next(f: &Facts) -> Step {
         .iter()
         .all(|(_, pr)| pr.as_ref().is_some_and(Pull::merged))
     {
-        // Pinned callers never wait on followers, but done claims them too.
-        if let Some(why) = &f.followers {
-            return Step::Stall(why.clone());
+        // Pinned callers never wait on holds, but done claims them too.
+        if !f.holds.is_empty() {
+            return Step::Stall(joined_holds(&f.holds));
         }
         return Step::Done;
     }
     Step::Wait("the review.yml pin bumps".into())
+}
+
+/// `holds` joined within `HOLDS_LIMIT`, counting those left out.
+fn joined_holds(holds: &[String]) -> String {
+    let mut text = String::new();
+    for (i, hold) in holds.iter().enumerate() {
+        let separator = if i == 0 { "" } else { "; " };
+        if text.len() + separator.len() + hold.len() > HOLDS_LIMIT {
+            let left = holds.len() - i;
+            return format!("{text}{separator}{left} more holds, listed in the pass output");
+        }
+        text.push_str(separator);
+        text.push_str(hold);
+    }
+    text
 }
 
 /// The start of each line in `toml`'s `[workspace.package]` table, the
@@ -1328,6 +1373,12 @@ struct Pass<'a> {
     used_reads: BTreeSet<String>,
     read_bytes: usize,
     callers: Vec<Target>,
+    /// The default-branch commit at which discovery listed each caller's files.
+    listed: BTreeMap<String, String>,
+    /// Ancestry results for the caller pins against this pass's wrappers merge.
+    pin_states: BTreeMap<String, CallerPin>,
+    /// Why caller pins the train leaves alone may not run the bump.
+    held: BTreeSet<String>,
     /// Once checked, why callers at `FOLLOWED_BRANCH` may not run the merged
     /// wrappers bump, if they may not.
     followed: Option<Option<String>>,
@@ -1376,6 +1427,9 @@ pub fn pass_with_cache(
         used_reads: BTreeSet::new(),
         read_bytes: 0,
         callers: vec![],
+        listed: BTreeMap::new(),
+        pin_states: BTreeMap::new(),
+        held: BTreeSet::new(),
         followed: None,
         discovering: None,
     }
@@ -1515,28 +1569,14 @@ impl Pass<'_> {
             let sha = string(&head, "/sha")?;
             ensure!(full_sha(&sha), "invalid default-branch head for {name}");
             heads.insert(name.clone(), sha.clone());
-            let tree = self.cached(&format!("/repos/{name}/git/trees/{sha}?recursive=1"))?;
-            ensure!(
-                tree["truncated"] == false,
-                "incomplete discovery: truncated tree for {name}"
-            );
-            for entry in list(&tree["tree"])? {
-                let path = string(entry, "/path")?;
-                if !workflow_file(&path) {
-                    continue;
-                }
-                ensure!(
-                    entry["type"] == "blob" && entry["mode"] == "100644",
-                    "unsupported workflow file {name}:{path}"
-                );
-                let content = self.discovery_contents(&name, &sha, &path)?;
-                if !caller_pins(&content, &c.wrappers, false)?.is_empty() {
-                    files.entry(name.clone()).or_default().insert(path);
-                }
+            let found = self.wrapper_workflows(&name, &sha)?;
+            if !found.is_empty() {
+                files.entry(name.clone()).or_default().extend(found);
             }
         }
         // A repository whose references all follow the wrappers needs no
-        // edit, and so no fork.
+        // edit or PR lookup. For pinned callers, keep tracking existing PRs
+        // where there is a fork, but only require a fork to move stale pins.
         let mut pinned = BTreeMap::new();
         for (repo, paths) in files {
             if paths.is_empty() {
@@ -1553,7 +1593,7 @@ impl Pass<'_> {
                     )?
                 }
             };
-            let mut edits = false;
+            let mut has_pin = false;
             for path in &paths {
                 let content = self.discovery_contents(&repo, &sha, path)?;
                 let pins = caller_pins(&content, &c.wrappers, !workflow_file(path))?;
@@ -1569,13 +1609,13 @@ impl Pass<'_> {
                     if pin == FOLLOWED_BRANCH {
                         self.follow(merge)?;
                     } else {
-                        edits = true;
+                        has_pin = true;
                     }
                     self.log(&format!("caller {repo} {path} {wrapper} {pin}"))?;
                 }
             }
-            if edits {
-                pinned.insert(repo, paths);
+            if has_pin {
+                pinned.insert(repo, (sha, paths));
             }
         }
         // Include private and renamed bot forks; the short name conveys no
@@ -1608,7 +1648,9 @@ impl Pass<'_> {
             }
         }
         let mut callers = vec![];
-        for (repo, paths) in pinned {
+        for (repo, (sha, paths)) in pinned {
+            self.discovering = Some(repo.clone());
+            let files: Vec<_> = paths.into_iter().collect();
             let fork = if let Some(fork) = overrides.get(&repo) {
                 ensure!(
                     self::owner(fork).eq_ignore_ascii_case(&c.bot),
@@ -1623,6 +1665,16 @@ impl Pass<'_> {
                 fork.clone()
             } else {
                 let candidates = by_parent.get(&repo).cloned().unwrap_or_default();
+                // Without a fork the repository is dropped, so judge the
+                // commit whose files discovery listed, and retry on a later
+                // pass if a new one could have added or changed callers.
+                if candidates.is_empty() && self.caller_is_current(&repo, &sha, &files, merge)? {
+                    ensure!(
+                        self.head(&repo)? == sha,
+                        "{repo}'s default branch moved during discovery; the next pass retries"
+                    );
+                    continue;
+                }
                 ensure!(
                     candidates.len() == 1,
                     "{repo}: missing or ambiguous bot fork ({} candidates); configure a verified callers fork override",
@@ -1630,13 +1682,40 @@ impl Pass<'_> {
                 );
                 candidates.into_iter().next().context("missing bot fork")?
             };
+            self.listed.insert(repo.clone(), sha);
             callers.push(Target {
                 repository: repo,
                 fork,
-                files: paths.into_iter().collect(),
+                files,
             });
         }
         Ok(callers)
+    }
+
+    /// The workflow files in `repo`'s tree at commit `sha` that reference a
+    /// configured wrapper.
+    fn wrapper_workflows(&mut self, repo: &str, sha: &str) -> Result<BTreeSet<String>> {
+        let tree = self.cached(&format!("/repos/{repo}/git/trees/{sha}?recursive=1"))?;
+        ensure!(
+            tree["truncated"] == false,
+            "incomplete discovery: truncated tree for {repo}"
+        );
+        let mut files = BTreeSet::new();
+        for entry in list(&tree["tree"])? {
+            let path = string(entry, "/path")?;
+            if !workflow_file(&path) {
+                continue;
+            }
+            ensure!(
+                entry["type"] == "blob" && entry["mode"] == "100644",
+                "unsupported workflow file {repo}:{path}"
+            );
+            let content = self.discovery_contents(repo, sha, &path)?;
+            if !caller_pins(&content, &self.config.wrappers, false)?.is_empty() {
+                files.insert(path);
+            }
+        }
+        Ok(files)
     }
 
     /// Checks, once a pass, what callers at the wrappers' `FOLLOWED_BRANCH`
@@ -1672,22 +1751,31 @@ impl Pass<'_> {
         )?;
         ensure!(full_sha(&head), "invalid {FOLLOWED_BRANCH} head for {repo}");
         self.log(&format!("wrappers {repo}@{FOLLOWED_BRANCH} {head}"))?;
-        let changed =
-            head != merge && self.workflows(&repo, &head)? != self.workflows(&repo, merge)?;
+        let changed = head != merge && !self.same_workflows(&repo, &head, merge)?;
         self.followed = Some(changed.then(|| format!(
             "callers follow {repo}@{FOLLOWED_BRANCH}, whose workflows at {head} differ from the wrappers' pin bump {merge}; if they still run this release, close this issue instead"
         )));
         Ok(())
     }
 
-    /// The tree of `repo`'s `.github/workflows` at commit `at`.
-    fn workflows(&mut self, repo: &str, at: &str) -> Result<String> {
-        let listing = self.get(&format!("/repos/{repo}/contents/.github?ref={at}"))?;
-        let dir = list(&listing)?
+    /// The tree of `repo`'s `.github/workflows` at commit `at`, or `None` if
+    /// GitHub confirms there is none, which differs from any tree.
+    fn workflows(&mut self, repo: &str, at: &str) -> Result<Option<String>> {
+        let listing = match self.get(&format!("/repos/{repo}/contents/.github?ref={at}")) {
+            Err(e) if status(&e) == Some(404) => return Ok(None),
+            listing => listing?,
+        };
+        list(&listing)?
             .iter()
             .find(|e| e["name"] == "workflows" && e["type"] == "dir")
-            .with_context(|| format!("{repo} has no .github/workflows at {at}"))?;
-        string(dir, "/sha")
+            .map(|dir| string(dir, "/sha"))
+            .transpose()
+    }
+
+    /// Whether `repo` has the same `.github/workflows` tree at `a` and `b`.
+    fn same_workflows(&mut self, repo: &str, a: &str, b: &str) -> Result<bool> {
+        let a = self.workflows(repo, a)?;
+        Ok(a.is_some() && a == self.workflows(repo, b)?)
     }
 
     fn discovery_contents(&mut self, repo: &str, sha: &str, path: &str) -> Result<String> {
@@ -1924,6 +2012,110 @@ impl Pass<'_> {
         Ok(())
     }
 
+    /// Whether to move a pin, which `file` has, to the wrappers merge: only
+    /// if the merge is a strict descendant of it. A pin that is not, and is
+    /// not the merge, is never moved, and holds done (as callers that follow
+    /// `FOLLOWED_BRANCH` do) unless it descends from the merge with the same
+    /// workflows: a later commit may have reverted the bump. Holding only
+    /// done keeps one such pin from blocking the other callers' bumps.
+    fn caller_pin_moves_forward(&mut self, merge: &str, file: &str, pin: &str) -> Result<bool> {
+        if pin == FOLLOWED_BRANCH || pin == merge {
+            return Ok(false);
+        }
+        let state = match self.pin_states.get(pin) {
+            Some(state) => state.clone(),
+            None => {
+                let state = self.compare_caller_pin(merge, pin)?;
+                self.pin_states.insert(pin.to_owned(), state.clone());
+                state
+            }
+        };
+        Ok(match state {
+            CallerPin::Behind => true,
+            CallerPin::Current => false,
+            CallerPin::Held(why) => {
+                let repo = &self.config.wrappers.repository;
+                self.held.insert(format!(
+                    "{file} pins {repo}@{pin}, which {why}; the train left it alone, so if it still runs this release, close this issue instead"
+                ));
+                false
+            }
+        })
+    }
+
+    fn compare_caller_pin(&mut self, merge: &str, pin: &str) -> Result<CallerPin> {
+        let repo = self.config.wrappers.repository.clone();
+        let comparison =
+            match self.get(&format!("/repos/{repo}/compare/{merge}...{pin}?per_page=1")) {
+                // GitHub answered that it cannot compare them: retrying will not help.
+                Err(e) if matches!(status(&e), Some(404 | 422)) => {
+                    return Ok(CallerPin::Held(format!(
+                        "GitHub cannot compare with wrappers merge {merge}"
+                    )));
+                }
+                comparison => comparison.with_context(|| {
+                    format!("compare {repo} caller pin {pin} with wrappers merge {merge}")
+                })?,
+            };
+        Ok(match comparison["status"].as_str() {
+            Some("behind") => CallerPin::Behind,
+            Some("ahead") => {
+                if self.same_workflows(&repo, pin, merge)? {
+                    CallerPin::Current
+                } else {
+                    CallerPin::Held(format!(
+                        "descends from wrappers merge {merge} but whose workflows differ from it"
+                    ))
+                }
+            }
+            Some("diverged") => CallerPin::Held(format!("diverges from wrappers merge {merge}")),
+            _ => anyhow::bail!(
+                "unexpected comparison of {repo} caller pin {pin} with wrappers merge {merge}"
+            ),
+        })
+    }
+
+    /// `repo`'s current default-branch head.
+    fn head(&mut self, repo: &str) -> Result<String> {
+        let base = self.default_branch(repo)?;
+        let sha = string(
+            &self.get(&format!("/repos/{repo}/commits/{}", encode(&base)))?,
+            "/sha",
+        )?;
+        ensure!(full_sha(&sha), "invalid default-branch head for {repo}");
+        Ok(sha)
+    }
+
+    /// Whether `files` at `repo`'s commit `sha` have no pin to move; pins
+    /// that hold done count as current here.
+    fn caller_is_current(
+        &mut self,
+        repo: &str,
+        sha: &str,
+        files: &[String],
+        merge: &str,
+    ) -> Result<bool> {
+        let mut current = true;
+        for path in files {
+            let content = self.discovery_contents(repo, sha, path)?;
+            let pins = caller_pins(&content, &self.config.wrappers, !workflow_file(path))?;
+            ensure!(
+                !pins.is_empty(),
+                "{repo}:{path} no longer pins a configured wrapper"
+            );
+            for (at, len, _) in pins {
+                match &content[at..at + len] {
+                    FOLLOWED_BRANCH => self.follow(merge)?,
+                    pin => {
+                        current &=
+                            !self.caller_pin_moves_forward(merge, &format!("{repo}:{path}"), pin)?
+                    }
+                }
+            }
+        }
+        Ok(current)
+    }
+
     /// The workspace version in `repo`'s Cargo.toml at `at`.
     fn workspace(&mut self, repo: &str, at: &str) -> Result<Option<String>> {
         let toml = self.get(&format!(
@@ -2037,7 +2229,7 @@ impl Pass<'_> {
         branch: &str,
         text: &Text,
         paths: &[String],
-        edit: impl FnOnce(&[(String, String)]) -> Result<Vec<(String, String)>>,
+        edit: impl FnOnce(&mut Self, &[(String, String)]) -> Result<Vec<(String, String)>>,
     ) -> Result<Option<String>> {
         let (repo, fork) = (&target.repository, &target.fork);
         let parent = self.get(&format!("/repos/{fork}"))?;
@@ -2047,7 +2239,8 @@ impl Pass<'_> {
         let base = self.default_branch(repo)?;
         let head = self.get(&format!("/repos/{repo}/commits/{}", encode(&base)))?;
         let sha = string(&head, "/sha")?;
-        let changed = edit(&self.contents(repo, &sha, paths)?)?;
+        let files = self.contents(repo, &sha, paths)?;
+        let changed = edit(self, &files)?;
         if changed.is_empty() {
             self.log(&format!("{repo} is already current"))?;
             return Ok(None);
@@ -2322,33 +2515,20 @@ impl Pass<'_> {
                     self.requests - start,
                     c.request_limit
                 ))?;
-                for caller in self.callers.clone() {
+                for i in 0..self.callers.len() {
+                    let mut caller = self.callers[i].clone();
                     let mut pr = self.pull(&caller, &branch, since)?;
-                    let base = self.default_branch(&caller.repository)?;
-                    let sha = string(
-                        &self.get(&format!(
-                            "/repos/{}/commits/{}",
-                            caller.repository,
-                            encode(&base)
-                        ))?,
-                        "/sha",
-                    )?;
-                    let mut current = true;
-                    for path in &caller.files {
-                        let content = self.discovery_contents(&caller.repository, &sha, path)?;
-                        let pins = caller_pins(&content, &c.wrappers, !workflow_file(path))?;
-                        ensure!(
-                            !pins.is_empty(),
-                            "{}:{path} no longer pins a configured wrapper",
-                            caller.repository
-                        );
-                        for (at, len, _) in pins {
-                            match &content[at..at + len] {
-                                FOLLOWED_BRANCH => self.follow(merge)?,
-                                pin => current &= pin == merge,
-                            }
-                        }
+                    let sha = self.head(&caller.repository)?;
+                    // A newer commit than discovery listed may add a caller
+                    // workflow: list them again, so the bump also moves it.
+                    if self.listed.get(&caller.repository) != Some(&sha) {
+                        let found = self.wrapper_workflows(&caller.repository, &sha)?;
+                        let files: BTreeSet<_> = caller.files.into_iter().chain(found).collect();
+                        caller.files = files.into_iter().collect();
+                        self.callers[i].files = caller.files.clone();
                     }
+                    let current =
+                        self.caller_is_current(&caller.repository, &sha, &caller.files, merge)?;
                     if current && pr.is_none() {
                         pr = Some(Pull {
                             state: "closed".into(),
@@ -2363,7 +2543,11 @@ impl Pass<'_> {
                     }
                     facts.callers.push((caller.repository, pr));
                 }
-                facts.followers = self.followed.clone().flatten();
+                facts.holds = self.followed.clone().flatten().into_iter().collect();
+                facts.holds.extend(self.held.iter().cloned());
+                for hold in &facts.holds {
+                    self.log(&format!("hold: {hold}"))?;
+                }
             }
             Ok(())
         })();
@@ -2436,7 +2620,7 @@ impl Pass<'_> {
                     body,
                 };
                 let paths = ["Cargo.toml".to_owned(), "Cargo.lock".to_owned()];
-                let url = self.open(&c.release, branch, &text, &paths, |files| {
+                let url = self.open(&c.release, branch, &text, &paths, |_, files| {
                     let (toml, lock) = bump_cargo(&files[0].1, &files[1].1, &p.current, version)?;
                     Ok(vec![(paths[0].clone(), toml), (paths[1].clone(), lock)])
                 })?;
@@ -2536,7 +2720,7 @@ impl Pass<'_> {
                     &format!("{branch}-secure-host"),
                     &text,
                     &target.files,
-                    |files| repin_image(files, &pin),
+                    |_, files| repin_image(files, &pin),
                 )?;
                 self.comment(
                     issue,
@@ -2591,28 +2775,27 @@ impl Pass<'_> {
                     version: version.into(),
                 };
                 let target = &c.release.repository;
-                let url =
-                    self.open(
-                        &c.wrappers,
-                        branch,
-                        &text,
-                        &c.wrappers.files,
-                        |files| match &host {
-                            Some(merge) => {
-                                let moved = repin_release(files, target, project, &to, false)?;
-                                let moved = repin_host(&moved, merge, version)?;
-                                for ((path, before), (_, after)) in files.iter().zip(&moved) {
-                                    if before == after {
-                                        return stall(format!(
-                                            "{path} has no release or secure-host pin to move"
-                                        ));
-                                    }
+                let url = self.open(
+                    &c.wrappers,
+                    branch,
+                    &text,
+                    &c.wrappers.files,
+                    |_, files| match &host {
+                        Some(merge) => {
+                            let moved = repin_release(files, target, project, &to, false)?;
+                            let moved = repin_host(&moved, merge, version)?;
+                            for ((path, before), (_, after)) in files.iter().zip(&moved) {
+                                if before == after {
+                                    return stall(format!(
+                                        "{path} has no release or secure-host pin to move"
+                                    ));
                                 }
-                                Ok(moved)
                             }
-                            None => repin(files, target, project, &to),
-                        },
-                    )?;
+                            Ok(moved)
+                        }
+                        None => repin(files, target, project, &to),
+                    },
+                )?;
                 let url = url.as_deref().unwrap_or("(dry run)");
                 self.comment(issue, &format!("Opened the wrappers' pin bump: {url}"))
             }
@@ -2645,10 +2828,20 @@ impl Pass<'_> {
                         body: format!("{why}\n\n{}", notes(version, &release, &issue.html_url)),
                         why,
                     };
-                    let url = self.open(&caller, branch, &text, &caller.files, |files| {
-                        repin_caller(files, &c.wrappers, project, &to)
+                    let mut changed = false;
+                    let url = self.open(&caller, branch, &text, &caller.files, |pass, files| {
+                        let edits = repin_caller(files, &c.wrappers, project, &to, |path, pin| {
+                            pass.caller_pin_moves_forward(&to.pin, &format!("{repo}:{path}"), pin)
+                        })?;
+                        changed = !edits.is_empty();
+                        Ok(edits)
                     })?;
-                    urls.push(url.unwrap_or_else(|| format!("(dry run on {repo})")));
+                    if changed {
+                        urls.push(url.unwrap_or_else(|| format!("(dry run on {repo})")));
+                    }
+                }
+                if urls.is_empty() {
+                    return Ok(());
                 }
                 self.comment(
                     issue,
