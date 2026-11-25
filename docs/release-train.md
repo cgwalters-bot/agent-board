@@ -56,9 +56,16 @@ The steps of a train, each a pass:
    differ or are gone (it may have reverted the bump), a divergent pin and a pin GitHub
    cannot compare are left alone and, like callers following `main` below,
    hold done: the other callers still get their PRs, and then the train
-   stalls naming each such pin. A caller without a fork whose pins need no
-   move is checked at the commit discovery read; if its default branch has
-   moved since, the pass ends with an error and the next one retries. For a
+   stalls naming each such pin. Only that summary of held pins is redacted:
+   it names pins in callers the inventory reported public when discovery
+   read it, and only counts the rest. Other messages on the tracking issue
+   may still name callers, and the pass output names every caller and hold,
+   so it is only as private as the log that holds it. A caller without
+   a fork whose pins need no move is judged at the commit discovery read, and
+   its head is read once more before the pass closes the train or stalls on
+   held pins; a different head there ends the pass with an error, and the
+   next one retries. The other callers' bumps do not wait on that read. A
+   move after a caller's re-read is not seen. For a
    caller with a fork, the workflows are listed again at its newer head, so a
    bump also moves a caller workflow added since discovery.
    Discover callers across every non-archived, non-fork repository of the

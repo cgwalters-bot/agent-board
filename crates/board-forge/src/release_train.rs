@@ -927,6 +927,21 @@ pub fn next(f: &Facts) -> Step {
     Step::Wait("the review.yml pin bumps".into())
 }
 
+/// The holds the public tracking issue may show: `held` pins in public
+/// callers are named, the others only counted, which the pass output lists.
+/// The count comes first, so `joined_holds` cannot cut it.
+fn issue_holds(followed: Option<String>, held: &BTreeMap<String, bool>) -> Vec<String> {
+    let private = held.values().filter(|public| !**public).count();
+    let count = (private > 0).then(|| {
+        format!("held pins in callers that are not public: {private}, listed in the pass output")
+    });
+    let public = held
+        .iter()
+        .filter(|(_, public)| **public)
+        .map(|(hold, _)| hold.clone());
+    count.into_iter().chain(followed).chain(public).collect()
+}
+
 /// `holds` joined within `HOLDS_LIMIT`, counting those left out.
 fn joined_holds(holds: &[String]) -> String {
     let mut text = String::new();
@@ -1377,8 +1392,13 @@ struct Pass<'a> {
     listed: BTreeMap<String, String>,
     /// Ancestry results for the caller pins against this pass's wrappers merge.
     pin_states: BTreeMap<String, CallerPin>,
-    /// Why caller pins the train leaves alone may not run the bump.
-    held: BTreeSet<String>,
+    /// Why caller pins the train leaves alone may not run the bump, each
+    /// with whether its caller is public and so may be named on the issue.
+    held: BTreeMap<String, bool>,
+    /// The inventory's repositories that say they are public.
+    public: BTreeSet<String>,
+    /// The commit at which each caller without a fork was found current.
+    forkless: BTreeMap<String, String>,
     /// Once checked, why callers at `FOLLOWED_BRANCH` may not run the merged
     /// wrappers bump, if they may not.
     followed: Option<Option<String>>,
@@ -1429,7 +1449,9 @@ pub fn pass_with_cache(
         callers: vec![],
         listed: BTreeMap::new(),
         pin_states: BTreeMap::new(),
-        held: BTreeSet::new(),
+        held: BTreeMap::new(),
+        public: BTreeSet::new(),
+        forkless: BTreeMap::new(),
         followed: None,
         discovering: None,
     }
@@ -1557,6 +1579,10 @@ impl Pass<'_> {
             let fork = repo["fork"]
                 .as_bool()
                 .context("inventory missing fork flag")?;
+            // Only an explicit `false` makes it public: anything else stays unnamed.
+            if repo["private"].as_bool() == Some(false) {
+                self.public.insert(name.clone());
+            }
             if archived || fork {
                 continue;
             }
@@ -1666,13 +1692,10 @@ impl Pass<'_> {
             } else {
                 let candidates = by_parent.get(&repo).cloned().unwrap_or_default();
                 // Without a fork the repository is dropped, so judge the
-                // commit whose files discovery listed, and retry on a later
-                // pass if a new one could have added or changed callers.
+                // commit whose files discovery listed; the pass checks its
+                // head once more before it writes (`revalidate_forkless`).
                 if candidates.is_empty() && self.caller_is_current(&repo, &sha, &files, merge)? {
-                    ensure!(
-                        self.head(&repo)? == sha,
-                        "{repo}'s default branch moved during discovery; the next pass retries"
-                    );
+                    self.forkless.insert(repo, sha);
                     continue;
                 }
                 ensure!(
@@ -2018,7 +2041,13 @@ impl Pass<'_> {
     /// `FOLLOWED_BRANCH` do) unless it descends from the merge with the same
     /// workflows: a later commit may have reverted the bump. Holding only
     /// done keeps one such pin from blocking the other callers' bumps.
-    fn caller_pin_moves_forward(&mut self, merge: &str, file: &str, pin: &str) -> Result<bool> {
+    fn caller_pin_moves_forward(
+        &mut self,
+        merge: &str,
+        caller: &str,
+        path: &str,
+        pin: &str,
+    ) -> Result<bool> {
         if pin == FOLLOWED_BRANCH || pin == merge {
             return Ok(false);
         }
@@ -2035,9 +2064,10 @@ impl Pass<'_> {
             CallerPin::Current => false,
             CallerPin::Held(why) => {
                 let repo = &self.config.wrappers.repository;
+                let public = self.public.contains(caller);
                 self.held.insert(format!(
-                    "{file} pins {repo}@{pin}, which {why}; the train left it alone, so if it still runs this release, close this issue instead"
-                ));
+                    "{caller}:{path} pins {repo}@{pin}, which {why}; the train left it alone, so if it still runs this release, close this issue instead"
+                ), public);
                 false
             }
         })
@@ -2086,6 +2116,21 @@ impl Pass<'_> {
         Ok(sha)
     }
 
+    /// Fails if a caller without a fork, judged at the commit discovery
+    /// read, has a new default-branch head: it may pin an older release or
+    /// add a caller, and the next pass judges it again. One read each, after
+    /// the other reads and before closing or stalling on held pins, so a
+    /// move seen here stops either; a move after its read is not seen.
+    fn revalidate_forkless(&mut self) -> Result<()> {
+        for (repo, sha) in self.forkless.clone() {
+            ensure!(
+                self.head(&repo)? == sha,
+                "{repo}'s default branch moved since discovery; the next pass retries"
+            );
+        }
+        Ok(())
+    }
+
     /// Whether `files` at `repo`'s commit `sha` have no pin to move; pins
     /// that hold done count as current here.
     fn caller_is_current(
@@ -2106,10 +2151,7 @@ impl Pass<'_> {
             for (at, len, _) in pins {
                 match &content[at..at + len] {
                     FOLLOWED_BRANCH => self.follow(merge)?,
-                    pin => {
-                        current &=
-                            !self.caller_pin_moves_forward(merge, &format!("{repo}:{path}"), pin)?
-                    }
+                    pin => current &= !self.caller_pin_moves_forward(merge, repo, path, pin)?,
                 }
             }
         }
@@ -2543,11 +2585,12 @@ impl Pass<'_> {
                     }
                     facts.callers.push((caller.repository, pr));
                 }
-                facts.holds = self.followed.clone().flatten().into_iter().collect();
-                facts.holds.extend(self.held.iter().cloned());
-                for hold in &facts.holds {
+                let followed = self.followed.clone().flatten();
+                let all: Vec<_> = followed.iter().chain(self.held.keys()).cloned().collect();
+                for hold in all {
                     self.log(&format!("hold: {hold}"))?;
                 }
+                facts.holds = issue_holds(followed, &self.held);
             }
             Ok(())
         })();
@@ -2560,6 +2603,12 @@ impl Pass<'_> {
         }
 
         let step = next(&facts);
+        // Only done and the stall on held pins claim the callers without a
+        // fork; the other steps, such as the other callers' bumps, go ahead.
+        let holds = !facts.holds.is_empty() && step == Step::Stall(joined_holds(&facts.holds));
+        if step == Step::Done || holds {
+            self.revalidate_forkless()?;
+        }
         self.log(&format!("{} v{version}: {step}", issue.html_url))?;
         match self.take(&step, &issue, &version, &branch, &facts) {
             Err(e) if e.is::<Stall>() => self.halt(&issue, &e),
@@ -2831,7 +2880,7 @@ impl Pass<'_> {
                     let mut changed = false;
                     let url = self.open(&caller, branch, &text, &caller.files, |pass, files| {
                         let edits = repin_caller(files, &c.wrappers, project, &to, |path, pin| {
-                            pass.caller_pin_moves_forward(&to.pin, &format!("{repo}:{path}"), pin)
+                            pass.caller_pin_moves_forward(&to.pin, repo, path, pin)
                         })?;
                         changed = !edits.is_empty();
                         Ok(edits)
