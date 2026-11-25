@@ -35,6 +35,9 @@ const CASES: &[(&str, &str, &str)] = &[
 /// The key of a fixture response that answers successive reads differently.
 const SEQUENCE: &str = "$sequence";
 
+/// The key of a fixture response whose first read replaces other responses.
+const THEN: &str = "$then";
+
 struct Fake {
     responses: RefCell<serde_json::Map<String, Value>>,
     apply: bool,
@@ -136,7 +139,17 @@ impl Api for Fake {
             );
         }
         let mut responses = self.responses.borrow_mut();
-        let body = match responses.get_mut(&decoded(path)) {
+        let key = decoded(path);
+        // The first read of a response with `THEN` answers its `body` and
+        // replaces the responses it names, as a commit landing elsewhere would.
+        if let Some(then) = responses.get(&key).and_then(|r| r.get(THEN)).cloned() {
+            let body = responses[&key]["body"].clone();
+            responses.insert(key.clone(), body);
+            for (other, response) in then.as_object().unwrap() {
+                responses.insert(other.clone(), response.clone());
+            }
+        }
+        let body = match responses.get_mut(&key) {
             // Successive reads take a sequence's responses in turn, the last repeating.
             Some(Value::Object(o)) if o.contains_key(SEQUENCE) => {
                 let sequence = o[SEQUENCE].as_array_mut().unwrap();
@@ -449,6 +462,12 @@ fn optional_host_stage_waits_for_review_and_is_off_by_default() {
 
 /// The pass's lines, then its writes; or its error.
 fn replay(fixture: &Value, apply: bool) -> Result<String, String> {
+    let (text, result) = replay_all(fixture, apply);
+    result.map(|()| text)
+}
+
+/// The pass's lines, then its writes, and its error, if any.
+fn replay_all(fixture: &Value, apply: bool) -> (String, Result<(), String>) {
     let config = Config::from_json(&fixture["config"]).unwrap();
     let now = parse_time(fixture["now"].as_str().unwrap()).unwrap();
     let fake = Fake {
@@ -466,7 +485,7 @@ fn replay(fixture: &Value, apply: bool) -> Result<String, String> {
         text.push_str(write);
         text.push('\n');
     }
-    result.map(|()| text).map_err(|e| format!("{e:#}"))
+    (text, result.map_err(|e| format!("{e:#}")))
 }
 
 #[test]
@@ -964,7 +983,7 @@ fn discovery_fixture(current: bool) -> Value {
             .iter()
             .map(
                 |name| json!({"full_name": format!("cgwalters-forge/{name}"),
-        "archived": *name == "archived", "fork": *name == "fork", "default_branch": "main"})
+        "archived": *name == "archived", "fork": *name == "fork", "private": false, "default_branch": "main"})
             )
             .collect::<Vec<_>>()
     );
@@ -1191,7 +1210,62 @@ fn caller_pinned_ahead_of_the_wrappers_merge_is_current() {
         "{out}"
     );
 
+    // Without a fork, current at discovery but moved while the pass reads
+    // another caller's PRs, perhaps to an older pin: the train stays open,
+    // writing nothing, and the next pass judges the head; so does its held pin.
     let old = format!("    uses: {reference}@{CALLER_HEAD} # agentic-job v0.6.3");
+    let mut later = no_fork.clone();
+    let r = &mut later["responses"];
+    let lookup = "/repos/cgwalters-forge/tracker/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100";
+    let moved = json!({"sha": WRAPPER_AHEAD, "commit": {"tree": {"sha": WRAPPER_AHEAD}}});
+    r[lookup] = json!({THEN: {format!("{repo}/commits/main"): moved}, "body": r[lookup]});
+    let mut held = later.clone();
+    trees(&mut held, &"6".repeat(40));
+    for (f, apply) in [
+        (&later, false),
+        (&later, true),
+        (&held, false),
+        (&held, true),
+    ] {
+        let (out, result) = replay_all(f, apply);
+        let error = result.unwrap_err();
+        assert!(error.contains("moved since discovery"), "{error}");
+        assert!(!out.contains("POST ") && !out.contains("PATCH "), "{out}");
+    }
+    // The same move does not stop a stale caller's bump.
+    let mut bump = later;
+    bump["responses"]
+        [format!("/repos/cgwalters-forge/tracker/contents/{CALLER_WORKFLOW}?ref={CALLER_HEAD}")] =
+        json!({"encoding": "base64", "content": base64(&format!("jobs:\n  review:\n{old}\n"))});
+    let out = replay(&bump, true).unwrap();
+    assert!(out.contains("v0.6.4: callers"), "{out}");
+    assert!(
+        out.contains("POST /repos/cgwalters-forge/tracker/pulls"),
+        "{out}"
+    );
+
+    // That check costs no more than discovery's did: a done pass with exactly
+    // the requests it needs closes and comments, and one fewer is refused.
+    let budget = |limit: u32| {
+        let mut f = no_fork.clone();
+        f["config"]["requestLimit"] = json!(limit);
+        replay(&f, true)
+    };
+    let limit = (1..=REQUEST_LIMIT)
+        .find(|&limit| budget(limit).is_ok())
+        .expect("a done pass within the default limit");
+    // As many as when discovery itself read the head: one read, not two.
+    assert_eq!(limit, 44, "requests for a done pass with a forkless caller");
+    let out = budget(limit).unwrap();
+    assert!(out.contains("v0.6.4: done"), "{out}");
+    assert!(
+        out.contains("PATCH /repos/cgwalters-forge/tracker/issues/"),
+        "{out}"
+    );
+    assert!(out.contains("Done: v0.6.4"), "{out}");
+    let error = budget(limit - 1).unwrap_err();
+    assert!(error.contains("request budget of"), "{error}");
+
     // Inventory saw the ahead pin, but the default branch has moved since, which
     // could have reverted it or added a caller: retry rather than drop the repository.
     let repo = "/repos/cgwalters-forge/cgwalters-forge.github.io";
@@ -1202,7 +1276,7 @@ fn caller_pinned_ahead_of_the_wrappers_merge_is_current() {
     r[format!("{repo}/contents/{CALLER_WORKFLOW}?ref={WRAPPER_MERGE}")] =
         json!({"encoding": "base64", "content": base64(&format!("jobs:\n  review:\n{old}\n"))});
     let error = replay(&no_fork, true).unwrap_err();
-    assert!(error.contains("moved during discovery"), "{error}");
+    assert!(error.contains("moved since discovery"), "{error}");
 
     // An older pin in the same workflow still moves, without touching the newer one.
     let mixed = format!("{workflow}  other:\n{old}\n");
@@ -1226,6 +1300,25 @@ fn caller_pinned_ahead_of_the_wrappers_merge_is_current() {
         out.contains(&format!("v0.6.4: stall ({pinned}, which diverges")),
         "{out}"
     );
+    // The public tracking issue only counts a caller that is not public, or
+    // whose visibility the inventory omits; the pass output names it.
+    for private in [json!(true), Value::Null] {
+        let mut f = f.clone();
+        f["responses"][OWNER_REPOS][2]["private"] = private;
+        let out = replay(&f, true).unwrap();
+        assert!(
+            out.contains(&format!("hold: {pinned}, which diverges")),
+            "{out}"
+        );
+        let halted = out.lines().find(|l| l.contains("Halted:")).unwrap();
+        assert!(
+            halted.contains(
+                "Halted: held pins in callers that are not public: 1, listed in the pass output."
+            ),
+            "{out}"
+        );
+        assert!(!halted.contains("github.io"), "{halted}");
+    }
 
     // A descendant without workflows does not stop the other callers' bumps.
     for listing in without_workflows {
@@ -1262,8 +1355,19 @@ fn holds_fit_a_comment_and_count_those_left_out() {
     }
     let long = "h".repeat(HOLDS_LIMIT + 1);
     assert_eq!(
-        joined_holds(&[long]),
+        joined_holds(std::slice::from_ref(&long)),
         "1 more holds, listed in the pass output"
+    );
+
+    // Public holds over the limit cut themselves, not the count of the others.
+    let held = BTreeMap::from([
+        (long, true),
+        ("private a".into(), false),
+        ("private b".into(), false),
+    ]);
+    assert_eq!(
+        joined_holds(&issue_holds(Some("followed".into()), &held)),
+        "held pins in callers that are not public: 2, listed in the pass output; followed; 1 more holds, listed in the pass output"
     );
 }
 
@@ -1666,7 +1770,9 @@ fn inventories_paginate_and_never_accept_partial_coverage() {
         callers: vec![],
         listed: BTreeMap::new(),
         pin_states: BTreeMap::new(),
-        held: BTreeSet::new(),
+        held: BTreeMap::new(),
+        public: BTreeSet::new(),
+        forkless: BTreeMap::new(),
         followed: None,
         discovering: None,
     };
