@@ -146,11 +146,34 @@ class ReviewContracts(unittest.TestCase):
         # its output in the review. AGENTS.md asks the same of implement runs.
         self.assertIn("`node workflow/decision-diff.cjs . HEAD`", task)
         self.assertIn("`Decision diff` heading", task)
+        self.assertIn(
+            "If the recording exercises the symptom of a claimed live fix, compare the targeted decision "
+            "even if other rows changed and report if the symptom persists. Treat these findings as important "
+            "unless the evidence meets a blocker rule below.",
+            " ".join(task.split()),
+        )
         agents = (ROOT / "AGENTS.md").read_text()
         self.assertIn("Run the decision diff against the start commit", agents)
         self.assertIn("[compare two revisions](docs/setup.md#compare-two-revisions)", agents)
         self.assertIn("`just decision-diff ../base`", (ROOT / "docs/setup.md").read_text())
         self.assertIn("decision-diff base:\n    node workflow/decision-diff.cjs {{quote(base)}} .\n", (ROOT / "Justfile").read_text())
+
+    def test_review_blocker_rules(self):
+        task = " ".join((ROOT / "workflow/review.md").read_text().split())
+        for contract in (
+            "introduces or makes reachable that makes behavior worse than the base",
+            "No exemption below, whether a pin bump, a default-off option, a race or a pre-existing gap, "
+            "ever covers a security hole, data loss or a confirmed dependency-integrity failure",
+            "A dependency or pin bump that fixes something and regresses nothing is approved",
+            "a change that does not do its main stated purpose at all, such as a fix that leaves the bug "
+            "it targets in place, is also a blocker",
+            "Partial delivery is a follow-up",
+            "Opt-in status bears only on reachability. A material regression in an existing supported "
+            "operation is a blocker even if it is reachable only by enabling a supported opt-in option.",
+            'In an approving review, list important findings and nits under a "Follow-ups" heading',
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, task)
 
     def test_decision_diff_of_one_tree_is_empty(self):
         # The same checkout on both sides: both previews run (the build is
