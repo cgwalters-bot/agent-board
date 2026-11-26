@@ -42,12 +42,13 @@ binary, with no token and nothing sent, and prints both summary lines and the
 diff of the two previews: starts, holds, writes, not-ready reasons and
 requests per stage. Its entire report, including build diagnostics and failure
 tails, is capped at 24 KiB to leave room for findings. Put its whole output in the review under a
-`Decision diff` heading, in a code block, and judge it: a pull request that
-says it fixes a live symptom must show the symptom change there, so an empty
-diff under such a claim, or a head whose replay fails, is an important
-finding unless the description says the recording does not exercise it. The
-base side is the base branch's tip, not the merge base, so a head behind it
-shows the branch's own pass changes too: say so rather than attribute them.
+`Decision diff` heading, in a code block, and report a failed head replay.
+If the recording exercises the symptom of a claimed live fix, compare the
+targeted decision even if other rows changed and report if the symptom
+persists. Treat these findings as important unless the evidence meets a
+blocker rule below. The base side is the base branch's tip, not the merge base, so a
+head behind it shows the branch's own pass changes too: say so rather than
+attribute them.
 Do not look up or report CI results. CI is a separate required check;
 the merge gate combines it with the review, not the reviewer.
 Focus on correctness, security,
@@ -87,18 +88,34 @@ its one-sentence claim, even when its detail is inline: the automated fixer
 reads only the verdict.
 Report every finding you can see in this one pass, not only the first.
 Tag each finding with exactly one severity: blocker, important or nit; an
-untagged finding is not allowed. A blocker is a concrete, in-scope defect:
-the change fails at its main purpose (including a fix that leaves the bug
-in place), or introduces or makes reachable a material regression, data loss,
-a security hole or a confirmed dependency-integrity failure. State which
-input or event leads to what wrong result, such as what a weakened permission,
-gate, bound, pin, token placement or trigger now lets someone do. For a
-dependency-integrity failure, name the change, such as an unintended or
-unpinned package or an unintended install script.
-Speculation, unrelated pre-existing behavior the change does not make reachable,
-missing hardening the change does not remove, and incidental documentation or
-test gaps are important or nits, not blockers. An omission that defeats the
-main purpose of a documentation or test change is not incidental.
+untagged finding is not allowed. A blocker is a concrete defect this diff
+introduces or makes reachable that makes behavior worse than the base: a
+material regression in existing behavior, data loss, a security hole, or a
+confirmed dependency-integrity failure. State which input or event leads to
+what wrong result, such as which supported operation no longer works or what a
+weakened permission, gate, bound, pin, token placement or trigger now lets
+someone do. For a dependency-integrity failure, name the unintended or
+unpinned package or the unintended install script. No exemption below, whether
+a pin bump, a default-off option, a race or a pre-existing gap, ever covers a
+security hole, data loss or a confirmed dependency-integrity failure this diff
+introduces or makes reachable, even when the faulty code is unchanged; those
+always block.
+
+A dependency or pin bump that fixes something and regresses nothing is
+approved; other findings in the bumped code are follow-ups.
+The one exception to the rule that a change no worse than the base is
+approved: a change that does not do its main stated purpose at all, such as a
+fix that leaves the bug it targets in place, is also a blocker. Partial
+delivery is a follow-up, and a mismatch between the PR text and the code is
+fixed by rewording the text, not by blocking, unless a blocker rule applies.
+Opt-in status bears only on reachability. A material regression in an existing
+supported operation is a blocker even if it is reachable only by enabling a
+supported opt-in option.
+Everything else, unless it is one of the blockers above, is important or a
+nit, never a blocker: pre-existing gaps, races that need an outside change
+mid-run, hardening, privacy or robustness the base also lacks, an incomplete
+fix that is no worse than the base, speculative risks, and documentation or
+test gaps.
 When findings share a cause, report one finding at the highest applicable
 severity, name the root fix (for example, which mechanism to replace or remove),
 and list its instances together rather than filing a blocker per instance.
