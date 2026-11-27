@@ -5697,9 +5697,15 @@ is due, and plans its run:
    plan lists them again.
 3. Otherwise it lists the open pull requests of each repository, one REST
    request each, with no inference. Those the operator or the bot opened are
-   left out. A repository with more than 100 open pull requests, or more than
-   200 incoming in all, is not read whole and fails the stage
+   left out. A repository with more than 100 open pull requests is not read
+   whole, and it or any other unreadable listing fails the stage
    (`maintain error: …`, a failure); nothing is planned and nothing reserved.
+   With more than 200 incoming in all, the digest considers the 200 most
+   recently updated, ties by `OWNER/REPO#N`, and says so
+   (`maintain: L incoming pull request(s) past the 200 most recently updated
+   wait for a later digest: OWNER/REPO (K), …`), as its brief does. The plan
+   records none of those left out, acknowledged before or not, so they stay
+   due and are considered once they are among the 200 most recently updated.
 4. A pull request is due a review when its head commit's first 12 hex
    characters differ from those acknowledged for it, or none are; a plan
    comment whose block cannot be read acknowledges none, and its line says

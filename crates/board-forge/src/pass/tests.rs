@@ -15329,7 +15329,7 @@ fn maintained_with(hour: u8, comments: Vec<Value>, used: f64, repos: Value) -> (
             .collect();
         get(operator_search(qualifier), json!({"items": items}));
     }
-    let pull = |number: u64, login: &str, sha: &str| json!({"number": number, "user": {"login": login}, "head": {"sha": head(sha)}});
+    let pull = |number: u64, login: &str, sha: &str| json!({"number": number, "user": {"login": login}, "head": {"sha": head(sha)}, "updated_at": "2026-10-20T00:00:00Z"});
     for repo in LISTED {
         get(format!("{API_ROOT}repos/{repo}"), visible(true));
         let pulls = match *repo {
@@ -16426,7 +16426,7 @@ fn maintain_advances_through_more_than_a_digest() {
     let listing = format!("{API_ROOT}repos/up/a/pulls?state=open&per_page=100");
     let sha = |n: u32| head(&format!("{n:02}"));
     let pulls: Vec<Value> = (1..=25)
-        .map(|n| json!({"number": n, "user": {"login": "visitor"}, "head": {"sha": sha(n)}}))
+        .map(|n| json!({"number": n, "user": {"login": "visitor"}, "head": {"sha": sha(n)}, "updated_at": "2026-10-20T00:00:00Z"}))
         .collect();
     answer(&mut replay, &listing)["body"] = pulls.into();
     let (config, mut forge) = two_days((config, replay));
@@ -16464,6 +16464,211 @@ fn maintain_advances_through_more_than_a_digest() {
     let reviews = format!("; reviews {}", keys(&[3, 5, 21, 22, 23, 24, 25]).join(", "));
     assert!(lines[1].starts_with(due), "{lines:#?}");
     assert!(lines[1].ends_with(&reviews), "{lines:#?}");
+}
+
+/// The repositories of [`over_cap`].
+const OVER_CAP: [&str; 3] = ["up/a", "up/b", "up/c"];
+
+/// The update time of [`over_cap`]'s oldest pull requests.
+const OVER_CAP_BASE: &str = "2026-10-20T00:00:00Z";
+
+/// [`maintained_with`] [`OVER_CAP`] included, listing `counts` incoming pull
+/// requests of each, numbered from 1, each updated a minute after the one
+/// before it in that order, except up/b#1, updated with the first.
+fn over_cap(counts: [u64; 3]) -> (Config, Replay) {
+    let repos = json!({"sinceDays": 90, "min": 3, "max": 3, "include": OVER_CAP});
+    let (config, mut replay) = maintained_with(9, vec![], 40.0, repos);
+    let mut minutes = 0;
+    for (repo, count) in OVER_CAP.into_iter().zip(counts) {
+        let pulls: Vec<Value> = (1..=count)
+            .map(|n| {
+                let tied = repo == "up/b" && n == 1;
+                let updated = at(OVER_CAP_BASE) + time::Duration::minutes(minutes);
+                let updated = if tied { at(OVER_CAP_BASE) } else { updated };
+                minutes += 1;
+                let sha = head(&format!("{}{n:03}", &repo[3..]));
+                json!({"number": n, "user": {"login": "visitor"}, "head": {"sha": sha},
+                    "updated_at": updated.format(&Rfc3339).unwrap()})
+            })
+            .collect();
+        let listing = format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100");
+        answer(&mut replay, &listing)["body"] = pulls.into();
+    }
+    (config, replay)
+}
+
+/// `OWNER/REPO#N, …` of `repo`'s `numbers`.
+fn pull_keys(repo: &str, numbers: impl IntoIterator<Item = u64>) -> Vec<String> {
+    (numbers.into_iter())
+        .map(|n| format!("{repo}#{n}"))
+        .collect()
+}
+
+/// Individually complete listings that jointly exceed the digest's 200
+/// incoming pull requests no longer fail the stage: it considers the 200
+/// most recently updated, ties by key, says how many of each repository
+/// it left out, and plans the digest from the rest.
+#[test]
+fn maintain_considers_the_most_recently_updated_incoming() {
+    let truncated = "maintain: 1 incoming pull request(s) past the 200 most recently updated \
+                     wait for a later digest: up/b (1)";
+    let cases = [
+        ("below", [0, 100, 99], 199, None),
+        ("at", [0, 100, 100], 200, None),
+        ("above", [1, 100, 100], 200, Some(truncated)),
+    ];
+    for (name, counts, n, left) in cases {
+        let (config, replay) = over_cap(counts);
+        let report = preview(&config, &replay);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let reviews = match counts[0] {
+            // up/a#1 is kept over up/b#1, updated with it, by its key.
+            1 => [vec!["up/a#1".to_owned()], pull_keys("up/b", 2..=20)].concat(),
+            _ => pull_keys("up/b", 1..=20),
+        };
+        let mut expected = vec!["maintain: repositories: up/a, up/b, up/c".to_owned()];
+        expected.extend(left.map(str::to_owned));
+        expected.push(format!(
+            "maintain: digest due: {n} of {n} incoming pull request(s) changed since no plan; reviews {}",
+            reviews.join(", ")
+        ));
+        let lines = maintain_lines(&report);
+        assert_eq!(lines[..expected.len()], expected, "{name}");
+    }
+}
+
+/// The pull requests left out stay unacknowledged: the plan records neither
+/// their heads nor them as pending, the next day leaves out the same, and
+/// one updated since is considered and due, while the one it displaces,
+/// acknowledged or not, drops out of the record.
+#[test]
+fn maintain_carries_omitted_incoming_across_days() {
+    let (config, mut forge) = two_days(over_cap([1, 100, 100]));
+    let report = apply(&forge, &config);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let comments = forge.comments_on("cgwalters-forge/bot-ops", 9);
+    let record = (comments.iter())
+        .find(|c| c.starts_with(maintain::PLAN_MARKER))
+        .and_then(|c| plan::fenced_json(c, maintain::PLAN_BLOCK).unwrap())
+        .unwrap();
+    let reviewed = [vec!["up/a#1".to_owned()], pull_keys("up/b", 2..=20)].concat();
+    let pending = record["pending"]["heads"].as_object().unwrap();
+    assert_eq!(
+        pending.keys().collect::<BTreeSet<_>>(),
+        reviewed.iter().collect()
+    );
+    assert_eq!(record["heads"], json!({}));
+    let brief = text(&record, "/plan/brief");
+    assert!(
+        brief.contains(
+            "1 more incoming pull request(s), the least recently updated past the 200 considered, \
+             were left out and wait for a later digest: up/b (1). Do not assess them."
+        ),
+        "{brief}"
+    );
+    let assessed: Vec<(&str, String)> = (pending.iter())
+        .map(|(pr, head)| (pr.as_str(), head.as_str().unwrap().to_owned()))
+        .collect();
+    post_on_digest(&forge, "cgwalters-bot", digest_of(&assessed, &[]));
+    let state = report.state.unwrap();
+    let truncated = |repo: &str| {
+        format!(
+            "maintain: 1 incoming pull request(s) past the 200 most recently updated \
+             wait for a later digest: {repo} (1)"
+        )
+    };
+    let due = |c: usize, reviews: Vec<String>| {
+        format!(
+            "maintain: digest due: {c} of 200 incoming pull request(s) changed since \
+             {DIGEST}#issuecomment-*; reviews {}",
+            reviews.join(", ")
+        )
+    };
+    let day_two = |forge: &Forge, name: &str| {
+        let next = block(run(
+            forge,
+            forge,
+            &config,
+            state.clone(),
+            (Mode::Preview, Limits::default()),
+            forge.replay.now + time::Duration::days(1),
+        ))
+        .unwrap();
+        assert_eq!(next.failures, 0, "{name}: {:#?}", next.lines);
+        let lines: Vec<String> = (maintain_lines(&next).iter())
+            .map(|l| l.to_string())
+            .collect();
+        lines
+    };
+    let cases = [
+        (
+            "unchanged",
+            None,
+            vec![
+                "assessed 20 of 20 planned pull request(s)".to_owned(),
+                truncated("up/b"),
+                due(180, pull_keys("up/b", 21..=40)),
+            ],
+        ),
+        (
+            "omitted one updated",
+            Some("2026-10-23T12:00:00Z"),
+            vec![
+                "assessed 20 of 20 planned pull request(s)".to_owned(),
+                truncated("up/a"),
+                due(
+                    181,
+                    [vec!["up/b#1".to_owned()], pull_keys("up/b", 21..=39)].concat(),
+                ),
+            ],
+        ),
+    ];
+    for (name, updated, expected) in cases {
+        if let Some(updated) = updated {
+            let listing = format!("{API_ROOT}repos/up/b/pulls?state=open&per_page=100");
+            answer(&mut forge.replay, &listing)["body"][0]["updated_at"] = json!(updated);
+        }
+        let lines = day_two(&forge, name);
+        let matches = |line: &str, expected: &str| expected.split('*').all(|p| line.contains(p));
+        assert!(lines.len() > expected.len(), "{name}: {lines:#?}");
+        for (line, expected) in lines[1..].iter().zip(&expected) {
+            assert!(matches(line, expected), "{name}: {expected}: {lines:#?}");
+        }
+    }
+}
+
+/// Genuine read errors over the cap still fail the stage, before any
+/// selection: a failed listing, one not read whole, and a pull request
+/// without an update time to rank it by.
+#[test]
+fn maintain_fails_unreadable_incoming() {
+    let listing = format!("{API_ROOT}repos/up/c/pulls?state=open&per_page=100");
+    let cases = [
+        (
+            "/status",
+            json!(500),
+            "maintain error: listing up/c's pull requests: GitHub HTTP status 500",
+        ),
+        (
+            "/link",
+            json!("<https://api.github.com/next>; rel=\"next\""),
+            "maintain error: up/c has more than 100 open pull requests, not read whole",
+        ),
+        (
+            "/body/99/updated_at",
+            Value::Null,
+            "maintain error: up/c#100 has no update time",
+        ),
+    ];
+    for (name, value, expected) in cases {
+        let (config, mut replay) = over_cap([1, 100, 100]);
+        *answer(&mut replay, &listing).pointer_mut(name).unwrap() = value;
+        let report = preview(&config, &replay);
+        assert_eq!(report.failures, 1, "{name}: {:#?}", report.lines);
+        let lines = maintain_lines(&report);
+        assert_eq!(lines.len(), 2, "{name}: {lines:#?}");
+        assert!(lines[1].starts_with(expected), "{name}: {lines:#?}");
+    }
 }
 
 /// A marker the bot never edited, as a run can post one, supplies no day or

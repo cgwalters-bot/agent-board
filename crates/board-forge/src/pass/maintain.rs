@@ -189,8 +189,9 @@ const SEARCH_PAGE_SIZE: usize = 100;
 /// The searches whose pull requests count for a repository, by the
 /// operator's login: those they opened and those they reviewed.
 const SEARCHES: &[&str] = &["author", "reviewed-by"];
-/// The most incoming pull requests read: their heads are copied into the
-/// brief, which [`plan::JobPlan`] bounds.
+/// The most incoming pull requests one digest considers: their heads are
+/// copied into the recorded plan, one comment; the least recently updated
+/// of the rest wait for a later digest ([`considered`]).
 const INCOMING_LIMIT: usize = 200;
 /// The most pull requests one digest reviews; the rest wait for the next.
 const REVIEW_LIMIT: usize = 20;
@@ -344,14 +345,47 @@ impl Day {
     }
 }
 
-/// An incoming pull request: `OWNER/REPO#N`, its address, its head commit
-/// as the run assesses it, and the start of it the pass records.
+/// An incoming pull request: `OWNER/REPO#N`, its repository as configured,
+/// its address, its head commit as the run assesses it, the start of it the
+/// pass records, and when GitHub last updated it.
 #[derive(Debug, PartialEq)]
 pub(super) struct Pull {
     key: String,
+    repo: String,
     url: String,
     sha: String,
     head: String,
+    updated: OffsetDateTime,
+}
+
+/// The incoming pull requests one digest considers: all of `pulls` up to
+/// [`INCOMING_LIMIT`], else the most recently updated, ties by key, in their
+/// listed order; with how many of each repository's were left out. No
+/// record acknowledges those, so a later digest finds them still due.
+fn considered(pulls: Vec<Pull>) -> (Vec<Pull>, BTreeMap<String, usize>) {
+    let mut left = BTreeMap::new();
+    if pulls.len() <= INCOMING_LIMIT {
+        return (pulls, left);
+    }
+    let mut ranked: Vec<&Pull> = pulls.iter().collect();
+    ranked.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.key.cmp(&b.key)));
+    let kept: BTreeSet<String> = (ranked[..INCOMING_LIMIT].iter())
+        .map(|p| p.key.clone())
+        .collect();
+    let (kept, omitted): (Vec<Pull>, Vec<Pull>) =
+        pulls.into_iter().partition(|p| kept.contains(&p.key));
+    for pull in omitted {
+        *left.entry(pull.repo).or_default() += 1;
+    }
+    (kept, left)
+}
+
+/// `left`'s counts, as `OWNER/REPO (N), …`.
+fn left_out(left: &BTreeMap<String, usize>) -> String {
+    let counts: Vec<String> = (left.iter())
+        .map(|(repo, n)| format!("{repo} ({n})"))
+        .collect();
+    counts.join(", ")
 }
 
 /// When `now`'s day's digest is due: that day at `hour` UTC.
@@ -518,6 +552,7 @@ fn brief(
     repos: &[String],
     review: &[&Pull],
     more: usize,
+    left: &BTreeMap<String, usize>,
 ) -> String {
     let digest = &maintain.digest;
     let mut brief = format!(
@@ -549,6 +584,14 @@ fn brief(
     if more > 0 {
         brief.push_str(&format!(
             "{more} more changed pull request(s) wait for the next digest.\n"
+        ));
+    }
+    if !left.is_empty() {
+        brief.push_str(&format!(
+            "{} more incoming pull request(s), the least recently updated past the {INCOMING_LIMIT} \
+             considered, were left out and wait for a later digest: {}. Do not assess them.\n",
+            left.values().sum::<usize>(),
+            left_out(left)
         ));
     }
     brief.push_str(&format!(
@@ -706,7 +749,15 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 format!("{url}, whose heads are unreadable: {why}"),
             ),
         };
-        let pulls = self.incoming(&repos)?;
+        let (pulls, left) = considered(self.incoming(&repos)?);
+        if !left.is_empty() {
+            self.line(format!(
+                "maintain: {} incoming pull request(s) past the {INCOMING_LIMIT} most recently updated \
+                 wait for a later digest: {}",
+                left.values().sum::<usize>(),
+                left_out(&left)
+            ));
+        }
         let changed: Vec<&Pull> = (pulls.iter())
             .filter(|p| heads.get(&p.key) != Some(&p.head))
             .collect();
@@ -777,7 +828,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 let plan = json!({
                     "schema": JOB_PLAN_SCHEMA, "repo": on.0, "item": on.1,
                     "kind": DIGEST_KIND, "runner": TRIAGE_RUNNER, "pool": pool,
-                    "brief": self.directed(brief(config, maintain, from.date(), &repos, review, more)),
+                    "brief": self.directed(brief(config, maintain, from.date(), &repos, review, more, &left)),
                 });
                 plan::JobPlan::from_json(&plan).context("the digest's plan")?;
                 let public = target.is_some();
@@ -1300,7 +1351,8 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     }
 
     /// The open pull requests of `repos` that neither the operator nor the
-    /// bot opened, in the given order, each read whole.
+    /// bot opened, in the given order, each repository read whole: at most
+    /// [`REPOS_LIMIT`] pages of 100, which [`considered`] then bounds.
     fn incoming(&self, repos: &[String]) -> Result<Vec<Pull>> {
         let writers = self.writers();
         let mut pulls = Vec::new();
@@ -1334,17 +1386,17 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     "{repo}#{number} has no head commit"
                 );
                 let sha = sha.to_ascii_lowercase();
+                let updated = OffsetDateTime::parse(text(pull, "/updated_at"), &Rfc3339)
+                    .with_context(|| format!("{repo}#{number} has no update time"))?;
                 pulls.push(Pull {
                     key: format!("{repo}#{number}"),
+                    repo: repo.clone(),
                     url: format!("https://github.com/{repo}/pull/{number}"),
                     head: sha[..HEAD_CHARS].to_owned(),
                     sha,
+                    updated,
                 });
             }
-            ensure!(
-                pulls.len() <= INCOMING_LIMIT,
-                "more than {INCOMING_LIMIT} incoming pull requests"
-            );
         }
         Ok(pulls)
     }
